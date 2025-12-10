@@ -43,7 +43,7 @@ all: dependencies original_tools parallel_tools
 
 original_tools: demux_vcf demux_mt demux_tags demux_species quant_contam doublet_dragon bulkprops utils
 
-parallel_tools: demux_parallel vcf_loader_daemon
+parallel_tools: demux_parallel vcf_loader_daemon utils/downsample_vcf_parallel
 
 utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts utils/downsample_vcf
 
@@ -83,6 +83,9 @@ demux_parallel: src/demux_parallel.cpp build/common_parallel.o build/demux_vcf_i
 
 vcf_loader_daemon: src/vcf_loader_daemon.cpp build/common_parallel.o build/demux_parallel_hts.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o build/demux_parallel_hts.o src/vcf_loader_daemon.cpp -o vcf_loader_daemon $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
+
+utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp src/downsample_vcf.h build/common_parallel.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o src/downsample_vcf_parallel.cpp -o utils/downsample_vcf_parallel $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
 # ============================================================================
 # UTILITY TOOLS
@@ -198,7 +201,7 @@ clean_binaries:
 	rm -f demux_parallel vcf_loader_daemon
 	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers
 	rm -f utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts
-	rm -f utils/composite_bam2counts utils/downsample_vcf
+	rm -f utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel
 
 clean_deps:
 	cd dependencies/htswrapper && $(MAKE) clean || true
@@ -218,6 +221,6 @@ install: all
 	cp demux_parallel vcf_loader_daemon $(PREFIX)/bin/
 	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers $(PREFIX)/bin/
 	cp utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts $(PREFIX)/bin/
-	cp utils/composite_bam2counts utils/downsample_vcf $(PREFIX)/bin/
+	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
 
 .PHONY: all original_tools parallel_tools utils dependencies clean clean_build clean_binaries clean_deps clean_all install
