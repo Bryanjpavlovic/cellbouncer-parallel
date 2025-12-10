@@ -708,50 +708,67 @@ int main(int argc, char *argv[]) {
     // Compute downsampling probabilities using Brent's method
     // ========================================================================
     
-    double allbc = 0.0;
-    for (auto& bc : branchcounts){
-        allbc += bc.second;
-    }
-    fprintf(stderr, "%f total clade counts\n", allbc);
-    
-    vector<bitset<NBITS>> bs_idx;
     unordered_map<bitset<NBITS>, double> downsample_prob;
     
+    fprintf(stderr, "Determine number of sites to downsample...\n");
+
     double allbc2 = 0.0;
-    map<string, double> data_d;
-    map<string, int> data_i;
-    char buf[50];
+    vector<bitset<NBITS>> bs_idx;
+    vector<pair<double, int>> clcountsort;  // (negative_count, index)
     
-    vector<pair<double, bitset<NBITS>>> clcountsort;
-    for (auto& bc : branchcounts){
-        clcountsort.push_back(make_pair(-bc.second, bc.first));
+    // Build sorted list
+    for (auto bc = branchcounts.begin(); bc != branchcounts.end(); ){
+        allbc2 += bc->second;
+        clcountsort.push_back(make_pair(-bc->second, bs_idx.size()));
+        bs_idx.push_back(bc->first);
+        branchcounts.erase(bc++);
     }
-    sort(clcountsort.begin(), clcountsort.end());
     
-    int idx2 = 0;
-    for (auto& cls : clcountsort){
-        sprintf(&buf[0], "x%d", idx2);
-        string bufstr = buf;
-        data_d.insert(make_pair(bufstr, -cls.first));
-        allbc2 += -cls.first;
-        bs_idx.push_back(cls.second);
-        idx2++;
-    }
-    data_i.insert(make_pair("num", idx2));
-    data_i.insert(make_pair("target", num));
+    fprintf(stderr, "%f total clade counts\n", allbc2);
     
-    if (allbc2 > num){
-        double upper = 1.0;
-        double lower = 0.0;
+    if (allbc2 > (double)num){
+        sort(clcountsort.begin(), clcountsort.end());
         
-        double x = optimML::brent_solver(brentfun, dbrentfun, data_d, data_i, lower, upper, 0.001);
-        
-        fprintf(stderr, "Brent solver found x = %f\n", x);
-        
-        for (int i = 0; i < (int)clcountsort.size(); ++i){
-            double dsp = pow(-clcountsort[i].first, x) / (-clcountsort[i].first);
-            if (dsp < 1.0){
-                downsample_prob.insert(make_pair(clcountsort[i].second, dsp));
+        for (int n_hi = 1; n_hi <= (int)clcountsort.size(); ++n_hi){
+            double sum_hi = 0;
+            
+            optimML::brent_solver solver(brentfun, dbrentfun);
+            solver.set_root();
+            char buf[50];
+            vector<vector<double>> vecs;
+
+            for (int i = 0; i < n_hi; ++i){
+                vecs.push_back(vector<double>{ -clcountsort[i].first });
+                sprintf(&buf[0], "x%d", i);
+                string bufstr = buf;
+                solver.add_data(bufstr, vecs[vecs.size()-1]);
+                sum_hi += -clcountsort[i].first;
+            }
+
+            double sum_lo = allbc2 - sum_hi;
+            if (n_hi == (int)clcountsort.size() || sum_lo < (double)num){
+                double lastcount = -clcountsort[n_hi-1].first;
+                double nextcount = -1;
+                if (n_hi < (int)clcountsort.size()){
+                    nextcount = -clcountsort[n_hi].first;
+                }
+                
+                solver.add_data_fixed("target", (int)round((double)num - sum_lo));
+                solver.add_data_fixed("num", n_hi);
+                double res = solver.solve(0, 1);
+
+                if (res < 1.0){
+                    lastcount = pow(lastcount, res);
+                    
+                    if (lastcount > nextcount){
+                        fprintf(stderr, "Brent solver found x = %f\n", res);
+                        for (int i = 0; i < n_hi; ++i){
+                            double dsp = pow(-clcountsort[i].first, res) / -clcountsort[i].first;
+                            downsample_prob.insert(make_pair(bs_idx[clcountsort[i].second], dsp));
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
@@ -807,7 +824,10 @@ int main(int argc, char *argv[]) {
     }
     
     htsFile* outf = hts_open(outfile.c_str(), "wz");
-    bcf_hdr_write(outf, bcf_header);
+    if (bcf_hdr_write(outf, bcf_header) < 0) {
+        fprintf(stderr, "ERROR: Failed to write VCF header\n");
+        exit(1);
+    }
 
     // Random number generator
     random_device rd;
