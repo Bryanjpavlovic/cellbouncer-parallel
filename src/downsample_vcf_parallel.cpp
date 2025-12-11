@@ -11,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <map>
 #include <unordered_map>
 #include <set>
@@ -91,6 +92,93 @@ float get_annot_score(const string& chrom, int pos, const map<string, vector<Int
     }
     
     return 0.1;
+}
+
+// Coverage interval with score
+struct CoverageInterval {
+    int start;
+    int end;
+    float score;
+    bool operator<(const CoverageInterval& other) const {
+        return start < other.start;
+    }
+};
+
+// Load coverage bedgraph into memory
+map<string, vector<CoverageInterval>> load_coverage(const string& filename) {
+    map<string, vector<CoverageInterval>> cov_map;
+    
+    htsFile* fp = hts_open(filename.c_str(), "r");
+    if (!fp) return cov_map;
+    
+    kstring_t str = {0, 0, 0};
+    long count = 0;
+    
+    while (hts_getline(fp, KS_SEP_LINE, &str) >= 0) {
+        if (str.l == 0 || str.s[0] == '#') continue;
+        
+        char* chrom = str.s;
+        char* p = str.s;
+        int col = 0;
+        int start = 0, end = 0;
+        float score = 0;
+        
+        while (*p) {
+            if (*p == '\t') {
+                *p = '\0';
+                col++;
+                if (col == 1) start = atoi(p + 1);
+                else if (col == 2) end = atoi(p + 1);
+                else if (col == 3) {
+                    score = atof(p + 1);
+                    break;
+                }
+            }
+            p++;
+        }
+        
+        if (col >= 3) {
+            cov_map[string(chrom)].push_back({start, end, score});
+            count++;
+            if (count % 10000000 == 0) {
+                fprintf(stderr, "  Loaded %ld coverage intervals...\r", count);
+            }
+        }
+    }
+    
+    free(str.s);
+    hts_close(fp);
+    
+    // Sort each chromosome's intervals
+    for (auto& kv : cov_map) {
+        sort(kv.second.begin(), kv.second.end());
+    }
+    
+    fprintf(stderr, "  Loaded %ld coverage intervals from %zu chromosomes\n", count, cov_map.size());
+    return cov_map;
+}
+
+// Fast in-memory coverage lookup
+float get_coverage_score_fast(const string& chrom, int pos, const map<string, vector<CoverageInterval>>& coverage) {
+    auto it = coverage.find(chrom);
+    if (it == coverage.end()) return 0.0;
+    
+    const vector<CoverageInterval>& ivs = it->second;
+    auto cit = lower_bound(ivs.begin(), ivs.end(), CoverageInterval{pos, 0, 0});
+    
+    // Check current interval
+    if (cit != ivs.end() && cit->start <= pos && cit->end > pos) {
+        return cit->score;
+    }
+    // Check previous interval
+    if (cit != ivs.begin()) {
+        auto prev = std::prev(cit);
+        if (prev->start <= pos && prev->end > pos) {
+            return prev->score;
+        }
+    }
+    
+    return 0.0;
 }
 
 float get_coverage_score(const string& chrom, int pos, tbx_t* tbx, htsFile* fp) {
@@ -446,15 +534,11 @@ int main(int argc, char *argv[]) {
         load_gtf(gtf_file, annotations);
     }
 
-    htsFile* cov_fp = NULL;
-    tbx_t* cov_tbx = NULL;
+    // Load coverage into memory for fast lookup
+    map<string, vector<CoverageInterval>> coverage_map;
     if (!cov_file.empty()) {
-        cov_fp = hts_open(cov_file.c_str(), "r");
-        cov_tbx = tbx_index_load(cov_file.c_str());
-        if (!cov_tbx) {
-            fprintf(stderr, "ERROR: Coverage file must be bgzipped and tabix indexed.\n");
-            exit(1);
-        }
+        fprintf(stderr, "Loading coverage from %s...\n", cov_file.c_str());
+        coverage_map = load_coverage(cov_file);
     }
 
     // ========================================================================
@@ -494,6 +578,19 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Found %d chromosomes, %d samples\n", (int)chroms.size(), num_samples);
 
     // ========================================================================
+    // Load VCF index (CSI required for parallel region queries)
+    // ========================================================================
+    
+    fprintf(stderr, "Loading VCF index...\n");
+    hts_idx_t* vcf_idx = bcf_index_load(vcf_file.c_str());
+    if (!vcf_idx) {
+        fprintf(stderr, "ERROR: Could not load VCF index (.csi required for parallel queries)\n");
+        fprintf(stderr, "  Create with: bcftools index -c %s\n", vcf_file.c_str());
+        exit(1);
+    }
+    fprintf(stderr, "  Index loaded successfully\n");
+
+    // ========================================================================
     // PASS 1: Count clades (PARALLEL BY CHROMOSOME)
     // ========================================================================
     
@@ -507,31 +604,18 @@ int main(int argc, char *argv[]) {
 
     auto start_time = chrono::high_resolution_clock::now();
     
-    fprintf(stderr, "Pass 1: Counting mutations on branches (parallel)...\n");
+    fprintf(stderr, "Pass 1: Counting mutations on branches (parallel, %d threads)...\n", n_threads);
 
-    #pragma omp parallel
+    #pragma omp parallel num_threads(n_threads)
     {
         // Thread-local data structures
         unordered_map<bitset<NBITS>, double> local_branchcounts;
         unordered_map<pair<bitset<NBITS>, bitset<NBITS>>, double> local_branchcounts_missing;
         unordered_map<bitset<NBITS>, bitset<NBITS>> local_miss2flip;
         
-        // Thread-local VCF reader
+        // Thread-local VCF reader (each thread needs its own)
         htsFile* thread_reader = bcf_open(vcf_file.c_str(), "r");
         bcf_hdr_t* thread_header = bcf_hdr_read(thread_reader);
-        
-        // Load index for region queries
-        hts_idx_t* idx = bcf_index_load(vcf_file.c_str());
-        if (!idx){
-            // Try tabix index
-            tbx_t* tbx = tbx_index_load(vcf_file.c_str());
-            if (!tbx){
-                fprintf(stderr, "ERROR: VCF must be indexed (.tbi or .csi)\n");
-                exit(1);
-            }
-            tbx_destroy(tbx);
-            idx = bcf_index_load(vcf_file.c_str());
-        }
         
         bcf1_t* bcf_record = bcf_init();
         bitset<NBITS> alt, alt_flip, present;
@@ -540,9 +624,12 @@ int main(int argc, char *argv[]) {
         for (size_t c = 0; c < chroms.size(); c++){
             const string& chrom = chroms[c];
             
-            // Query this chromosome
-            hts_itr_t* iter = bcf_itr_querys(idx, thread_header, chrom.c_str());
-            if (!iter) continue;
+            // Query this chromosome using shared index
+            hts_itr_t* iter = bcf_itr_querys(vcf_idx, thread_header, chrom.c_str());
+            if (!iter) {
+                chroms_done++;
+                continue;
+            }
             
             long local_snps = 0;
             
@@ -560,19 +647,21 @@ int main(int argc, char *argv[]) {
                         count_branch(local_branchcounts, alt, alt_flip, ac, afc, 1.0);
                     }
                     else{
-                        count_branch_missing(local_branchcounts_missing,
-                            local_miss2flip, present, alt, alt_flip, ac, afc, 1.0);
+                        count_branch_missing(local_branchcounts_missing, local_miss2flip, 
+                            present, alt, alt_flip, ac, afc, 1.0);
                     }
+                    local_snps++;
                 }
-                local_snps++;
             }
             
             hts_itr_destroy(iter);
             total_snps += local_snps;
-            chroms_done++;
+            int done = ++chroms_done;
             
-            fprintf(stderr, "  Chromosome %s done (%ld SNPs) [%d/%lu]\r", 
-                chrom.c_str(), local_snps, chroms_done.load(), chroms.size());
+            if (local_snps > 0 || done % 100 == 0) {
+                fprintf(stderr, "  Chromosome %s: %ld SNPs [%d/%zu]\n", 
+                    chrom.c_str(), local_snps, done, chroms.size());
+            }
         }
         
         // Merge thread-local counts into global
@@ -581,10 +670,12 @@ int main(int argc, char *argv[]) {
         merge_miss2flip(miss2flip, local_miss2flip, m2f_mutex);
         
         bcf_destroy(bcf_record);
-        hts_idx_destroy(idx);
         bcf_hdr_destroy(thread_header);
         hts_close(thread_reader);
     }
+    
+    // Clean up shared index
+    hts_idx_destroy(vcf_idx);
     
     auto end_time = chrono::high_resolution_clock::now();
     auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
@@ -593,9 +684,9 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Found %lu unique clade patterns\n", branchcounts.size());
     
     if (branchcounts.size() >= (size_t)num){
-        fprintf(stderr, "ERROR: %ld distinct allele sharing patterns found, but %d SNPs requested.\n", 
+        fprintf(stderr, "ERROR: %zu distinct allele sharing patterns found, but %d SNPs requested.\n", 
             branchcounts.size(), num);
-        fprintf(stderr, "  Please set sample size to at least %ld.\n", branchcounts.size());
+        fprintf(stderr, "  Please set sample size to at least %zu.\n", branchcounts.size());
         exit(1);
     }
 
@@ -615,12 +706,20 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    fprintf(stderr, "Adjusting counts using data from sites with missing genotypes...\n");
+    fprintf(stderr, "Adjusting counts using data from sites with missing genotypes (%zu entries)...\n", branchcounts_missing.size());
+    fflush(stderr);
+    
     unordered_map<bitset<NBITS>, vector<bitset<NBITS>>> keyuniqparent;
     unordered_map<bitset<NBITS>, float> to_add;
     unordered_map<pair<bitset<NBITS>, bitset<NBITS>>, unordered_map<bitset<NBITS>, float>> miss_clade_probs;
     
+    long adj_count = 0;
     for (auto& bcm : branchcounts_missing){
+        adj_count++;
+        if (adj_count % 100000 == 0) {
+            fprintf(stderr, "  Adjusting: %ld/%zu\r", adj_count, branchcounts_missing.size());
+            fflush(stderr);
+        }
         unordered_map<bitset<NBITS>, float> mx;
         miss_clade_probs.insert(make_pair(bcm.first, mx));
         double parent_tot = 0.0;
@@ -711,63 +810,153 @@ int main(int argc, char *argv[]) {
     unordered_map<bitset<NBITS>, double> downsample_prob;
     
     fprintf(stderr, "Determine number of sites to downsample...\n");
+    fflush(stderr);
 
     double allbc2 = 0.0;
     vector<bitset<NBITS>> bs_idx;
     vector<pair<double, int>> clcountsort;  // (negative_count, index)
     
     // Build sorted list
+    fprintf(stderr, "Building clade count list from %zu entries...\n", branchcounts.size());
+    fflush(stderr);
     for (auto bc = branchcounts.begin(); bc != branchcounts.end(); ){
         allbc2 += bc->second;
         clcountsort.push_back(make_pair(-bc->second, bs_idx.size()));
         bs_idx.push_back(bc->first);
         branchcounts.erase(bc++);
     }
+    fprintf(stderr, "  Built list with %zu entries\n", clcountsort.size());
+    fflush(stderr);
     
     fprintf(stderr, "%f total clade counts\n", allbc2);
+    fflush(stderr);
     
     if (allbc2 > (double)num){
+        fprintf(stderr, "Sorting %zu clade counts...\n", clcountsort.size());
+        fflush(stderr);
         sort(clcountsort.begin(), clcountsort.end());
+        fprintf(stderr, "Sort complete.\n");
+        fflush(stderr);
         
-        for (int n_hi = 1; n_hi <= (int)clcountsort.size(); ++n_hi){
-            double sum_hi = 0;
-            
-            optimML::brent_solver solver(brentfun, dbrentfun);
-            solver.set_root();
-            char buf[50];
-            vector<vector<double>> vecs;
-
-            for (int i = 0; i < n_hi; ++i){
-                vecs.push_back(vector<double>{ -clcountsort[i].first });
-                sprintf(&buf[0], "x%d", i);
-                string bufstr = buf;
-                solver.add_data(bufstr, vecs[vecs.size()-1]);
-                sum_hi += -clcountsort[i].first;
+        // Extract counts into a simple vector for fast access
+        vector<double> counts(clcountsort.size());
+        for (size_t i = 0; i < clcountsort.size(); i++) {
+            counts[i] = -clcountsort[i].first;
+        }
+        
+        // Pre-compute cumulative sums
+        fprintf(stderr, "Computing cumulative sums...\n");
+        fflush(stderr);
+        vector<double> cumsum(counts.size() + 1, 0.0);
+        for (size_t i = 0; i < counts.size(); i++) {
+            cumsum[i + 1] = cumsum[i] + counts[i];
+        }
+        
+        // Find starting point where sum_lo < num
+        double threshold = allbc2 - (double)num;
+        int start_n_hi = 1;
+        for (size_t i = 1; i <= counts.size(); i++) {
+            if (cumsum[i] > threshold) {
+                start_n_hi = i;
+                break;
             }
-
+        }
+        fprintf(stderr, "Starting optimization at n_hi=%d (sum_hi=%.0f, need > %.0f)\n", 
+            start_n_hi, cumsum[start_n_hi], threshold);
+        fprintf(stderr, "Top 10 clade counts: ");
+        for (int i = 0; i < min(10, (int)counts.size()); i++) {
+            fprintf(stderr, "%.0f ", counts[i]);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+        
+        auto brent_start = chrono::high_resolution_clock::now();
+        
+        // Lambda to compute sum of counts[0..n-1]^x (parallelized)
+        auto power_sum = [&counts](int n, double x) -> double {
+            double sum = 0.0;
+            #pragma omp parallel for reduction(+:sum)
+            for (int i = 0; i < n; i++) {
+                sum += pow(counts[i], x);
+            }
+            return sum;
+        };
+        
+        // For each n_hi, find x such that power_sum(n_hi, x) = target
+        // Using bisection (simpler and robust)
+        int solutions_tried = 0;
+        for (int n_hi = start_n_hi; n_hi <= (int)counts.size(); ++n_hi){
+            double sum_hi = cumsum[n_hi];
             double sum_lo = allbc2 - sum_hi;
-            if (n_hi == (int)clcountsort.size() || sum_lo < (double)num){
-                double lastcount = -clcountsort[n_hi-1].first;
-                double nextcount = -1;
-                if (n_hi < (int)clcountsort.size()){
-                    nextcount = -clcountsort[n_hi].first;
+            
+            if (n_hi == (int)counts.size() || sum_lo < (double)num){
+                solutions_tried++;
+                
+                if (solutions_tried % 1000 == 0) {
+                    auto now = chrono::high_resolution_clock::now();
+                    auto elapsed = chrono::duration_cast<chrono::seconds>(now - brent_start);
+                    fprintf(stderr, "  Tried %d solutions, n_hi=%d, elapsed=%lds\r", 
+                        solutions_tried, n_hi, elapsed.count());
+                    fflush(stderr);
                 }
                 
-                solver.add_data_fixed("target", (int)round((double)num - sum_lo));
-                solver.add_data_fixed("num", n_hi);
-                double res = solver.solve(0, 1);
-
+                double target = (double)num - sum_lo;
+                double lastcount = counts[n_hi - 1];
+                double nextcount = (n_hi < (int)counts.size()) ? counts[n_hi] : -1;
+                
+                // Bisection to find x where power_sum(n_hi, x) = target
+                // At x=0: power_sum = n_hi (each count^0 = 1)
+                // At x=1: power_sum = sum_hi
+                // We need target, which is between n_hi and sum_hi
+                
+                double x_lo = 0.0, x_hi = 1.0;
+                double res = 0.5;
+                
+                // Quick check: if target is out of range, skip
+                if (target < n_hi || target > sum_hi) {
+                    continue;
+                }
+                
+                // Bisection with 20 iterations (gives ~6 decimal places)
+                for (int iter = 0; iter < 20; iter++) {
+                    res = (x_lo + x_hi) / 2.0;
+                    double ps = power_sum(n_hi, res);
+                    if (ps < target) {
+                        x_lo = res;
+                    } else {
+                        x_hi = res;
+                    }
+                }
+                
                 if (res < 1.0){
-                    lastcount = pow(lastcount, res);
+                    double transformed_last = pow(lastcount, res);
                     
-                    if (lastcount > nextcount){
-                        fprintf(stderr, "Brent solver found x = %f\n", res);
+                    if (transformed_last > nextcount){
+                        auto brent_end = chrono::high_resolution_clock::now();
+                        auto brent_dur = chrono::duration_cast<chrono::seconds>(brent_end - brent_start);
+                        fprintf(stderr, "\nFound solution: x = %f at n_hi=%d (after %ld seconds, %d solutions tried)\n", 
+                            res, n_hi, brent_dur.count(), solutions_tried);
+                        fflush(stderr);
+                        
+                        fprintf(stderr, "Building downsample probability map for %d clades...\n", n_hi);
+                        fflush(stderr);
                         for (int i = 0; i < n_hi; ++i){
-                            double dsp = pow(-clcountsort[i].first, res) / -clcountsort[i].first;
+                            double dsp = pow(counts[i], res) / counts[i];
                             downsample_prob.insert(make_pair(bs_idx[clcountsort[i].second], dsp));
                         }
+                        fprintf(stderr, "  Added %zu probabilities\n", downsample_prob.size());
+                        fflush(stderr);
                         break;
                     }
+                    else if (solutions_tried <= 10) {
+                        fprintf(stderr, "  n_hi=%d: x=%.4f, transformed_last=%.2f <= nextcount=%.2f (failed)\n",
+                            n_hi, res, transformed_last, nextcount);
+                        fflush(stderr);
+                    }
+                }
+                else if (solutions_tried <= 10) {
+                    fprintf(stderr, "  n_hi=%d: x=%.4f >= 1.0 (failed)\n", n_hi, res);
+                    fflush(stderr);
                 }
             }
         }
@@ -778,8 +967,12 @@ int main(int argc, char *argv[]) {
     }
     
     // Compute downsample probabilities for missing genotype sites
+    fprintf(stderr, "Computing downsample probabilities for missing genotype sites (%zu entries)...\n", miss_clade_probs.size());
+    fflush(stderr);
+    
     unordered_map<pair<bitset<NBITS>, bitset<NBITS>>, double> downsample_miss_prob;
 
+    long miss_count = 0;
     for (auto mcp = miss_clade_probs.begin(); mcp != miss_clade_probs.end(); ){
         double p = 0.0;
         for (auto mcp2 = mcp->second.begin(); mcp2 != mcp->second.end(); ){
@@ -795,7 +988,14 @@ int main(int argc, char *argv[]) {
             downsample_miss_prob.insert(make_pair(mcp->first, p));
         }
         miss_clade_probs.erase(mcp++);
+        miss_count++;
+        if (miss_count % 100000 == 0) {
+            fprintf(stderr, "  Processed %ld missing entries...\r", miss_count);
+            fflush(stderr);
+        }
     }
+    fprintf(stderr, "  Computed %zu missing genotype probabilities\n", downsample_miss_prob.size());
+    fflush(stderr);
     
     if (downsample_prob.size() == 0){
         fprintf(stderr, "No clades were found with more than %d occurrences.\n", num);
@@ -804,138 +1004,244 @@ int main(int argc, char *argv[]) {
     }
 
     // ========================================================================
-    // PASS 2: Filter VCF (sequential - output must be ordered)
+    // PASS 2: Filter VCF (PARALLEL BY CHROMOSOME)
     // ========================================================================
     
-    fprintf(stderr, "Pass 2: Filtering VCF...\n");
+    fprintf(stderr, "Pass 2: Filtering VCF (parallel, %d threads)...\n", n_threads);
+    fflush(stderr);
     start_time = chrono::high_resolution_clock::now();
     
-    bcf_reader = hts_open(vcf_file.c_str(), "r");
-    bcf_header = bcf_hdr_read(bcf_reader);
-    bcf1_t* bcf_record = bcf_init();
-    
-    // Add INFO headers
-    bcf_hdr_append(bcf_header, "##INFO=<ID=DEMUX_SCORE,Number=1,Type=Float,Description=\"Clade rarity score\">");
-    if (!gtf_file.empty()) {
-        bcf_hdr_append(bcf_header, "##INFO=<ID=ANNOT_SCORE,Number=1,Type=Float,Description=\"Annotation weight (1.0=genic, 0.1=intergenic)\">");
-    }
-    if (cov_tbx) {
-        bcf_hdr_append(bcf_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"Coverage score from bedgraph\">");
-    }
-    
-    htsFile* outf = hts_open(outfile.c_str(), "wz");
-    if (bcf_hdr_write(outf, bcf_header) < 0) {
-        fprintf(stderr, "ERROR: Failed to write VCF header\n");
+    // Reload index for Pass 2
+    vcf_idx = bcf_index_load(vcf_file.c_str());
+    if (!vcf_idx) {
+        fprintf(stderr, "ERROR: Could not reload VCF index for Pass 2\n");
         exit(1);
     }
-
-    // Random number generator
-    random_device rd;
-    mt19937 gen(seed >= 0 ? seed : rd());
-    uniform_real_distribution<> rand_dist(0.0, 1.0);
     
-    bitset<NBITS> alt, alt_flip, present;
-    long nsnp = 0;
-    int elim = 0;
-    int kept = 0;
+    // Get header for INFO field additions
+    htsFile* hdr_reader = hts_open(vcf_file.c_str(), "r");
+    bcf_hdr_t* out_header = bcf_hdr_read(hdr_reader);
+    hts_close(hdr_reader);
     
-    while(bcf_read(bcf_reader, bcf_header, bcf_record) == 0){
-        
-        if (bcf_record->n_allele == 2){ 
-            bool pass;
-            if (proc_bcf_record(bcf_record, bcf_header, num_samples,
-                alt, alt_flip, present, pass)){
-                
-                double samp_prob = 1.0;
-                int ac = alt.count();
-                int afc = alt_flip.count();
-                
-                if (present.count() == num_samples){
-                    if (ac < afc || (ac == afc && alt < alt_flip)){
-                        if (downsample_prob.count(alt) > 0){
-                            samp_prob = downsample_prob[alt];
-                        }
-                    }
-                    else{
-                        if (downsample_prob.count(alt_flip) > 0){
-                            samp_prob = downsample_prob[alt_flip];
-                        }
-                    }
-                }
-                else{
-                    pair<bitset<NBITS>, bitset<NBITS>> key;
-                    if (ac < afc || (ac == afc && alt < alt_flip)){
-                        key = make_pair(present, alt);
-                    }
-                    else{
-                        key = make_pair(present, alt_flip);
-                    }
-                    if (downsample_miss_prob.count(key) > 0){
-                        samp_prob = downsample_miss_prob[key];
-                    }
-                }
-
-                bool print_rec = true;
-                if (samp_prob < 1.0){
-                    double r = rand_dist(gen);
-                    if (r > samp_prob){
-                        print_rec = false;
-                    }
-                }
-                
-                if (print_rec){
-                    float demux_score = (samp_prob < 1.0) ? (float)samp_prob : 1.0f;
-                    bcf_update_info_float(bcf_header, bcf_record, "DEMUX_SCORE", &demux_score, 1);
-                    
-                    if (!gtf_file.empty()) {
-                        float annot_score = get_annot_score(
-                            bcf_hdr_id2name(bcf_header, bcf_record->rid),
-                            bcf_record->pos,
-                            annotations);
-                        bcf_update_info_float(bcf_header, bcf_record, "ANNOT_SCORE", &annot_score, 1);
-                    }
-                    
-                    if (cov_tbx) {
-                        float cov_score = get_coverage_score(
-                            bcf_hdr_id2name(bcf_header, bcf_record->rid),
-                            bcf_record->pos,
-                            cov_tbx,
-                            cov_fp);
-                        bcf_update_info_float(bcf_header, bcf_record, "COV_SCORE", &cov_score, 1);
-                    }
-                    
-                    bcf_write1(outf, bcf_header, bcf_record);
-                    kept++;
-                }
-                else{
-                    elim++;
-                }
-            }
-            else{
-                ++elim;
-            }
-        }
-        ++nsnp;
-        if (nsnp % 100000 == 0){
-            fprintf(stderr, "  Processed %ld SNPs, kept %d, eliminated %d\r", nsnp, kept, elim);
-        }
+    // Add INFO headers
+    bcf_hdr_append(out_header, "##INFO=<ID=DEMUX_SCORE,Number=1,Type=Float,Description=\"Clade rarity score\">");
+    if (!gtf_file.empty()) {
+        bcf_hdr_append(out_header, "##INFO=<ID=ANNOT_SCORE,Number=1,Type=Float,Description=\"Annotation weight (1.0=genic, 0.1=intergenic)\">");
     }
+    if (!coverage_map.empty()) {
+        bcf_hdr_append(out_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"Coverage score from bedgraph\">");
+    }
+    if (bcf_hdr_sync(out_header) < 0) {
+        fprintf(stderr, "ERROR: Failed to sync header\n");
+        exit(1);
+    }
+    
+    // Create temp directory for per-chromosome outputs
+    string temp_dir = outfile + ".tmp";
+    mkdir(temp_dir.c_str(), 0755);
+    fprintf(stderr, "  Temp directory: %s\n", temp_dir.c_str());
+    fflush(stderr);
+    
+    atomic<long> total_kept(0);
+    atomic<long> total_elim(0);
+    atomic<int> chroms_written(0);
+    
+    // Vector to track which chromosomes have output (for concatenation order)
+    vector<string> chrom_files(chroms.size());
+    vector<bool> chrom_has_data(chroms.size(), false);
+    
+    #pragma omp parallel num_threads(n_threads)
+    {
+        // Thread-local VCF reader
+        htsFile* thread_reader = bcf_open(vcf_file.c_str(), "r");
+        bcf_hdr_t* thread_header = bcf_hdr_read(thread_reader);
+        
+        // Thread-local copy of output header (bcf_update_info_float is NOT thread-safe with shared header)
+        bcf_hdr_t* thread_out_header = bcf_hdr_dup(out_header);
+        
+        // Thread-local random generator with unique seed per thread
+        int thread_id = omp_get_thread_num();
+        mt19937 gen(seed >= 0 ? seed + thread_id : random_device{}());
+        uniform_real_distribution<> rand_dist(0.0, 1.0);
+        
+        bcf1_t* bcf_record = bcf_init();
+        bitset<NBITS> alt, alt_flip, present;
+        
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t c = 0; c < chroms.size(); c++) {
+            const string& chrom = chroms[c];
+            
+            hts_itr_t* iter = bcf_itr_querys(vcf_idx, thread_header, chrom.c_str());
+            if (!iter) {
+                chroms_written++;
+                continue;
+            }
+            
+            // Create temp output file for this chromosome
+            string temp_file = temp_dir + "/chr_" + to_string(c) + ".bcf";
+            chrom_files[c] = temp_file;
+            
+            htsFile* temp_out = hts_open(temp_file.c_str(), "wb");
+            
+            // Write header (needed for valid BCF)
+            (void)bcf_hdr_write(temp_out, thread_out_header);
+            
+            long local_kept = 0;
+            long local_elim = 0;
+            
+            while (bcf_itr_next(thread_reader, iter, bcf_record) >= 0) {
+                if (bcf_record->n_allele != 2) continue;
+                
+                bool pass;
+                if (proc_bcf_record(bcf_record, thread_header, num_samples,
+                    alt, alt_flip, present, pass)) {
+                    
+                    double samp_prob = 1.0;
+                    int ac = alt.count();
+                    int afc = alt_flip.count();
+                    
+                    if (present.count() == num_samples) {
+                        if (ac < afc || (ac == afc && alt < alt_flip)) {
+                            if (downsample_prob.count(alt) > 0) {
+                                samp_prob = downsample_prob[alt];
+                            }
+                        } else {
+                            if (downsample_prob.count(alt_flip) > 0) {
+                                samp_prob = downsample_prob[alt_flip];
+                            }
+                        }
+                    } else {
+                        pair<bitset<NBITS>, bitset<NBITS>> key;
+                        if (ac < afc || (ac == afc && alt < alt_flip)) {
+                            key = make_pair(present, alt);
+                        } else {
+                            key = make_pair(present, alt_flip);
+                        }
+                        if (downsample_miss_prob.count(key) > 0) {
+                            samp_prob = downsample_miss_prob[key];
+                        }
+                    }
+                    
+                    bool print_rec = true;
+                    if (samp_prob < 1.0) {
+                        double r = rand_dist(gen);
+                        if (r > samp_prob) {
+                            print_rec = false;
+                        }
+                    }
+                    
+                    if (print_rec) {
+                        float demux_score = (samp_prob < 1.0) ? (float)samp_prob : 1.0f;
+                        bcf_update_info_float(thread_out_header, bcf_record, "DEMUX_SCORE", &demux_score, 1);
+                        
+                        if (!gtf_file.empty()) {
+                            float annot_score = get_annot_score(
+                                bcf_hdr_id2name(thread_header, bcf_record->rid),
+                                bcf_record->pos,
+                                annotations);
+                            bcf_update_info_float(thread_out_header, bcf_record, "ANNOT_SCORE", &annot_score, 1);
+                        }
+                        
+                        if (!coverage_map.empty()) {
+                            float cov_score = get_coverage_score_fast(
+                                bcf_hdr_id2name(thread_header, bcf_record->rid),
+                                bcf_record->pos,
+                                coverage_map);
+                            bcf_update_info_float(thread_out_header, bcf_record, "COV_SCORE", &cov_score, 1);
+                        }
+                        
+                        bcf_write1(temp_out, thread_out_header, bcf_record);
+                        local_kept++;
+                    } else {
+                        local_elim++;
+                    }
+                } else {
+                    local_elim++;
+                }
+            }
+            
+            hts_itr_destroy(iter);
+            hts_close(temp_out);
+            
+            if (local_kept > 0) {
+                chrom_has_data[c] = true;
+            } else {
+                // Remove empty file
+                remove(temp_file.c_str());
+            }
+            
+            total_kept += local_kept;
+            total_elim += local_elim;
+            int done = ++chroms_written;
+            
+            if (local_kept > 0 || done % 100 == 0) {
+                fprintf(stderr, "  Chromosome %s: kept %ld [%d/%zu]\n", 
+                    chrom.c_str(), local_kept, done, chroms.size());
+                fflush(stderr);
+            }
+        }
+        
+        bcf_destroy(bcf_record);
+        bcf_hdr_destroy(thread_header);
+        bcf_hdr_destroy(thread_out_header);
+        hts_close(thread_reader);
+    }
+    
+    hts_idx_destroy(vcf_idx);
     
     end_time = chrono::high_resolution_clock::now();
     duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
     
-    fprintf(stderr, "\nPass 2 complete: %ld SNPs in %ld seconds\n", nsnp, duration.count());
-    fprintf(stderr, "Kept %d SNPs, eliminated %d SNPs\n", kept, elim);
-
-    bcf_destroy(bcf_record);
-    bcf_hdr_destroy(bcf_header);
-    hts_close(bcf_reader);
-    hts_close(outf);
+    fprintf(stderr, "\nPass 2 filtering complete: %ld kept, %ld eliminated in %ld seconds\n", 
+        total_kept.load(), total_elim.load(), duration.count());
     
-    if (cov_tbx) {
-        tbx_destroy(cov_tbx);
-        hts_close(cov_fp);
+    // ========================================================================
+    // Concatenate chromosome files in order
+    // ========================================================================
+    
+    fprintf(stderr, "Concatenating chromosome files...\n");
+    start_time = chrono::high_resolution_clock::now();
+    
+    htsFile* outf = hts_open(outfile.c_str(), "wz");
+    hts_set_threads(outf, n_threads);
+    if (bcf_hdr_write(outf, out_header) < 0) {
+        fprintf(stderr, "ERROR: Failed to write output header\n");
+        exit(1);
     }
+    
+    bcf1_t* rec = bcf_init();
+    long final_count = 0;
+    
+    for (size_t c = 0; c < chroms.size(); c++) {
+        if (!chrom_has_data[c]) continue;
+        
+        htsFile* temp_in = hts_open(chrom_files[c].c_str(), "r");
+        bcf_hdr_t* temp_hdr = bcf_hdr_read(temp_in);
+        
+        while (bcf_read(temp_in, temp_hdr, rec) >= 0) {
+            bcf_write1(outf, out_header, rec);
+            final_count++;
+        }
+        
+        bcf_hdr_destroy(temp_hdr);
+        hts_close(temp_in);
+        
+        // Remove temp file
+        remove(chrom_files[c].c_str());
+    }
+    
+    bcf_destroy(rec);
+    hts_close(outf);
+    bcf_hdr_destroy(out_header);
+    
+    // Remove temp directory
+    rmdir(temp_dir.c_str());
+    
+    end_time = chrono::high_resolution_clock::now();
+    duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+    
+    fprintf(stderr, "Concatenation complete: %ld SNPs in %ld seconds\n", final_count, duration.count());
+    fprintf(stderr, "\nOutput: %s\n", outfile.c_str());
 
     return 0;
 }

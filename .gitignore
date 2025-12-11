@@ -19,3 +19,5 @@
 !src/*cpp
 !src/*h
 !utils/
+!sbatch/
+!sbatch/*
