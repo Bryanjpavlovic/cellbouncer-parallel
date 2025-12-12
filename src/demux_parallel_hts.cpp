@@ -716,24 +716,63 @@ void dump_vcs_counts(robin_hood::unordered_map<unsigned long, pair<float, float>
 /**
  * Get base at position from BAM record, accounting for CIGAR operations
  */
+/**
+ * Get base at position from BAM record, accounting for CIGAR operations.
+ *
+ * IMPORTANT: HTSlib returns the read sequence as stored in the BAM record.
+ * For reads aligned to the reverse strand (BAM_FREVERSE), the query indexing
+ * must be reversed and the returned base must be reverse-complemented to match
+ * the reference/VCF allele orientation.
+ *
+ * pos is 0-based reference coordinate (same as bam1_t::core.pos and VCF bcf1_t::pos).
+ */
+static inline char compl_base(char b){
+    switch (b){
+        case 'A': return 'T';
+        case 'C': return 'G';
+        case 'G': return 'C';
+        case 'T': return 'A';
+        case 'a': return 't';
+        case 'c': return 'g';
+        case 'g': return 'c';
+        case 't': return 'a';
+        default:  return b;
+    }
+}
+
 char get_base_at_pos(bam1_t* record, int pos){
     uint32_t* cigar = bam_get_cigar(record);
     uint8_t* seq = bam_get_seq(record);
-    
-    int ref_pos = record->core.pos;
-    int read_pos = 0;
-    
+
+    int ref_pos  = record->core.pos; // 0-based reference start
+    int read_pos = 0;                // 0-based query offset as we walk the CIGAR
+
     for (uint32_t i = 0; i < record->core.n_cigar; i++){
-        int op = bam_cigar_op(cigar[i]);
+        int op  = bam_cigar_op(cigar[i]);
         int len = bam_cigar_oplen(cigar[i]);
-        
+
         if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF){
             if (ref_pos + len > pos){
                 read_pos += (pos - ref_pos);
-                int base_code = bam_seqi(seq, read_pos);
-                return seq_nt16_str[base_code];
+
+                int qpos = read_pos;
+                int lq   = record->core.l_qseq;
+
+                // Reverse-strand alignments: reverse query indexing
+                if (record->core.flag & BAM_FREVERSE){
+                    qpos = lq - 1 - qpos;
+                }
+
+                int base_code = bam_seqi(seq, qpos);
+                char b = seq_nt16_str[base_code];
+
+                // Reverse-strand alignments: return base in reference orientation
+                if (record->core.flag & BAM_FREVERSE){
+                    b = compl_base(b);
+                }
+                return b;
             }
-            ref_pos += len;
+            ref_pos  += len;
             read_pos += len;
         }
         else if (op == BAM_CINS || op == BAM_CSOFT_CLIP){
@@ -741,14 +780,16 @@ char get_base_at_pos(bam1_t* record, int pos){
         }
         else if (op == BAM_CDEL || op == BAM_CREF_SKIP){
             if (ref_pos + len > pos){
-                return '-';  // Deletion at this position
+                return '-';  // deletion / skipped reference at this position
             }
             ref_pos += len;
         }
+        // Other ops (hard clip, pad) consume neither ref nor query for base lookup.
     }
-    
-    return 'N';  // Position not found
+
+    return 'N';  // position not found / outside alignment
 }
+
 
 void count_alleles_parallel(
     const string& bamfile,
@@ -834,7 +875,10 @@ void count_alleles_parallel(
                     
                     while (sam_itr_next(bam_fp, iter, record) >= 0){
                         // Skip filtered reads
-                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FDUP | BAM_FQCFAIL)){
+                        // NOTE: Must include BAM_FSUPPLEMENTARY (0x800) to match V0 behavior.
+                        // Supplementary alignments are split reads that can have different
+                        // bases at the same reference position, causing incorrect counts.
+                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FDUP | BAM_FQCFAIL | BAM_FSUPPLEMENTARY)){
                             continue;
                         }
                         
@@ -868,7 +912,7 @@ void count_alleles_parallel(
                         
                         // Process all SNPs overlapping this read
                         for (auto snp_check = snp_iter; 
-                             snp_check != snp_end && snp_check->pos <= read_end; 
+                             snp_check != snp_end && snp_check->pos < read_end; 
                              ++snp_check){
                             
                             char allele = get_base_at_pos(record, snp_check->pos);
@@ -895,18 +939,19 @@ void count_alleles_parallel(
                                     }
                                 }
                                 else{
-                                    // May need to create new entry
+                                    // Lock to prevent race condition on map access.
+                                    // The previous implementation had a bug: it did find() 
+                                    // outside the lock, but if another thread modified the map
+                                    // (causing a rehash), the iterator became invalid.
+                                    // We must hold the lock for the entire find-or-insert operation.
+                                    lock_guard<mutex> guard(global_bc_mutex);
+                                    
                                     auto it = cell_counts.find(bc_key);
                                     if (it == cell_counts.end()){
-                                        lock_guard<mutex> guard(global_bc_mutex);
-                                        // Double-check after lock
+                                        cell_counts.emplace(std::piecewise_construct,
+                                            std::forward_as_tuple(bc_key),
+                                            std::forward_as_tuple(n_samples));
                                         it = cell_counts.find(bc_key);
-                                        if (it == cell_counts.end()){
-                                            cell_counts.emplace(std::piecewise_construct,
-                                                std::forward_as_tuple(bc_key),
-                                                std::forward_as_tuple(n_samples));
-                                            it = cell_counts.find(bc_key);
-                                        }
                                     }
                                     cc_ptr = &(it->second);
                                 }

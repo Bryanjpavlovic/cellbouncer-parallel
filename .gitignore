@@ -15,6 +15,7 @@
 !lib/
 !/pipelines
 !plot/
+!plot/*
 !src/
 !src/*cpp
 !src/*h

@@ -832,9 +832,12 @@ bool populate_llr_table_optimized(
     // Iterate over all individual pairs and genotype combinations
     for (int i = 0; i < n_samples; ++i){
         for (int nalt_i = 0; nalt_i < 3; ++nalt_i){
-            // Get total counts for individual i with this genotype
-            auto total_i = counts.get_total(i, nalt_i);
-            if (total_i.first + total_i.second == 0) continue;
+            // NOTE: We intentionally do NOT skip when individual i has zero total counts.
+            // Even if i has no reads at this genotype, we still need to calculate
+            // llrs[j][k] (singlet j vs doublet i+j) which depends on j's pairwise counts.
+            // The original "optimization" that skipped here caused doublets to be
+            // misclassified as singlets because the doublet hypothesis was never
+            // properly evaluated against the singlet j hypothesis.
             
             for (int j = i + 1; j < n_samples; ++j){
                 for (int nalt_j = 0; nalt_j < 3; ++nalt_j){
