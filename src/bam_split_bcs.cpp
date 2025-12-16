@@ -144,7 +144,7 @@ file name prefix.\n", output_prefix.c_str());
         if (ppos != string::npos){
             id = id.substr(0, ppos) + "x" + id.substr(ppos+1, id.length()-ppos-1);
         }
-        char outbuf[100];
+        char outbuf[512];
         sprintf(outbuf, "%s.%s.bam", output_prefix.c_str(), id.c_str());
         outs.insert(make_pair(*ind, bgzf_open(&outbuf[0], "w")));
     }   
