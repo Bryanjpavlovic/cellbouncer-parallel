@@ -45,6 +45,7 @@ class llr_table{
         void print_ranges(std::string& barcode, std::vector<std::string>& samples);
         void insert(short i1, short i2, double llr);
         void disallow(short i);
+        void recalculate_minmax();
         bool del(int n_keep);
         void get_max(int& best_idx, double& best_llr);
 };

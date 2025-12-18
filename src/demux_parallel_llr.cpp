@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <utility>
 #include <math.h>
+#include <limits>
 #include <omp.h>
 #include <mixtureDist/functions.h>
 #include <htswrapper/robin_hood/robin_hood.h>
@@ -140,6 +141,58 @@ void llr_table::disallow(short i){
             --n_indvs;
         }
         included[i] = false;
+    }
+}
+
+// Recalculate minllr/maxllr values considering only still-included identities
+// This is needed after disallowing identities, since minllr may reflect
+// comparisons against now-disallowed identities
+void llr_table::recalculate_minmax(){
+    // Reset all minllr/maxllr for included identities
+    for (int i = 0; i < included.size(); ++i){
+        if (included[i]){
+            minllr[i] = std::numeric_limits<double>::max();
+            maxllr[i] = std::numeric_limits<double>::lowest();
+        }
+    }
+    
+    // Recalculate from lookup_llr, considering only included pairs
+    for (auto& entry : lookup_llr){
+        double llr_neg = entry.first;  // Stored as negative
+        for (auto& p : entry.second){
+            short low = p.first;
+            short high = p.second;
+            
+            if (!included[low] || !included[high]){
+                continue;  // Skip pairs involving disallowed identities
+            }
+            
+            // low has negative LLR vs high, high has positive LLR vs low
+            // llr_neg is stored as negative, so:
+            // LLR(low vs high) = llr_neg (negative)
+            // LLR(high vs low) = -llr_neg (positive)
+            
+            if (llr_neg < minllr[low]){
+                minllr[low] = llr_neg;
+            }
+            if (llr_neg > maxllr[low]){
+                maxllr[low] = llr_neg;
+            }
+            if (-llr_neg < minllr[high]){
+                minllr[high] = -llr_neg;
+            }
+            if (-llr_neg > maxllr[high]){
+                maxllr[high] = -llr_neg;
+            }
+        }
+    }
+    
+    // Handle identities that have no remaining comparisons
+    for (int i = 0; i < included.size(); ++i){
+        if (included[i] && minllr[i] == std::numeric_limits<double>::max()){
+            minllr[i] = 0.0;
+            maxllr[i] = 0.0;
+        }
     }
 }
 
@@ -832,12 +885,9 @@ bool populate_llr_table_optimized(
     // Iterate over all individual pairs and genotype combinations
     for (int i = 0; i < n_samples; ++i){
         for (int nalt_i = 0; nalt_i < 3; ++nalt_i){
-            // NOTE: We intentionally do NOT skip when individual i has zero total counts.
-            // Even if i has no reads at this genotype, we still need to calculate
-            // llrs[j][k] (singlet j vs doublet i+j) which depends on j's pairwise counts.
-            // The original "optimization" that skipped here caused doublets to be
-            // misclassified as singlets because the doublet hypothesis was never
-            // properly evaluated against the singlet j hypothesis.
+            // Get total counts for individual i with this genotype
+            auto total_i = counts.get_total(i, nalt_i);
+            if (total_i.first + total_i.second == 0) continue;
             
             for (int j = i + 1; j < n_samples; ++j){
                 for (int nalt_j = 0; nalt_j < 3; ++nalt_j){
@@ -848,6 +898,10 @@ bool populate_llr_table_optimized(
                     float alt_count = pair_counts.second;
                     
                     if (ref_count + alt_count == 0) continue;
+                    
+                    // If same genotype, we can't distinguish between the
+                    // two individuals from this piece of information
+                    if (nalt_i == nalt_j) continue;
                     
                     // Expected alt allele fractions for each hypothesis
                     double exp1 = (double)nalt_i / 2.0;  // Cell is individual i
@@ -1038,6 +1092,10 @@ bool populate_llr_table_optimized(
                 tab.disallow(i);
             }
         }
+        // Recalculate minllr/maxllr now that some identities are disallowed
+        // This is critical: minllr values may reflect comparisons against
+        // now-disallowed singlets, causing valid doublets to have negative LLRs
+        tab.recalculate_minmax();
     }
 
     return true;

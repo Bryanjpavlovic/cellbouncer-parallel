@@ -40,6 +40,10 @@ using std::cout;
 using std::endl;
 using namespace std;
 
+// Version information
+const string VERSION = "1.12";
+const string VERSION_MESSAGE = "Fixed doublet assignment with -i/-I, CIGAR boundary handling, O3 without fast-math";
+
 // Global verbose flag (defined in demux_vcf_llr.cpp)
 extern bool g_verbose;
 
@@ -488,6 +492,8 @@ void dump_cellcounts_optimized(gzFile& out_cell,
  * Print help message
  */
 void help(int code){
+    fprintf(stderr, "demux_parallel version %s\n", VERSION.c_str());
+    fprintf(stderr, "%s\n\n", VERSION_MESSAGE.c_str());
     fprintf(stderr, "demux_parallel [OPTIONS]\n");
     fprintf(stderr, "Parallel version of demux_vcf - demultiplexes cells based on genotype data.\n");
     fprintf(stderr, "\n[OPTIONS]:\n");
@@ -521,6 +527,11 @@ void help(int code){
 }
 
 int main(int argc, char *argv[]) {    
+    
+    // Print version info
+    fprintf(stderr, "demux_parallel version %s\n", VERSION.c_str());
+    fprintf(stderr, "%s\n", VERSION_MESSAGE.c_str());
+    fprintf(stderr, "\n");
    
     static struct option long_options[] = {
        {"bam", required_argument, 0, 'b'},
@@ -958,8 +969,12 @@ int main(int argc, char *argv[]) {
     map<int, double> prior_weights;
     
     // First round of assignments
+    // NOTE: allowed_ids contains all singlets + doublets (including singlet components)
+    //       allowed_ids2 contains ONLY what was in the original ID file
+    // When -I is used with doublet combinations, allowed_ids2 has only doublets,
+    // which causes singlets to be disallowed in the final assignment step.
     assign_ids_parallel(cell_counts, samples, assn, assn_llr,
-        allowed_ids, allowed_ids, doublet_rate, error_ref, error_alt,
+        allowed_ids, allowed_ids2, doublet_rate, error_ref, error_alt,
         false, prior_weights, n_threads, n_target);
     
     robin_hood::unordered_map<unsigned long, int> assncpy = assn;
@@ -979,7 +994,7 @@ int main(int argc, char *argv[]) {
     // Re-assign with posterior error rates
     fprintf(stderr, "Re-inferring identities of cells...\n");
     assign_ids_parallel(cell_counts, samples, assn, assn_llr,
-        allowed_ids, allowed_ids, doublet_rate, error_ref_posterior, error_alt_posterior,
+        allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
         false, prior_weights, n_threads, n_target);
 
     // Handle doublet-specific ID filtering

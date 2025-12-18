@@ -6,11 +6,12 @@ PREFIX ?= /usr/local
 # Standard flags for original CellBouncer tools
 CXXFLAGS_STD = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2)
 
-# Optimized flags for parallel tools: -Ofast for aggressive optimization, 
-# -march=native for CPU-specific instructions, -ffast-math for faster floating point, 
+# Optimized flags for parallel tools:
+# -O3 for high optimization without enabling fast-math semantics
+# -march=native for CPU-specific instructions
 # -fopenmp for parallelism
 CXXFLAGS_PARALLEL = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -DNBITS=$(NBITS) \
-                    -Ofast -march=native -ffast-math -fopenmp
+                    -O3 -march=native -fopenmp
 
 CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 -march=native
 CXXIFLAGS = -I$(PREFIX)/include -Iinclude
@@ -224,3 +225,4 @@ install: all
 	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
 
 .PHONY: all original_tools parallel_tools utils dependencies clean clean_build clean_binaries clean_deps clean_all install
+
