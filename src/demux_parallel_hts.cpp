@@ -909,7 +909,7 @@ void count_alleles_parallel(
                         
                         // Process all SNPs overlapping this read
                         for (auto snp_check = snp_iter; 
-                             snp_check != snp_end && snp_check->pos <= read_end; 
+                             snp_check != snp_end && snp_check->pos < read_end; 
                              ++snp_check){
                             
                             char allele = get_base_at_pos(record, snp_check->pos);

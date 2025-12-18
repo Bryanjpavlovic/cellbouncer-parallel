@@ -41,8 +41,8 @@ using std::endl;
 using namespace std;
 
 // Version information
-const string VERSION = "1.12";
-const string VERSION_MESSAGE = "Fixed doublet assignment with -i/-I, CIGAR boundary handling, O3 without fast-math";
+const string VERSION = "1.11";
+const string VERSION_MESSAGE = "Fixed CIGAR boundary handling to match V0 behavior,no ffastmath!";
 
 // Global verbose flag (defined in demux_vcf_llr.cpp)
 extern bool g_verbose;
@@ -109,6 +109,7 @@ pair<double, double> infer_error_rates_optimized(
     vector<double> expected;
     vector<double> weights_llr;
 
+    int doublet_points = 0, singlet_points = 0;
     for (auto& a : assn){
         double weight = assn_llr[a.first];
         const CellCounts& counts = cell_counts[a.first];
@@ -118,6 +119,14 @@ pair<double, double> infer_error_rates_optimized(
         if (is_combo){
             combo = idx_to_hap_comb(a.second, n_samples);
         }
+        
+        // Debug: show assignment details for each cell
+        fprintf(stderr, "DEBUG cell: assn=%d n_samples=%d is_combo=%d", 
+                a.second, n_samples, is_combo);
+        if (is_combo) {
+            fprintf(stderr, " combo=(%d,%d)", combo.first, combo.second);
+        }
+        fprintf(stderr, "\n");
         
         if (is_combo){
             // Doublet - use pairwise counts for the two component individuals
@@ -136,6 +145,7 @@ pair<double, double> infer_error_rates_optimized(
                         n.push_back(ref_count + alt_count);
                         k.push_back(alt_count);
                         weights_llr.push_back(weight);
+                        doublet_points++;
                     }
                 }
             }
@@ -153,13 +163,35 @@ pair<double, double> infer_error_rates_optimized(
                     n.push_back(ref_count + alt_count);
                     k.push_back(alt_count);
                     weights_llr.push_back(weight);
+                    singlet_points++;
                 }
             }
         }
     }
+    fprintf(stderr, "DEBUG: doublet_points=%d singlet_points=%d\n", doublet_points, singlet_points);
 
     if (n.empty()){
         return make_pair(error_ref, error_alt);
+    }
+
+    // Diagnostic: print totals going into optimizer
+    double total_n = 0, total_k = 0, total_weight = 0;
+    std::map<double, std::pair<double, double>> by_expected;  // expected -> (n, k)
+    for (size_t i = 0; i < n.size(); i++) {
+        total_n += n[i];
+        total_k += k[i];
+        total_weight += weights_llr[i];
+        by_expected[expected[i]].first += n[i];
+        by_expected[expected[i]].second += k[i];
+    }
+    fprintf(stderr, "DEBUG infer_error_rates_optimized:\n");
+    fprintf(stderr, "  data_points=%lu total_n=%.2f total_k=%.2f total_weight=%.2f\n", 
+            n.size(), total_n, total_k, total_weight);
+    fprintf(stderr, "  overall_alt_frac=%.6f\n", total_k / total_n);
+    for (auto& e : by_expected) {
+        fprintf(stderr, "  expected=%.2f: n=%.2f k=%.2f alt_frac=%.6f\n",
+                e.first, e.second.first, e.second.second, 
+                e.second.second / e.second.first);
     }
 
     optimML::multivar_ml_solver solver({error_ref, error_alt}, ll_err, dll_err);
