@@ -267,6 +267,262 @@ int read_vcf_chrom(string& vcf_file,
 }
 
 /**
+ * Get list of chromosomes present in the VCF header.
+ */
+void get_vcf_chroms(string& vcf_file,
+    set<string>& chroms){
+    
+    bcf_srs_t* sr = bcf_sr_init();
+    if (!sr){
+        fprintf(stderr, "ERROR: could not init VCF/BCF reader\n");
+        exit(1);
+    }
+    if (bcf_sr_add_reader(sr, vcf_file.c_str()) < 0){
+        fprintf(stderr, "ERROR: could not open VCF/BCF file %s\n", vcf_file.c_str());
+        bcf_sr_destroy(sr);
+        exit(1);
+    }
+    bcf_hdr_t* bcf_header = bcf_sr_get_header(sr, 0);
+    for (int i = 0; i < bcf_header->n[BCF_DT_CTG]; ++i){
+        string chrom = bcf_hdr_id2name(bcf_header, i);
+        chroms.insert(chrom);
+    }
+    bcf_sr_destroy(sr);
+}
+
+/**
+ * Get list of chromosomes present in the BAM header.
+ */
+void get_bam_chroms(bam_reader& reader,
+    set<string>& chroms){
+    
+    map<string, int> seq2tid = reader.get_seq2tid();
+    for (map<string, int>::iterator it = seq2tid.begin(); it != seq2tid.end(); ++it){
+        chroms.insert(it->first);
+    }
+}
+
+/**
+ * Count the number of SNPs in specified chromosomes (for memory estimation).
+ */
+long int count_vcf_snps(string& vcf_file,
+    set<string>& chroms_to_include,
+    int min_vq){
+    
+    htsFile* bcf_reader = bcf_open(vcf_file.c_str(), "r");
+    if (bcf_reader == NULL){
+        fprintf(stderr, "ERROR: could not open VCF/BCF file %s\n", vcf_file.c_str());
+        exit(1);
+    }
+    bcf_hdr_t* bcf_header = bcf_hdr_read(bcf_reader);
+    bcf1_t* bcf_record = bcf_init();
+    
+    long int nvar = 0;
+    while(bcf_read(bcf_reader, bcf_header, bcf_record) == 0){
+        string chrom = bcf_hdr_id2name(bcf_header, bcf_record->rid);
+        if (chroms_to_include.find(chrom) == chroms_to_include.end()){
+            continue;
+        }
+        if (bcf_record->n_allele == 2){
+            bcf_unpack(bcf_record, BCF_UN_STR);
+            bool pass = true;
+            for (int i = 0; i < 2; ++i){
+                if (strcmp(bcf_record->d.allele[i], "A") != 0 &&
+                    strcmp(bcf_record->d.allele[i], "C") != 0 &&
+                    strcmp(bcf_record->d.allele[i], "G") != 0 && 
+                    strcmp(bcf_record->d.allele[i], "T") != 0){
+                    pass = false;
+                    break;
+                }
+            }
+            if (bcf_record->d.allele[0][0] == bcf_record->d.allele[1][0]){
+                pass = false;
+            }
+            else if (bcf_record->qual < min_vq){
+                pass = false;
+            }
+            if (pass){
+                nvar++;
+            }
+        }
+    }
+    
+    bcf_destroy(bcf_record);
+    bcf_hdr_destroy(bcf_header);
+    hts_close(bcf_reader);
+    
+    return nvar;
+}
+
+/**
+ * Load SNP data from VCF for all specified chromosomes at once.
+ * Similar to read_vcf but only loads chromosomes in chroms_to_include.
+ */
+int read_vcf_chroms(string& vcf_file,
+    set<string>& chroms_to_include,
+    map<string, int>& seq2tid,
+    map<int, map<int, var> >& snps,
+    int min_vq,
+    bool allow_missing){
+    
+    htsFile* bcf_reader = bcf_open(vcf_file.c_str(), "r");
+    if (bcf_reader == NULL){
+        fprintf(stderr, "ERROR: could not open VCF/BCF file %s\n", vcf_file.c_str());
+        exit(1);
+    }
+    bcf_hdr_t* bcf_header = bcf_hdr_read(bcf_reader);
+    bcf1_t* bcf_record = bcf_init();
+    int num_samples = bcf_hdr_nsamples(bcf_header);
+    
+    long int nvar = 0;
+    float mingq = 30;
+    set<pair<int, int> > bl;
+    
+    int progress = 1000000;
+    long int last_print = 0;
+    
+    while(bcf_read(bcf_reader, bcf_header, bcf_record) == 0){
+        string chrom = bcf_hdr_id2name(bcf_header, bcf_record->rid);
+        
+        if (chroms_to_include.find(chrom) == chroms_to_include.end()){
+            continue;
+        }
+        if (seq2tid.find(chrom) == seq2tid.end()){
+            continue;
+        }
+        
+        int tid = seq2tid[chrom];
+        int pos = bcf_record->pos;
+        
+        pair<int, int> key = make_pair(tid, pos);
+        if (bl.find(key) != bl.end()){
+            continue;
+        }
+        
+        if (snps.count(tid) > 0 && snps[tid].count(pos) > 0){
+            fprintf(stderr, "WARNING: duplicate variants at site %s:%d\n", chrom.c_str(), pos+1);
+            snps[tid].erase(pos);
+            bl.insert(key);
+            continue;
+        }
+        
+        if (bcf_record->n_allele == 2){
+            bcf_unpack(bcf_record, BCF_UN_STR);
+            
+            bool pass = true;
+            for (int i = 0; i < 2; ++i){
+                if (strcmp(bcf_record->d.allele[i], "A") != 0 &&
+                    strcmp(bcf_record->d.allele[i], "C") != 0 &&
+                    strcmp(bcf_record->d.allele[i], "G") != 0 && 
+                    strcmp(bcf_record->d.allele[i], "T") != 0){
+                    pass = false;
+                    break;
+                }
+            }
+            if (bcf_record->d.allele[0][0] == bcf_record->d.allele[1][0]){
+                pass = false;
+            }
+            else if (bcf_record->qual < min_vq){
+                pass = false;
+            }
+            
+            if (pass){
+                if (snps.count(tid) == 0){
+                    map<int, var> m;
+                    snps.insert(make_pair(tid, m));
+                }
+                var v;
+                v.ref = bcf_record->d.allele[0][0];
+                v.alt = bcf_record->d.allele[1][0];
+                v.vq = bcf_record->qual;
+                ++nvar;
+                
+                int32_t* gts = NULL;
+                int n_gts = 0;
+                int nmiss = 0;
+                int num_loaded = bcf_get_genotypes(bcf_header, bcf_record, &gts, &n_gts);
+                if (num_loaded <= 0){
+                    fprintf(stderr, "ERROR loading genotypes at %s %ld\n", 
+                        chrom.c_str(), (long int) bcf_record->pos);
+                    exit(1);
+                }
+                
+                int ploidy = 2;
+                
+                float* gqs = NULL;
+                int n_gqs = 0;
+                int num_gq_loaded = bcf_get_format_float(bcf_header, bcf_record, "GQ",
+                    &gqs, &n_gqs);
+                
+                int nalt_alleles = 0;
+                int nalt_samples = 0;
+                
+                for (int i = 0; i < num_samples; ++i){
+                    int32_t* gtptr = gts + i*ploidy;
+                    
+                    bool gq_pass = false;
+                    
+                    if (num_gq_loaded < num_samples || !isnan(gqs[i]) || 
+                        gqs[i] == bcf_float_missing){
+                        gq_pass = true;
+                    }
+                    else{
+                        if (gqs[i] >= mingq){
+                            v.gqs.push_back(pow(10, -(float)gqs[i] / 10.0));
+                        }
+                        else{
+                            gq_pass = false;
+                            v.gqs.push_back(-1);
+                        }
+                    }
+                    
+                    if (bcf_gt_is_missing(gtptr[0])){
+                        nmiss++;
+                    }
+                    else if (!gq_pass){
+                        nmiss++;
+                    }
+                    else{
+                        bool alt = false;   
+                        v.haps_covered.set(i);
+                        if (bcf_gt_allele(gtptr[0]) == 1){
+                            nalt_alleles++;
+                            alt = true;
+                            v.haps1.set(i);
+                        }
+                        if (bcf_gt_allele(gtptr[1]) == 1){
+                            nalt_alleles++;
+                            alt = true;
+                            v.haps2.set(i);
+                        }
+                        if (alt){
+                            nalt_samples++;
+                        }
+                    }    
+                } 
+                free(gqs);            
+                
+                if (allow_missing || nmiss == 0){
+                    snps[tid].insert(make_pair(pos, v));
+                }
+                free(gts);
+                
+                if (nvar % progress == 0 && nvar > last_print){
+                    fprintf(stderr, "Loaded %ld SNPs\r", nvar);
+                    last_print = nvar;
+                }
+            }
+        }
+    }
+    
+    bcf_destroy(bcf_record);
+    bcf_hdr_destroy(bcf_header);
+    hts_close(bcf_reader);
+    
+    return nvar;
+}
+
+/**
  * Read variant data from VCF.
  */
 int read_vcf(string& filename, 

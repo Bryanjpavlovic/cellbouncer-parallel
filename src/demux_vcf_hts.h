@@ -70,6 +70,23 @@ int read_vcf_chrom(std::string& vcf_file,
     int min_vq,
     bool allow_missing=true);
 
+void get_vcf_chroms(std::string& vcf_file,
+    std::set<std::string>& chroms);
+
+void get_bam_chroms(bam_reader& reader,
+    std::set<std::string>& chroms);
+
+long int count_vcf_snps(std::string& vcf_file,
+    std::set<std::string>& chroms_to_include,
+    int min_vq);
+
+int read_vcf_chroms(std::string& vcf_file,
+    std::set<std::string>& chroms_to_include,
+    std::map<std::string, int>& seq2tid,
+    std::map<int, std::map<int, var> >& snps,
+    int min_vq,
+    bool allow_missing=true);
+
 int read_vcf(std::string& filename, 
     bam_reader& reader,
     std::vector<std::string>& samples,

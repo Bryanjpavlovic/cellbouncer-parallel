@@ -771,6 +771,15 @@ void help(int code){
     fprintf(stderr, "       of two individuals can be specified by giving both individual names\n");
     fprintf(stderr, "       separated by \"+\", with names in either order.\n");
     fprintf(stderr, "----- I/O options -----\n");
+    fprintf(stderr, "    --mem_limit -m Amount of memory available for loading VCF data.\n");
+    fprintf(stderr, "       When provided, the program will estimate whether all VCF data\n");
+    fprintf(stderr, "       can fit in memory and load it at startup if possible. This can\n");
+    fprintf(stderr, "       dramatically improve performance when the reference genome has\n");
+    fprintf(stderr, "       many contigs. Accepts suffixes G (gigabytes) or M (megabytes).\n");
+    fprintf(stderr, "       Example: --mem_limit 50G\n");
+    fprintf(stderr, "    --vcf_chroms -c Optional file listing chromosome names (one per line)\n");
+    fprintf(stderr, "       to include from the VCF. By default, only chromosomes present in\n");
+    fprintf(stderr, "       both the BAM and VCF are processed.\n");
     print_libname_help();
     /*
     fprintf(stderr, "    --index_jump -j Instead of reading through the entire BAM file \n");
@@ -817,6 +826,8 @@ int main(int argc, char *argv[]) {
        {"error_sigma", required_argument, 0, 's'},
        {"disable_conditional", no_argument, 0, 'f'},
        {"dump_conditional", no_argument, 0, 'F'},
+       {"mem_limit", required_argument, 0, 'm'},
+       {"vcf_chroms", required_argument, 0, 'c'},
        {0, 0, 0, 0} 
     };
     
@@ -845,13 +856,17 @@ int main(int argc, char *argv[]) {
     bool disable_conditional = false;
     bool dump_conditional = false;
 
+    long int mem_limit = -1;
+    string vcf_chroms_file = "";
+    bool vcf_chroms_given = false;
+
     int option_index = 0;
     int ch;
     
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:p:s:fFCSUh", long_options, &option_index )) != -1){
+    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:p:s:m:c:fFCSUh", long_options, &option_index )) != -1){
         switch(ch){
             case 0:
                 // This option set a flag. No need to do anything here.
@@ -915,6 +930,25 @@ int main(int argc, char *argv[]) {
                 break;
             case 'F':
                 dump_conditional = true;
+                break;
+            case 'm':
+                {
+                    string mem_str = optarg;
+                    char suffix = mem_str[mem_str.length()-1];
+                    if (suffix == 'G' || suffix == 'g'){
+                        mem_limit = atol(mem_str.substr(0, mem_str.length()-1).c_str()) * 1024L * 1024L * 1024L;
+                    }
+                    else if (suffix == 'M' || suffix == 'm'){
+                        mem_limit = atol(mem_str.substr(0, mem_str.length()-1).c_str()) * 1024L * 1024L;
+                    }
+                    else{
+                        mem_limit = atol(mem_str.c_str());
+                    }
+                }
+                break;
+            case 'c':
+                vcf_chroms_given = true;
+                vcf_chroms_file = optarg;
                 break;
             default:
                 help(0);
@@ -1075,6 +1109,80 @@ all possible individuals\n", idfile_doublet.c_str());
         }
     }
 
+    // Determine which chromosomes to process
+    set<string> chroms_bam;
+    set<string> chroms_vcf;
+    set<string> chroms_to_process;
+    bool preload_vcf = false;
+    map<int, map<int, var> > snpdat_all;
+    map<string, int> seq2tid;
+    
+    if (!load_counts && !dump_conditional){
+        // Get chromosome lists from BAM and VCF
+        fprintf(stderr, "Identifying shared chromosomes between BAM and VCF...\n");
+        get_bam_chroms(reader, chroms_bam);
+        get_vcf_chroms(vcf_file, chroms_vcf);
+        
+        // Intersect chromosome lists
+        for (set<string>::iterator it = chroms_bam.begin(); it != chroms_bam.end(); ++it){
+            if (chroms_vcf.find(*it) != chroms_vcf.end()){
+                chroms_to_process.insert(*it);
+            }
+        }
+        
+        // If user provided a chromosome list, further filter
+        if (vcf_chroms_given){
+            set<string> user_chroms;
+            ifstream chromfile(vcf_chroms_file.c_str());
+            string chrom;
+            while (chromfile >> chrom){
+                user_chroms.insert(chrom);
+            }
+            set<string> filtered_chroms;
+            for (set<string>::iterator it = chroms_to_process.begin(); 
+                it != chroms_to_process.end(); ++it){
+                if (user_chroms.find(*it) != user_chroms.end()){
+                    filtered_chroms.insert(*it);
+                }
+            }
+            chroms_to_process = filtered_chroms;
+        }
+        
+        fprintf(stderr, "Found %d chromosomes in BAM, %d in VCF, %d shared\n",
+            (int)chroms_bam.size(), (int)chroms_vcf.size(), (int)chroms_to_process.size());
+        
+        // Memory estimation and preload decision
+        if (mem_limit > 0 && chroms_to_process.size() > 0){
+            fprintf(stderr, "Counting SNPs on shared chromosomes...\n");
+            long int snp_count = count_vcf_snps(vcf_file, chroms_to_process, vq);
+            
+            // Estimate memory: ~320 bytes per SNP (var struct + map overhead)
+            long int estimated_mem = snp_count * 320L;
+            
+            fprintf(stderr, "SNPs to load: %ld\n", snp_count);
+            fprintf(stderr, "Estimated memory for VCF data: %.2f GB\n", 
+                (double)estimated_mem / (1024.0 * 1024.0 * 1024.0));
+            fprintf(stderr, "Memory limit provided: %.2f GB\n",
+                (double)mem_limit / (1024.0 * 1024.0 * 1024.0));
+            
+            if (estimated_mem < mem_limit){
+                preload_vcf = true;
+                fprintf(stderr, "Loading all VCF data into memory...\n");
+                seq2tid = reader.get_seq2tid();
+                int nloaded = read_vcf_chroms(vcf_file, chroms_to_process, seq2tid, 
+                    snpdat_all, vq);
+                fprintf(stderr, "Loaded %d SNPs from %d chromosomes\n", nloaded, 
+                    (int)chroms_to_process.size());
+            }
+            else{
+                fprintf(stderr, "Insufficient memory for preloading, using per-chromosome mode\n");
+            }
+        }
+        else if (mem_limit <= 0){
+            fprintf(stderr, "No --mem_limit provided, using per-chromosome VCF loading\n");
+        }
+    }
+
     // Data structure to store allele counts at SNPs of each possible type.
     // SNPs are defined by their allelic state in each pair of 2 individuals.
     
@@ -1141,6 +1249,9 @@ all possible individuals\n", idfile_doublet.c_str());
             int curtid = -1;
             
             map<int, var>::iterator cursnp;
+            map<int, var>::iterator cursnp_end;
+            map<int, var>* active_snpdat = &snpdat;
+            
             while (reader.next()){
                 if (reader.unmapped() || reader.secondary() || reader.qcfail() || reader.dup()){
                     continue;
@@ -1148,8 +1259,8 @@ all possible individuals\n", idfile_doublet.c_str());
                 if (curtid != reader.tid()){
                     // Started a new chromosome
                     if (curtid != -1){
-                        while (cursnp != snpdat.end()){
-                            if (snpdat.count(cursnp->first) > 0){        
+                        while (cursnp != cursnp_end){
+                            if (varcounts_site.count(cursnp->first) > 0){        
                                 dump_vcs_counts(varcounts_site[cursnp->first], 
                                     indv_allelecounts,
                                     cursnp->second, samples.size());
@@ -1159,25 +1270,52 @@ all possible individuals\n", idfile_doublet.c_str());
                             ++cursnp;
                         }
                     }
-                    snpdat.clear();
+                    
                     char* curchromptr = reader.ref_id();
                     if (curchromptr == NULL){
+                        active_snpdat = &snpdat;
+                        snpdat.clear();
                         cursnp = snpdat.end();
+                        cursnp_end = snpdat.end();
                     }
                     else{
                         string curchrom = curchromptr;
-                        read_vcf_chrom(vcf_file, curchrom, snpdat, vq); 
-                        cursnp = snpdat.begin();
+                        
+                        if (chroms_to_process.size() > 0 && 
+                            chroms_to_process.find(curchrom) == chroms_to_process.end()){
+                            active_snpdat = &snpdat;
+                            snpdat.clear();
+                            cursnp = snpdat.end();
+                            cursnp_end = snpdat.end();
+                        }
+                        else if (preload_vcf){
+                            int tid = reader.tid();
+                            if (snpdat_all.count(tid) > 0){
+                                active_snpdat = &snpdat_all[tid];
+                            }
+                            else{
+                                active_snpdat = &snpdat;
+                                snpdat.clear();
+                            }
+                            cursnp = active_snpdat->begin();
+                            cursnp_end = active_snpdat->end();
+                        }
+                        else{
+                            snpdat.clear();
+                            read_vcf_chrom(vcf_file, curchrom, snpdat, vq); 
+                            active_snpdat = &snpdat;
+                            cursnp = snpdat.begin();
+                            cursnp_end = snpdat.end();
+                        }
                     }
                     curtid = reader.tid();
                     if (!disable_conditional){
-                        // Compute contribution of new chrom to conditional match fracs
-                        get_conditional_match_fracs_chrom(snpdat, 
+                        get_conditional_match_fracs_chrom(*active_snpdat, 
                             conditional_match_fracs, conditional_match_tots, samples.size()); 
                     }
                 }
                 // Advance to position within cur read
-                while (cursnp != snpdat.end() && 
+                while (cursnp != cursnp_end && 
                     cursnp->first < reader.reference_start){
                     
                     if (varcounts_site.count(cursnp->first) > 0){
@@ -1187,13 +1325,12 @@ all possible individuals\n", idfile_doublet.c_str());
                         varcounts_site.erase(cursnp->first);
                     }
                     ++nsnp_processed;
-                    snpdat.erase(cursnp++);
-                    //++cursnp;
+                    ++cursnp;
                 }
                 // Create a second iterator to look ahead for any additional SNPs 
                 // within the current read
                 map<int, var>::iterator cursnp2 = cursnp;
-                while (cursnp2 != snpdat.end() && 
+                while (cursnp2 != cursnp_end && 
                     cursnp2->first >= reader.reference_start && 
                     cursnp2->first <= reader.reference_end){   
                     process_bam_record(reader, cursnp2->first, cursnp2->second,
@@ -1208,16 +1345,15 @@ all possible individuals\n", idfile_doublet.c_str());
             
             // Handle any final SNPs.
             if (curtid != -1){
-                while (cursnp != snpdat.end()){
-                    if (snpdat.count(cursnp->first) > 0){
+                while (cursnp != cursnp_end){
+                    if (varcounts_site.count(cursnp->first) > 0){
                         dump_vcs_counts(varcounts_site[cursnp->first], 
                             indv_allelecounts,
                             cursnp->second, samples.size());
                         varcounts_site.erase(cursnp->first);
                     }
                     ++nsnp_processed;
-                    snpdat.erase(cursnp++);
-                    //++cursnp;    
+                    ++cursnp;
                 }
             }
         }
