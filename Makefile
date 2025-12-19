@@ -17,7 +17,7 @@ CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 -march=native
 CXXIFLAGS = -I$(PREFIX)/include -Iinclude
 CIFLAGS = -I$(PREFIX)/include -Iinclude
 LFLAGS = -L$(PREFIX)/lib -Llib
-LFLAGS_PARALLEL = -L$(PREFIX)/lib -Llib -fopenmp -flto
+LFLAGS_PARALLEL = -L$(PREFIX)/lib -Llib -fopenmp -flto=auto
 NBITS ?= 2048
 
 ifeq ($(findstring cellbouncer, ${CONDA_PREFIX}), cellbouncer)
