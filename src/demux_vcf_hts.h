@@ -117,6 +117,9 @@ void process_bam_record(bam_reader& reader,
     bool has_bc_list,
     std::set<unsigned long>& bcs_valid);
 
+void print_v1_base_stats();
+void increment_v1_read_counter();
+
 void process_bam_record_bulk(bam_reader& reader,
     int snppos,
     var& vardat,

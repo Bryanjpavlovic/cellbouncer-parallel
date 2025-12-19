@@ -21,6 +21,7 @@
 #include <zlib.h>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 #include <omp.h>
 #include <htslib/sam.h>
 #include <htslib/vcf.h>
@@ -324,8 +325,17 @@ int read_vcf_chroms(string& vcf_file,
     float mingq = 30;
     set<pair<int, int> > bl;
     
+    int progress = 1000000;
+    long int last_print = 0;
+    
     while(bcf_read(bcf_reader, bcf_header, bcf_record) == 0){
         string chrom = bcf_hdr_id2name(bcf_header, bcf_record->rid);
+        
+        // Progress indicator
+        if (nvar - last_print >= progress){
+            fprintf(stderr, "Loaded %ld SNPs\r", nvar);
+            last_print = nvar;
+        }
         
         if (chroms_to_include.find(chrom) == chroms_to_include.end()){
             continue;
@@ -467,12 +477,22 @@ int read_vcf_chroms_optimized(string& vcf_file,
     int min_vq,
     bool allow_missing){
     
+    auto t1 = std::chrono::steady_clock::now();
+    
     // First read into old format
     map<int, map<int, var> > snps_old;
     int nvar = read_vcf_chroms(vcf_file, chroms_to_include, seq2tid, snps_old, min_vq, allow_missing);
     
+    auto t2 = std::chrono::steady_clock::now();
+    auto read_secs = std::chrono::duration_cast<std::chrono::seconds>(t2 - t1).count();
+    fprintf(stderr, "  VCF parsing took %ld seconds\n", read_secs);
+    
     // Convert to optimized format
     convert_snpdat_to_optimized(snps_old, snpdat_optimized);
+    
+    auto t3 = std::chrono::steady_clock::now();
+    auto convert_secs = std::chrono::duration_cast<std::chrono::seconds>(t3 - t2).count();
+    fprintf(stderr, "  Conversion took %ld seconds\n", convert_secs);
     
     return nvar;
 }
@@ -713,6 +733,15 @@ void dump_vcs_counts(robin_hood::unordered_map<unsigned long, pair<float, float>
 // PARALLEL BAM PROCESSING FUNCTIONS
 // ============================================================================
 
+// Debug counters for base extraction
+static std::atomic<long> g_base_queries{0};
+static std::atomic<long> g_base_valid{0};
+static std::atomic<long> g_base_N{0};
+static std::atomic<long> g_base_dash{0};
+static std::atomic<long> g_base_other{0};  // non-ref, non-alt
+
+static std::atomic<long> g_debug_print_count{0};
+
 /**
  * Get base at position from BAM record, accounting for CIGAR operations.
  *
@@ -724,6 +753,15 @@ void dump_vcs_counts(robin_hood::unordered_map<unsigned long, pair<float, float>
  * pos is 0-based reference coordinate (same as bam1_t::core.pos and VCF bcf1_t::pos).
  */
 char get_base_at_pos(bam1_t* record, int pos){
+    g_base_queries++;
+    
+    // Debug: print first 20 queries
+    long count = g_debug_print_count.fetch_add(1);
+    if (count < 20){
+        fprintf(stderr, "DEBUG QUERY %ld: tid=%d read_pos=%ld-%ld snp_pos=%d\n",
+            count, record->core.tid, record->core.pos, (long)bam_endpos(record), pos);
+    }
+    
     // Rewritten to exactly match V0's get_pos_in_read boundary behavior
     // V0 uses 1-based positions internally; we use 0-based throughout
     uint32_t* cigar = bam_get_cigar(record);
@@ -757,15 +795,15 @@ char get_base_at_pos(bam1_t* record, int pos){
             next_ref_pos = ref_pos;
         }
         
-        // Check if position is strictly inside a deletion (V0 returns -1 for this)
+        // Check if position is strictly inside a deletion (returns '-')
         if (op == BAM_CDEL || op == BAM_CREF_SKIP){
             if (ref_pos < pos && next_ref_pos > pos){
+                g_base_dash++;
                 return '-';
             }
         }
         
-        // Range check - V0 uses pos >= map_pos && pos <= next_map_pos
-        // In 0-based: pos >= ref_pos && pos <= next_ref_pos
+        // Range check - inclusive end boundary
         if (pos >= ref_pos && pos <= next_ref_pos){
             int increment = pos - ref_pos;
             ref_pos += increment;
@@ -782,9 +820,17 @@ char get_base_at_pos(bam1_t* record, int pos){
     // Check if we found the position
     if (ref_pos == pos){
         int base_code = bam_seqi(seq, read_pos);
-        return seq_nt16_str[base_code];
+        char base = seq_nt16_str[base_code];
+        // Convert ANY non-ACGT base to N (match htswrapper behavior)
+        // seq_nt16_str can return IUPAC codes like M, R, Y, etc.
+        if (base != 'A' && base != 'C' && base != 'G' && base != 'T') {
+            g_base_N++;
+            return 'N';
+        }
+        return base;
     }
     
+    g_base_N++;
     return 'N';
 }
 
@@ -870,13 +916,26 @@ void count_alleles_parallel(
                     auto snp_end = chrom_snps.snps.end();
                     long local_snps = 0;
                     long local_reads = 0;
+                    long local_all_reads = 0;  // All reads passing flag filter (like V1)
                     
                     while (sam_itr_next(bam_fp, iter, record) >= 0){
-                        // Skip filtered reads - match V0/htswrapper behavior
-                        // V0 only checks: unmapped, secondary, dup
-                        // It does NOT filter qcfail or supplementary
-                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FDUP)){
+                        // Skip filtered reads - match V1 behavior exactly
+                        // V1 filters: unmapped, secondary, qcfail, dup
+                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
                             continue;
+                        }
+                        
+                        // Count ALL reads that pass flag filter (before CB check) - matches V1
+                        local_all_reads++;
+                        
+                        int read_start = record->core.pos;
+                        int read_end = bam_endpos(record);
+                        
+                        // Advance SNP iterator past SNPs before this read
+                        // IMPORTANT: Do this for ALL reads (like V1), not just those with CB
+                        while (snp_iter != snp_end && snp_iter->pos < read_start){
+                            ++snp_iter;
+                            ++local_snps;
                         }
                         
                         // Extract cell barcode
@@ -895,21 +954,14 @@ void count_alleles_parallel(
                         
                         local_reads++;
                         
-                        int read_start = record->core.pos;
-                        int read_end = bam_endpos(record);
-                        
-                        // Advance SNP iterator past SNPs before this read
-                        while (snp_iter != snp_end && snp_iter->pos < read_start){
-                            ++snp_iter;
-                            ++local_snps;
-                        }
-                        
                         // Get mapping quality probability
                         float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
                         
                         // Process all SNPs overlapping this read
+                        // V1 uses <= reference_end, and debug shows reference_end == bam_endpos
+                        // So we need <= read_end to match V1 exactly
                         for (auto snp_check = snp_iter; 
-                             snp_check != snp_end && snp_check->pos < read_end; 
+                             snp_check != snp_end && snp_check->pos <= read_end; 
                              ++snp_check){
                             
                             char allele = get_base_at_pos(record, snp_check->pos);
@@ -919,9 +971,14 @@ void count_alleles_parallel(
                             
                             if (allele == snp_check->data.ref){
                                 ref_add = prob_correct;
+                                g_base_valid++;  // Count ref matches
                             }
                             else if (allele == snp_check->data.alt){
                                 alt_add = prob_correct;
+                                g_base_valid++;  // Count alt matches
+                            }
+                            else {
+                                g_base_other++;  // non-ref, non-alt base
                             }
                             
                             if (ref_add > 0 || alt_add > 0){
@@ -991,7 +1048,7 @@ void count_alleles_parallel(
                     }
                     
                     snps_processed += local_snps;
-                    reads_processed += local_reads;
+                    reads_processed += local_all_reads;  // Use all reads (like V1)
                     int done = ++chroms_done;
                     
                     if (done % 10 == 0 || done == (int)tids_to_process.size()){
@@ -1015,6 +1072,16 @@ void count_alleles_parallel(
     fprintf(stderr, "\nCompleted: %lu chromosomes, %ld SNPs, %ld reads, %lu cells\n",
         tids_to_process.size(), snps_processed.load(), reads_processed.load(), 
         cell_counts.size());
+    
+    // Debug: print base extraction stats
+    fprintf(stderr, "DEBUG base extraction stats:\n");
+    fprintf(stderr, "  reads processed: %ld\n", reads_processed.load());
+    fprintf(stderr, "  queries: %ld\n", g_base_queries.load());
+    fprintf(stderr, "  valid (ref/alt): %ld\n", g_base_valid.load());
+    fprintf(stderr, "  N:       %ld\n", g_base_N.load());
+    fprintf(stderr, "  dash:    %ld\n", g_base_dash.load());
+    fprintf(stderr, "  other:   %ld\n", g_base_other.load());
+    fprintf(stderr, "  queries per read: %.2f\n", (double)g_base_queries.load() / reads_processed.load());
 }
 
 void count_alleles_single_threaded(
@@ -1055,6 +1122,9 @@ void count_alleles_single_threaded(
             continue;
         }
         
+        // Count ALL reads after flag filter (like V1)
+        reads_processed++;
+        
         if (curtid != reader.tid()){
             // New chromosome
             curtid = reader.tid();
@@ -1077,6 +1147,12 @@ void count_alleles_single_threaded(
         
         if (!active_chrom) continue;
         
+        // Advance SNP iterator BEFORE CB check (match V1 behavior)
+        while (cursnp != cursnp_end && cursnp->pos < reader.reference_start){
+            ++cursnp;
+            ++snps_processed;
+        }
+        
         if (!reader.has_cb_z) continue;
         
         bc cb_bits;
@@ -1085,14 +1161,6 @@ void count_alleles_single_threaded(
         
         if (has_bc_list && valid_barcodes.find(bc_key) == valid_barcodes.end()){
             continue;
-        }
-        
-        reads_processed++;
-        
-        // Advance SNP iterator
-        while (cursnp != cursnp_end && cursnp->pos < reader.reference_start){
-            ++cursnp;
-            ++snps_processed;
         }
         
         float prob_correct = 1.0f - powf(10.0f, -(float)reader.mapq / 10.0f);

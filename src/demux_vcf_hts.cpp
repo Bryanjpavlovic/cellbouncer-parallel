@@ -913,6 +913,15 @@ void conditional_match_fracs_normalize(map<pair<int, int>, map<int, float> >& co
 
 // ===== BAM-related functions =====
 
+// Debug counters for V1 base extraction
+static long g_v1_base_queries = 0;
+static long g_v1_base_valid = 0;
+static long g_v1_base_N = 0;
+static long g_v1_base_dash = 0;
+static long g_v1_base_other = 0;
+static long g_v1_reads_processed = 0;
+static long g_v1_debug_print_count = 0;
+
 /**
  * Extract an allele count from the current BAM record.
  */
@@ -933,6 +942,14 @@ void process_bam_record(bam_reader& reader,
         
         if (!has_bc_list || bcs_valid.find(bc_key) != bcs_valid.end()){
             
+            // Debug: print first 20 queries
+            if (g_v1_debug_print_count < 20){
+                fprintf(stderr, "DEBUG V1 QUERY %ld: tid=%d read_pos=%ld-%ld snp_pos=%d\n",
+                    g_v1_debug_print_count, reader.tid(), reader.reference_start, 
+                    reader.reference_end, snppos);
+                g_v1_debug_print_count++;
+            }
+            
             // Instead of storing actual read counts, store the probability
             // that the mapping was correct.
             float prob_corr = 1.0 - pow(10, -(float)reader.mapq/10.0);
@@ -949,17 +966,42 @@ void process_bam_record(bam_reader& reader,
             // Note: this function expects positions to be 1-based, but 
             // BCF/BAM functions store as 0-based
             char allele = reader.get_base_at(snppos + 1);
+            g_v1_base_queries++;
             
-            if (allele != 'N' && allele != '-'){
+            if (allele == 'N'){
+                g_v1_base_N++;
+            } else if (allele == '-'){
+                g_v1_base_dash++;
+            } else if (allele != 'N' && allele != '-'){
                 if (allele == vardat.ref){
                     var_counts[snppos][bc_key].first += prob_corr;
+                    g_v1_base_valid++;
                 }
                 else if (allele == vardat.alt){
                     var_counts[snppos][bc_key].second += prob_corr;
+                    g_v1_base_valid++;
+                }
+                else {
+                    g_v1_base_other++;
                 }
             }
         }
     }
+}
+
+void print_v1_base_stats(){
+    fprintf(stderr, "DEBUG V1 base extraction stats:\n");
+    fprintf(stderr, "  reads processed: %ld\n", g_v1_reads_processed);
+    fprintf(stderr, "  queries: %ld\n", g_v1_base_queries);
+    fprintf(stderr, "  valid (ref/alt): %ld\n", g_v1_base_valid);
+    fprintf(stderr, "  N:       %ld\n", g_v1_base_N);
+    fprintf(stderr, "  dash:    %ld\n", g_v1_base_dash);
+    fprintf(stderr, "  other:   %ld\n", g_v1_base_other);
+    fprintf(stderr, "  queries per read: %.2f\n", (double)g_v1_base_queries / g_v1_reads_processed);
+}
+
+void increment_v1_read_counter(){
+    g_v1_reads_processed++;
 }
 
 /**

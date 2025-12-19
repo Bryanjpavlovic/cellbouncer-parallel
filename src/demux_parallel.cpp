@@ -18,6 +18,7 @@
 #include <utility>
 #include <math.h>
 #include <float.h>
+#include <chrono>
 #include <omp.h>
 #include <htslib/sam.h>
 #include <htslib/vcf.h>
@@ -41,8 +42,9 @@ using std::endl;
 using namespace std;
 
 // Version information
-const string VERSION = "1.11";
-const string VERSION_MESSAGE = "Fixed CIGAR boundary handling to match V0 behavior,no ffastmath!";
+const string VERSION = "1.14";
+const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT→N, V1-matching read count, auto htslib_threads, timing output, base extraction debug stats";
+const string VERSION_NEW = "v1.14: Fixed -I flag assignment bug (recalculate_minmax), SNP end boundary (< to <=), non-ACGT bases return N, reads_processed counts reads on SNP-containing chromosomes";
 
 // Global verbose flag (defined in demux_vcf_llr.cpp)
 extern bool g_verbose;
@@ -535,7 +537,7 @@ void help(int code){
     fprintf(stderr, "    --output_prefix -o Base name for output files\n");
     fprintf(stderr, "\n===== OPTIONAL =====\n");
     fprintf(stderr, "    --threads -t Number of threads for parallel processing [auto]\n");
-    fprintf(stderr, "    --hts_threads -T Number of decompression threads per BAM reader [2]\n");
+    // hts_threads now auto-calculated based on thread count
     fprintf(stderr, "    --barcodes -B A file listing cell barcodes (one per line)\n");
     fprintf(stderr, "    --ids -i A file listing allowed individual IDs (singlets)\n");
     fprintf(stderr, "    --ids_doublet -I A file listing allowed doublet combinations\n");
@@ -544,7 +546,7 @@ void help(int code){
     fprintf(stderr, "    --error_ref -e Prior error rate for ref allele [0.005]\n");
     fprintf(stderr, "    --error_alt -E Prior error rate for alt allele [0.005]\n");
     fprintf(stderr, "    --error_sigma -s Sigma for error rate prior [0.1]\n");
-    fprintf(stderr, "    --mem_limit -m Memory limit for VCF preloading (e.g. 100G, 500M) [-1 = unlimited]\n");
+    fprintf(stderr, "    --no_preload -P Disable VCF preloading (use with --shared_vcf for low memory)\n");
     fprintf(stderr, "    --shared_vcf -S Name of shared memory VCF to attach to\n");
     fprintf(stderr, "    --vcf_chroms -c File listing chromosomes to use from VCF\n");
     fprintf(stderr, "    --libname -n Library name to append to barcodes\n");
@@ -558,12 +560,25 @@ void help(int code){
     exit(code);
 }
 
+// Timing helper
+void print_elapsed(const std::chrono::steady_clock::time_point& start, const char* step) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
+    int hours = elapsed / 3600;
+    int mins = (elapsed % 3600) / 60;
+    int secs = elapsed % 60;
+    fprintf(stderr, "[%02d:%02d:%02d] %s\n", hours, mins, secs, step);
+}
+
 int main(int argc, char *argv[]) {    
+    
+    // Start timing
+    auto start_time = std::chrono::steady_clock::now();
     
     // Print version info
     fprintf(stderr, "demux_parallel version %s\n", VERSION.c_str());
     fprintf(stderr, "%s\n", VERSION_MESSAGE.c_str());
-    fprintf(stderr, "\n");
+    fprintf(stderr, "New: %s\n", VERSION_NEW.c_str());
    
     static struct option long_options[] = {
        {"bam", required_argument, 0, 'b'},
@@ -582,10 +597,9 @@ int main(int argc, char *argv[]) {
        {"error_alt", required_argument, 0, 'E'},
        {"error_sigma", required_argument, 0, 's'},
        {"disable_conditional", no_argument, 0, 'f'},
-       {"mem_limit", required_argument, 0, 'm'},
+       {"no_preload", no_argument, 0, 'P'},
        {"vcf_chroms", required_argument, 0, 'c'},
        {"threads", required_argument, 0, 't'},
-       {"hts_threads", required_argument, 0, 'T'},
        {"shared_vcf", required_argument, 0, 'S'},
        {"n_target", required_argument, 0, 'N'},
        {"verbose", no_argument, 0, 'V'},
@@ -616,13 +630,13 @@ int main(int argc, char *argv[]) {
 
     bool disable_conditional = false;
 
-    long int mem_limit = -1;
+    bool no_preload = false;
     string vcf_chroms_file = "";
     bool vcf_chroms_given = false;
     
     // New parallel processing options
     int n_threads = omp_get_num_procs();
-    int htslib_threads = 2;
+    int htslib_threads = 0;  // 0 = auto-calculate after parsing args
     string shared_vcf_name = "";
     int n_target = -1;    // -1=auto, 0=no prune, >0=use value
     bool verbose = false;
@@ -633,7 +647,7 @@ int main(int argc, char *argv[]) {
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:s:m:c:t:T:S:N:fCRUVh", 
+    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:s:c:t:S:N:fPCRUVh", 
         long_options, &option_index )) != -1){
         switch(ch){
             case 0:
@@ -692,20 +706,8 @@ int main(int argc, char *argv[]) {
             case 'f':
                 disable_conditional = true;
                 break;
-            case 'm':
-                {
-                    string mem_str = optarg;
-                    char suffix = mem_str[mem_str.length()-1];
-                    if (suffix == 'G' || suffix == 'g'){
-                        mem_limit = atol(mem_str.substr(0, mem_str.length()-1).c_str()) * 1024L * 1024L * 1024L;
-                    }
-                    else if (suffix == 'M' || suffix == 'm'){
-                        mem_limit = atol(mem_str.substr(0, mem_str.length()-1).c_str()) * 1024L * 1024L;
-                    }
-                    else{
-                        mem_limit = atol(mem_str.c_str());
-                    }
-                }
+            case 'P':
+                no_preload = true;
                 break;
             case 'c':
                 vcf_chroms_given = true;
@@ -713,9 +715,6 @@ int main(int argc, char *argv[]) {
                 break;
             case 't':
                 n_threads = atoi(optarg);
-                break;
-            case 'T':
-                htslib_threads = atoi(optarg);
                 break;
             case 'S':
                 shared_vcf_name = optarg;
@@ -758,6 +757,13 @@ int main(int argc, char *argv[]) {
     }
     if (n_threads < 1){
         n_threads = 1;
+    }
+    
+    // Auto-calculate htslib threads per reader
+    // With many workers (>=8), use 1 thread to avoid oversubscription
+    // With few workers (<8), use 2 threads since decompression may bottleneck
+    if (htslib_threads == 0){
+        htslib_threads = (n_threads >= 8) ? 1 : 2;
     }
     
     fprintf(stderr, "demux_parallel: Parallel VCF-based demultiplexing\n");
@@ -898,6 +904,7 @@ int main(int argc, char *argv[]) {
         }
         
         // Load VCF data
+        print_elapsed(start_time, "Starting VCF loading...");
         robin_hood::unordered_map<int, ChromSNPs> snpdat_optimized;
         map<string, int> seq2tid = reader.get_seq2tid();
         
@@ -910,40 +917,25 @@ int main(int argc, char *argv[]) {
             }
         }
         else{
-            // Load VCF into memory
-            bool preload_vcf = false;
-            
-            if (mem_limit > 0 && chroms_to_process.size() > 0){
-                fprintf(stderr, "Counting SNPs on shared chromosomes...\n");
-                long int snp_count = count_vcf_snps(vcf_file, chroms_to_process, vq);
-                
-                long int estimated_mem = snp_count * 320L;
-                
-                fprintf(stderr, "SNPs to load: %ld\n", snp_count);
-                fprintf(stderr, "Estimated memory: %.2f GB (limit: %.2f GB)\n", 
-                    (double)estimated_mem / (1024.0 * 1024.0 * 1024.0),
-                    (double)mem_limit / (1024.0 * 1024.0 * 1024.0));
-                
-                if (estimated_mem < mem_limit){
-                    preload_vcf = true;
-                }
-            }
-            
-            if (preload_vcf || mem_limit < 0){
+            // Load VCF into memory (default behavior)
+            // Use --no_preload to disable if memory is limited
+            if (!no_preload){
+                print_elapsed(start_time, "Loading VCF data into memory...");
                 fprintf(stderr, "Loading VCF data into memory...\n");
                 int nloaded = read_vcf_chroms_optimized(vcf_file, chroms_to_process, 
                     seq2tid, snpdat_optimized, vq);
+                print_elapsed(start_time, "VCF loading complete");
                 fprintf(stderr, "Loaded %d SNPs from %lu chromosomes\n", 
                     nloaded, chroms_to_process.size());
             }
             else{
-                fprintf(stderr, "Insufficient memory for preloading VCF\n");
-                fprintf(stderr, "Consider using --shared_vcf or increasing --mem_limit\n");
+                fprintf(stderr, "VCF preloading disabled. Use --shared_vcf for large datasets.\n");
                 exit(1);
             }
         }
         
         // Count alleles
+        print_elapsed(start_time, "Starting allele counting...");
         fprintf(stderr, "Counting alleles in BAM file...\n");
         
         if (n_threads > 1){
@@ -984,6 +976,7 @@ int main(int argc, char *argv[]) {
     } // end else (not load_counts)
     
     // Write counts to disk
+    print_elapsed(start_time, "Writing allele counts to disk...");
     {
         string fname = output_prefix + ".counts";
         gzFile outf = gzopen(fname.c_str(), "w");
@@ -994,6 +987,7 @@ int main(int argc, char *argv[]) {
     }
         
     // Assign identities
+    print_elapsed(start_time, "Starting identity assignment (round 1)...");
     robin_hood::unordered_map<unsigned long, int> assn;
     robin_hood::unordered_map<unsigned long, double> assn_llr;
     
@@ -1012,6 +1006,7 @@ int main(int argc, char *argv[]) {
     robin_hood::unordered_map<unsigned long, int> assncpy = assn;
     
     // Re-estimate error rates
+    print_elapsed(start_time, "Estimating error rates...");
     fprintf(stderr, "Finding likeliest error rates...\n");
     pair<double, double> err_new = infer_error_rates_optimized(cell_counts, samples.size(),
         assn, assn_llr, error_ref, error_alt, error_sigma);
@@ -1024,6 +1019,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "\talt mismatch: %f\n", error_alt_posterior);
     
     // Re-assign with posterior error rates
+    print_elapsed(start_time, "Re-inferring identities (round 2)...");
     fprintf(stderr, "Re-inferring identities of cells...\n");
     assign_ids_parallel(cell_counts, samples, assn, assn_llr,
         allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
@@ -1042,6 +1038,7 @@ int main(int argc, char *argv[]) {
                 allowed_ids2);
 
             if (altered){
+                print_elapsed(start_time, "Re-inferring identities (round 3)...");
                 fprintf(stderr, "Re-inferring with unlikely singlet identities removed...\n");
                 assign_ids_parallel(cell_counts, samples, assn, assn_llr,
                     allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior,
@@ -1053,11 +1050,13 @@ int main(int argc, char *argv[]) {
     }
 
     // QC
+    print_elapsed(start_time, "Running QC...");
     map<int, double> p_ncell;
     map<int, double> p_llr;
     id_qc(assn, assn_llr, p_ncell, p_llr);
 
     // Write assignments
+    print_elapsed(start_time, "Writing outputs...");
     {
         string fname = output_prefix + ".assignments";
         FILE* outf = fopen(fname.c_str(), "w");
@@ -1077,6 +1076,7 @@ int main(int argc, char *argv[]) {
         fclose(outf);
     }
     
+    print_elapsed(start_time, "Complete!");
     fprintf(stderr, "Done!\n");
     
     return 0;

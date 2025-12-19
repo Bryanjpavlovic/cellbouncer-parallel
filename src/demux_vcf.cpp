@@ -308,6 +308,7 @@ pair<double, double> infer_error_rates(robin_hood::unordered_map<unsigned long, 
     vector<double> weights_llr;
 
     pair<int, int> nullkey = make_pair(-1, -1);
+    int doublet_points = 0, singlet_points = 0;
     for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin(); a != assn.end();
         ++a){
         
@@ -318,6 +319,15 @@ pair<double, double> infer_error_rates(robin_hood::unordered_map<unsigned long, 
             is_combo = true;
             combo = idx_to_hap_comb(a->second, n_samples);
         }
+        
+        // Debug: show assignment details for each cell
+        fprintf(stderr, "DEBUG cell: assn=%d n_samples=%d is_combo=%d", 
+                a->second, n_samples, is_combo);
+        if (is_combo) {
+            fprintf(stderr, " combo=(%d,%d)", combo.first, combo.second);
+        }
+        fprintf(stderr, "\n");
+        
         for (map<pair<int, int>, map<pair<int, int>, pair<float, float> > >::iterator x = 
             indv_allelecounts[a->first].begin(); x != indv_allelecounts[a->first].end(); ++x){
             if ((!is_combo && x->first.first == a->second) || (is_combo && x->first.first == combo.first)){
@@ -330,6 +340,7 @@ pair<double, double> infer_error_rates(robin_hood::unordered_map<unsigned long, 
                             n.push_back(y->second.first + y->second.second);
                             k.push_back(y->second.second);
                             weights_llr.push_back(weight);
+                            doublet_points++;
                         }
                     }
                 }
@@ -339,9 +350,31 @@ pair<double, double> infer_error_rates(robin_hood::unordered_map<unsigned long, 
                     n.push_back(x->second[nullkey].first + x->second[nullkey].second);
                     k.push_back(x->second[nullkey].second);
                     weights_llr.push_back(weight);
+                    singlet_points++;
                 }
             }
         }
+    }
+    fprintf(stderr, "DEBUG: doublet_points=%d singlet_points=%d\n", doublet_points, singlet_points);
+
+    // Diagnostic: print totals going into optimizer
+    double total_n = 0, total_k = 0, total_weight = 0;
+    std::map<double, std::pair<double, double>> by_expected;  // expected -> (n, k)
+    for (size_t i = 0; i < n.size(); i++) {
+        total_n += n[i];
+        total_k += k[i];
+        total_weight += weights_llr[i];
+        by_expected[expected[i]].first += n[i];
+        by_expected[expected[i]].second += k[i];
+    }
+    fprintf(stderr, "DEBUG infer_error_rates (V1):\n");
+    fprintf(stderr, "  data_points=%lu total_n=%.2f total_k=%.2f total_weight=%.2f\n", 
+            n.size(), total_n, total_k, total_weight);
+    fprintf(stderr, "  overall_alt_frac=%.6f\n", total_k / total_n);
+    for (auto& e : by_expected) {
+        fprintf(stderr, "  expected=%.2f: n=%.2f k=%.2f alt_frac=%.6f\n",
+                e.first, e.second.first, e.second.second, 
+                e.second.second / e.second.first);
     }
 
     optimML::multivar_ml_solver solver({error_ref, error_alt}, ll_err, dll_err);
@@ -771,12 +804,9 @@ void help(int code){
     fprintf(stderr, "       of two individuals can be specified by giving both individual names\n");
     fprintf(stderr, "       separated by \"+\", with names in either order.\n");
     fprintf(stderr, "----- I/O options -----\n");
-    fprintf(stderr, "    --mem_limit -m Amount of memory available for loading VCF data.\n");
-    fprintf(stderr, "       When provided, the program will estimate whether all VCF data\n");
-    fprintf(stderr, "       can fit in memory and load it at startup if possible. This can\n");
-    fprintf(stderr, "       dramatically improve performance when the reference genome has\n");
-    fprintf(stderr, "       many contigs. Accepts suffixes G (gigabytes) or M (megabytes).\n");
-    fprintf(stderr, "       Example: --mem_limit 50G\n");
+    fprintf(stderr, "    --no_preload -P Disable VCF preloading. By default, all VCF data\n");
+    fprintf(stderr, "       is loaded into memory at startup for better performance. Use this\n");
+    fprintf(stderr, "       flag to load VCF data per-chromosome if memory is limited.\n");
     fprintf(stderr, "    --vcf_chroms -c Optional file listing chromosome names (one per line)\n");
     fprintf(stderr, "       to include from the VCF. By default, only chromosomes present in\n");
     fprintf(stderr, "       both the BAM and VCF are processed.\n");
@@ -826,7 +856,7 @@ int main(int argc, char *argv[]) {
        {"error_sigma", required_argument, 0, 's'},
        {"disable_conditional", no_argument, 0, 'f'},
        {"dump_conditional", no_argument, 0, 'F'},
-       {"mem_limit", required_argument, 0, 'm'},
+       {"no_preload", no_argument, 0, 'P'},
        {"vcf_chroms", required_argument, 0, 'c'},
        {0, 0, 0, 0} 
     };
@@ -856,7 +886,7 @@ int main(int argc, char *argv[]) {
     bool disable_conditional = false;
     bool dump_conditional = false;
 
-    long int mem_limit = -1;
+    bool no_preload = false;
     string vcf_chroms_file = "";
     bool vcf_chroms_given = false;
 
@@ -866,7 +896,7 @@ int main(int argc, char *argv[]) {
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:p:s:m:c:fFCSUh", long_options, &option_index )) != -1){
+    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:p:s:c:fFPCSUh", long_options, &option_index )) != -1){
         switch(ch){
             case 0:
                 // This option set a flag. No need to do anything here.
@@ -931,20 +961,8 @@ int main(int argc, char *argv[]) {
             case 'F':
                 dump_conditional = true;
                 break;
-            case 'm':
-                {
-                    string mem_str = optarg;
-                    char suffix = mem_str[mem_str.length()-1];
-                    if (suffix == 'G' || suffix == 'g'){
-                        mem_limit = atol(mem_str.substr(0, mem_str.length()-1).c_str()) * 1024L * 1024L * 1024L;
-                    }
-                    else if (suffix == 'M' || suffix == 'm'){
-                        mem_limit = atol(mem_str.substr(0, mem_str.length()-1).c_str()) * 1024L * 1024L;
-                    }
-                    else{
-                        mem_limit = atol(mem_str.c_str());
-                    }
-                }
+            case 'P':
+                no_preload = true;
                 break;
             case 'c':
                 vcf_chroms_given = true;
@@ -1151,35 +1169,18 @@ all possible individuals\n", idfile_doublet.c_str());
         fprintf(stderr, "Found %d chromosomes in BAM, %d in VCF, %d shared\n",
             (int)chroms_bam.size(), (int)chroms_vcf.size(), (int)chroms_to_process.size());
         
-        // Memory estimation and preload decision
-        if (mem_limit > 0 && chroms_to_process.size() > 0){
-            fprintf(stderr, "Counting SNPs on shared chromosomes...\n");
-            long int snp_count = count_vcf_snps(vcf_file, chroms_to_process, vq);
-            
-            // Estimate memory: ~320 bytes per SNP (var struct + map overhead)
-            long int estimated_mem = snp_count * 320L;
-            
-            fprintf(stderr, "SNPs to load: %ld\n", snp_count);
-            fprintf(stderr, "Estimated memory for VCF data: %.2f GB\n", 
-                (double)estimated_mem / (1024.0 * 1024.0 * 1024.0));
-            fprintf(stderr, "Memory limit provided: %.2f GB\n",
-                (double)mem_limit / (1024.0 * 1024.0 * 1024.0));
-            
-            if (estimated_mem < mem_limit){
-                preload_vcf = true;
-                fprintf(stderr, "Loading all VCF data into memory...\n");
-                seq2tid = reader.get_seq2tid();
-                int nloaded = read_vcf_chroms(vcf_file, chroms_to_process, seq2tid, 
-                    snpdat_all, vq);
-                fprintf(stderr, "Loaded %d SNPs from %d chromosomes\n", nloaded, 
-                    (int)chroms_to_process.size());
-            }
-            else{
-                fprintf(stderr, "Insufficient memory for preloading, using per-chromosome mode\n");
-            }
+        // Load VCF data (preload by default for better performance)
+        if (!no_preload && chroms_to_process.size() > 0){
+            preload_vcf = true;
+            fprintf(stderr, "Loading all VCF data into memory...\n");
+            seq2tid = reader.get_seq2tid();
+            int nloaded = read_vcf_chroms(vcf_file, chroms_to_process, seq2tid, 
+                snpdat_all, vq);
+            fprintf(stderr, "Loaded %d SNPs from %d chromosomes\n", nloaded, 
+                (int)chroms_to_process.size());
         }
-        else if (mem_limit <= 0){
-            fprintf(stderr, "No --mem_limit provided, using per-chromosome VCF loading\n");
+        else if (no_preload){
+            fprintf(stderr, "VCF preloading disabled, using per-chromosome mode\n");
         }
     }
 
@@ -1256,6 +1257,10 @@ all possible individuals\n", idfile_doublet.c_str());
                 if (reader.unmapped() || reader.secondary() || reader.qcfail() || reader.dup()){
                     continue;
                 }
+                
+                // Count this read (passed filter)
+                increment_v1_read_counter();
+                
                 if (curtid != reader.tid()){
                     // Started a new chromosome
                     if (curtid != -1){
@@ -1391,6 +1396,9 @@ all possible individuals\n", idfile_doublet.c_str());
         }
         fprintf(stderr, "Processed %d SNPs\n", nsnp_processed);
         
+        // Print base extraction stats
+        print_v1_base_stats();
+        
         // Write the data just compiled to disk.
         string fname = output_prefix + ".counts";
         //FILE* outf = fopen(fname.c_str(), "w");   
@@ -1439,7 +1447,7 @@ all possible individuals\n", idfile_doublet.c_str());
     map<pair<int, int>, double> er_map;
     map<pair<int, int>, double> ea_map; 
     assign_ids(indv_allelecounts, samples, assn, assn_llr, 
-        allowed_ids, allowed_ids, doublet_rate, error_ref, error_alt,
+        allowed_ids, allowed_ids2, doublet_rate, error_ref, error_alt,
         false, prior_weights);
 
     robin_hood::unordered_map<unsigned long, int> assncpy = assn;
@@ -1461,7 +1469,7 @@ all possible individuals\n", idfile_doublet.c_str());
     // Re-assign individuals using posterior error rates
     fprintf(stderr, "Re-inferring identities of cells...\n");
     assign_ids(indv_allelecounts, samples, assn, assn_llr,
-        allowed_ids, allowed_ids, doublet_rate, error_ref_posterior, error_alt_posterior,
+        allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
         false, prior_weights);
     
     // This function can infer sample-specific error rates, which might be better able to 
