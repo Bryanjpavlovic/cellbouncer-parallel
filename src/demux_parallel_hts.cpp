@@ -1307,6 +1307,11 @@ bool create_shared_vcf(
         return false;
     }
     
+    // Read sample names from VCF
+    vector<string> samples;
+    read_vcf_samples(vcf_file_copy, samples);
+    fprintf(stderr, "Found %lu samples in VCF\n", samples.size());
+    
     // Calculate total size needed
     size_t total_size = sizeof(SharedVCFHeader);
     int n_chroms = 0;
@@ -1346,6 +1351,14 @@ bool create_shared_vcf(
     header->total_size = total_size;
     header->n_chromosomes = n_chroms;
     header->n_snps_total = nvar;
+    
+    // Store sample names
+    header->n_samples = samples.size();
+    for (size_t i = 0; i < samples.size() && i < 512; i++){
+        strncpy(header->sample_names[i], samples[i].c_str(), 63);
+        header->sample_names[i][63] = '\0';
+    }
+    fprintf(stderr, "Stored %d sample names in shared memory\n", header->n_samples);
     
     char* data_ptr = (char*)ptr + sizeof(SharedVCFHeader);
     size_t offset = sizeof(SharedVCFHeader);
@@ -1404,6 +1417,13 @@ bool attach_shared_vcf(
     
     fprintf(stderr, "Attached to shared VCF: %s (%d SNPs, %d chromosomes)\n",
         shm_name.c_str(), header->n_snps_total, header->n_chromosomes);
+    
+    // Retrieve sample names
+    samples.clear();
+    for (int i = 0; i < header->n_samples && i < 512; i++){
+        samples.push_back(string(header->sample_names[i]));
+    }
+    fprintf(stderr, "Loaded %lu sample names from shared VCF\n", samples.size());
     
     // Deserialize
     snpdat_all.clear();

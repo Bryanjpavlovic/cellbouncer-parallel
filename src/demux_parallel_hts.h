@@ -285,6 +285,8 @@ struct SharedVCFHeader {
     size_t chrom_offsets[8192];
     size_t chrom_snp_counts[8192];
     int chrom_tids[8192];
+    // Sample names (max 512 samples, 64 chars each)
+    char sample_names[512][64];
 };
 
 // ============================================================================

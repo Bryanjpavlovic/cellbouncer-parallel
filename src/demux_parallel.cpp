@@ -42,9 +42,9 @@ using std::endl;
 using namespace std;
 
 // Version information
-const string VERSION = "1.15";
-const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT→N, exact V1 read count, deterministic float accumulation, auto htslib_threads, timing output, base extraction debug stats";
-const string VERSION_NEW = "v1.15: Count reads on ALL chromosomes, per-chromosome accumulation merged in chromosome order for exact float reproducibility";
+const string VERSION = "1.16";
+const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT->N, exact V1 read count, deterministic float accumulation, auto htslib_threads, timing output, base extraction debug stats, count reads on ALL chromosomes, per-chromosome accumulation merged in chromosome order for exact float reproducibility";
+const string VERSION_NEW = "v1.16: Shared memory VCF now stores and retrieves sample names, deferred samples/idfile processing when using -S";
 
 // Global verbose flag (defined in demux_vcf_llr.cpp)
 extern bool g_verbose;
@@ -815,28 +815,31 @@ int main(int argc, char *argv[]) {
         samples_from_vcf = true;
     }
     
-    fprintf(stderr, "Number of individuals in VCF: %lu\n", samples.size());
-
-    // Parse allowed IDs
+    // Parse allowed IDs - deferred until after VCF loading if using shared memory
     set<int> allowed_ids;
     set<int> allowed_ids2;
-
-    if (idfile_given){
-        parse_idfile(idfile, samples, allowed_ids, allowed_ids2, true);
-        if (allowed_ids.size() == 0){
-            fprintf(stderr, "No valid individual names found in %s; allowing all\n", idfile.c_str());
-        }
-    }
-    if (idfile_doublet_given){
-        parse_idfile(idfile_doublet, samples, allowed_ids, allowed_ids2, false);
-        if (allowed_ids.size() == 0){
-            fprintf(stderr, "No valid individual names found in %s; allowing all\n", idfile_doublet.c_str());
-        }
-    }
     
-    if (samples_from_vcf){
-        string samplesfile = output_prefix + ".samples"; 
-        write_samples(samplesfile, samples);
+    // Process samples now if not using shared VCF (otherwise defer until after attach)
+    if (shared_vcf_name.length() == 0){
+        fprintf(stderr, "Number of individuals in VCF: %lu\n", samples.size());
+        
+        if (idfile_given){
+            parse_idfile(idfile, samples, allowed_ids, allowed_ids2, true);
+            if (allowed_ids.size() == 0){
+                fprintf(stderr, "No valid individual names found in %s; allowing all\n", idfile.c_str());
+            }
+        }
+        if (idfile_doublet_given){
+            parse_idfile(idfile_doublet, samples, allowed_ids, allowed_ids2, false);
+            if (allowed_ids.size() == 0){
+                fprintf(stderr, "No valid individual names found in %s; allowing all\n", idfile_doublet.c_str());
+            }
+        }
+        
+        if (samples_from_vcf){
+            string samplesfile = output_prefix + ".samples"; 
+            write_samples(samplesfile, samples);
+        }
     }
     
     // Load cell barcodes
@@ -915,6 +918,26 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "ERROR: Could not attach to shared VCF\n");
                 exit(1);
             }
+            
+            // Deferred samples processing (samples now populated from shared memory)
+            fprintf(stderr, "Number of individuals in VCF: %lu\n", samples.size());
+            
+            if (idfile_given){
+                parse_idfile(idfile, samples, allowed_ids, allowed_ids2, true);
+                if (allowed_ids.size() == 0){
+                    fprintf(stderr, "No valid individual names found in %s; allowing all\n", idfile.c_str());
+                }
+            }
+            if (idfile_doublet_given){
+                parse_idfile(idfile_doublet, samples, allowed_ids, allowed_ids2, false);
+                if (allowed_ids.size() == 0){
+                    fprintf(stderr, "No valid individual names found in %s; allowing all\n", idfile_doublet.c_str());
+                }
+            }
+            
+            // Write samples file
+            string samplesfile = output_prefix + ".samples"; 
+            write_samples(samplesfile, samples);
         }
         else{
             // Load VCF into memory (default behavior)
