@@ -43,8 +43,8 @@ using namespace std;
 
 // Version information
 const string VERSION = "1.16";
-const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT->N, exact V1 read count, deterministic float accumulation, auto htslib_threads, timing output, base extraction debug stats, count reads on ALL chromosomes, per-chromosome accumulation merged in chromosome order for exact float reproducibility";
-const string VERSION_NEW = "v1.16: Shared memory VCF now stores and retrieves sample names, deferred samples/idfile processing when using -S";
+const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT->N, exact V1 read count, fixed-point int64 accumulation, auto htslib_threads, timing output, base extraction debug stats, shared memory VCF support";
+const string VERSION_NEW = "v1.16: Fixed-point int64, per-thread storage, chunking by SNP density OR read density (fixes chrM bottleneck)";
 
 // Global verbose flag (defined in demux_vcf_llr.cpp)
 extern bool g_verbose;

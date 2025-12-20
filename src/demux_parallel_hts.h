@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <set>
 #include <cstdlib>
+#include <cstdint>
 #include <utility>
 #include <zlib.h>
 #include <mutex>
@@ -148,27 +149,36 @@ struct ChromSNPs {
  * 
  * We use a dynamic size based on actual number of samples to avoid
  * allocating huge arrays.
+ * 
+ * FIXED-POINT ARITHMETIC: Values are stored as int64_t scaled by FIXED_POINT_SCALE.
+ * This makes accumulation order-independent (integer addition is associative),
+ * enabling deterministic results regardless of thread scheduling.
  */
+
+// Scale factor for fixed-point arithmetic
+// 1,000,000 gives 6 decimal places of precision, well within int64 range
+constexpr int64_t FIXED_POINT_SCALE = 1000000;
+
 struct CellCounts {
     int n_samples;
     int state_count;
     
-    // Flattened storage for pairwise counts: ref_counts[idx1 * state_count + idx2]
-    std::vector<float> ref_counts;
-    std::vector<float> alt_counts;
+    // Flattened storage for pairwise counts (fixed-point int64)
+    std::vector<int64_t> ref_counts;
+    std::vector<int64_t> alt_counts;
     
-    // SEPARATE storage for totals per individual/genotype (fixes index collision bug)
-    std::vector<float> total_ref;
-    std::vector<float> total_alt;
+    // SEPARATE storage for totals per individual/genotype (fixed-point int64)
+    std::vector<int64_t> total_ref;
+    std::vector<int64_t> total_alt;
     
     CellCounts() : n_samples(0), state_count(0) {}
     
     CellCounts(int n_samp) : n_samples(n_samp), state_count(n_samp * GENOTYPE_STATES) {
         size_t total_size = (size_t)state_count * state_count;
-        ref_counts.resize(total_size, 0.0f);
-        alt_counts.resize(total_size, 0.0f);
-        total_ref.resize(state_count, 0.0f);
-        total_alt.resize(state_count, 0.0f);
+        ref_counts.resize(total_size, 0);
+        alt_counts.resize(total_size, 0);
+        total_ref.resize(state_count, 0);
+        total_alt.resize(state_count, 0);
     }
     
     CellCounts(const CellCounts& other) = default;
@@ -176,7 +186,8 @@ struct CellCounts {
     CellCounts(CellCounts&& other) = default;
     CellCounts& operator=(CellCounts&& other) = default;
     
-    inline void add(int indv1, int nalt1, int indv2, int nalt2, float ref, float alt) {
+    // Add using pre-scaled int64 values (caller scales by FIXED_POINT_SCALE)
+    inline void add(int indv1, int nalt1, int indv2, int nalt2, int64_t ref, int64_t alt) {
         int idx1 = indv1 * GENOTYPE_STATES + nalt1;
         int idx2 = indv2 * GENOTYPE_STATES + nalt2;
         size_t flat_idx = (size_t)idx1 * state_count + idx2;
@@ -184,26 +195,31 @@ struct CellCounts {
         alt_counts[flat_idx] += alt;
     }
     
+    // Get returns float (converts from fixed-point)
     inline std::pair<float, float> get(int indv1, int nalt1, int indv2, int nalt2) const {
         int idx1 = indv1 * GENOTYPE_STATES + nalt1;
         int idx2 = indv2 * GENOTYPE_STATES + nalt2;
         size_t flat_idx = (size_t)idx1 * state_count + idx2;
-        return {ref_counts[flat_idx], alt_counts[flat_idx]};
+        return {(float)ref_counts[flat_idx] / FIXED_POINT_SCALE, 
+                (float)alt_counts[flat_idx] / FIXED_POINT_SCALE};
     }
     
-    // Totals stored in separate vectors - no collision with pairwise data
-    inline void add_total(int indv, int nalt, float ref, float alt) {
+    // Add totals using pre-scaled int64 values
+    inline void add_total(int indv, int nalt, int64_t ref, int64_t alt) {
         int idx = indv * GENOTYPE_STATES + nalt;
         total_ref[idx] += ref;
         total_alt[idx] += alt;
     }
     
+    // Get totals returns float (converts from fixed-point)
     inline std::pair<float, float> get_total(int indv, int nalt) const {
         int idx = indv * GENOTYPE_STATES + nalt;
-        return {total_ref[idx], total_alt[idx]};
+        return {(float)total_ref[idx] / FIXED_POINT_SCALE, 
+                (float)total_alt[idx] / FIXED_POINT_SCALE};
     }
     
-    // Merge another CellCounts into this one (for deterministic accumulation)
+    // Merge another CellCounts into this one
+    // Integer addition is associative - order doesn't matter!
     void merge(const CellCounts& other) {
         if (other.n_samples == 0) return;
         
@@ -218,7 +234,7 @@ struct CellCounts {
             return;
         }
         
-        // Add other's counts to ours
+        // Add other's counts to ours (exact integer arithmetic)
         for (size_t i = 0; i < ref_counts.size(); ++i) {
             ref_counts[i] += other.ref_counts[i];
             alt_counts[i] += other.alt_counts[i];
@@ -230,10 +246,10 @@ struct CellCounts {
     }
     
     void clear() {
-        std::fill(ref_counts.begin(), ref_counts.end(), 0.0f);
-        std::fill(alt_counts.begin(), alt_counts.end(), 0.0f);
-        std::fill(total_ref.begin(), total_ref.end(), 0.0f);
-        std::fill(total_alt.begin(), total_alt.end(), 0.0f);
+        std::fill(ref_counts.begin(), ref_counts.end(), 0);
+        std::fill(alt_counts.begin(), alt_counts.end(), 0);
+        std::fill(total_ref.begin(), total_ref.end(), 0);
+        std::fill(total_alt.begin(), total_alt.end(), 0);
     }
     
     bool is_empty() const {

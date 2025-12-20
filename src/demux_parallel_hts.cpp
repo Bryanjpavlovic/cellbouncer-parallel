@@ -856,51 +856,177 @@ void count_alleles_parallel(
         }
     }
     
-    // Get total number of chromosomes from BAM header
+    // Get total number of chromosomes and their lengths from BAM header
+    // Also get read counts per chromosome from BAM index
     htsFile* bam_tmp = hts_open(bamfile.c_str(), "r");
     if (!bam_tmp){
         fprintf(stderr, "ERROR: Could not open BAM file to get header\n");
         return;
     }
     bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
+    hts_idx_t* idx_tmp = sam_index_load(bam_tmp, bamfile.c_str());
     int n_chroms = hdr_tmp->n_targets;
+    
+    // Get read counts per chromosome from index
+    vector<uint64_t> chrom_read_counts(n_chroms, 0);
+    vector<int64_t> chrom_lengths(n_chroms);
+    
+    if (idx_tmp){
+        for (int i = 0; i < n_chroms; i++){
+            uint64_t mapped, unmapped;
+            hts_idx_get_stat(idx_tmp, i, &mapped, &unmapped);
+            chrom_read_counts[i] = mapped;
+            chrom_lengths[i] = hdr_tmp->target_len[i];
+        }
+        hts_idx_destroy(idx_tmp);
+    } else {
+        fprintf(stderr, "WARNING: Could not load BAM index for read count estimation\n");
+        for (int i = 0; i < n_chroms; i++){
+            chrom_lengths[i] = hdr_tmp->target_len[i];
+        }
+    }
     bam_hdr_destroy(hdr_tmp);
     hts_close(bam_tmp);
     
-    // Build chromosome work list - include ALL chromosomes (not just those with SNPs)
-    // This ensures reads_processed matches V1 exactly
-    vector<int> tids_to_process;
-    vector<long> snps_per_tid;
+    // Work unit: represents a region to process (whole chromosome or chunk)
+    struct WorkUnit {
+        int tid;
+        int start_pos;      // BAM region start (0 for whole chrom)
+        int end_pos;        // BAM region end (INT_MAX for whole chrom)
+        size_t snp_start;   // Index into ChromSNPs vector
+        size_t snp_end;     // Index into ChromSNPs vector (exclusive)
+        bool has_snps;
+        uint64_t est_reads; // Estimated reads for sorting
+    };
+    
+    // Build work units - chunk based on SNP density OR read density
+    vector<WorkUnit> work_units;
     long total_snps = 0;
     int chroms_with_snps = 0;
+    int chroms_chunked_by_snp = 0;
+    int chroms_chunked_by_reads = 0;
+    
+    // Thresholds for chunking
+    const size_t CHUNK_SNP_THRESHOLD = 100000;       // Chunk if >100k SNPs
+    const uint64_t CHUNK_READ_THRESHOLD = 10000000;  // Chunk if >10M reads
     
     for (int tid = 0; tid < n_chroms; tid++){
-        tids_to_process.push_back(tid);
         auto it = snpdat_all.find(tid);
-        if (it != snpdat_all.end() && !it->second.empty()){
-            snps_per_tid.push_back(it->second.size());
-            total_snps += it->second.size();
+        int64_t chrom_len = chrom_lengths[tid];
+        uint64_t chrom_reads = chrom_read_counts[tid];
+        
+        if (it == snpdat_all.end() || it->second.empty()){
+            // No SNPs - check if high read density warrants chunking
+            if (chrom_reads > CHUNK_READ_THRESHOLD){
+                // High read count - split into chunks by position
+                size_t n_chunks = (chrom_reads + CHUNK_READ_THRESHOLD - 1) / CHUNK_READ_THRESHOLD;
+                // Cap at reasonable number of chunks
+                n_chunks = std::min(n_chunks, (size_t)20);
+                int64_t chunk_size = (chrom_len + n_chunks - 1) / n_chunks;
+                uint64_t reads_per_chunk = chrom_reads / n_chunks;
+                
+                for (size_t c = 0; c < n_chunks; c++){
+                    int start_pos = c * chunk_size;
+                    int end_pos = (c == n_chunks - 1) ? INT_MAX : (int)((c + 1) * chunk_size);
+                    work_units.push_back({tid, start_pos, end_pos, 0, 0, false, reads_per_chunk});
+                }
+                chroms_chunked_by_reads++;
+            }
+            else{
+                // Low read count - single unit
+                work_units.push_back({tid, 0, INT_MAX, 0, 0, false, chrom_reads});
+            }
+        }
+        else{
+            ChromSNPs& chrom_snps = it->second;
+            size_t n_snps = chrom_snps.snps.size();
+            total_snps += n_snps;
             chroms_with_snps++;
-        } else {
-            snps_per_tid.push_back(0);
+            
+            // Decide chunking strategy: SNP density or read density, whichever is higher
+            size_t chunks_by_snp = (n_snps > CHUNK_SNP_THRESHOLD) ? 
+                (n_snps + CHUNK_SNP_THRESHOLD - 1) / CHUNK_SNP_THRESHOLD : 1;
+            size_t chunks_by_reads = (chrom_reads > CHUNK_READ_THRESHOLD) ?
+                (chrom_reads + CHUNK_READ_THRESHOLD - 1) / CHUNK_READ_THRESHOLD : 1;
+            
+            // Cap read-based chunks
+            chunks_by_reads = std::min(chunks_by_reads, (size_t)20);
+            
+            if (chunks_by_snp >= chunks_by_reads && chunks_by_snp > 1){
+                // Chunk by SNP count
+                size_t snps_per_chunk = (n_snps + chunks_by_snp - 1) / chunks_by_snp;
+                uint64_t reads_per_chunk = chrom_reads / chunks_by_snp;
+                
+                for (size_t c = 0; c < chunks_by_snp; c++){
+                    size_t snp_start = c * snps_per_chunk;
+                    size_t snp_end = std::min(snp_start + snps_per_chunk, n_snps);
+                    
+                    int start_pos = (snp_start == 0) ? 0 : chrom_snps.snps[snp_start].pos;
+                    int end_pos = (snp_end >= n_snps) ? INT_MAX : chrom_snps.snps[snp_end - 1].pos + 1000;
+                    
+                    work_units.push_back({tid, start_pos, end_pos, snp_start, snp_end, true, reads_per_chunk});
+                }
+                chroms_chunked_by_snp++;
+            }
+            else if (chunks_by_reads > 1){
+                // Chunk by read density - split position space
+                int64_t chunk_size = (chrom_len + chunks_by_reads - 1) / chunks_by_reads;
+                uint64_t reads_per_chunk = chrom_reads / chunks_by_reads;
+                
+                size_t snp_idx = 0;
+                for (size_t c = 0; c < chunks_by_reads; c++){
+                    int start_pos = c * chunk_size;
+                    int end_pos = (c == chunks_by_reads - 1) ? INT_MAX : (int)((c + 1) * chunk_size);
+                    
+                    // Find SNPs in this position range
+                    size_t snp_start = snp_idx;
+                    while (snp_idx < n_snps && chrom_snps.snps[snp_idx].pos < (c + 1) * chunk_size){
+                        snp_idx++;
+                    }
+                    size_t snp_end = snp_idx;
+                    
+                    work_units.push_back({tid, start_pos, end_pos, snp_start, snp_end, true, reads_per_chunk});
+                }
+                chroms_chunked_by_reads++;
+            }
+            else{
+                // No chunking needed - single unit
+                work_units.push_back({tid, 0, INT_MAX, 0, n_snps, true, chrom_reads});
+            }
         }
     }
     
+    // Sort work units by estimated reads (highest first for best load balancing)
+    std::sort(work_units.begin(), work_units.end(),
+              [](const WorkUnit& a, const WorkUnit& b){
+                  return a.est_reads > b.est_reads;
+              });
+    
     fprintf(stderr, "Processing %d chromosomes (%d with SNPs, %ld total SNPs) using %d threads...\n",
         n_chroms, chroms_with_snps, total_snps, n_threads);
+    fprintf(stderr, "  Split into %lu work units (%d by SNP density, %d by read density)\n", 
+        work_units.size(), chroms_chunked_by_snp, chroms_chunked_by_reads);
+    if (work_units.size() > 0){
+        const WorkUnit& largest = work_units[0];
+        fprintf(stderr, "  Largest work unit: %lu SNPs, ~%luM reads\n", 
+            largest.snp_end - largest.snp_start, largest.est_reads / 1000000);
+    }
     
     // Progress tracking
     atomic<long> snps_processed(0);
-    atomic<int> chroms_done(0);
+    atomic<int> units_done(0);
     atomic<long> reads_processed(0);
     
-    // Per-chromosome cell counts for deterministic accumulation
-    // Each chromosome accumulates to its own map, then we merge in chromosome order
+    // Per-thread cell counts for memory-efficient accumulation
+    // With fixed-point int64 arithmetic, merge order doesn't matter (integer addition is associative)
     omp_set_num_threads(n_threads);
-    vector<robin_hood::unordered_map<unsigned long, CellCounts>> chrom_counts(n_chroms);
+    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts(n_threads);
     
     #pragma omp parallel
     {
+        int thread_id = omp_get_thread_num();
+        auto& local_counts = thread_counts[thread_id];
+        
         // Each thread gets its own BAM reader
         htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
         if (!bam_fp){
@@ -917,24 +1043,21 @@ void count_alleles_parallel(
                 fprintf(stderr, "ERROR: Could not load BAM index\n");
             }
             else{
-                // Process chromosomes with dynamic scheduling
+                // Process work units with dynamic scheduling
                 #pragma omp for schedule(dynamic, 1)
-                for (size_t i = 0; i < tids_to_process.size(); i++){
-                    int tid = tids_to_process[i];
+                for (size_t i = 0; i < work_units.size(); i++){
+                    WorkUnit& wu = work_units[i];
+                    int tid = wu.tid;
                     
-                    // Check if this chromosome has SNPs
-                    auto snp_it = snpdat_all.find(tid);
-                    bool has_snps = (snp_it != snpdat_all.end() && !snp_it->second.empty());
-                    
-                    // Query BAM for this chromosome
-                    hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, INT_MAX);
+                    // Query BAM for this region
+                    hts_itr_t* iter = sam_itr_queryi(idx, tid, wu.start_pos, wu.end_pos);
                     if (!iter) continue;
                     
                     long local_snps = 0;
                     long local_reads = 0;
-                    long local_all_reads = 0;  // All reads passing flag filter (like V1)
+                    long local_all_reads = 0;
                     
-                    if (!has_snps){
+                    if (!wu.has_snps){
                         // No SNPs on this chromosome - just count reads
                         while (sam_itr_next(bam_fp, iter, record) >= 0){
                             if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
@@ -945,19 +1068,26 @@ void count_alleles_parallel(
                         hts_itr_destroy(iter);
                         reads_processed += local_all_reads;
                         
-                        int done = ++chroms_done;
-                        if (done % 100 == 0 || done == (int)tids_to_process.size()){
-                            fprintf(stderr, "\r  Chromosomes: %d/%lu, SNPs: %ld/%ld, Reads: %ld",
-                                done, tids_to_process.size(), snps_processed.load(), total_snps,
+                        int done = ++units_done;
+                        if (done % 100 == 0 || done == (int)work_units.size()){
+                            fprintf(stderr, "\rProgress: %d/%lu units, %ld/%ld SNPs, %ld reads",
+                                done, work_units.size(), snps_processed.load(), total_snps,
                                 reads_processed.load());
                         }
                         continue;
                     }
                     
-                    // Has SNPs - do full processing
+                    // Has SNPs - do full processing for this chunk
+                    auto snp_it = snpdat_all.find(tid);
                     ChromSNPs& chrom_snps = snp_it->second;
-                    auto snp_iter = chrom_snps.snps.begin();
-                    auto snp_end = chrom_snps.snps.end();
+                    
+                    // Get iterators for just our chunk of SNPs
+                    auto snp_iter = chrom_snps.snps.begin() + wu.snp_start;
+                    auto snp_chunk_end = chrom_snps.snps.begin() + wu.snp_end;
+                    
+                    // Get chromosome name for progress reporting
+                    const char* chrom_name = header->target_name[tid];
+                    long chunk_snp_count = wu.snp_end - wu.snp_start;
                     
                     while (sam_itr_next(bam_fp, iter, record) >= 0){
                         // Skip filtered reads - match V1 behavior exactly
@@ -969,12 +1099,18 @@ void count_alleles_parallel(
                         // Count ALL reads that pass flag filter (before CB check) - matches V1
                         local_all_reads++;
                         
+                        // Progress within large chunks (every 5M reads)
+                        if (local_all_reads % 5000000 == 0){
+                            fprintf(stderr, "\r  [%s:%d-%d] %ldM reads, %ld/%ld SNPs...          ",
+                                chrom_name, wu.start_pos, wu.end_pos, 
+                                local_all_reads / 1000000, local_snps, chunk_snp_count);
+                        }
+                        
                         int read_start = record->core.pos;
                         int read_end = bam_endpos(record);
                         
-                        // Advance SNP iterator past SNPs before this read
-                        // IMPORTANT: Do this for ALL reads (like V1), not just those with CB
-                        while (snp_iter != snp_end && snp_iter->pos < read_start){
+                        // Advance SNP iterator past SNPs before this read (within our chunk)
+                        while (snp_iter != snp_chunk_end && snp_iter->pos < read_start){
                             ++snp_iter;
                             ++local_snps;
                         }
@@ -995,27 +1131,26 @@ void count_alleles_parallel(
                         
                         local_reads++;
                         
-                        // Get mapping quality probability
+                        // Get mapping quality probability and scale to fixed-point
                         float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
+                        int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
                         
-                        // Process all SNPs overlapping this read
-                        // V1 uses <= reference_end, and debug shows reference_end == bam_endpos
-                        // So we need <= read_end to match V1 exactly
+                        // Process all SNPs overlapping this read (within our chunk)
                         for (auto snp_check = snp_iter; 
-                             snp_check != snp_end && snp_check->pos <= read_end; 
+                             snp_check != snp_chunk_end && snp_check->pos <= read_end; 
                              ++snp_check){
                             
                             char allele = get_base_at_pos(record, snp_check->pos);
                             if (allele == 'N' || allele == '-') continue;
                             
-                            float ref_add = 0.0f, alt_add = 0.0f;
+                            int64_t ref_add = 0, alt_add = 0;
                             
                             if (allele == snp_check->data.ref){
-                                ref_add = prob_correct;
+                                ref_add = prob_scaled;
                                 g_base_valid++;  // Count ref matches
                             }
                             else if (allele == snp_check->data.alt){
-                                alt_add = prob_correct;
+                                alt_add = prob_scaled;
                                 g_base_valid++;  // Count alt matches
                             }
                             else {
@@ -1023,8 +1158,7 @@ void count_alleles_parallel(
                             }
                             
                             if (ref_add > 0 || alt_add > 0){
-                                // Accumulate to per-chromosome storage (no locks needed)
-                                auto& local_counts = chrom_counts[tid];
+                                // Accumulate to per-thread storage (no locks needed)
                                 auto it = local_counts.find(bc_key);
                                 if (it == local_counts.end()){
                                     local_counts.emplace(bc_key, CellCounts(n_samples));
@@ -1032,7 +1166,7 @@ void count_alleles_parallel(
                                 }
                                 CellCounts& cc = it->second;
                                 
-                                // Update for all individuals
+                                // Update for all individuals (fixed-point arithmetic)
                                 for (int indv = 0; indv < n_samples; ++indv){
                                     if (!snp_check->data.haps_covered.test(indv)) continue;
                                     
@@ -1058,19 +1192,19 @@ void count_alleles_parallel(
                         }
                     }
                     
-                    // Count remaining SNPs
-                    while (snp_iter != snp_end){
+                    // Count remaining SNPs in this chunk
+                    while (snp_iter != snp_chunk_end){
                         ++snp_iter;
                         ++local_snps;
                     }
                     
                     snps_processed += local_snps;
-                    reads_processed += local_all_reads;  // Use all reads (like V1)
-                    int done = ++chroms_done;
+                    reads_processed += local_all_reads;
+                    int done = ++units_done;
                     
-                    if (done % 10 == 0 || done == (int)tids_to_process.size()){
-                        fprintf(stderr, "Progress: %d/%lu chromosomes, %ld/%ld SNPs, %ld reads\r",
-                            done, tids_to_process.size(), snps_processed.load(), total_snps,
+                    if (done % 10 == 0 || done == (int)work_units.size()){
+                        fprintf(stderr, "\rProgress: %d/%lu units, %ld/%ld SNPs, %ld reads          ",
+                            done, work_units.size(), snps_processed.load(), total_snps,
                             reads_processed.load());
                     }
                     
@@ -1086,44 +1220,37 @@ void count_alleles_parallel(
         }
     }
     
-    // Deterministic merge: combine per-chromosome counts in chromosome order
-    // This ensures identical results regardless of which thread processed each chromosome
-    fprintf(stderr, "\nMerging per-chromosome counts...\n");
+    // Merge per-thread counts (order doesn't matter with fixed-point int64 arithmetic)
+    fprintf(stderr, "\nMerging per-thread counts (fixed-point)...\n");
     
-    // Collect all unique barcodes first
-    set<unsigned long> all_barcodes;
-    for (int tid = 0; tid < n_chroms; tid++){
-        for (auto& kv : chrom_counts[tid]){
-            all_barcodes.insert(kv.first);
-        }
-    }
-    
-    // For each barcode, merge counts from all chromosomes in chromosome order
-    for (unsigned long bc_key : all_barcodes){
-        // Create entry in final cell_counts if needed
-        auto it = cell_counts.find(bc_key);
-        if (it == cell_counts.end()){
-            cell_counts.emplace(std::piecewise_construct,
-                std::forward_as_tuple(bc_key),
-                std::forward_as_tuple(n_samples));
-            it = cell_counts.find(bc_key);
-        }
-        
-        // Merge from each chromosome in order (tid 0, 1, 2, ...)
-        for (int tid = 0; tid < n_chroms; tid++){
-            auto chrom_it = chrom_counts[tid].find(bc_key);
-            if (chrom_it != chrom_counts[tid].end()){
-                it->second.counts.merge(chrom_it->second);
+    // Efficient merge: iterate each thread's map once and merge directly
+    // This is O(total_entries) instead of O(cells * threads) lookups
+    for (int t = 0; t < n_threads; t++){
+        for (auto& kv : thread_counts[t]){
+            unsigned long bc_key = kv.first;
+            auto it = cell_counts.find(bc_key);
+            if (it == cell_counts.end()){
+                cell_counts.emplace(std::piecewise_construct,
+                    std::forward_as_tuple(bc_key),
+                    std::forward_as_tuple(n_samples));
+                it = cell_counts.find(bc_key);
             }
+            it->second.counts.merge(kv.second);
+        }
+        // Free memory incrementally
+        thread_counts[t].clear();
+        
+        if ((t + 1) % 10 == 0 || t == n_threads - 1){
+            fprintf(stderr, "  Merged thread %d/%d\n", t + 1, n_threads);
         }
     }
     
-    // Clear per-chromosome storage to free memory
-    chrom_counts.clear();
-    chrom_counts.shrink_to_fit();
+    // Final cleanup
+    thread_counts.clear();
+    thread_counts.shrink_to_fit();
     
-    fprintf(stderr, "Completed: %lu chromosomes, %ld SNPs, %ld reads, %lu cells\n",
-        tids_to_process.size(), snps_processed.load(), reads_processed.load(), 
+    fprintf(stderr, "Completed: %d chromosomes (%lu work units), %ld SNPs, %ld reads, %lu cells\n",
+        n_chroms, work_units.size(), snps_processed.load(), reads_processed.load(), 
         cell_counts.size());
     
     // Debug: print base extraction stats
@@ -1216,7 +1343,9 @@ void count_alleles_single_threaded(
             continue;
         }
         
+        // Get mapping quality probability and scale to fixed-point
         float prob_correct = 1.0f - powf(10.0f, -(float)reader.mapq / 10.0f);
+        int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
         
         // Process overlapping SNPs
         for (auto snp_check = cursnp;
@@ -1226,13 +1355,13 @@ void count_alleles_single_threaded(
             char allele = reader.get_base_at(snp_check->pos + 1);
             if (allele == 'N' || allele == '-') continue;
             
-            float ref_add = 0.0f, alt_add = 0.0f;
+            int64_t ref_add = 0, alt_add = 0;
             
             if (allele == snp_check->data.ref){
-                ref_add = prob_correct;
+                ref_add = prob_scaled;
             }
             else if (allele == snp_check->data.alt){
-                alt_add = prob_correct;
+                alt_add = prob_scaled;
             }
             
             if (ref_add > 0 || alt_add > 0){
@@ -1243,7 +1372,7 @@ void count_alleles_single_threaded(
                     it = cell_counts.find(bc_key);
                 }
                 
-                // Update counts
+                // Update counts (fixed-point arithmetic)
                 for (int indv = 0; indv < n_samples; ++indv){
                     if (!snp_check->data.haps_covered.test(indv)) continue;
                     
