@@ -42,9 +42,9 @@ using std::endl;
 using namespace std;
 
 // Version information
-const string VERSION = "1.14";
-const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT→N, V1-matching read count, auto htslib_threads, timing output, base extraction debug stats";
-const string VERSION_NEW = "v1.14: Fixed -I flag assignment bug (recalculate_minmax), SNP end boundary (< to <=), non-ACGT bases return N, reads_processed counts reads on SNP-containing chromosomes";
+const string VERSION = "1.15";
+const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT→N, exact V1 read count, deterministic float accumulation, auto htslib_threads, timing output, base extraction debug stats";
+const string VERSION_NEW = "v1.15: Count reads on ALL chromosomes, per-chromosome accumulation merged in chromosome order for exact float reproducibility";
 
 // Global verbose flag (defined in demux_vcf_llr.cpp)
 extern bool g_verbose;

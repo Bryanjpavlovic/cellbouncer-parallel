@@ -203,6 +203,32 @@ struct CellCounts {
         return {total_ref[idx], total_alt[idx]};
     }
     
+    // Merge another CellCounts into this one (for deterministic accumulation)
+    void merge(const CellCounts& other) {
+        if (other.n_samples == 0) return;
+        
+        // Initialize if we're empty
+        if (n_samples == 0) {
+            n_samples = other.n_samples;
+            state_count = other.state_count;
+            ref_counts = other.ref_counts;
+            alt_counts = other.alt_counts;
+            total_ref = other.total_ref;
+            total_alt = other.total_alt;
+            return;
+        }
+        
+        // Add other's counts to ours
+        for (size_t i = 0; i < ref_counts.size(); ++i) {
+            ref_counts[i] += other.ref_counts[i];
+            alt_counts[i] += other.alt_counts[i];
+        }
+        for (size_t i = 0; i < total_ref.size(); ++i) {
+            total_ref[i] += other.total_ref[i];
+            total_alt[i] += other.total_alt[i];
+        }
+    }
+    
     void clear() {
         std::fill(ref_counts.begin(), ref_counts.end(), 0.0f);
         std::fill(alt_counts.begin(), alt_counts.end(), 0.0f);

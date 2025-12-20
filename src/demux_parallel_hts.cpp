@@ -856,31 +856,48 @@ void count_alleles_parallel(
         }
     }
     
-    // Build chromosome work list
+    // Get total number of chromosomes from BAM header
+    htsFile* bam_tmp = hts_open(bamfile.c_str(), "r");
+    if (!bam_tmp){
+        fprintf(stderr, "ERROR: Could not open BAM file to get header\n");
+        return;
+    }
+    bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
+    int n_chroms = hdr_tmp->n_targets;
+    bam_hdr_destroy(hdr_tmp);
+    hts_close(bam_tmp);
+    
+    // Build chromosome work list - include ALL chromosomes (not just those with SNPs)
+    // This ensures reads_processed matches V1 exactly
     vector<int> tids_to_process;
     vector<long> snps_per_tid;
     long total_snps = 0;
+    int chroms_with_snps = 0;
     
-    for (auto& kv : snpdat_all){
-        if (!kv.second.empty()){
-            tids_to_process.push_back(kv.first);
-            snps_per_tid.push_back(kv.second.size());
-            total_snps += kv.second.size();
+    for (int tid = 0; tid < n_chroms; tid++){
+        tids_to_process.push_back(tid);
+        auto it = snpdat_all.find(tid);
+        if (it != snpdat_all.end() && !it->second.empty()){
+            snps_per_tid.push_back(it->second.size());
+            total_snps += it->second.size();
+            chroms_with_snps++;
+        } else {
+            snps_per_tid.push_back(0);
         }
     }
     
-    fprintf(stderr, "Processing %lu chromosomes with %ld SNPs using %d threads...\n",
-        tids_to_process.size(), total_snps, n_threads);
+    fprintf(stderr, "Processing %d chromosomes (%d with SNPs, %ld total SNPs) using %d threads...\n",
+        n_chroms, chroms_with_snps, total_snps, n_threads);
     
     // Progress tracking
     atomic<long> snps_processed(0);
     atomic<int> chroms_done(0);
     atomic<long> reads_processed(0);
     
-    // Global mutex for adding new barcodes (only needed when no BC list)
-    mutex global_bc_mutex;
-    
+    // Per-chromosome cell counts for deterministic accumulation
+    // Each chromosome accumulates to its own map, then we merge in chromosome order
     omp_set_num_threads(n_threads);
+    vector<robin_hood::unordered_map<unsigned long, CellCounts>> chrom_counts(n_chroms);
     
     #pragma omp parallel
     {
@@ -904,19 +921,43 @@ void count_alleles_parallel(
                 #pragma omp for schedule(dynamic, 1)
                 for (size_t i = 0; i < tids_to_process.size(); i++){
                     int tid = tids_to_process[i];
-                    ChromSNPs& chrom_snps = snpdat_all[tid];
                     
-                    if (chrom_snps.empty()) continue;
+                    // Check if this chromosome has SNPs
+                    auto snp_it = snpdat_all.find(tid);
+                    bool has_snps = (snp_it != snpdat_all.end() && !snp_it->second.empty());
                     
                     // Query BAM for this chromosome
                     hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, INT_MAX);
                     if (!iter) continue;
                     
-                    auto snp_iter = chrom_snps.snps.begin();
-                    auto snp_end = chrom_snps.snps.end();
                     long local_snps = 0;
                     long local_reads = 0;
                     long local_all_reads = 0;  // All reads passing flag filter (like V1)
+                    
+                    if (!has_snps){
+                        // No SNPs on this chromosome - just count reads
+                        while (sam_itr_next(bam_fp, iter, record) >= 0){
+                            if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
+                                continue;
+                            }
+                            local_all_reads++;
+                        }
+                        hts_itr_destroy(iter);
+                        reads_processed += local_all_reads;
+                        
+                        int done = ++chroms_done;
+                        if (done % 100 == 0 || done == (int)tids_to_process.size()){
+                            fprintf(stderr, "\r  Chromosomes: %d/%lu, SNPs: %ld/%ld, Reads: %ld",
+                                done, tids_to_process.size(), snps_processed.load(), total_snps,
+                                reads_processed.load());
+                        }
+                        continue;
+                    }
+                    
+                    // Has SNPs - do full processing
+                    ChromSNPs& chrom_snps = snp_it->second;
+                    auto snp_iter = chrom_snps.snps.begin();
+                    auto snp_end = chrom_snps.snps.end();
                     
                     while (sam_itr_next(bam_fp, iter, record) >= 0){
                         // Skip filtered reads - match V1 behavior exactly
@@ -982,59 +1023,35 @@ void count_alleles_parallel(
                             }
                             
                             if (ref_add > 0 || alt_add > 0){
-                                // Get or create cell counts entry
-                                AlignedCellCounts* cc_ptr = nullptr;
-                                
-                                if (has_bc_list){
-                                    // Already pre-allocated
-                                    auto it = cell_counts.find(bc_key);
-                                    if (it != cell_counts.end()){
-                                        cc_ptr = &(it->second);
-                                    }
+                                // Accumulate to per-chromosome storage (no locks needed)
+                                auto& local_counts = chrom_counts[tid];
+                                auto it = local_counts.find(bc_key);
+                                if (it == local_counts.end()){
+                                    local_counts.emplace(bc_key, CellCounts(n_samples));
+                                    it = local_counts.find(bc_key);
                                 }
-                                else{
-                                    // Lock to prevent race condition on map access.
-                                    // The previous implementation had a bug: it did find() 
-                                    // outside the lock, but if another thread modified the map
-                                    // (causing a rehash), the iterator became invalid.
-                                    // We must hold the lock for the entire find-or-insert operation.
-                                    lock_guard<mutex> guard(global_bc_mutex);
-                                    
-                                    auto it = cell_counts.find(bc_key);
-                                    if (it == cell_counts.end()){
-                                        cell_counts.emplace(std::piecewise_construct,
-                                            std::forward_as_tuple(bc_key),
-                                            std::forward_as_tuple(n_samples));
-                                        it = cell_counts.find(bc_key);
-                                    }
-                                    cc_ptr = &(it->second);
-                                }
+                                CellCounts& cc = it->second;
                                 
-                                if (cc_ptr){
-                                    // Lock only this cell
-                                    lock_guard<mutex> guard(cc_ptr->lock);
+                                // Update for all individuals
+                                for (int indv = 0; indv < n_samples; ++indv){
+                                    if (!snp_check->data.haps_covered.test(indv)) continue;
                                     
-                                    // Update for all individuals
-                                    for (int indv = 0; indv < n_samples; ++indv){
-                                        if (!snp_check->data.haps_covered.test(indv)) continue;
+                                    int nalt = 0;
+                                    if (snp_check->data.haps1.test(indv)) nalt++;
+                                    if (snp_check->data.haps2.test(indv)) nalt++;
+                                    
+                                    // Store total for this individual
+                                    cc.add_total(indv, nalt, ref_add, alt_add);
+                                    
+                                    // Pairwise counts
+                                    for (int indv2 = indv + 1; indv2 < n_samples; ++indv2){
+                                        if (!snp_check->data.haps_covered.test(indv2)) continue;
                                         
-                                        int nalt = 0;
-                                        if (snp_check->data.haps1.test(indv)) nalt++;
-                                        if (snp_check->data.haps2.test(indv)) nalt++;
+                                        int nalt2 = 0;
+                                        if (snp_check->data.haps1.test(indv2)) nalt2++;
+                                        if (snp_check->data.haps2.test(indv2)) nalt2++;
                                         
-                                        // Store total for this individual
-                                        cc_ptr->counts.add_total(indv, nalt, ref_add, alt_add);
-                                        
-                                        // Pairwise counts
-                                        for (int indv2 = indv + 1; indv2 < n_samples; ++indv2){
-                                            if (!snp_check->data.haps_covered.test(indv2)) continue;
-                                            
-                                            int nalt2 = 0;
-                                            if (snp_check->data.haps1.test(indv2)) nalt2++;
-                                            if (snp_check->data.haps2.test(indv2)) nalt2++;
-                                            
-                                            cc_ptr->counts.add(indv, nalt, indv2, nalt2, ref_add, alt_add);
-                                        }
+                                        cc.add(indv, nalt, indv2, nalt2, ref_add, alt_add);
                                     }
                                 }
                             }
@@ -1069,7 +1086,43 @@ void count_alleles_parallel(
         }
     }
     
-    fprintf(stderr, "\nCompleted: %lu chromosomes, %ld SNPs, %ld reads, %lu cells\n",
+    // Deterministic merge: combine per-chromosome counts in chromosome order
+    // This ensures identical results regardless of which thread processed each chromosome
+    fprintf(stderr, "\nMerging per-chromosome counts...\n");
+    
+    // Collect all unique barcodes first
+    set<unsigned long> all_barcodes;
+    for (int tid = 0; tid < n_chroms; tid++){
+        for (auto& kv : chrom_counts[tid]){
+            all_barcodes.insert(kv.first);
+        }
+    }
+    
+    // For each barcode, merge counts from all chromosomes in chromosome order
+    for (unsigned long bc_key : all_barcodes){
+        // Create entry in final cell_counts if needed
+        auto it = cell_counts.find(bc_key);
+        if (it == cell_counts.end()){
+            cell_counts.emplace(std::piecewise_construct,
+                std::forward_as_tuple(bc_key),
+                std::forward_as_tuple(n_samples));
+            it = cell_counts.find(bc_key);
+        }
+        
+        // Merge from each chromosome in order (tid 0, 1, 2, ...)
+        for (int tid = 0; tid < n_chroms; tid++){
+            auto chrom_it = chrom_counts[tid].find(bc_key);
+            if (chrom_it != chrom_counts[tid].end()){
+                it->second.counts.merge(chrom_it->second);
+            }
+        }
+    }
+    
+    // Clear per-chromosome storage to free memory
+    chrom_counts.clear();
+    chrom_counts.shrink_to_fit();
+    
+    fprintf(stderr, "Completed: %lu chromosomes, %ld SNPs, %ld reads, %lu cells\n",
         tids_to_process.size(), snps_processed.load(), reads_processed.load(), 
         cell_counts.size());
     
