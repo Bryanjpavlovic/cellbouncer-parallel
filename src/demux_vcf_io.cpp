@@ -75,14 +75,20 @@ void parse_idfile(string& idfile,
                 idx2 = name2idx[id2];
             }
             if (idx1 != -1 && idx2 != -1){
-                int k;
-                if (idx1 < idx2){
-                    k = hap_comb_to_idx(idx1, idx2, samples.size());
+                if (idx1 == idx2){
+                    // Same individual twice (e.g., "A+A") means singlet
+                    ids_allowed.insert(idx1);
                 }
                 else{
-                    k = hap_comb_to_idx(idx2, idx1, samples.size());
+                    int k;
+                    if (idx1 < idx2){
+                        k = hap_comb_to_idx(idx1, idx2, samples.size());
+                    }
+                    else{
+                        k = hap_comb_to_idx(idx2, idx1, samples.size());
+                    }
+                    ids_allowed.insert(k);
                 }
-                ids_allowed.insert(k);
             }
         }
         else{
@@ -196,10 +202,12 @@ void load_allowed(string& filename, set<int>& allowed, vector<string>& samples){
                     if (idx1 == idx2){
                         allowed.insert(idx1);
                     }
-                    else if (idx2 < idx1){
-                        int tmp = idx1;
-                        idx1 = idx2;
-                        idx2 = tmp;
+                    else{
+                        if (idx2 < idx1){
+                            int tmp = idx1;
+                            idx1 = idx2;
+                            idx2 = tmp;
+                        }
                         int idx3 = hap_comb_to_idx(idx1, idx2, samples.size());
                         allowed.insert(idx3);
                         // Also allow either component individual
