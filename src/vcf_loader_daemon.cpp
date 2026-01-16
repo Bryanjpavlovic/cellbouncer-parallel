@@ -17,6 +17,7 @@ using namespace std;
 
 static volatile sig_atomic_t keep_running = 1;
 static string shm_name_global;
+static string shm_name_het_global;
 
 void signal_handler(int sig) {
     keep_running = 0;
@@ -24,19 +25,23 @@ void signal_handler(int sig) {
 
 void help(int code) {
     fprintf(stderr, "vcf_loader_daemon [OPTIONS]\n");
-    fprintf(stderr, "Load VCF into shared memory for use by multiple demux_parallel instances.\n");
+    fprintf(stderr, "Load VCF(s) into shared memory for use by multiple demux_parallel instances.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "[OPTIONS]:\n");
     fprintf(stderr, "===== REQUIRED =====\n");
-    fprintf(stderr, "    --vcf -v VCF/BCF file to load\n");
+    fprintf(stderr, "    --vcf -v VCF/BCF file to load (main demux VCF)\n");
     fprintf(stderr, "    --bam -b BAM file (for chromosome/TID mapping)\n");
     fprintf(stderr, "    --name -n Shared memory segment name\n");
     fprintf(stderr, "===== OPTIONAL =====\n");
+    fprintf(stderr, "    --het_vcf -H Het VCF file for ploidy detection (from downsample_vcf_parallel)\n");
     fprintf(stderr, "    --qual -q Minimum variant quality (default: 50)\n");
     fprintf(stderr, "    --chroms -c File listing chromosomes to include\n");
     fprintf(stderr, "    --foreground -f Run in foreground (don't daemonize)\n");
-    fprintf(stderr, "    --destroy -d Destroy existing shared memory segment and exit\n");
+    fprintf(stderr, "    --destroy -d Destroy existing shared memory segment(s) and exit\n");
     fprintf(stderr, "    --help -h Display this message and exit\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "When --het_vcf is provided, a second shared memory segment is created\n");
+    fprintf(stderr, "with the suffix '_het' (e.g., /myvcf becomes /myvcf and /myvcf_het).\n");
     exit(code);
 }
 
@@ -44,6 +49,7 @@ int main(int argc, char* argv[]) {
     
     static struct option long_options[] = {
         {"vcf", required_argument, 0, 'v'},
+        {"het_vcf", required_argument, 0, 'H'},
         {"bam", required_argument, 0, 'b'},
         {"name", required_argument, 0, 'n'},
         {"qual", required_argument, 0, 'q'},
@@ -55,6 +61,7 @@ int main(int argc, char* argv[]) {
     };
     
     string vcf_file = "";
+    string het_vcf_file = "";
     string bam_file = "";
     string shm_name = "";
     string chroms_file = "";
@@ -69,10 +76,13 @@ int main(int argc, char* argv[]) {
         help(0);
     }
     
-    while ((ch = getopt_long(argc, argv, "v:b:n:q:c:fdh", long_options, &option_index)) != -1) {
+    while ((ch = getopt_long(argc, argv, "v:H:b:n:q:c:fdh", long_options, &option_index)) != -1) {
         switch (ch) {
             case 'v':
                 vcf_file = optarg;
+                break;
+            case 'H':
+                het_vcf_file = optarg;
                 break;
             case 'b':
                 bam_file = optarg;
@@ -111,9 +121,18 @@ int main(int argc, char* argv[]) {
     }
     
     shm_name_global = shm_name;
+    string shm_name_het = shm_name + "_het";
+    shm_name_het_global = shm_name_het;
     
     if (destroy_only) {
+        fprintf(stderr, "Destroying shared memory segments...\n");
         destroy_shared_vcf(shm_name);
+        if (!het_vcf_file.empty()) {
+            destroy_shared_vcf(shm_name_het);
+        }
+        // Also try to destroy het segment even if not specified (cleanup)
+        // This will just print an error if it doesn't exist, which is fine
+        destroy_shared_vcf(shm_name_het);
         return 0;
     }
     
@@ -176,12 +195,65 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
     
-    // Create shared memory segment
-    fprintf(stderr, "Creating shared memory segment: %s\n", shm_name.c_str());
+    // Create shared memory segment for main VCF
+    fprintf(stderr, "Creating shared memory segment for main VCF: %s\n", shm_name.c_str());
     
     if (!create_shared_vcf(vcf_file, shm_name, chroms_to_include, seq2tid, min_vq)) {
-        fprintf(stderr, "ERROR: Failed to create shared memory segment\n");
+        fprintf(stderr, "ERROR: Failed to create shared memory segment for main VCF\n");
         exit(1);
+    }
+    
+    // Create shared memory segment for het VCF if provided
+    bool het_loaded = false;
+    if (!het_vcf_file.empty()) {
+        fprintf(stderr, "\nCreating shared memory segment for het VCF: %s\n", shm_name_het.c_str());
+        
+        // Get chromosomes from het VCF
+        set<string> chroms_het_vcf;
+        get_vcf_chroms(het_vcf_file, chroms_het_vcf);
+        
+        // Find shared chromosomes (intersection of BAM and het VCF)
+        set<string> chroms_to_include_het;
+        for (auto& c : chroms_bam) {
+            if (chroms_het_vcf.find(c) != chroms_het_vcf.end()) {
+                chroms_to_include_het.insert(c);
+            }
+        }
+        
+        // Apply same user filter if provided
+        if (!chroms_file.empty()) {
+            set<string> user_chroms;
+            ifstream cf(chroms_file);
+            string line;
+            while (getline(cf, line)) {
+                if (!line.empty()) {
+                    user_chroms.insert(line);
+                }
+            }
+            
+            set<string> filtered;
+            for (auto& c : chroms_to_include_het) {
+                if (user_chroms.find(c) != user_chroms.end()) {
+                    filtered.insert(c);
+                }
+            }
+            chroms_to_include_het = filtered;
+        }
+        
+        fprintf(stderr, "Het VCF chromosomes to load: %lu\n", chroms_to_include_het.size());
+        
+        if (chroms_to_include_het.empty()) {
+            fprintf(stderr, "WARNING: No shared chromosomes found for het VCF, skipping\n");
+        }
+        else {
+            if (!create_shared_vcf(het_vcf_file, shm_name_het, chroms_to_include_het, seq2tid, min_vq)) {
+                fprintf(stderr, "ERROR: Failed to create shared memory segment for het VCF\n");
+                // Clean up main VCF segment
+                destroy_shared_vcf(shm_name);
+                exit(1);
+            }
+            het_loaded = true;
+        }
     }
     
     // Set up signal handlers
@@ -194,13 +266,26 @@ int main(int argc, char* argv[]) {
         if (pid < 0) {
             perror("fork");
             destroy_shared_vcf(shm_name);
+            if (het_loaded) {
+                destroy_shared_vcf(shm_name_het);
+            }
             exit(1);
         }
         if (pid > 0) {
             // Parent - print info and exit
-            fprintf(stderr, "Daemon started with PID %d\n", pid);
-            fprintf(stderr, "Shared memory available as: %s\n", shm_name.c_str());
-            fprintf(stderr, "To destroy: vcf_loader_daemon --destroy --name %s\n", shm_name.c_str());
+            fprintf(stderr, "\nDaemon started with PID %d\n", pid);
+            fprintf(stderr, "Shared memory available as:\n");
+            fprintf(stderr, "  Main VCF: %s\n", shm_name.c_str());
+            if (het_loaded) {
+                fprintf(stderr, "  Het VCF:  %s\n", shm_name_het.c_str());
+            }
+            fprintf(stderr, "\nTo use with demux_parallel:\n");
+            fprintf(stderr, "  demux_parallel --shared_vcf %s", shm_name.c_str());
+            if (het_loaded) {
+                fprintf(stderr, " --shared_het_vcf %s", shm_name_het.c_str());
+            }
+            fprintf(stderr, " ...\n");
+            fprintf(stderr, "\nTo destroy: vcf_loader_daemon --destroy --name %s\n", shm_name.c_str());
             exit(0);
         }
         
@@ -213,8 +298,12 @@ int main(int argc, char* argv[]) {
         close(STDERR_FILENO);
     }
     else {
-        fprintf(stderr, "Running in foreground. Press Ctrl+C to stop.\n");
-        fprintf(stderr, "Shared memory available as: %s\n", shm_name.c_str());
+        fprintf(stderr, "\nRunning in foreground. Press Ctrl+C to stop.\n");
+        fprintf(stderr, "Shared memory available as:\n");
+        fprintf(stderr, "  Main VCF: %s\n", shm_name.c_str());
+        if (het_loaded) {
+            fprintf(stderr, "  Het VCF:  %s\n", shm_name_het.c_str());
+        }
     }
     
     // Keep running until signaled
@@ -227,6 +316,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "\nShutting down...\n");
     }
     destroy_shared_vcf(shm_name);
+    if (het_loaded) {
+        destroy_shared_vcf(shm_name_het);
+    }
     
     return 0;
 }
