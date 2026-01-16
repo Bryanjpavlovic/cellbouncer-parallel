@@ -1261,6 +1261,14 @@ all possible individuals\n", idfile_doublet.c_str());
                 // Count this read (passed filter)
                 increment_v1_read_counter();
                 
+                // Debug: print first 10 reads' positions
+                static int read_debug_count = 0;
+                if (read_debug_count < 10){
+                    fprintf(stderr, "DEBUG READ %d: tid=%d ref_start=%ld ref_end=%ld\n",
+                        read_debug_count, reader.tid(), reader.reference_start, reader.reference_end);
+                    read_debug_count++;
+                }
+                
                 if (curtid != reader.tid()){
                     // Started a new chromosome
                     if (curtid != -1){
@@ -1304,6 +1312,11 @@ all possible individuals\n", idfile_doublet.c_str());
                             }
                             cursnp = active_snpdat->begin();
                             cursnp_end = active_snpdat->end();
+                            // Debug: print first SNP for this chromosome
+                            if (cursnp != cursnp_end){
+                                fprintf(stderr, "DEBUG CHROM tid=%d first_snp_pos=%d num_snps=%zu\n", 
+                                    curtid, cursnp->first, active_snpdat->size());
+                            }
                         }
                         else{
                             snpdat.clear();
@@ -1335,6 +1348,17 @@ all possible individuals\n", idfile_doublet.c_str());
                 // Create a second iterator to look ahead for any additional SNPs 
                 // within the current read
                 map<int, var>::iterator cursnp2 = cursnp;
+                
+                // Debug: print first 5 SNP match attempts
+                static int snp_match_debug = 0;
+                if (snp_match_debug < 5 && cursnp2 != cursnp_end){
+                    fprintf(stderr, "DEBUG SNP_MATCH %d: read=[%ld-%ld] first_snp=%d in_range=%d\n",
+                        snp_match_debug, reader.reference_start, reader.reference_end,
+                        cursnp2->first,
+                        (cursnp2->first >= reader.reference_start && cursnp2->first <= reader.reference_end));
+                    snp_match_debug++;
+                }
+                
                 while (cursnp2 != cursnp_end && 
                     cursnp2->first >= reader.reference_start && 
                     cursnp2->first <= reader.reference_end){   
