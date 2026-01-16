@@ -44,7 +44,7 @@ all: dependencies original_tools parallel_tools
 
 original_tools: demux_vcf demux_mt demux_tags demux_species quant_contam doublet_dragon bulkprops utils
 
-parallel_tools: demux_parallel vcf_loader_daemon utils/downsample_vcf_parallel
+parallel_tools: demux_parallel vcf_loader_daemon utils/downsample_vcf_parallel tetra_refine
 
 utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts utils/downsample_vcf
 
@@ -87,6 +87,9 @@ vcf_loader_daemon: src/vcf_loader_daemon.cpp build/common_parallel.o build/demux
 
 utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp src/downsample_vcf.h build/common_parallel.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o src/downsample_vcf_parallel.cpp -o utils/downsample_vcf_parallel $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
+
+tetra_refine: src/tetra_refine.cpp lib/libhtswrapper.a
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 src/tetra_refine.cpp -o tetra_refine $(LFLAGS) lib/libhtswrapper.a -lz
 
 # ============================================================================
 # UTILITY TOOLS
@@ -199,7 +202,7 @@ clean_build:
 
 clean_binaries:
 	rm -f demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops
-	rm -f demux_parallel vcf_loader_daemon
+	rm -f demux_parallel vcf_loader_daemon tetra_refine
 	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers
 	rm -f utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts
 	rm -f utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel
@@ -219,7 +222,7 @@ clean_all: clean clean_deps
 install: all
 	mkdir -p $(PREFIX)/bin
 	cp demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops $(PREFIX)/bin/
-	cp demux_parallel vcf_loader_daemon $(PREFIX)/bin/
+	cp demux_parallel vcf_loader_daemon tetra_refine $(PREFIX)/bin/
 	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers $(PREFIX)/bin/
 	cp utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts $(PREFIX)/bin/
 	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
