@@ -47,6 +47,11 @@
 
 #include "gene_core.c"
 
+//  Macros to suppress warn_unused_result warnings for read/write calls
+//  where return value checking is intentionally omitted
+#define FREAD(fd,buf,sz)  (void)!read(fd,buf,sz)
+#define FWRITE(fd,buf,sz) (void)!write(fd,buf,sz)
+
 /*********************************************************************************************\
  *
  *  HISTOGRAM CODE
@@ -105,18 +110,18 @@ Histogram *Load_Histogram(char *name)
   free(root);
   free(dir);
 
-  read(f,&kmer,sizeof(int));
-  read(f,&low,sizeof(int));
-  read(f,&high,sizeof(int));
-  read(f,&ilowcnt,sizeof(int64));
-  read(f,&ihighcnt,sizeof(int64));
+  FREAD(f,&kmer,sizeof(int));
+  FREAD(f,&low,sizeof(int));
+  FREAD(f,&high,sizeof(int));
+  FREAD(f,&ilowcnt,sizeof(int64));
+  FREAD(f,&ihighcnt,sizeof(int64));
 
   H    = Malloc(sizeof(Histogram),"Allocating histogram");
   hist = Malloc(sizeof(int64)*((high-low)+3),"Allocating histogram");
   if (H == NULL || hist == NULL)
     exit (1);
 
-  read(f,hist,sizeof(int64)*((high-low)+1));
+  FREAD(f,hist,sizeof(int64)*((high-low)+1));
     
   close(f);
 
@@ -207,12 +212,12 @@ int Write_Histogram(char *name, Histogram *H)
   free(root);
   free(dir);
 
-  write(f,&H->kmer,sizeof(int));
-  write(f,&low,sizeof(int));
-  write(f,&high,sizeof(int));
-  write(f,hist+(high+1),sizeof(int64));
-  write(f,hist+(high+2),sizeof(int64));
-  write(f,hist+low,sizeof(int64)*((high-low)+1));
+  FWRITE(f,&H->kmer,sizeof(int));
+  FWRITE(f,&low,sizeof(int));
+  FWRITE(f,&high,sizeof(int));
+  FWRITE(f,hist+(high+1),sizeof(int64));
+  FWRITE(f,hist+(high+2),sizeof(int64));
+  FWRITE(f,hist+low,sizeof(int64)*((high-low)+1));
   close(f);
 
   if (H->unique == 0)
@@ -389,10 +394,10 @@ Kmer_Table *Load_Kmer_Table(char *name, int cut_off)
       return (NULL);
     }
 
-  read(f,&smer,sizeof(int));
-  read(f,&nthreads,sizeof(int));
-  read(f,&minval,sizeof(int));
-  read(f,&ibyte,sizeof(int));
+  FREAD(f,&smer,sizeof(int));
+  FREAD(f,&nthreads,sizeof(int));
+  FREAD(f,&minval,sizeof(int));
+  FREAD(f,&ibyte,sizeof(int));
 
   kmer  = smer;
   kbyte = (kmer+3)>>2;
@@ -425,7 +430,7 @@ Kmer_Table *Load_Kmer_Table(char *name, int cut_off)
     { int    p;
       int64  n;
 
-      read(f,index,ixlen*sizeof(int64));
+      FREAD(f,index,ixlen*sizeof(int64));
       close(f);
 
       for (p = 1; p <= nthreads; p++)
@@ -435,8 +440,8 @@ Kmer_Table *Load_Kmer_Table(char *name, int cut_off)
             { fprintf(stderr,"Table part %s is missing ?\n",full);
               exit (1);
             }
-          read(f,&kmer,sizeof(int));
-          read(f,&n,sizeof(int64));
+          FREAD(f,&kmer,sizeof(int));
+          FREAD(f,&n,sizeof(int64));
           nels += n;
           if (kmer != smer)
             { fprintf(stderr,"Table part %s does not have k-mer length matching stub ?\n",
@@ -490,8 +495,8 @@ Kmer_Table *Load_Kmer_Table(char *name, int cut_off)
       for (p = 1; p <= nthreads; p++)
         { sprintf(full+flen,"%d",p);
           f = open(full,O_RDONLY);
-          read(f,&kmer,sizeof(int));
-          read(f,&n,sizeof(int64));
+          FREAD(f,&kmer,sizeof(int));
+          FREAD(f,&n,sizeof(int64));
           big_read(f,table+nels*pbyte,n*pbyte);
           nels += n;
           close(f);
@@ -849,10 +854,10 @@ Kmer_Stream *Open_Kmer_Stream(char *name)
     { free(full);
       return (NULL);
     }
-  read(f,&smer,sizeof(int));
-  read(f,&nthreads,sizeof(int));
-  read(f,&minval,sizeof(int));
-  read(f,&ibyte,sizeof(int));
+  FREAD(f,&smer,sizeof(int));
+  FREAD(f,&nthreads,sizeof(int));
+  FREAD(f,&minval,sizeof(int));
+  FREAD(f,&ibyte,sizeof(int));
 
   //  Set size variables and allocate space for components
 
@@ -874,7 +879,7 @@ Kmer_Stream *Open_Kmer_Stream(char *name)
 
   //  Read in index from stub and then close it
 
-  read(f,S->index,ixlen*sizeof(int64));
+  FREAD(f,S->index,ixlen*sizeof(int64));
   close(f);
 
   //  Read header of each part aaccumulating # of elements
@@ -887,8 +892,8 @@ Kmer_Stream *Open_Kmer_Stream(char *name)
         { fprintf(stderr,"%s: Table part %s is missing ?\n",Prog_Name,S->name);
           exit (1);
         }
-      read(copn,&kmer,sizeof(int));
-      read(copn,&n,sizeof(int64));
+      FREAD(copn,&kmer,sizeof(int));
+      FREAD(copn,&n,sizeof(int64));
       nels += n;
       S->neps[p-1] = nels;
       if (kmer != smer)
@@ -1251,7 +1256,7 @@ int GoTo_Kmer_Entry(Kmer_Stream *_S, uint8 *entry)
   while (r-l > STREAM_BLOCK)
     { m = ((l+r) >> 1);
       lseek(f,proff+m*pbyte,SEEK_SET);
-      read(f,kbuf,hbyte);
+      FREAD(f,kbuf,hbyte);
       if (mycmp(kbuf,entry,hbyte) < 0)
         l = m+1;
       else
@@ -1341,8 +1346,8 @@ Profile_Index *Open_Profiles(char *name)
   free(dir);
   if (f < 0)
     return (NULL);
-  read(f,&smer,sizeof(int));
-  read(f,&nthreads,sizeof(int));
+  FREAD(f,&smer,sizeof(int));
+  FREAD(f,&nthreads,sizeof(int));
   close(f);
 
   //  Find all parts and accumulate total size
@@ -1355,9 +1360,9 @@ Profile_Index *Open_Profiles(char *name)
         { fprintf(stderr,"Profile part %s is misssing ?\n",full);
           exit (1);
         }
-      read(f,&kmer,sizeof(int));
-      read(f,&n,sizeof(int64));
-      read(f,&n,sizeof(int64));
+      FREAD(f,&kmer,sizeof(int));
+      FREAD(f,&n,sizeof(int64));
+      FREAD(f,&n,sizeof(int64));
       nreads += n;
       if (kmer != smer)
         { fprintf(stderr,"Profile part %s does not have k-mer length matching stub ?\n",full);
@@ -1380,10 +1385,10 @@ Profile_Index *Open_Profiles(char *name)
   for (nparts = 0; nparts < nthreads; nparts++)
     { sprintf(full+x,"pidx.%d",nparts+1);
       f = open(full,O_RDONLY);
-      read(f,&kmer,sizeof(int));
-      read(f,&n,sizeof(int64));
-      read(f,&n,sizeof(int64));
-      read(f,index+(nreads+1),n*sizeof(int64));
+      FREAD(f,&kmer,sizeof(int));
+      FREAD(f,&n,sizeof(int64));
+      FREAD(f,&n,sizeof(int64));
+      FREAD(f,index+(nreads+1),n*sizeof(int64));
       nreads += n;
       nbase[nparts] = nreads;
       close(f);
@@ -1512,7 +1517,7 @@ int Fetch_Profile(Profile_Index *_P, int64 id, int plen, uint16 *profile)
   count = P->count;
   cend  = count + PROF_BUF1;
 
-  read(f,count,PROF_BUF0);
+  FREAD(f,count,PROF_BUF0);
 
   p = count;
   q = count + len;
@@ -1534,11 +1539,11 @@ int Fetch_Profile(Profile_Index *_P, int64 id, int plen, uint16 *profile)
         { if (p >= cend)
             { if (p == cend)
                 { *count = *p; 
-                  read(f,count+1,PROF_BUF1);
+                  FREAD(f,count+1,PROF_BUF1);
                   q -= PROF_BUF1;
                 }
               else
-                { read(f,count,PROF_BUF0);
+                { FREAD(f,count,PROF_BUF0);
                   q -= PROF_BUF0;
                 }
               p = count;
@@ -1592,11 +1597,11 @@ int Fetch_Profile(Profile_Index *_P, int64 id, int plen, uint16 *profile)
     { if (p >= cend)
         { if (p == cend)
             { *count = *p; 
-              read(f,count+1,PROF_BUF1);
+              FREAD(f,count+1,PROF_BUF1);
               q -= PROF_BUF1;
             }
           else
-            { read(f,count,PROF_BUF0);
+            { FREAD(f,count,PROF_BUF0);
               q -= PROF_BUF0;
             }
           p = count;
