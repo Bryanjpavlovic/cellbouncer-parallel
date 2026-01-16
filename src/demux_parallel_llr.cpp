@@ -29,6 +29,9 @@ using namespace std;
 // Global verbose flag (set from main)
 bool g_verbose = false;
 
+// Global debug flag (set from main)
+bool g_debug = false;
+
 /**
  * ===== Contains functions relating to identifying individuals of  ===== 
  * ===== origin, used by demux_vcf.                                 =====
@@ -292,6 +295,14 @@ void llr_table::get_max(int& best_idx, double& best_llr){
             }
         }
     }
+}
+
+// NEW: Get min_margin for a specific identity
+double llr_table::get_min_margin(int identity) const {
+    if (identity < 0 || identity >= (int)minllr.size() || !included[identity]){
+        return 0.0;
+    }
+    return minllr[identity];
 }
 
 // ============================================================================
@@ -1102,6 +1113,387 @@ bool populate_llr_table_optimized(
 }
 
 // ============================================================================
+// DIAGNOSTIC EXTRACTION FUNCTIONS (NEW)
+// ============================================================================
+
+/**
+ * Extract diagnostic information from LLR table before destruction
+ */
+void get_diagnostics_from_llrs(
+    const map<int, map<int, double> >& llrs,
+    const llr_table& tab,
+    int winner,
+    double winner_llr,
+    int n_samples,
+    int n_runner_ups,
+    double close_threshold,
+    CellDiagnostics& diag,
+    vector<RunnerUp>& runners){
+    
+    runners.clear();
+    
+    // Get min_margin for the winner (already computed in tab)
+    diag.min_margin = tab.get_min_margin(winner);
+    
+    // Find the worst competitor (identity that gave min_margin to winner)
+    // We need to look through all LLRs involving the winner
+    double min_llr_found = std::numeric_limits<double>::max();
+    int worst_comp = -1;
+    
+    // Check all pairwise comparisons involving the winner
+    if (llrs.count(winner) > 0){
+        for (const auto& kv : llrs.at(winner)){
+            int other = kv.first;
+            if (!tab.included[other]) continue;
+            
+            // LLR(winner vs other) = llrs[winner][other] if winner < other in storage
+            // Need to get the direct LLR from winner's perspective
+            double direct_llr = kv.second;
+            if (direct_llr < min_llr_found){
+                min_llr_found = direct_llr;
+                worst_comp = other;
+            }
+        }
+    }
+    
+    // Also check cases where winner is in the "other" position
+    for (const auto& outer : llrs){
+        if (outer.first == winner) continue;
+        if (!tab.included[outer.first]) continue;
+        
+        if (outer.second.count(winner) > 0){
+            // llrs[outer.first][winner] is from outer.first's perspective
+            // So from winner's perspective, it's -llrs[outer.first][winner]
+            double llr_from_winner = -outer.second.at(winner);
+            if (llr_from_winner < min_llr_found){
+                min_llr_found = llr_from_winner;
+                worst_comp = outer.first;
+            }
+        }
+    }
+    
+    diag.worst_competitor = worst_comp;
+    
+    // Count n_close: identities within close_threshold of winner
+    diag.n_close = 0;
+    
+    // Build list of all identity scores for runner-up extraction
+    vector<pair<double, int> > identity_scores;  // (min_margin, identity)
+    
+    const vector<double>& all_minllr = tab.get_minllr();
+    
+    for (size_t i = 0; i < tab.included.size(); ++i){
+        if (!tab.included[i]) continue;
+        if ((int)i == winner) continue;
+        
+        double score = all_minllr[i];
+        identity_scores.push_back(make_pair(score, (int)i));
+        
+        // Check if within close_threshold of winner
+        // A competitor is "close" if winner's margin over them is small
+        // winner_llr is the winner's min_margin
+        // If (winner_llr - score) < close_threshold, they're close
+        if ((diag.min_margin - score) < close_threshold){
+            diag.n_close++;
+        }
+    }
+    
+    // Sort by score descending to get best runner-ups
+    sort(identity_scores.begin(), identity_scores.end(), 
+         [](const pair<double, int>& a, const pair<double, int>& b){
+             return a.first > b.first;  // Descending
+         });
+    
+    // Extract top n_runner_ups
+    int n_to_extract = min((int)identity_scores.size(), n_runner_ups);
+    for (int i = 0; i < n_to_extract; ++i){
+        int runner_id = identity_scores[i].second;
+        double runner_margin = identity_scores[i].first;
+        
+        // Get direct LLR vs winner
+        double llr_vs_winner = 0.0;
+        
+        // Look up in llrs map
+        if (winner < runner_id){
+            if (llrs.count(winner) > 0 && llrs.at(winner).count(runner_id) > 0){
+                llr_vs_winner = -llrs.at(winner).at(runner_id);  // Negative because runner lost
+            }
+        }
+        else{
+            if (llrs.count(runner_id) > 0 && llrs.at(runner_id).count(winner) > 0){
+                llr_vs_winner = llrs.at(runner_id).at(winner);  // Already from runner's perspective
+            }
+        }
+        
+        runners.push_back(RunnerUp(runner_id, llr_vs_winner, runner_margin));
+    }
+}
+
+/**
+ * Compute het site balance statistics for ploidy detection
+ */
+void compute_het_balance_stats(
+    const CellCounts& het_counts,
+    int assigned_id,
+    int n_samples,
+    CellDiagnostics& diag){
+    
+    vector<double> alt_fracs;
+    double total_depth = 0.0;
+    
+    bool is_doublet = (assigned_id >= n_samples);
+    
+    if (is_doublet){
+        // Doublet: use sites where BOTH component individuals are het
+        pair<int, int> combo = idx_to_hap_comb(assigned_id, n_samples);
+        int indv1 = combo.first;
+        int indv2 = combo.second;
+        
+        // Get counts at sites where both are het (genotype = 1 for both)
+        auto both_het = het_counts.get(indv1, 1, indv2, 1);
+        float ref = both_het.first;
+        float alt = both_het.second;
+        
+        if (ref + alt > 0){
+            alt_fracs.push_back(alt / (ref + alt));
+            total_depth += (ref + alt);
+        }
+        
+        // Also consider sites where one is het and the other has known genotype
+        // This gives us more data points
+        for (int gt1 = 0; gt1 < 3; ++gt1){
+            for (int gt2 = 0; gt2 < 3; ++gt2){
+                // Skip if neither is het
+                if (gt1 != 1 && gt2 != 1) continue;
+                // Skip the both-het case (already handled)
+                if (gt1 == 1 && gt2 == 1) continue;
+                
+                auto counts = het_counts.get(indv1, gt1, indv2, gt2);
+                float r = counts.first;
+                float a = counts.second;
+                if (r + a > 0){
+                    alt_fracs.push_back(a / (r + a));
+                    total_depth += (r + a);
+                }
+            }
+        }
+    }
+    else{
+        // Singlet: use sites where the assigned individual is het
+        int indv = assigned_id;
+        
+        // Get all het sites for this individual
+        for (int other = 0; other < n_samples; ++other){
+            if (other == indv) continue;
+            
+            for (int gt_other = 0; gt_other < 3; ++gt_other){
+                // indv is het (genotype = 1)
+                pair<float, float> counts;
+                if (indv < other){
+                    counts = het_counts.get(indv, 1, other, gt_other);
+                }
+                else{
+                    counts = het_counts.get(other, gt_other, indv, 1);
+                }
+                
+                float ref = counts.first;
+                float alt = counts.second;
+                if (ref + alt > 0){
+                    alt_fracs.push_back(alt / (ref + alt));
+                    total_depth += (ref + alt);
+                }
+            }
+        }
+        
+        // Also use totals for het genotype
+        auto total = het_counts.get_total(indv, 1);
+        if (total.first + total.second > 0 && alt_fracs.empty()){
+            // Fallback: use total counts if no pairwise data
+            alt_fracs.push_back(total.second / (total.first + total.second));
+            total_depth = total.first + total.second;
+        }
+    }
+    
+    diag.n_het_sites = (int)alt_fracs.size();
+    diag.het_total_depth = total_depth;
+    
+    // Compute variance of alt_frac
+    // Minimum number of sites needed for reliable variance estimate
+    const int MIN_HET_SITES = 10;
+    
+    if (alt_fracs.size() < MIN_HET_SITES){
+        diag.het_balance_var = -1.0;  // Insufficient data
+        return;
+    }
+    
+    // Compute mean
+    double sum = 0.0;
+    for (double af : alt_fracs){
+        sum += af;
+    }
+    double mean = sum / alt_fracs.size();
+    
+    // Compute variance
+    double var_sum = 0.0;
+    for (double af : alt_fracs){
+        double diff = af - mean;
+        var_sum += diff * diff;
+    }
+    diag.het_balance_var = var_sum / (alt_fracs.size() - 1);  // Sample variance
+}
+
+/**
+ * Compute total depth from main demux counts
+ */
+double compute_total_depth(const CellCounts& counts, int n_samples){
+    double total = 0.0;
+    for (int indv = 0; indv < n_samples; ++indv){
+        for (int nalt = 0; nalt < 3; ++nalt){
+            auto tot = counts.get_total(indv, nalt);
+            total += tot.first + tot.second;
+        }
+    }
+    // Divide by n_samples since each read contributes to multiple individuals
+    return total / n_samples;
+}
+
+/**
+ * Compute het balance using per-site data (PERSITE method)
+ */
+void compute_het_balance_persite(
+    const HetSiteData& persite_data,
+    const robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
+    const vector<pair<int, int>>& idx_to_site,
+    int assigned_id,
+    int n_samples,
+    double min_depth,
+    int min_sites,
+    CellDiagnostics& diag) {
+    
+    vector<double> alt_fracs;
+    double total_depth = 0.0;
+    
+    bool is_doublet = (assigned_id >= n_samples);
+    int indv1 = -1, indv2 = -1;
+    
+    if (is_doublet) {
+        auto combo = idx_to_hap_comb(assigned_id, n_samples);
+        indv1 = combo.first;
+        indv2 = combo.second;
+    } else {
+        indv1 = assigned_id;
+    }
+    
+    for (const auto& site : persite_data.sites) {
+        if (site.site_idx < 0 || site.site_idx >= (int)idx_to_site.size()) continue;
+        
+        int tid = idx_to_site[site.site_idx].first;
+        int pos = idx_to_site[site.site_idx].second;
+        
+        auto chrom_it = het_snpdat.find(tid);
+        if (chrom_it == het_snpdat.end()) continue;
+        
+        const ChromSNPs& chrom_snps = chrom_it->second;
+        SNPData target;
+        target.pos = pos;
+        auto snp_it = lower_bound(chrom_snps.snps.begin(), chrom_snps.snps.end(), target);
+        if (snp_it == chrom_snps.snps.end() || snp_it->pos != pos) continue;
+        
+        const var& v = snp_it->data;
+        
+        bool use_site = false;
+        if (is_doublet) {
+            use_site = v.is_het(indv1) || v.is_het(indv2);
+        } else {
+            use_site = v.is_het(indv1);
+        }
+        
+        if (!use_site) continue;
+        
+        double depth = site.ref + site.alt;
+        if (depth < min_depth) continue;
+        
+        double alt_frac = site.alt / depth;
+        alt_fracs.push_back(alt_frac);
+        total_depth += depth;
+    }
+    
+    diag.n_het_sites = (int)alt_fracs.size();
+    diag.het_total_depth = total_depth;
+    diag.het_method = HetBalanceMethod::PERSITE;
+    
+    if ((int)alt_fracs.size() < min_sites) {
+        diag.het_balance_var = -1.0;
+        return;
+    }
+    
+    double sum = 0.0;
+    for (double af : alt_fracs) sum += af;
+    double mean = sum / alt_fracs.size();
+    
+    double var_sum = 0.0;
+    for (double af : alt_fracs) {
+        double diff = af - mean;
+        var_sum += diff * diff;
+    }
+    diag.het_balance_var = var_sum / (alt_fracs.size() - 1);
+}
+
+/**
+ * Compute het balance using Welford stats (WELFORD method)
+ */
+void compute_het_balance_welford(
+    const CellWelfordStats& welford_stats,
+    int assigned_id,
+    int n_samples,
+    int min_sites,
+    CellDiagnostics& diag) {
+    
+    diag.het_method = HetBalanceMethod::WELFORD;
+    
+    bool is_doublet = (assigned_id >= n_samples);
+    
+    if (is_doublet) {
+        auto combo = idx_to_hap_comb(assigned_id, n_samples);
+        int indv1 = combo.first;
+        int indv2 = combo.second;
+        
+        const WelfordStats& ws1 = welford_stats.get(indv1);
+        const WelfordStats& ws2 = welford_stats.get(indv2);
+        
+        double var1 = ws1.variance(min_sites);
+        double var2 = ws2.variance(min_sites);
+        
+        if (var1 < 0 && var2 < 0) {
+            diag.het_balance_var = -1.0;
+            diag.n_het_sites = 0;
+            diag.het_total_depth = 0;
+            return;
+        }
+        
+        if (var1 < 0) {
+            diag.het_balance_var = var2;
+            diag.n_het_sites = (int)ws2.n;
+            diag.het_total_depth = ws2.total_depth;
+        } else if (var2 < 0) {
+            diag.het_balance_var = var1;
+            diag.n_het_sites = (int)ws1.n;
+            diag.het_total_depth = ws1.total_depth;
+        } else {
+            double n_total = ws1.n + ws2.n;
+            diag.het_balance_var = (var1 * ws1.n + var2 * ws2.n) / n_total;
+            diag.n_het_sites = (int)n_total;
+            diag.het_total_depth = ws1.total_depth + ws2.total_depth;
+        }
+    } else {
+        const WelfordStats& ws = welford_stats.get(assigned_id);
+        diag.het_balance_var = ws.variance(min_sites);
+        diag.n_het_sites = (int)ws.n;
+        diag.het_total_depth = ws.total_depth;
+    }
+}
+
+// ============================================================================
 // PARALLEL IDENTITY ASSIGNMENT
 // ============================================================================
 
@@ -1209,5 +1601,291 @@ void assign_ids_parallel(
                     samples[combo.first].c_str(), samples[combo.second].c_str(), ac.second);
             }
         }
+    }
+}
+
+// ============================================================================
+// NEW: PARALLEL IDENTITY ASSIGNMENT WITH DIAGNOSTICS
+// ============================================================================
+
+void assign_ids_parallel_with_diagnostics(
+    robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
+    vector<string>& samples,
+    robin_hood::unordered_map<unsigned long, int>& assignments,
+    robin_hood::unordered_map<unsigned long, double>& assignments_llr,
+    set<int>& allowed_assignments,
+    set<int>& allowed_assignments2,
+    double doublet_rate,
+    double error_rate_ref,
+    double error_rate_alt,
+    bool use_prior_weights,
+    map<int, double>& prior_weights,
+    int n_threads,
+    int n_target,
+    // Diagnostic options
+    bool compute_diagnostics,
+    int n_runner_ups,
+    double close_threshold,
+    robin_hood::unordered_map<unsigned long, CellCounts>* het_counts,
+    // Diagnostic outputs
+    robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
+    robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups){
+    
+    assignments.clear();
+    assignments_llr.clear();
+    diagnostics.clear();
+    runner_ups.clear();
+    
+    if (g_verbose){
+        fprintf(stderr, "[VERBOSE] assign_ids_parallel_with_diagnostics: n_samples=%d, n_target=%d\n",
+            (int)samples.size(), n_target);
+        fprintf(stderr, "[VERBOSE]   compute_diagnostics=%d, n_runner_ups=%d, close_threshold=%.1f\n",
+            compute_diagnostics, n_runner_ups, close_threshold);
+        fprintf(stderr, "[VERBOSE]   het_counts provided: %s\n", het_counts ? "yes" : "no");
+    }
+    
+    // Collect barcodes into vector for parallel processing
+    vector<unsigned long> barcodes;
+    barcodes.reserve(cell_counts.size());
+    for (auto& kv : cell_counts){
+        barcodes.push_back(kv.first);
+    }
+    
+    // Pre-allocate results
+    vector<int> result_assn(barcodes.size(), -1);
+    vector<double> result_llr(barcodes.size(), 0.0);
+    vector<CellDiagnostics> result_diag(barcodes.size());
+    vector<vector<RunnerUp> > result_runners(barcodes.size());
+    
+    fprintf(stderr, "Assigning identities to %lu cells using %d threads%s...\n",
+        barcodes.size(), n_threads, 
+        compute_diagnostics ? " (with diagnostics)" : "");
+    
+    int n_samples = samples.size();
+    
+    #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 100)
+    for (size_t idx = 0; idx < barcodes.size(); ++idx){
+        unsigned long bc = barcodes[idx];
+        const CellCounts& counts = cell_counts[bc];
+        
+        // Skip empty cells
+        if (counts.is_empty()) continue;
+        
+        map<int, map<int, double> > llrs;
+        llr_table tab(n_samples);
+        
+        map<int, double>* pw_ptr = use_prior_weights ? &prior_weights : NULL;
+        
+        bool success = populate_llr_table_optimized(
+            counts, llrs, tab, n_samples,
+            allowed_assignments, allowed_assignments2,
+            doublet_rate, error_rate_ref, error_rate_alt,
+            pw_ptr, false, 0.0, 0.0, NULL, n_target);
+        
+        if (success){
+            int assn = -1;
+            double llr_final = 0.0;
+            tab.get_max(assn, llr_final);
+            
+            if (llr_final > 0.0){
+                result_assn[idx] = assn;
+                result_llr[idx] = llr_final;
+                
+                // Extract diagnostics BEFORE table destruction
+                if (compute_diagnostics){
+                    CellDiagnostics diag;
+                    vector<RunnerUp> runners;
+                    
+                    get_diagnostics_from_llrs(llrs, tab, assn, llr_final, n_samples,
+                        n_runner_ups, close_threshold, diag, runners);
+                    
+                    // Compute total depth from main counts
+                    diag.total_depth = compute_total_depth(counts, n_samples);
+                    
+                    // Compute het balance stats if het counts provided
+                    if (het_counts != NULL){
+                        auto het_it = het_counts->find(bc);
+                        if (het_it != het_counts->end()){
+                            compute_het_balance_stats(het_it->second, assn, n_samples, diag);
+                        }
+                    }
+                    
+                    result_diag[idx] = diag;
+                    result_runners[idx] = runners;
+                }
+            }
+        }
+    }
+    
+    // Collect results
+    for (size_t idx = 0; idx < barcodes.size(); ++idx){
+        if (result_assn[idx] >= 0){
+            unsigned long bc = barcodes[idx];
+            assignments.emplace(bc, result_assn[idx]);
+            assignments_llr.emplace(bc, result_llr[idx]);
+            
+            if (compute_diagnostics){
+                diagnostics.emplace(bc, result_diag[idx]);
+                runner_ups.emplace(bc, result_runners[idx]);
+            }
+        }
+    }
+    
+    fprintf(stderr, "Assigned %lu cells\n", assignments.size());
+    if (compute_diagnostics){
+        fprintf(stderr, "Collected diagnostics for %lu cells\n", diagnostics.size());
+    }
+}
+
+/**
+ * Extended assignment with Welford het balance method
+ */
+void assign_ids_parallel_with_diagnostics_extended(
+    robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
+    vector<string>& samples,
+    robin_hood::unordered_map<unsigned long, int>& assignments,
+    robin_hood::unordered_map<unsigned long, double>& assignments_llr,
+    set<int>& allowed_assignments,
+    set<int>& allowed_assignments2,
+    double doublet_rate,
+    double error_rate_ref,
+    double error_rate_alt,
+    bool use_prior_weights,
+    map<int, double>& prior_weights,
+    int n_threads,
+    int n_target,
+    bool compute_diagnostics,
+    int n_runner_ups,
+    double close_threshold,
+    robin_hood::unordered_map<unsigned long, CellHetData>* het_data,
+    const robin_hood::unordered_map<int, ChromSNPs>* het_snpdat,
+    const vector<pair<int, int>>* idx_to_site,
+    HetBalanceMethod het_method,
+    int min_het_sites,
+    double min_het_depth,
+    robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
+    robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups) {
+    
+    int n_samples = samples.size();
+    const char* method_name = (het_method == HetBalanceMethod::PERSITE) ? "per-site" : "Welford";
+    
+    if (g_verbose) {
+        fprintf(stderr, "[VERBOSE] assign_ids_parallel_with_diagnostics_extended:\n");
+        fprintf(stderr, "[VERBOSE]   cells: %lu, method: %s, min_het_sites: %d\n", 
+                cell_counts.size(), method_name, min_het_sites);
+    }
+    
+    // Convert to vector for parallel processing
+    vector<unsigned long> barcodes;
+    barcodes.reserve(cell_counts.size());
+    for (const auto& kv : cell_counts) {
+        barcodes.push_back(kv.first);
+    }
+    
+    // Results storage
+    vector<int> result_assn(barcodes.size(), -1);
+    vector<double> result_llr(barcodes.size(), 0.0);
+    vector<CellDiagnostics> result_diag(barcodes.size());
+    vector<vector<RunnerUp> > result_runners(barcodes.size());
+    
+    atomic<int> cells_done(0);
+    int total_cells = barcodes.size();
+    
+    #pragma omp parallel num_threads(n_threads)
+    {
+        map<int, map<int, double> > llrs;
+        
+        #pragma omp for schedule(dynamic, 100)
+        for (size_t idx = 0; idx < barcodes.size(); idx++) {
+            unsigned long bc = barcodes[idx];
+            const CellCounts& counts = cell_counts[bc];
+            
+            if (counts.is_empty()) continue;
+            
+            int n_identities = n_samples + n_samples * (n_samples - 1) / 2;
+            llr_table tab(n_identities);
+            llrs.clear();
+            
+            bool success = populate_llr_table_optimized(
+                counts, llrs, tab, n_samples,
+                allowed_assignments, allowed_assignments2,
+                doublet_rate, error_rate_ref, error_rate_alt,
+                use_prior_weights ? &prior_weights : NULL,
+                false, 0.0, 0.0, NULL, n_target);
+            
+            if (!success) continue;
+            
+            int best_idx;
+            double best_llr;
+            tab.get_max(best_idx, best_llr);
+            
+            result_assn[idx] = best_idx;
+            result_llr[idx] = best_llr;
+            
+            if (compute_diagnostics) {
+                CellDiagnostics diag;
+                vector<RunnerUp> runners;
+                
+                get_diagnostics_from_llrs(llrs, tab, best_idx, best_llr,
+                    n_samples, n_runner_ups, close_threshold, diag, runners);
+                
+                diag.total_depth = compute_total_depth(counts, n_samples);
+                
+                // Compute het balance using selected method
+                if (het_data != NULL) {
+                    auto het_it = het_data->find(bc);
+                    if (het_it != het_data->end()) {
+                        const CellHetData& cell_het = het_it->second;
+                        
+                        if (het_method == HetBalanceMethod::PERSITE && 
+                            het_snpdat != NULL && idx_to_site != NULL) {
+                            compute_het_balance_persite(
+                                cell_het.persite_data,
+                                *het_snpdat,
+                                *idx_to_site,
+                                best_idx,
+                                n_samples,
+                                min_het_depth,
+                                min_het_sites,
+                                diag);
+                        } else {
+                            compute_het_balance_welford(
+                                cell_het.welford_stats,
+                                best_idx,
+                                n_samples,
+                                min_het_sites,
+                                diag);
+                        }
+                    }
+                }
+                
+                result_diag[idx] = diag;
+                result_runners[idx] = runners;
+            }
+            
+            int done = ++cells_done;
+            if (done % 1000 == 0 || done == total_cells) {
+                fprintf(stderr, "\rAssigning: %d/%d cells    ", done, total_cells);
+            }
+        }
+    }
+    
+    // Collect results
+    for (size_t idx = 0; idx < barcodes.size(); ++idx) {
+        if (result_assn[idx] >= 0) {
+            unsigned long bc = barcodes[idx];
+            assignments.emplace(bc, result_assn[idx]);
+            assignments_llr.emplace(bc, result_llr[idx]);
+            
+            if (compute_diagnostics) {
+                diagnostics.emplace(bc, result_diag[idx]);
+                runner_ups.emplace(bc, result_runners[idx]);
+            }
+        }
+    }
+    
+    fprintf(stderr, "\nAssigned %lu cells (%s het method)\n", assignments.size(), method_name);
+    if (compute_diagnostics) {
+        fprintf(stderr, "Collected diagnostics for %lu cells\n", diagnostics.size());
     }
 }

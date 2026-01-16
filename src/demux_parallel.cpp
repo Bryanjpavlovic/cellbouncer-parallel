@@ -42,12 +42,15 @@ using std::endl;
 using namespace std;
 
 // Version information
-const string VERSION = "1.16";
-const string VERSION_MESSAGE = "-I flag fix (recalculate_minmax), SNP end boundary fix, SNP iterator order fix, non-ACGT->N, exact V1 read count, fixed-point int64 accumulation, auto htslib_threads, timing output, base extraction debug stats, shared memory VCF support";
-const string VERSION_NEW = "v1.16: Fixed-point int64, per-thread storage, chunking by SNP density OR read density (fixes chrM bottleneck)";
+const string VERSION = "1.17";
+const string VERSION_MESSAGE = "Diagnostic output support: .diagnostics.gz, .runner_ups.gz, --het_vcf for ploidy detection";
+const string VERSION_NEW = "v1.17: Added --debug, --diagnostics, --het_vcf, --n_runner_ups, --close_threshold for tetra_refine pipeline";
 
-// Global verbose flag (defined in demux_vcf_llr.cpp)
+// Global verbose flag (defined in demux_parallel_llr.cpp)
 extern bool g_verbose;
+
+// Global debug flag (defined in demux_parallel_llr.cpp)
+extern bool g_debug;
 
 /**
  * Log likelihood function for computing error rates
@@ -537,7 +540,6 @@ void help(int code){
     fprintf(stderr, "    --output_prefix -o Base name for output files\n");
     fprintf(stderr, "\n===== OPTIONAL =====\n");
     fprintf(stderr, "    --threads -t Number of threads for parallel processing [auto]\n");
-    // hts_threads now auto-calculated based on thread count
     fprintf(stderr, "    --barcodes -B A file listing cell barcodes (one per line)\n");
     fprintf(stderr, "    --ids -i A file listing allowed individual IDs (singlets)\n");
     fprintf(stderr, "    --ids_doublet -I A file listing allowed doublet combinations\n");
@@ -548,6 +550,7 @@ void help(int code){
     fprintf(stderr, "    --error_sigma -s Sigma for error rate prior [0.1]\n");
     fprintf(stderr, "    --no_preload -P Disable VCF preloading (use with --shared_vcf for low memory)\n");
     fprintf(stderr, "    --shared_vcf -S Name of shared memory VCF to attach to\n");
+    fprintf(stderr, "    --shared_het_vcf NAME Shared memory het VCF for ploidy stats (from vcf_loader_daemon)\n");
     fprintf(stderr, "    --vcf_chroms -c File listing chromosomes to use from VCF\n");
     fprintf(stderr, "    --libname -n Library name to append to barcodes\n");
     fprintf(stderr, "    --cellranger -C Format barcodes for CellRanger\n");
@@ -556,7 +559,19 @@ void help(int code){
     fprintf(stderr, "    --disable_conditional -f Disable computing conditional match fractions\n");
     fprintf(stderr, "    --n_target -N Max singlets to keep before doublet eval [-1=auto, 0=no limit]\n");
     fprintf(stderr, "    --verbose -V Enable verbose output\n");
-    fprintf(stderr, "    --help -h Display this message and exit\n");
+    fprintf(stderr, "\n===== DIAGNOSTIC OUTPUT (NEW) =====\n");
+    fprintf(stderr, "    --debug          Enable DEBUG spam to stderr\n");
+    fprintf(stderr, "    --diagnostics    Write diagnostic files (default: ON)\n");
+    fprintf(stderr, "    --no-diagnostics Disable diagnostic file output\n");
+    fprintf(stderr, "    --het_vcf FILE   Het VCF for ploidy stats (from downsample_vcf_parallel)\n");
+    fprintf(stderr, "    --het_method M   Het balance method: welford (default) or persite\n");
+    fprintf(stderr, "                     welford: Online variance, low memory\n");
+    fprintf(stderr, "                     persite: Store per-site counts, more memory\n");
+    fprintf(stderr, "    --min_het_sites N  Minimum het sites for variance (default: 100)\n");
+    fprintf(stderr, "    --min_het_depth D  Minimum depth per het site for persite method (default: 5.0)\n");
+    fprintf(stderr, "    --n_runner_ups N Number of runner-ups to report [8]\n");
+    fprintf(stderr, "    --close_threshold F LLR threshold for n_close [20.0]\n");
+    fprintf(stderr, "\n    --help -h Display this message and exit\n");
     exit(code);
 }
 
@@ -568,6 +583,123 @@ void print_elapsed(const std::chrono::steady_clock::time_point& start, const cha
     int mins = (elapsed % 3600) / 60;
     int secs = elapsed % 60;
     fprintf(stderr, "[%02d:%02d:%02d] %s\n", hours, mins, secs, step);
+}
+
+// ============================================================================
+// NEW: DIAGNOSTIC OUTPUT FUNCTIONS
+// ============================================================================
+
+/**
+ * Write per-cell diagnostics to gzipped TSV file
+ */
+void write_diagnostics_gz(
+    const string& filename,
+    vector<string>& samples,
+    robin_hood::unordered_map<unsigned long, int>& assignments,
+    robin_hood::unordered_map<unsigned long, double>& assignments_llr,
+    robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
+    int n_samples,
+    const string& libname,
+    bool cellranger,
+    bool seurat,
+    bool underscore){
+    
+    gzFile outf = gzopen(filename.c_str(), "w");
+    if (!outf){
+        fprintf(stderr, "ERROR: Could not open %s for writing\n", filename.c_str());
+        return;
+    }
+    
+    // Header
+    gzprintf(outf, "barcode\tassignment\tsinglet_doublet\tllr\tmin_margin\tworst_competitor\t"
+                   "n_close\ttotal_depth\thet_balance_var\tn_het_sites\thet_total_depth\n");
+    
+    for (const auto& kv : assignments){
+        unsigned long bc = kv.first;
+        int assn = kv.second;
+        
+        string bc_str = bc2str(bc);
+        mod_bc_libname(bc_str, libname, cellranger, seurat, underscore);
+        
+        string identity = idx2name(assn, samples);
+        char s_d = (assn < n_samples) ? 'S' : 'D';
+        double llr = assignments_llr.count(bc) > 0 ? assignments_llr.at(bc) : 0.0;
+        
+        // Get diagnostics
+        CellDiagnostics diag;
+        if (diagnostics.count(bc) > 0){
+            diag = diagnostics.at(bc);
+        }
+        
+        // Format worst competitor
+        string worst_comp = ".";
+        if (diag.worst_competitor >= 0){
+            worst_comp = idx2name(diag.worst_competitor, samples);
+        }
+        
+        gzprintf(outf, "%s\t%s\t%c\t%.4f\t%.4f\t%s\t%d\t%.2f\t%.6f\t%d\t%.2f\n",
+            bc_str.c_str(),
+            identity.c_str(),
+            s_d,
+            llr,
+            diag.min_margin,
+            worst_comp.c_str(),
+            diag.n_close,
+            diag.total_depth,
+            diag.het_balance_var,
+            diag.n_het_sites,
+            diag.het_total_depth);
+    }
+    
+    gzclose(outf);
+    fprintf(stderr, "Wrote diagnostics for %lu cells to %s\n", assignments.size(), filename.c_str());
+}
+
+/**
+ * Write runner-ups to gzipped TSV file
+ */
+void write_runner_ups_gz(
+    const string& filename,
+    vector<string>& samples,
+    robin_hood::unordered_map<unsigned long, int>& assignments,
+    robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups,
+    int n_samples,
+    const string& libname,
+    bool cellranger,
+    bool seurat,
+    bool underscore){
+    
+    gzFile outf = gzopen(filename.c_str(), "w");
+    if (!outf){
+        fprintf(stderr, "ERROR: Could not open %s for writing\n", filename.c_str());
+        return;
+    }
+    
+    // Header
+    gzprintf(outf, "barcode\trank\tidentity\tllr_vs_winner\tmin_margin\n");
+    
+    for (const auto& kv : runner_ups){
+        unsigned long bc = kv.first;
+        const vector<RunnerUp>& runners = kv.second;
+        
+        string bc_str = bc2str(bc);
+        mod_bc_libname(bc_str, libname, cellranger, seurat, underscore);
+        
+        for (size_t i = 0; i < runners.size(); ++i){
+            const RunnerUp& runner = runners[i];
+            string identity = idx2name(runner.identity, samples);
+            
+            gzprintf(outf, "%s\t%d\t%s\t%.4f\t%.4f\n",
+                bc_str.c_str(),
+                (int)(i + 1),  // 1-indexed rank
+                identity.c_str(),
+                runner.llr_vs_winner,
+                runner.min_margin);
+        }
+    }
+    
+    gzclose(outf);
+    fprintf(stderr, "Wrote runner-ups for %lu cells to %s\n", runner_ups.size(), filename.c_str());
 }
 
 int main(int argc, char *argv[]) {    
@@ -601,8 +733,19 @@ int main(int argc, char *argv[]) {
        {"vcf_chroms", required_argument, 0, 'c'},
        {"threads", required_argument, 0, 't'},
        {"shared_vcf", required_argument, 0, 'S'},
+       {"shared_het_vcf", required_argument, 0, 1007},
        {"n_target", required_argument, 0, 'N'},
        {"verbose", no_argument, 0, 'V'},
+       // NEW diagnostic options
+       {"debug", no_argument, 0, 1001},
+       {"diagnostics", no_argument, 0, 1002},
+       {"no-diagnostics", no_argument, 0, 1003},
+       {"het_vcf", required_argument, 0, 1004},
+       {"n_runner_ups", required_argument, 0, 1005},
+       {"close_threshold", required_argument, 0, 1006},
+       {"het_method", required_argument, 0, 1010},
+       {"min_het_sites", required_argument, 0, 1011},
+       {"min_het_depth", required_argument, 0, 1012},
        {"help", no_argument, 0, 'h'},
        {0, 0, 0, 0} 
     };
@@ -638,8 +781,19 @@ int main(int argc, char *argv[]) {
     int n_threads = omp_get_num_procs();
     int htslib_threads = 0;  // 0 = auto-calculate after parsing args
     string shared_vcf_name = "";
+    string shared_het_vcf_name = "";
     int n_target = -1;    // -1=auto, 0=no prune, >0=use value
     bool verbose = false;
+    
+    // NEW diagnostic options
+    bool debug_mode = false;
+    bool write_diagnostics = true;  // Default ON
+    string het_vcf_file = "";
+    HetBalanceMethod het_method = HetBalanceMethod::WELFORD;  // Default to Welford
+    int min_het_sites = 100;   // Minimum sites for reliable variance
+    double min_het_depth = 5.0;  // Minimum depth per site (persite method only)
+    int n_runner_ups = 8;
+    double close_threshold = 20.0;
 
     int option_index = 0;
     int ch;
@@ -725,6 +879,45 @@ int main(int argc, char *argv[]) {
             case 'V':
                 verbose = true;
                 break;
+            // NEW diagnostic options
+            case 1001:  // --debug
+                debug_mode = true;
+                break;
+            case 1002:  // --diagnostics
+                write_diagnostics = true;
+                break;
+            case 1003:  // --no-diagnostics
+                write_diagnostics = false;
+                break;
+            case 1004:  // --het_vcf
+                het_vcf_file = optarg;
+                break;
+            case 1005:  // --n_runner_ups
+                n_runner_ups = atoi(optarg);
+                break;
+            case 1006:  // --close_threshold
+                close_threshold = atof(optarg);
+                break;
+            case 1007:  // --shared_het_vcf
+                shared_het_vcf_name = optarg;
+                break;
+            case 1010:  // --het_method
+                if (strcmp(optarg, "persite") == 0) {
+                    het_method = HetBalanceMethod::PERSITE;
+                } else if (strcmp(optarg, "welford") == 0) {
+                    het_method = HetBalanceMethod::WELFORD;
+                } else {
+                    fprintf(stderr, "ERROR: Unknown het_method: %s\n", optarg);
+                    fprintf(stderr, "Valid options: welford, persite\n");
+                    exit(1);
+                }
+                break;
+            case 1011:  // --min_het_sites
+                min_het_sites = atoi(optarg);
+                break;
+            case 1012:  // --min_het_depth
+                min_het_depth = atof(optarg);
+                break;
             default:
                 help(0);
                 break;
@@ -733,6 +926,9 @@ int main(int argc, char *argv[]) {
     
     // Set global verbose flag
     g_verbose = verbose;
+    
+    // Set global debug flag
+    g_debug = debug_mode;
     
     // Error check arguments
     if (vq < 0){
@@ -1072,6 +1268,109 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // NEW: Final assignment with diagnostic collection
+    robin_hood::unordered_map<unsigned long, CellDiagnostics> cell_diagnostics;
+    robin_hood::unordered_map<unsigned long, vector<RunnerUp> > cell_runner_ups;
+    
+    // Het data structures
+    robin_hood::unordered_map<unsigned long, CellHetData> het_data;
+    robin_hood::unordered_map<int, ChromSNPs> het_snpdat;
+    vector<pair<int, int>> idx_to_site;  // Site index to (tid, pos) for persite method
+    
+    bool het_vcf_available = (het_vcf_file.length() > 0 || shared_het_vcf_name.length() > 0);
+    int n_het_loaded = 0;
+    
+    if (het_vcf_available && write_diagnostics){
+        vector<string> het_samples;  // Not used but needed for attach_shared_vcf
+        
+        if (shared_het_vcf_name.length() > 0){
+            // Load from shared memory
+            print_elapsed(start_time, "Attaching to shared het VCF for ploidy diagnostics...");
+            fprintf(stderr, "Attaching to shared het VCF: %s\n", shared_het_vcf_name.c_str());
+            
+            if (!attach_shared_vcf(shared_het_vcf_name, het_snpdat, het_samples)){
+                fprintf(stderr, "WARNING: Could not attach to shared het VCF: %s\n", shared_het_vcf_name.c_str());
+                fprintf(stderr, "Ploidy-related diagnostics will not be computed.\n");
+            }
+            else{
+                // Count SNPs loaded
+                for (auto& kv : het_snpdat){
+                    n_het_loaded += kv.second.snps.size();
+                }
+                fprintf(stderr, "Attached to shared het VCF with %d sites\n", n_het_loaded);
+            }
+        }
+        else{
+            // Load from file
+            print_elapsed(start_time, "Loading het VCF for ploidy diagnostics...");
+            fprintf(stderr, "Loading het VCF: %s\n", het_vcf_file.c_str());
+            
+            map<string, int> seq2tid_het = reader.get_seq2tid();
+            
+            // Get chromosome names from BAM header
+            set<string> chroms_for_het;
+            for (auto& s2t : seq2tid_het){
+                chroms_for_het.insert(s2t.first);
+            }
+            
+            n_het_loaded = load_het_vcf(het_vcf_file, chroms_for_het, seq2tid_het, het_snpdat, vq);
+            fprintf(stderr, "Loaded %d het sites\n", n_het_loaded);
+        }
+        
+        if (n_het_loaded > 0){
+            const char* method_name = (het_method == HetBalanceMethod::PERSITE) ? "per-site" : "Welford";
+            fprintf(stderr, "Using %s method (min_het_sites=%d", method_name, min_het_sites);
+            if (het_method == HetBalanceMethod::PERSITE) {
+                fprintf(stderr, ", min_het_depth=%.1f", min_het_depth);
+            }
+            fprintf(stderr, ")\n");
+            print_elapsed(start_time, "Counting alleles at het sites...");
+            count_het_alleles_extended(bamfile, het_snpdat, het_data, idx_to_site,
+                cell_barcodes, samples.size(), n_threads, htslib_threads, het_method);
+        }
+        else{
+            fprintf(stderr, "WARNING: No het sites available\n");
+        }
+    }
+    else if (write_diagnostics && !het_vcf_available){
+        fprintf(stderr, "WARNING: --het_vcf/--shared_het_vcf not provided. Ploidy-related diagnostics "
+                        "(het_balance_var, n_het_sites, het_total_depth) will not be computed.\n"
+                        "For full tetraploid analysis, provide het VCF from downsample_vcf_parallel.\n");
+    }
+    
+    // Do final assignment with diagnostics if requested
+    if (write_diagnostics){
+        print_elapsed(start_time, "Final assignment with diagnostic collection...");
+        
+        if (het_data.empty()){
+            // No het data - use original function
+            assign_ids_parallel_with_diagnostics(
+                cell_counts, samples, assn, assn_llr,
+                allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
+                false, prior_weights, n_threads, n_target,
+                true,  // compute_diagnostics
+                n_runner_ups,
+                close_threshold,
+                NULL,  // no het counts
+                cell_diagnostics,
+                cell_runner_ups);
+        }
+        else{
+            // Use extended method (Welford or per-site)
+            assign_ids_parallel_with_diagnostics_extended(
+                cell_counts, samples, assn, assn_llr,
+                allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
+                false, prior_weights, n_threads, n_target,
+                true,  // compute_diagnostics
+                n_runner_ups,
+                close_threshold,
+                &het_data, &het_snpdat, &idx_to_site,
+                het_method, min_het_sites, min_het_depth,
+                cell_diagnostics,
+                cell_runner_ups);
+        }
+    }
+
     // QC
     print_elapsed(start_time, "Running QC...");
     map<int, double> p_ncell;
@@ -1097,6 +1396,28 @@ int main(int argc, char *argv[]) {
             error_alt_posterior, vcf_file, vq, doublet_rate,
             p_ncell, p_llr);
         fclose(outf);
+    }
+    
+    // NEW: Write diagnostic files
+    if (write_diagnostics){
+        // Write .diagnostics.gz
+        {
+            string fname = output_prefix + ".diagnostics.gz";
+            write_diagnostics_gz(fname, samples, assn, assn_llr, cell_diagnostics,
+                samples.size(), barcode_group, cellranger, seurat, underscore);
+        }
+        
+        // Write .runner_ups.gz
+        {
+            string fname = output_prefix + ".runner_ups.gz";
+            write_runner_ups_gz(fname, samples, assn, cell_runner_ups,
+                samples.size(), barcode_group, cellranger, seurat, underscore);
+        }
+        
+        fprintf(stderr, "Diagnostic output complete.\n");
+        if (!het_vcf_available){
+            fprintf(stderr, "Note: het_balance_var columns contain -1 (no --het_vcf provided)\n");
+        }
     }
     
     print_elapsed(start_time, "Complete!");

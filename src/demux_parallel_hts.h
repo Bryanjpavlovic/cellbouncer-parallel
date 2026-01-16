@@ -43,6 +43,167 @@ constexpr int GENOTYPE_STATES = 3;
 constexpr int STATE_COUNT = MAX_INDIVIDUALS * GENOTYPE_STATES;
 
 // ============================================================================
+// HET BALANCE COMPUTATION OPTIONS
+// ============================================================================
+
+/**
+ * Het balance computation method:
+ * - WELFORD: Online Welford variance per individual during counting (default, low memory)
+ * - PERSITE: Store per-site (ref, alt) counts, compute variance after assignment (more memory)
+ */
+enum class HetBalanceMethod {
+    WELFORD,      // Online Welford variance (default)
+    PERSITE       // Store per-site counts
+};
+
+// ============================================================================
+// PER-SITE HET DATA STORAGE
+// ============================================================================
+
+/**
+ * Per-site het count data - stores (ref, alt) for each site with coverage.
+ */
+struct HetSiteCount {
+    int32_t site_idx;      // Global index into het VCF sites
+    float ref;             // Ref allele count (quality-weighted)
+    float alt;             // Alt allele count (quality-weighted)
+    
+    HetSiteCount() : site_idx(-1), ref(0), alt(0) {}
+    HetSiteCount(int32_t idx, float r, float a) : site_idx(idx), ref(r), alt(a) {}
+};
+
+/**
+ * Per-cell het site storage for PERSITE method.
+ */
+struct HetSiteData {
+    std::vector<HetSiteCount> sites;
+    
+    void add_site(int32_t site_idx, float ref, float alt) {
+        for (auto& s : sites) {
+            if (s.site_idx == site_idx) {
+                s.ref += ref;
+                s.alt += alt;
+                return;
+            }
+        }
+        sites.emplace_back(site_idx, ref, alt);
+    }
+    
+    void clear() { sites.clear(); }
+    size_t size() const { return sites.size(); }
+    bool empty() const { return sites.empty(); }
+    
+    void merge(const HetSiteData& other) {
+        for (const auto& s : other.sites) {
+            add_site(s.site_idx, s.ref, s.alt);
+        }
+    }
+};
+
+// ============================================================================
+// WELFORD ONLINE VARIANCE STATISTICS
+// ============================================================================
+
+/**
+ * Welford online variance for a single individual.
+ * Tracks running mean and variance without storing per-site data.
+ */
+struct WelfordStats {
+    int64_t n;           // Number of sites
+    double mean;         // Running mean of alt_frac
+    double M2;           // Sum of squared deviations
+    double total_depth;  // Total depth at het sites
+    
+    WelfordStats() : n(0), mean(0.0), M2(0.0), total_depth(0.0) {}
+    
+    void add(double alt_frac, double depth) {
+        n++;
+        total_depth += depth;
+        double delta = alt_frac - mean;
+        mean += delta / n;
+        double delta2 = alt_frac - mean;
+        M2 += delta * delta2;
+    }
+    
+    double variance(int min_sites = 10) const {
+        if (n < min_sites) return -1.0;
+        return M2 / (n - 1);
+    }
+    
+    // Chan's parallel merge algorithm
+    void merge(const WelfordStats& other) {
+        if (other.n == 0) return;
+        if (n == 0) { *this = other; return; }
+        
+        int64_t n_combined = n + other.n;
+        double delta = other.mean - mean;
+        double mean_combined = mean + delta * other.n / n_combined;
+        double M2_combined = M2 + other.M2 + delta * delta * n * other.n / n_combined;
+        
+        n = n_combined;
+        mean = mean_combined;
+        M2 = M2_combined;
+        total_depth += other.total_depth;
+    }
+    
+    void clear() { n = 0; mean = 0.0; M2 = 0.0; total_depth = 0.0; }
+};
+
+/**
+ * Per-cell Welford stats for all individuals.
+ */
+struct CellWelfordStats {
+    int n_samples;
+    std::vector<WelfordStats> indiv_stats;
+    
+    CellWelfordStats() : n_samples(0) {}
+    CellWelfordStats(int n_samp) : n_samples(n_samp), indiv_stats(n_samp) {}
+    
+    void add(int indiv, double alt_frac, double depth) {
+        if (indiv >= 0 && indiv < n_samples) {
+            indiv_stats[indiv].add(alt_frac, depth);
+        }
+    }
+    
+    const WelfordStats& get(int indiv) const {
+        static WelfordStats empty;
+        if (indiv >= 0 && indiv < n_samples) return indiv_stats[indiv];
+        return empty;
+    }
+    
+    void merge(const CellWelfordStats& other) {
+        if (other.n_samples == 0) return;
+        if (n_samples == 0) { *this = other; return; }
+        for (int i = 0; i < n_samples; ++i) {
+            indiv_stats[i].merge(other.indiv_stats[i]);
+        }
+    }
+    
+    void clear() { for (auto& s : indiv_stats) s.clear(); }
+};
+
+/**
+ * Per-cell het data (supports both methods).
+ */
+struct CellHetData {
+    HetSiteData persite_data;       // For PERSITE method
+    CellWelfordStats welford_stats; // For WELFORD method
+    
+    CellHetData() {}
+    CellHetData(int n_samples) : welford_stats(n_samples) {}
+    
+    void merge(const CellHetData& other) {
+        persite_data.merge(other.persite_data);
+        welford_stats.merge(other.welford_stats);
+    }
+    
+    void clear() {
+        persite_data.clear();
+        welford_stats.clear();
+    }
+};
+
+// ============================================================================
 // ORIGINAL VAR STRUCTURE (unchanged for compatibility)
 // ============================================================================
 
@@ -76,6 +237,21 @@ struct var{
         this->haps_covered = v.haps_covered;
         this->gqs = v.gqs;
         this->vq = v.vq;
+    }
+    
+    // Check if individual is het at this site
+    bool is_het(int indiv) const {
+        if (!haps_covered.test(indiv)) return false;
+        return haps1.test(indiv) != haps2.test(indiv);
+    }
+    
+    // Get genotype (0, 1, 2) for individual, -1 if not covered
+    int get_genotype(int indiv) const {
+        if (!haps_covered.test(indiv)) return -1;
+        int nalt = 0;
+        if (haps1.test(indiv)) nalt++;
+        if (haps2.test(indiv)) nalt++;
+        return nalt;
     }
 };
 
@@ -502,5 +678,65 @@ void detach_shared_vcf(const std::string& shm_name);
  * Destroy shared memory segment
  */
 void destroy_shared_vcf(const std::string& shm_name);
+
+// ============================================================================
+// HET VCF FUNCTIONS (NEW - for ploidy detection)
+// ============================================================================
+
+/**
+ * Load het VCF into ChromSNPs structure for parallel processing
+ * 
+ * @param het_vcf_file Path to het-enriched VCF from downsample_vcf_parallel
+ * @param chroms_to_include Set of chromosomes to load
+ * @param seq2tid Chromosome name to tid mapping
+ * @param het_snpdat Output: SNP data structure
+ * @param min_vq Minimum variant quality
+ * @return Number of variants loaded
+ */
+int load_het_vcf(
+    const std::string& het_vcf_file,
+    const std::set<std::string>& chroms_to_include,
+    std::map<std::string, int>& seq2tid,
+    robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
+    int min_vq);
+
+/**
+ * Count alleles at het sites in parallel
+ * Similar to count_alleles_parallel but for het VCF
+ * 
+ * @param bamfile Path to BAM file
+ * @param het_snpdat Het SNP data (tid -> ChromSNPs)
+ * @param het_counts Output: per-cell allele counts at het sites
+ * @param valid_barcodes Set of barcodes to process
+ * @param n_samples Number of individuals in VCF
+ * @param n_threads Number of OpenMP threads
+ * @param htslib_threads Number of decompression threads per reader
+ */
+void count_het_alleles_parallel(
+    const std::string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
+    robin_hood::unordered_map<unsigned long, CellCounts>& het_counts,
+    const std::set<unsigned long>& valid_barcodes,
+    int n_samples,
+    int n_threads,
+    int htslib_threads);
+
+/**
+ * Extended het allele counting with Welford online variance or per-site storage.
+ * 
+ * @param het_data Output: per-cell het data
+ * @param idx_to_site Output: site index to (tid, pos) mapping (only for PERSITE)
+ * @param method Which method to use (WELFORD or PERSITE)
+ */
+void count_het_alleles_extended(
+    const std::string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
+    robin_hood::unordered_map<unsigned long, CellHetData>& het_data,
+    std::vector<std::pair<int, int>>& idx_to_site,
+    const std::set<unsigned long>& valid_barcodes,
+    int n_samples,
+    int n_threads,
+    int htslib_threads,
+    HetBalanceMethod method);
 
 #endif 

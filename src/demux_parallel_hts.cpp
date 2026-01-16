@@ -1590,3 +1590,305 @@ void destroy_shared_vcf(const string& shm_name){
         fprintf(stderr, "Shared memory destroyed: %s\n", shm_name.c_str());
     }
 }
+
+// ============================================================================
+// HET VCF FUNCTIONS (NEW - for ploidy detection)
+// ============================================================================
+
+int load_het_vcf(
+    const string& het_vcf_file,
+    const set<string>& chroms_to_include,
+    map<string, int>& seq2tid,
+    robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
+    int min_vq){
+    
+    // This is essentially read_vcf_chroms_optimized but for het VCF
+    // We can reuse that function since the format is the same
+    string vcf_file_copy = het_vcf_file;
+    set<string> chroms_copy = chroms_to_include;
+    
+    return read_vcf_chroms_optimized(vcf_file_copy, chroms_copy, seq2tid, het_snpdat, min_vq);
+}
+
+void count_het_alleles_parallel(
+    const string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
+    robin_hood::unordered_map<unsigned long, CellCounts>& het_counts,
+    const set<unsigned long>& valid_barcodes,
+    int n_samples,
+    int n_threads,
+    int htslib_threads){
+    
+    // This is essentially count_alleles_parallel but with a different output structure
+    // We can use the same parallel counting infrastructure
+    
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts> parallel_counts;
+    
+    // Use the same counting function - it works with any SNP set
+    count_alleles_parallel(bamfile, het_snpdat, parallel_counts,
+        valid_barcodes, n_samples, n_threads, htslib_threads);
+    
+    // Finalize into the output structure
+    finalize_parallel_counts(parallel_counts, het_counts);
+    
+    fprintf(stderr, "Het allele counting complete: %lu cells\n", het_counts.size());
+}
+
+/**
+ * Extended het allele counting that collects per-site data and/or Welford stats.
+ * 
+ * Unlike count_het_alleles_parallel which aggregates by genotype pair (losing per-site info),
+ * this preserves per-site information needed for accurate het balance variance.
+ */
+void count_het_alleles_extended(
+    const string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
+    robin_hood::unordered_map<unsigned long, CellHetData>& het_data,
+    vector<pair<int, int>>& idx_to_site,
+    const set<unsigned long>& valid_barcodes,
+    int n_samples,
+    int n_threads,
+    int htslib_threads,
+    HetBalanceMethod method) {
+    
+    bool collect_persite = (method == HetBalanceMethod::PERSITE);
+    bool collect_welford = (method == HetBalanceMethod::WELFORD);
+    bool has_bc_list = !valid_barcodes.empty();
+    
+    // Build global site index for persite method
+    map<pair<int, int>, int32_t> site_to_idx;
+    idx_to_site.clear();
+    int32_t global_idx = 0;
+    
+    for (auto& kv : het_snpdat) {
+        int tid = kv.first;
+        for (const auto& snp : kv.second.snps) {
+            site_to_idx[{tid, snp.pos}] = global_idx;
+            idx_to_site.push_back({tid, snp.pos});
+            global_idx++;
+        }
+    }
+    
+    long total_het_sites = global_idx;
+    const char* method_name = collect_persite ? "per-site" : "Welford";
+    fprintf(stderr, "Processing %ld het sites with %s method\n", total_het_sites, method_name);
+    
+    // Pre-allocate for known barcodes
+    if (has_bc_list) {
+        fprintf(stderr, "Pre-allocating het data for %lu cells...\n", valid_barcodes.size());
+        for (unsigned long bc : valid_barcodes) {
+            het_data.emplace(piecewise_construct,
+                forward_as_tuple(bc),
+                forward_as_tuple(n_samples));
+        }
+    }
+    
+    // Get chromosome info from BAM header
+    htsFile* bam_tmp = hts_open(bamfile.c_str(), "r");
+    if (!bam_tmp) {
+        fprintf(stderr, "ERROR: Could not open BAM file\n");
+        return;
+    }
+    bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
+    int n_chroms = hdr_tmp->n_targets;
+    bam_hdr_destroy(hdr_tmp);
+    hts_close(bam_tmp);
+    
+    // Build work units by chromosome
+    vector<int> chrom_work;
+    for (int tid = 0; tid < n_chroms; tid++) {
+        if (het_snpdat.find(tid) != het_snpdat.end() && !het_snpdat[tid].empty()) {
+            chrom_work.push_back(tid);
+        }
+    }
+    
+    fprintf(stderr, "Processing %lu chromosomes with %d threads...\n", chrom_work.size(), n_threads);
+    
+    mutex output_mutex;
+    atomic<int> chroms_done(0);
+    atomic<long> reads_processed(0);
+    atomic<long> sites_hit(0);
+    
+    #pragma omp parallel num_threads(n_threads)
+    {
+        // Thread-local het data
+        robin_hood::unordered_map<unsigned long, CellHetData> local_het_data;
+        
+        if (has_bc_list) {
+            for (unsigned long bc : valid_barcodes) {
+                local_het_data.emplace(piecewise_construct,
+                    forward_as_tuple(bc),
+                    forward_as_tuple(n_samples));
+            }
+        }
+        
+        // Open BAM for this thread
+        htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
+        if (!bam_fp) {
+            fprintf(stderr, "ERROR: Thread could not open BAM\n");
+        }
+        else {
+            if (htslib_threads > 1) {
+                hts_set_threads(bam_fp, htslib_threads);
+            }
+            
+            bam_hdr_t* header = sam_hdr_read(bam_fp);
+            hts_idx_t* idx = sam_index_load(bam_fp, bamfile.c_str());
+            bam1_t* record = bam_init1();
+            
+            if (idx) {
+                #pragma omp for schedule(dynamic)
+                for (size_t wi = 0; wi < chrom_work.size(); wi++) {
+                    int tid = chrom_work[wi];
+                    ChromSNPs& chrom_snps = het_snpdat[tid];
+                    
+                    long local_reads = 0;
+                    long local_sites = 0;
+                    
+                    hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, INT_MAX);
+                    if (!iter) continue;
+                    
+                    auto snp_iter = chrom_snps.snps.begin();
+                    auto snp_end = chrom_snps.snps.end();
+                    
+                    while (sam_itr_next(bam_fp, iter, record) >= 0) {
+                        local_reads++;
+                        
+                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY)) {
+                            continue;
+                        }
+                        
+                        uint8_t* cb_ptr = bam_aux_get(record, "CB");
+                        if (!cb_ptr) continue;
+                        
+                        const char* cb_str = bam_aux2Z(cb_ptr);
+                        if (!cb_str) continue;
+                        
+                        unsigned long bc_key = bc_ul((char*)cb_str);
+                        
+                        if (has_bc_list && valid_barcodes.find(bc_key) == valid_barcodes.end()) {
+                            continue;
+                        }
+                        
+                        int read_start = record->core.pos;
+                        int read_end = bam_endpos(record);
+                        
+                        // Advance SNP iterator
+                        while (snp_iter != snp_end && snp_iter->pos < read_start) {
+                            ++snp_iter;
+                        }
+                        
+                        float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
+                        
+                        // Process overlapping SNPs
+                        for (auto snp_check = snp_iter;
+                             snp_check != snp_end && snp_check->pos <= read_end;
+                             ++snp_check) {
+                            
+                            char allele = get_base_at_pos(record, snp_check->pos);
+                            if (allele == 'N' || allele == '-') continue;
+                            
+                            float ref_add = 0.0f, alt_add = 0.0f;
+                            
+                            if (allele == snp_check->data.ref) {
+                                ref_add = prob_correct;
+                            } else if (allele == snp_check->data.alt) {
+                                alt_add = prob_correct;
+                            } else {
+                                continue;
+                            }
+                            
+                            local_sites++;
+                            
+                            // Get or create cell's het data
+                            auto it = local_het_data.find(bc_key);
+                            if (it == local_het_data.end()) {
+                                if (has_bc_list) continue;
+                                local_het_data.emplace(bc_key, CellHetData(n_samples));
+                                it = local_het_data.find(bc_key);
+                            }
+                            CellHetData& cell_data = it->second;
+                            
+                            // Per-site method: store site counts
+                            if (collect_persite) {
+                                int32_t site_idx = site_to_idx[{tid, snp_check->pos}];
+                                cell_data.persite_data.add_site(site_idx, ref_add, alt_add);
+                            }
+                            
+                            // Welford method: update running stats for het individuals
+                            if (collect_welford) {
+                                float depth = ref_add + alt_add;
+                                if (depth > 0) {
+                                    float alt_frac = alt_add / depth;
+                                    
+                                    for (int indiv = 0; indiv < n_samples; ++indiv) {
+                                        if (snp_check->data.is_het(indiv)) {
+                                            cell_data.welford_stats.add(indiv, alt_frac, depth);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    hts_itr_destroy(iter);
+                    reads_processed += local_reads;
+                    sites_hit += local_sites;
+                    
+                    int done = ++chroms_done;
+                    if (done % 5 == 0 || done == (int)chrom_work.size()) {
+                        fprintf(stderr, "\rHet counting: %d/%lu chroms, %ld reads, %ld site hits    ",
+                                done, chrom_work.size(), reads_processed.load(), sites_hit.load());
+                    }
+                }
+                
+                hts_idx_destroy(idx);
+            }
+            
+            bam_destroy1(record);
+            bam_hdr_destroy(header);
+            hts_close(bam_fp);
+        }
+        
+        // Merge thread-local data
+        #pragma omp critical
+        {
+            for (auto& kv : local_het_data) {
+                auto it = het_data.find(kv.first);
+                if (it != het_data.end()) {
+                    it->second.merge(kv.second);
+                } else {
+                    het_data.emplace(kv.first, std::move(kv.second));
+                }
+            }
+        }
+    }
+    
+    fprintf(stderr, "\nHet counting complete: %lu cells, %ld reads, %ld site hits\n",
+            het_data.size(), reads_processed.load(), sites_hit.load());
+    
+    // Report stats
+    if (collect_persite) {
+        long total_sites_stored = 0;
+        long max_sites = 0;
+        for (const auto& kv : het_data) {
+            long n = kv.second.persite_data.size();
+            total_sites_stored += n;
+            if (n > max_sites) max_sites = n;
+        }
+        fprintf(stderr, "Per-site: %ld total entries, max %ld/cell, avg %.1f/cell\n",
+                total_sites_stored, max_sites, 
+                het_data.size() > 0 ? (double)total_sites_stored / het_data.size() : 0.0);
+    }
+    
+    if (collect_welford) {
+        long max_sites = 0;
+        for (const auto& kv : het_data) {
+            for (int i = 0; i < n_samples; ++i) {
+                long n = kv.second.welford_stats.get(i).n;
+                if (n > max_sites) max_sites = n;
+            }
+        }
+        fprintf(stderr, "Max het sites per individual per cell: %ld\n", max_sites);
+    }
+}
