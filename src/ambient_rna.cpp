@@ -27,6 +27,10 @@ using std::cout;
 using std::endl;
 using namespace std;
 
+// Version tracking for ambient_rna module
+const string AMBIENT_RNA_VERSION = "1.1";
+const string AMBIENT_RNA_VERSION_MSG = "Fixed est_min_c divide-by-zero, NaN propagation in ll_amb_prof_mixture, safe expfracs lookups";
+
 /**
  * Functions related to inferring ambient RNA profile within cells as part of
  * demux_vcf.
@@ -282,10 +286,15 @@ double ll_amb_prof_mixture(const vector<double>& params,
     double p_e = data_d.at("p_e");
     double binom_p = (1.0 - c) * p_e + c * p_c;
     
-    if (isnan(logbinom(n,k,binom_p)) || isinf(logbinom(n,k,binom_p))){
-       fprintf(stderr, "oops\n");
-       exit(1);
-
+    // Clamp binom_p to prevent NaN/Inf from logbinom
+    if (binom_p < DBL_MIN*1e6){
+        binom_p = DBL_MIN*1e6;
+    }
+    else if (binom_p > 1.0 - DBL_MIN*1e6){
+        binom_p = 1.0 - DBL_MIN*1e6;
+    }
+    if (isnan(binom_p)){
+        binom_p = 0.5;
     }
     return logbinom(n, k, binom_p);
 }
@@ -345,6 +354,9 @@ contamFinder::contamFinder(robin_hood::unordered_map<unsigned long,
     this->contam_prof_initialized = false;
     this->c_init = -1;
 
+    fprintf(stderr, "ambient_rna v%s: %s\n", AMBIENT_RNA_VERSION.c_str(), 
+        AMBIENT_RNA_VERSION_MSG.c_str());
+
     // Copy external data structures that we will need in the future 
     this->assn = assn;
     this->assn_llr = assn_llr;
@@ -367,12 +379,12 @@ contamFinder::contamFinder(robin_hood::unordered_map<unsigned long,
 
     for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin(); a != 
         assn.end(); ++a){
-        allowed_ids.insert(a->second);
+        this->allowed_ids.insert(a->second);
         // Make sure we also allow sub-IDs of combinations
         if (a->second >= n_samples){
             pair<int, int> combo = idx_to_hap_comb(a->second, n_samples);
-            allowed_ids.insert(combo.first);
-            allowed_ids.insert(combo.second);
+            this->allowed_ids.insert(combo.first);
+            this->allowed_ids.insert(combo.second);
         }
         if (id_llrsum.count(a->second) == 0){
             id_llrsum.insert(make_pair(a->second, 0.0));
@@ -825,19 +837,39 @@ double contamFinder::est_min_c(){
         vsum += mi->second/minc_by_id_count[mi->first];
         vcount++;
     }
-    double c_est = vsum/(vcount-1.0);
+    // Guard against divide-by-zero when only 0 or 1 individuals present.
+    // The (vcount-1) denominator is meant to exclude "self" contribution,
+    // but with <= 1 individual we fall back to a simple average.
+    double c_est;
+    if (vcount <= 1.0){
+        c_est = (vcount > 0) ? vsum / vcount : 0.01;
+    }
+    else{
+        c_est = vsum / (vcount - 1.0);
+    }
     
     contam_prof.clear();
     double minval = 0.01;
     double denom = 0.0;
-    for (map<int, double>::iterator mi = minc_by_id.begin(); mi != minc_by_id.end(); ++mi){
-        double val = mi->second/minc_by_id_count[mi->first];
-        double frac = 1.0 - val/c_est;
-        if (frac < minval){
-            frac = minval;
+    // Guard: if c_est is zero or negative, all fracs become degenerate.
+    // Fall back to equal proportions.
+    if (c_est <= 0.0 || isnan(c_est) || isinf(c_est)){
+        for (map<int, double>::iterator mi = minc_by_id.begin(); mi != minc_by_id.end(); ++mi){
+            double frac = 1.0 / (double)minc_by_id.size();
+            denom += frac;
+            contam_prof.insert(make_pair(mi->first, frac));
         }
-        denom += frac;
-        contam_prof.insert(make_pair(mi->first, frac));
+    }
+    else{
+        for (map<int, double>::iterator mi = minc_by_id.begin(); mi != minc_by_id.end(); ++mi){
+            double val = mi->second/minc_by_id_count[mi->first];
+            double frac = 1.0 - val/c_est;
+            if (frac < minval){
+                frac = minval;
+            }
+            denom += frac;
+            contam_prof.insert(make_pair(mi->first, frac));
+        }
     }
     if (inter_species){
         contam_prof.insert(make_pair(-1, 1.0/((double)minc_by_id.size() + 1.0)));
@@ -1297,7 +1329,13 @@ void contamFinder::compile_amb_prof_dat(bool solve_for_c,
                         for (int i = 0; i < idx2samp.size(); ++i){
                             int samp = idx2samp[i];
                             if (ac2->first.first == -1){
-                                mixfrac_row.push_back(expfracs[ac1->first][samp]);
+                                // Safe lookup: use 0.5 default if key missing from .condf
+                                double ef_val = 0.5;
+                                if (expfracs.count(ac1->first) > 0 && 
+                                    expfracs[ac1->first].count(samp) > 0){
+                                    ef_val = expfracs[ac1->first][samp];
+                                }
+                                mixfrac_row.push_back(ef_val);
                             }
                             else{
                                 if (ef_all_avg && ac1->first.first == samp){
@@ -1309,8 +1347,17 @@ void contamFinder::compile_amb_prof_dat(bool solve_for_c,
                                         ac2->first.second / 2.0, e_r, e_a));
                                 }
                                 else{
-                                    mixfrac_row.push_back(0.5 * expfracs[ac1->first][samp] + 
-                                        0.5 * expfracs[ac2->first][samp]);
+                                    // Safe lookup for doublet conditional fracs
+                                    double ef1 = 0.5, ef2 = 0.5;
+                                    if (expfracs.count(ac1->first) > 0 &&
+                                        expfracs[ac1->first].count(samp) > 0){
+                                        ef1 = expfracs[ac1->first][samp];
+                                    }
+                                    if (expfracs.count(ac2->first) > 0 &&
+                                        expfracs[ac2->first].count(samp) > 0){
+                                        ef2 = expfracs[ac2->first][samp];
+                                    }
+                                    mixfrac_row.push_back(0.5 * ef1 + 0.5 * ef2);
                                 }
                             }
                         }
@@ -1495,7 +1542,13 @@ double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, b
                     val += cp->second * ((double)key.second/2.0);
                 }
                 else{
-                    val += cp->second * expfracs[key][cp->first];
+                    // Safe lookup: default to nalt/2.0 if key missing
+                    double ef_val = (double)key.second / 2.0;
+                    if (expfracs.count(key) > 0 &&
+                        expfracs[key].count(cp->first) > 0){
+                        ef_val = expfracs[key][cp->first];
+                    }
+                    val += cp->second * ef_val;
                 }
             }
             amb_mu[key][nullkey] = val;
@@ -1523,8 +1576,18 @@ double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, b
                                     (double)key2.second / 2.0, e_r, e_a);
                             }
                             else{
-                                val += cp->second *
-                                    (0.5*expfracs[key][cp->first] + 0.5*expfracs[key2][cp->first]);
+                                // Safe lookup for doublet conditional fracs
+                                double ef1 = (double)key.second / 2.0;
+                                double ef2 = (double)key2.second / 2.0;
+                                if (expfracs.count(key) > 0 &&
+                                    expfracs[key].count(cp->first) > 0){
+                                    ef1 = expfracs[key][cp->first];
+                                }
+                                if (expfracs.count(key2) > 0 &&
+                                    expfracs[key2].count(cp->first) > 0){
+                                    ef2 = expfracs[key2][cp->first];
+                                }
+                                val += cp->second * (0.5*ef1 + 0.5*ef2);
                             }
                         }
                     }
