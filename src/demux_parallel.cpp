@@ -42,9 +42,9 @@ using std::endl;
 using namespace std;
 
 // Version information
-const string VERSION = "1.17";
-const string VERSION_MESSAGE = "Diagnostic output support: .diagnostics.gz, .runner_ups.gz, --het_vcf for ploidy detection";
-const string VERSION_NEW = "v1.17: Added --debug, --diagnostics, --het_vcf, --n_runner_ups, --close_threshold for tetra_refine pipeline";
+const string VERSION = "1.18";
+const string VERSION_MESSAGE = "Added --dump_conditional/-F and load_counts support";
+const string VERSION_NEW = "v1.18: -F generates .condf from VCF only (no BAM); existing .counts file auto-loaded to skip BAM scan";
 
 // Global verbose flag (defined in demux_parallel_llr.cpp)
 extern bool g_verbose;
@@ -526,6 +526,70 @@ void dump_cellcounts_optimized(gzFile& out_cell,
 }
 
 /**
+ * Load cell counts from gzipped file into CellCounts structures.
+ * Reverses dump_cellcounts_optimized: reads 7-column format, scales
+ * float values back to int64 fixed-point representation.
+ *
+ * Format per line: barcode indv1 nalt1 indv2 nalt2 ref_count alt_count
+ * When indv2==-1 && nalt2==-1: total row -> add_total(indv1, nalt1, ...)
+ * Otherwise: pairwise row -> add(indv1, nalt1, indv2, nalt2, ...)
+ */
+int load_cellcounts_optimized(const string& filename,
+    robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
+    int n_samples){
+    
+    gzreader reader(filename);
+    int n_lines = 0;
+    
+    while(reader.next()){
+        istringstream splitter(reader.line);
+        string field;
+        int idx = 0;
+        
+        unsigned long bc = 0;
+        int indv1 = 0, nalt1 = 0, indv2 = 0, nalt2 = 0;
+        float ref_val = 0.0f, alt_val = 0.0f;
+        
+        while(getline(splitter, field, '\t')){
+            switch(idx){
+                case 0: bc = strtoul(field.c_str(), NULL, 10); break;
+                case 1: indv1 = atoi(field.c_str()); break;
+                case 2: nalt1 = atoi(field.c_str()); break;
+                case 3: indv2 = atoi(field.c_str()); break;
+                case 4: nalt2 = atoi(field.c_str()); break;
+                case 5: ref_val = atof(field.c_str()); break;
+                case 6: alt_val = atof(field.c_str()); break;
+            }
+            idx++;
+        }
+        
+        if (idx < 7) continue;
+        
+        // Initialize CellCounts for this barcode if needed
+        if (cell_counts.count(bc) == 0){
+            cell_counts.emplace(bc, CellCounts(n_samples));
+        }
+        
+        // Convert float values back to fixed-point int64
+        int64_t ref_scaled = (int64_t)round((double)ref_val * FIXED_POINT_SCALE);
+        int64_t alt_scaled = (int64_t)round((double)alt_val * FIXED_POINT_SCALE);
+        
+        if (indv2 == -1 && nalt2 == -1){
+            // Total row
+            cell_counts[bc].add_total(indv1, nalt1, ref_scaled, alt_scaled);
+        }
+        else{
+            // Pairwise row
+            cell_counts[bc].add(indv1, nalt1, indv2, nalt2, ref_scaled, alt_scaled);
+        }
+        
+        n_lines++;
+    }
+    
+    return n_lines;
+}
+
+/**
  * Print help message
  */
 void help(int code){
@@ -557,6 +621,9 @@ void help(int code){
     fprintf(stderr, "    --seurat -R Format barcodes for Seurat\n");
     fprintf(stderr, "    --underscore -U Use underscore instead of hyphen for libname\n");
     fprintf(stderr, "    --disable_conditional -f Disable computing conditional match fractions\n");
+    fprintf(stderr, "    --dump_conditional -F Load VCF, compute conditional match fractions, write\n");
+    fprintf(stderr, "       .condf file, and exit. No BAM required. Use this to generate .condf after\n");
+    fprintf(stderr, "       a run that used -f.\n");
     fprintf(stderr, "    --n_target -N Max singlets to keep before doublet eval [-1=auto, 0=no limit]\n");
     fprintf(stderr, "    --verbose -V Enable verbose output\n");
     fprintf(stderr, "\n===== DIAGNOSTIC OUTPUT (NEW) =====\n");
@@ -729,6 +796,7 @@ int main(int argc, char *argv[]) {
        {"error_alt", required_argument, 0, 'E'},
        {"error_sigma", required_argument, 0, 's'},
        {"disable_conditional", no_argument, 0, 'f'},
+       {"dump_conditional", no_argument, 0, 'F'},
        {"no_preload", no_argument, 0, 'P'},
        {"vcf_chroms", required_argument, 0, 'c'},
        {"threads", required_argument, 0, 't'},
@@ -772,6 +840,7 @@ int main(int argc, char *argv[]) {
     bool underscore = false;
 
     bool disable_conditional = false;
+    bool dump_conditional = false;
 
     bool no_preload = false;
     string vcf_chroms_file = "";
@@ -801,7 +870,7 @@ int main(int argc, char *argv[]) {
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:s:c:t:S:N:fPCRUVh", 
+    while((ch = getopt_long(argc, argv, "b:v:o:B:i:I:q:D:n:e:E:s:c:t:S:N:fFPCRUVh", 
         long_options, &option_index )) != -1){
         switch(ch){
             case 0:
@@ -859,6 +928,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 'f':
                 disable_conditional = true;
+                break;
+            case 'F':
+                dump_conditional = true;
                 break;
             case 'P':
                 no_preload = true;
@@ -976,11 +1048,13 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Found existing counts file: %s\n", countsfilename.c_str());
     }
     else{
-        if (bamfile.length() == 0){
+        if (bamfile.length() == 0 && !dump_conditional){
             fprintf(stderr, "ERROR: bam file (--bam) required\n");
             exit(1);
-        }    
-        reader.set_file(bamfile);
+        }
+        if (bamfile.length() > 0){
+            reader.set_file(bamfile);
+        }
     }
 
     // Load sample names
@@ -1038,6 +1112,69 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    // Handle --dump_conditional / -F mode: VCF-only .condf generation
+    if (dump_conditional){
+        if (vcf_file.length() == 0 && shared_vcf_name.length() == 0){
+            fprintf(stderr, "ERROR: --vcf/-v or --shared_vcf/-S required for --dump_conditional/-F\n");
+            exit(1);
+        }
+        
+        robin_hood::unordered_map<int, ChromSNPs> snpdat_optimized;
+        
+        if (shared_vcf_name.length() > 0){
+            // Fast path: attach to shared memory daemon
+            print_elapsed(start_time, "dump_conditional mode: attaching to shared VCF...");
+            fprintf(stderr, "Attaching to shared VCF: %s\n", shared_vcf_name.c_str());
+            
+            if (!attach_shared_vcf(shared_vcf_name, snpdat_optimized, samples)){
+                fprintf(stderr, "ERROR: Could not attach to shared VCF: %s\n", shared_vcf_name.c_str());
+                exit(1);
+            }
+            fprintf(stderr, "Attached. %lu chromosomes, %lu samples\n",
+                snpdat_optimized.size(), samples.size());
+        }
+        else{
+            // Disk path: load VCF from file
+            print_elapsed(start_time, "dump_conditional mode: loading VCF from disk...");
+            
+            set<string> chroms_vcf;
+            get_vcf_chroms(vcf_file, chroms_vcf);
+            
+            // Build synthetic seq2tid (no BAM header available)
+            map<string, int> seq2tid_synthetic;
+            int tid_counter = 0;
+            for (const auto& c : chroms_vcf){
+                seq2tid_synthetic[c] = tid_counter++;
+            }
+            
+            int nloaded = read_vcf_chroms_optimized(vcf_file, chroms_vcf,
+                seq2tid_synthetic, snpdat_optimized, vq);
+            fprintf(stderr, "Loaded %d SNPs from %lu chromosomes\n", nloaded, chroms_vcf.size());
+        }
+        
+        // Compute conditional match fractions
+        print_elapsed(start_time, "Computing conditional match fractions...");
+        map<pair<int, int>, map<int, float>> conditional_match_fracs;
+        map<pair<int, int>, map<int, float>> conditional_match_tots;
+        
+        for (auto& kv : snpdat_optimized){
+            get_conditional_match_fracs_chrom_optimized(kv.second,
+                conditional_match_fracs, conditional_match_tots, samples.size());
+        }
+        conditional_match_fracs_normalize(conditional_match_fracs,
+            conditional_match_tots, samples.size());
+        
+        // Write .condf
+        string outname = output_prefix + ".condf";
+        FILE* outf = fopen(outname.c_str(), "w");
+        dump_exp_fracs(outf, conditional_match_fracs);
+        fclose(outf);
+        
+        print_elapsed(start_time, "Done. Wrote .condf file.");
+        fprintf(stderr, "Wrote conditional match fractions to %s\n", outname.c_str());
+        return 0;
+    }
+    
     // Load cell barcodes
     set<unsigned long> cell_barcodes;
     if (cell_barcode){
@@ -1056,10 +1193,65 @@ int main(int argc, char *argv[]) {
     map<pair<int, int>, map<int, float> > conditional_match_tots;
     
     if (load_counts){
-        // Load from file - need to convert format
-        fprintf(stderr, "Loading counts from file not yet supported in v3 format\n");
-        fprintf(stderr, "Please delete %s and re-run\n", countsfilename.c_str());
-        exit(1);
+        // Load counts from previous run
+        print_elapsed(start_time, "Loading counts from existing file...");
+        fprintf(stderr, "Loading allele counts from %s\n", countsfilename.c_str());
+        int n_lines = load_cellcounts_optimized(countsfilename, cell_counts, samples.size());
+        fprintf(stderr, "Loaded %d count records for %lu cells\n", n_lines, cell_counts.size());
+        
+        // Generate .condf if missing and not disabled
+        string condf_file = output_prefix + ".condf";
+        if (!disable_conditional && !file_exists(condf_file)){
+            if (vcf_file.length() == 0 && shared_vcf_name.length() == 0){
+                fprintf(stderr, "WARNING: No VCF or shared VCF provided and no .condf file found. "
+                                "Skipping conditional match fraction computation.\n");
+            }
+            else{
+                robin_hood::unordered_map<int, ChromSNPs> snpdat_optimized;
+                
+                if (shared_vcf_name.length() > 0){
+                    // Attach to shared memory daemon
+                    print_elapsed(start_time, "Generating .condf: attaching to shared VCF...");
+                    fprintf(stderr, "Attaching to shared VCF: %s\n", shared_vcf_name.c_str());
+                    
+                    vector<string> shm_samples;
+                    if (!attach_shared_vcf(shared_vcf_name, snpdat_optimized, shm_samples)){
+                        fprintf(stderr, "WARNING: Could not attach to shared VCF. Skipping .condf.\n");
+                    }
+                }
+                else{
+                    // Load from disk
+                    print_elapsed(start_time, "Generating .condf from VCF on disk...");
+                    
+                    set<string> chroms_vcf;
+                    get_vcf_chroms(vcf_file, chroms_vcf);
+                    
+                    map<string, int> seq2tid_synthetic;
+                    int tid_counter = 0;
+                    for (const auto& c : chroms_vcf){
+                        seq2tid_synthetic[c] = tid_counter++;
+                    }
+                    
+                    int nloaded = read_vcf_chroms_optimized(vcf_file, chroms_vcf,
+                        seq2tid_synthetic, snpdat_optimized, vq);
+                    fprintf(stderr, "Loaded %d SNPs for .condf computation\n", nloaded);
+                }
+                
+                if (!snpdat_optimized.empty()){
+                    for (auto& kv : snpdat_optimized){
+                        get_conditional_match_fracs_chrom_optimized(kv.second,
+                            conditional_match_fracs, conditional_match_tots, samples.size());
+                    }
+                    conditional_match_fracs_normalize(conditional_match_fracs,
+                        conditional_match_tots, samples.size());
+                    
+                    FILE* outf = fopen(condf_file.c_str(), "w");
+                    dump_exp_fracs(outf, conditional_match_fracs);
+                    fclose(outf);
+                    fprintf(stderr, "Wrote .condf to %s\n", condf_file.c_str());
+                }
+            }
+        }
     }
     else{
         // Determine chromosomes to process
@@ -1194,15 +1386,17 @@ int main(int argc, char *argv[]) {
         }
     } // end else (not load_counts)
     
-    // Write counts to disk
-    print_elapsed(start_time, "Writing allele counts to disk...");
-    {
-        string fname = output_prefix + ".counts";
-        gzFile outf = gzopen(fname.c_str(), "w");
-        fprintf(stderr, "Writing allele counts to disk...\n");
-        dump_cellcounts_optimized(outf, cell_counts, samples.size());
-        gzclose(outf);
-        fprintf(stderr, "Done writing counts\n");
+    // Write counts to disk (skip if we loaded from existing file)
+    if (!load_counts){
+        print_elapsed(start_time, "Writing allele counts to disk...");
+        {
+            string fname = output_prefix + ".counts";
+            gzFile outf = gzopen(fname.c_str(), "w");
+            fprintf(stderr, "Writing allele counts to disk...\n");
+            dump_cellcounts_optimized(outf, cell_counts, samples.size());
+            gzclose(outf);
+            fprintf(stderr, "Done writing counts\n");
+        }
     }
         
     // Assign identities
@@ -1281,55 +1475,62 @@ int main(int argc, char *argv[]) {
     int n_het_loaded = 0;
     
     if (het_vcf_available && write_diagnostics){
-        vector<string> het_samples;  // Not used but needed for attach_shared_vcf
-        
-        if (shared_het_vcf_name.length() > 0){
-            // Load from shared memory
-            print_elapsed(start_time, "Attaching to shared het VCF for ploidy diagnostics...");
-            fprintf(stderr, "Attaching to shared het VCF: %s\n", shared_het_vcf_name.c_str());
+        if (load_counts && bamfile.length() == 0){
+            fprintf(stderr, "WARNING: Het VCF diagnostics require a BAM file. Skipping het balance "
+                            "computation in counts-only mode.\n");
+            fprintf(stderr, "Re-run with --bam to include ploidy diagnostics.\n");
+        }
+        else{
+            vector<string> het_samples;  // Not used but needed for attach_shared_vcf
             
-            if (!attach_shared_vcf(shared_het_vcf_name, het_snpdat, het_samples)){
-                fprintf(stderr, "WARNING: Could not attach to shared het VCF: %s\n", shared_het_vcf_name.c_str());
-                fprintf(stderr, "Ploidy-related diagnostics will not be computed.\n");
+            if (shared_het_vcf_name.length() > 0){
+                // Load from shared memory
+                print_elapsed(start_time, "Attaching to shared het VCF for ploidy diagnostics...");
+                fprintf(stderr, "Attaching to shared het VCF: %s\n", shared_het_vcf_name.c_str());
+                
+                if (!attach_shared_vcf(shared_het_vcf_name, het_snpdat, het_samples)){
+                    fprintf(stderr, "WARNING: Could not attach to shared het VCF: %s\n", shared_het_vcf_name.c_str());
+                    fprintf(stderr, "Ploidy-related diagnostics will not be computed.\n");
+                }
+                else{
+                    // Count SNPs loaded
+                    for (auto& kv : het_snpdat){
+                        n_het_loaded += kv.second.snps.size();
+                    }
+                    fprintf(stderr, "Attached to shared het VCF with %d sites\n", n_het_loaded);
+                }
             }
             else{
-                // Count SNPs loaded
-                for (auto& kv : het_snpdat){
-                    n_het_loaded += kv.second.snps.size();
+                // Load from file
+                print_elapsed(start_time, "Loading het VCF for ploidy diagnostics...");
+                fprintf(stderr, "Loading het VCF: %s\n", het_vcf_file.c_str());
+                
+                map<string, int> seq2tid_het = reader.get_seq2tid();
+                
+                // Get chromosome names from BAM header
+                set<string> chroms_for_het;
+                for (auto& s2t : seq2tid_het){
+                    chroms_for_het.insert(s2t.first);
                 }
-                fprintf(stderr, "Attached to shared het VCF with %d sites\n", n_het_loaded);
-            }
-        }
-        else{
-            // Load from file
-            print_elapsed(start_time, "Loading het VCF for ploidy diagnostics...");
-            fprintf(stderr, "Loading het VCF: %s\n", het_vcf_file.c_str());
-            
-            map<string, int> seq2tid_het = reader.get_seq2tid();
-            
-            // Get chromosome names from BAM header
-            set<string> chroms_for_het;
-            for (auto& s2t : seq2tid_het){
-                chroms_for_het.insert(s2t.first);
+                
+                n_het_loaded = load_het_vcf(het_vcf_file, chroms_for_het, seq2tid_het, het_snpdat, vq);
+                fprintf(stderr, "Loaded %d het sites\n", n_het_loaded);
             }
             
-            n_het_loaded = load_het_vcf(het_vcf_file, chroms_for_het, seq2tid_het, het_snpdat, vq);
-            fprintf(stderr, "Loaded %d het sites\n", n_het_loaded);
-        }
-        
-        if (n_het_loaded > 0){
-            const char* method_name = (het_method == HetBalanceMethod::PERSITE) ? "per-site" : "Welford";
-            fprintf(stderr, "Using %s method (min_het_sites=%d", method_name, min_het_sites);
-            if (het_method == HetBalanceMethod::PERSITE) {
-                fprintf(stderr, ", min_het_depth=%.1f", min_het_depth);
+            if (n_het_loaded > 0){
+                const char* method_name = (het_method == HetBalanceMethod::PERSITE) ? "per-site" : "Welford";
+                fprintf(stderr, "Using %s method (min_het_sites=%d", method_name, min_het_sites);
+                if (het_method == HetBalanceMethod::PERSITE) {
+                    fprintf(stderr, ", min_het_depth=%.1f", min_het_depth);
+                }
+                fprintf(stderr, ")\n");
+                print_elapsed(start_time, "Counting alleles at het sites...");
+                count_het_alleles_extended(bamfile, het_snpdat, het_data, idx_to_site,
+                    cell_barcodes, samples.size(), n_threads, htslib_threads, het_method);
             }
-            fprintf(stderr, ")\n");
-            print_elapsed(start_time, "Counting alleles at het sites...");
-            count_het_alleles_extended(bamfile, het_snpdat, het_data, idx_to_site,
-                cell_barcodes, samples.size(), n_threads, htslib_threads, het_method);
-        }
-        else{
-            fprintf(stderr, "WARNING: No het sites available\n");
+            else{
+                fprintf(stderr, "WARNING: No het sites available\n");
+            }
         }
     }
     else if (write_diagnostics && !het_vcf_available){
