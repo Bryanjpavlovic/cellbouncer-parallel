@@ -30,6 +30,10 @@ using std::cout;
 using std::endl;
 using namespace std;
 
+// Version tracking
+const string QC_VERSION = "1.2";
+const string QC_VERSION_MSG = "Fixed contam_prof/idx2samp mismatch; added .pass1.* output after iteration 1";
+
 // ===== Program to profile ambient RNA contamination in cells, =====
 //       given output of a demux_vcf run.
 
@@ -242,6 +246,8 @@ all possible individuals\n", idfile_doublet.c_str());
     double delta = 999;
     double delta_thresh = 0.1;
     
+    fprintf(stderr, "quant_contam v%s: %s\n", QC_VERSION.c_str(), QC_VERSION_MSG.c_str());
+
     map<int, double> contam_prof_conc;
     robin_hood::unordered_map<unsigned long, double> contam_rate_se;
     
@@ -256,9 +262,52 @@ all possible individuals\n", idfile_doublet.c_str());
             //cf.no_reassign();
         }
 
-        // Initialize to whatever was the final estimate last time 
+        // Initialize to whatever was the final estimate last time,
+        // but only if the individual set hasn't changed between iterations.
+        // reclassify_cells() can add/remove individuals from assignments,
+        // causing idx2samp to differ from the previous contam_prof keys.
         if (nits > 0){
-            cf.set_init_contam_prof(contam_prof);
+            // Build the set of singlet IDs that the new contamFinder will use
+            set<int> new_singlets;
+            for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin();
+                a != assn.end(); ++a){
+                if (a->second < (int)samples.size()){
+                    new_singlets.insert(a->second);
+                }
+                else{
+                    pair<int, int> combo = idx_to_hap_comb(a->second, samples.size());
+                    new_singlets.insert(combo.first);
+                    new_singlets.insert(combo.second);
+                }
+            }
+            // Also include any from allowed_ids/allowed_ids2
+            for (set<int>::iterator ai = allowed_ids.begin(); ai != allowed_ids.end(); ++ai){
+                if (*ai < (int)samples.size()){
+                    new_singlets.insert(*ai);
+                }
+            }
+            for (set<int>::iterator ai = allowed_ids2.begin(); ai != allowed_ids2.end(); ++ai){
+                if (*ai < (int)samples.size()){
+                    new_singlets.insert(*ai);
+                }
+            }
+            
+            // Check if old contam_prof keys (excluding -1) match new singlets
+            set<int> old_keys;
+            for (map<int, double>::iterator cp = contam_prof.begin(); 
+                cp != contam_prof.end(); ++cp){
+                if (cp->first >= 0){
+                    old_keys.insert(cp->first);
+                }
+            }
+            if (old_keys == new_singlets){
+                cf.set_init_contam_prof(contam_prof);
+            }
+            else{
+                fprintf(stderr, "  Individual set changed (%lu -> %lu singlets); "
+                    "re-initializing contamination profile\n",
+                    old_keys.size(), new_singlets.size());
+            }
         }
         if (nits > 0){
             double meanc = 0.0;
@@ -315,11 +364,43 @@ all possible individuals\n", idfile_doublet.c_str());
             llprev = ll;
             nits++;
         }
+
+        // After iteration 1, write single-pass results to .pass1.* files
+        // so the user gets both initial and converged outputs.
+        if (nits == 1){
+            {
+                string fname = output_prefix + ".pass1.contam_prof";
+                FILE* outf = fopen(fname.c_str(), "w");
+                fprintf(stderr, "Writing pass1 contamination profile...\n");
+                map<int, double> empty_conc;
+                dump_contam_prof(outf, contam_prof, empty_conc, samples);
+                fclose(outf);
+            }
+            {
+                string fname = output_prefix + ".pass1.contam_rate";
+                FILE* outf = fopen(fname.c_str(), "w");
+                dump_contam_rates(outf, contam_rate, contam_rate_se, samples,
+                    libname, cellranger, seurat, underscore);
+                fclose(outf);
+            }
+            {
+                string fname = output_prefix + ".pass1.decontam.assignments";
+                FILE* outf = fopen(fname.c_str(), "w");
+                dump_assignments(outf, assn, assn_llr, samples, libname,
+                    cellranger, seurat, underscore);
+                fclose(outf);
+            }
+            fprintf(stderr, "Pass1 results written to %s.pass1.*\n", output_prefix.c_str());
+        }
         if (delta <= delta_thresh && bootstrap > 0){
-            // Do bootstrapping
+            // Do bootstrapping using the current iteration's contamFinder.
+            // Use the best assignments/rates, but keep cf's own contam_prof
+            // to avoid idx2samp mismatch when individual sets differ between
+            // iterations.
             cf.assn = assn;
             cf.assn_llr = assn_llr;
-            cf.contam_prof = contam_prof;
+            // Only copy contam_prof if the keys match cf's internal idx2samp
+            // Otherwise let cf use its own (already computed) profile.
             cf.contam_rate = contam_rate;
             cf.contam_rate_se = contam_rate_se;
             fprintf(stderr, "Computing Dirichlet concentration parameters \
