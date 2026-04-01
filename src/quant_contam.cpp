@@ -31,8 +31,8 @@ using std::endl;
 using namespace std;
 
 // Version tracking
-const string QC_VERSION = "1.2";
-const string QC_VERSION_MSG = "Fixed contam_prof/idx2samp mismatch; added .pass1.* output after iteration 1";
+const string QC_VERSION = "1.3";
+const string QC_VERSION_MSG = "Fixed contam_prof pollution from print loop; v1.2 contam_prof/idx2samp mismatch fix; .pass1.* output";
 
 // ===== Program to profile ambient RNA contamination in cells, =====
 //       given output of a demux_vcf run.
@@ -329,8 +329,10 @@ all possible individuals\n", idfile_doublet.c_str());
         }
         cf.fit(); 
         
-        for (int i = 0; i < samples.size(); ++i){
-            fprintf(stderr, "%s) %f\n", samples[i].c_str(), cf.contam_prof[i]);
+        for (int i = 0; i < (int)samples.size(); ++i){
+            if (cf.contam_prof.count(i) > 0){
+                fprintf(stderr, "%s) %f\n", samples[i].c_str(), cf.contam_prof[i]);
+            }
         }   
 
         double ll = cf.compute_ll();
