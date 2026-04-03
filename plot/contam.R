@@ -38,7 +38,16 @@ assnorig <- assn
 
 doubopt <- FALSE
 if (length(args) > 1 & (args[2] == 'D' | args[2] == 'd')){
-    # Include specific doublets.
+    doubopt <- TRUE
+}
+
+# Check if there are combo ("+") identities in the data
+has_combos <- any(grepl("+", assn$V2, fixed=TRUE))
+
+if (has_combos){
+    # Treat combo identities (e.g. C3649+H20961) as their own categories,
+    # alongside any singlet identities. This handles both tetraploid fusions
+    # and data sets with explicit doublet IDs.
     names1 <- apply(assn, 1, function(x){ strsplit(x[2], '+', fixed=T)[[1]][1] })
     names2 <- apply(assn, 1, function(x){ strsplit(x[2], '+', fixed=T)[[1]][2] })
     names <- unique(c(names1, names2))
@@ -46,11 +55,6 @@ if (length(args) > 1 & (args[2] == 'D' | args[2] == 'd')){
     names <- unique(c(assn$V2, names))
     names <- names[order(names)]
     doubopt <- TRUE
-} else{
-    if (length(rownames(assn[which(assn$V3=="D"),])) > 0){
-        names <- c(unique(assn[which(assn$V3=="S"),]$V2, "Doublet"))
-        assn[which(assn$V3=="D"),]$V2 <- "Doublet"
-    }
 }
 
 colnames(cr) <- c("bc", "cr", "cr.se")
@@ -100,6 +104,9 @@ bars <- ggplot(cr) +
           panel.grid.minor=element_blank(),
           panel.background=element_blank())
 
+# Scale boxplot label size for many identities (combo names are long)
+box_text_size <- ifelse(ncol > 20, 6, ifelse(ncol > 12, 7, ifelse(ncol > 8, 8, 10)))
+
 boxes <- ggplot(cr) + 
     geom_boxplot(aes(x=id, y=cr, colour=id), show.legend=FALSE) + 
     coord_flip() + 
@@ -107,7 +114,7 @@ boxes <- ggplot(cr) +
     theme_bw() +
     scale_colour_manual(values=name2col) +
     theme(axis.title.y=element_blank(),
-        axis.text.y=element_text(size=10),
+        axis.text.y=element_text(size=box_text_size),
         axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
         panel.grid.minor=element_blank())
 
@@ -165,20 +172,27 @@ make_plot <- function(){
 
         colnames(assnorig) <- c("bc", "id", "type", "llr") 
         if (length(rownames(assnorig[which(assnorig$type=="D"),])) > 0){
+            # Split combo IDs into component individuals for comparison with
+            # the ambient RNA profile (which is in terms of singlet individuals).
+            # Each combo cell contributes 0.5 weight per component; each singlet
+            # cell contributes 1.0 weight.
+            assnsing <- assnorig[which(assnorig$type=="S"),]
             assndoub <- assnorig[which(assnorig$type=="D"),]
             assndoub$id1 <- apply(assndoub, 1, function(x){ strsplit(x[2], "+", fixed=T)[[1]][1] })
             assndoub$id2 <- apply(assndoub, 1, function(x){ strsplit(x[2], "+", fixed=T)[[1]][2] })
-            assndoub1 <- assndoub[,c(1,5,3,4)]
-            assndoub2 <- assndoub[,c(1,6,3,4)]
-            colnames(assndoub1) <- c("bc", "id", "type", "llr")
-            colnames(assndoub2) <- c("bc", "id", "type", "llr")
-            # Count singlets twice (relative to doublets)
-            assnorig <- rbind(assnorig[which(assnorig$type=="S"),], 
-                assnorig[which(assnorig$type=="S"),],
-                assndoub1,
-                assndoub2)
+            # Build weighted frequency table
+            sing_tab <- if(nrow(assnsing) > 0) table(assnsing$id) else table(character(0))
+            doub_tab1 <- if(nrow(assndoub) > 0) table(assndoub$id1) else table(character(0))
+            doub_tab2 <- if(nrow(assndoub) > 0) table(assndoub$id2) else table(character(0))
+            all_ids <- unique(c(names(sing_tab), names(doub_tab1), names(doub_tab2)))
+            freq_vec <- setNames(rep(0, length(all_ids)), all_ids)
+            for (nm in names(sing_tab)) freq_vec[nm] <- freq_vec[nm] + sing_tab[nm]
+            for (nm in names(doub_tab1)) freq_vec[nm] <- freq_vec[nm] + 0.5 * doub_tab1[nm]
+            for (nm in names(doub_tab2)) freq_vec[nm] <- freq_vec[nm] + 0.5 * doub_tab2[nm]
+            assn_agg <- data.frame(Var1=names(freq_vec), Freq=as.numeric(freq_vec))
+        } else{
+            assn_agg <- as.data.frame(table(assnorig$id))
         }
-        assn_agg <- as.data.frame(table(assnorig$id))
         assn_agg_counts <- assn_agg
         assn_agg$Freq <- assn_agg$Freq / sum(assn_agg$Freq)
         colnames(assn_agg) <- c("var", "val")
@@ -259,11 +273,14 @@ make_plot <- function(){
     }
 }
 
-png(out_png, bg='white', width=6, height=9, units='in', res=150)
+# Scale plot height for many identities
+plot_height <- ifelse(ncol > 20, 14, ifelse(ncol > 12, 12, 9))
+
+png(out_png, bg='white', width=6, height=plot_height, units='in', res=150, type='cairo')
 make_plot()
 dev.off()
 
-pdf(out_pdf, bg='white', width=6, height=9)
+pdf(out_pdf, bg='white', width=6, height=plot_height)
 make_plot()
 dev.off()
 
