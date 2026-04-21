@@ -1352,13 +1352,18 @@ void contamFinder3::est_contam_cells(){
                 // the model can handle p_e near p_c by decomposing into p_A and p_B
                 if (!is_heterotypic && tetraploid_aware){
                     bool is_combo_cat = (type2_all[*i].first != -1);
-                    if (amb_mu_available){
-                        if (!category_passes_adaptive_filter(this_p_e, this_p_c, min_signal_gap)){
-                            continue;
-                        }
-                    } else if (is_combo_cat){
-                        if (!category_passes_hard_filter(true, type1_all[*i].second, type2_all[*i].second)){
-                            continue;
+                    // Only filter combo-structured categories (homotypic tetraploids).
+                    // Singlet cells have is_combo_cat == false for all categories,
+                    // and their p_e = nalt/2 carries valid signal even when close to p_c.
+                    if (is_combo_cat){
+                        if (amb_mu_available){
+                            if (!category_passes_adaptive_filter(this_p_e, this_p_c, min_signal_gap)){
+                                continue;
+                            }
+                        } else {
+                            if (!category_passes_hard_filter(true, type1_all[*i].second, type2_all[*i].second)){
+                                continue;
+                            }
                         }
                     }
                 }
