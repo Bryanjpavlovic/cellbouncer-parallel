@@ -22,3 +22,5 @@
 !utils/
 !sbatch/
 !sbatch/*
+qc_variants/
+quant3_contam

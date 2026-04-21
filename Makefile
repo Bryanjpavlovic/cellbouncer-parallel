@@ -92,6 +92,16 @@ tetra_refine: src/tetra_refine.cpp lib/libhtswrapper.a
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 src/tetra_refine.cpp -o tetra_refine $(LFLAGS) lib/libhtswrapper.a -lz
 
 # ============================================================================
+# THREE-COMPONENT MODEL (quant3_contam)
+# ============================================================================
+
+build/ambient_rna_three.o: src/ambient_rna_three.cpp src/ambient_rna_three.h src/common.h $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/ambient_rna_three.cpp -c -o build/ambient_rna_three.o
+
+quant3_contam: src/quant3_contam.cpp src/ambient_rna_three.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three.o build/ambient_rna_gex.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three.o build/ambient_rna_gex.o src/quant3_contam.cpp -o quant3_contam $(LFLAGS) $(DEPS) $(DEPS2)
+
+# ============================================================================
 # UTILITY TOOLS
 # ============================================================================
 
@@ -177,6 +187,9 @@ build/demux_parallel_llr.o: src/demux_parallel_llr.cpp src/demux_parallel_llr.h 
 
 # ============================================================================
 # DEPENDENCIES
+# Patch stlbfgs assert -> throw before building optimML so that BFGS
+# solver failures become catchable exceptions instead of process aborts.
+# The sed is idempotent: if already patched, it matches nothing.
 # ============================================================================
 
 lib/libhtswrapper.a:
@@ -188,6 +201,7 @@ lib/libmixturedist.a:
 	cd dependencies/mixtureDist && $(MAKE) install PREFIX=../..
 
 lib/liboptimml.a:
+	cd dependencies/optimML && sed -i 's/assert(-dot(g, p)<0);/if (-dot(g, p) >= 0) throw 1;/' src/stlbfgs/stlbfgs.cpp
 	cd dependencies/optimML && $(MAKE) PREFIX=../..
 	cd dependencies/optimML && $(MAKE) install PREFIX=../..
 
@@ -203,6 +217,7 @@ clean_build:
 clean_binaries:
 	rm -f demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops
 	rm -f demux_parallel vcf_loader_daemon tetra_refine
+	rm -f quant3_contam
 	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers
 	rm -f utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts
 	rm -f utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel
@@ -219,13 +234,13 @@ clean_all: clean clean_deps
 # INSTALL
 # ============================================================================
 
-install: all
+install: all quant3_contam
 	mkdir -p $(PREFIX)/bin
 	cp demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops $(PREFIX)/bin/
 	cp demux_parallel vcf_loader_daemon tetra_refine $(PREFIX)/bin/
+	cp quant3_contam $(PREFIX)/bin/
 	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers $(PREFIX)/bin/
 	cp utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts $(PREFIX)/bin/
 	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
 
 .PHONY: all original_tools parallel_tools utils dependencies clean clean_build clean_binaries clean_deps clean_all install
-
