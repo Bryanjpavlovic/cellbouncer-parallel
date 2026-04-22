@@ -443,6 +443,12 @@ contamFinder::contamFinder(robin_hood::unordered_map<unsigned long,
     this->maxits = 100;
     
     this->weighted = false;
+    
+    // Tetraploid-aware defaults (v1.4)
+    this->tetraploid_aware = false;
+    this->min_signal_gap = 0.10;
+    this->amb_mu_available = false;
+    this->ids_restricted = false;
 
     // Compile data in the format needed by other functions
     this->compile_data(assn, indv_allelecounts);
@@ -504,6 +510,43 @@ void contamFinder::set_init_c(double c){
 
 void contamFinder::set_num_threads(int nt){
     num_threads = nt;
+}
+
+void contamFinder::set_locked_identities(const set<int>& locked){
+    this->locked_identities = locked;
+}
+
+void contamFinder::set_safe_singlets(const set<int>& safe){
+    this->safe_singlets = safe;
+}
+
+void contamFinder::set_tetraploid_aware(bool enabled){
+    this->tetraploid_aware = enabled;
+}
+
+void contamFinder::set_min_signal_gap(double gap){
+    this->min_signal_gap = gap;
+}
+
+void contamFinder::set_ids_restricted(bool restricted){
+    this->ids_restricted = restricted;
+}
+
+// ============================================================================
+// Helper: check if a SNP category is informative for contamination estimation
+// ============================================================================
+
+// Hard filter: for combo identities, skip categories where (nalt1 + nalt2) is 1 or 3
+// These produce p_e = 0.25 or 0.75 which are close to typical pool averages
+static bool category_passes_hard_filter(bool is_combo, int nalt1, int nalt2){
+    if (!is_combo) return true;  // diploid categories always pass
+    int sum = nalt1 + nalt2;
+    return (sum != 1 && sum != 3);
+}
+
+// Adaptive filter: skip categories where |p_e - p_c| < min_signal_gap
+static bool category_passes_adaptive_filter(double p_e, double p_c, double min_gap){
+    return fabs(p_e - p_c) >= min_gap;
 }
 
 /**
@@ -704,6 +747,10 @@ double contamFinder::est_min_c(){
             for (int nalt1 = 0; nalt1 <= 2; ++nalt1){
                 pair<int, int> key1 = make_pair(combo.first, nalt1);
                 for (int nalt2 = 0; nalt2 <= 2; ++nalt2){
+                    // Tetraploid-aware: skip weak categories (p_e = 0.25 or 0.75)
+                    if (tetraploid_aware && !category_passes_hard_filter(true, nalt1, nalt2)){
+                        continue;
+                    }
                     pair<int, int> key2 = make_pair(combo.second, nalt2);
                     double ref = indv_allelecounts[a->first][key1][key2].first;
                     double alt = indv_allelecounts[a->first][key1][key2].second;
@@ -1043,10 +1090,39 @@ void contamFinder::est_contam_cells(){
         vector<double> p_c;
 
         for (vector<int>::iterator i = ci->second.begin(); i != ci->second.end(); ++i){
+            double this_p_e = adjust_p_err(p_e_all[*i], e_r, e_a);
+            double this_p_c = amb_mu[type1_all[*i]][type2_all[*i]];
+            
+            // Tetraploid-aware filtering
+            if (tetraploid_aware){
+                bool is_combo_cat = (type2_all[*i].first != -1);
+                if (amb_mu_available){
+                    // Adaptive filter: use actual |p_e - p_c| gap
+                    if (!category_passes_adaptive_filter(this_p_e, this_p_c, min_signal_gap)){
+                        continue;
+                    }
+                } else if (is_combo_cat){
+                    // Hard filter fallback: exclude p_e near 0.25 or 0.75 for combos
+                    if (!category_passes_hard_filter(true, type1_all[*i].second, type2_all[*i].second)){
+                        continue;
+                    }
+                }
+            }
+            
             n.push_back(n_all[*i]);
             k.push_back(k_all[*i]);
-            p_e.push_back(adjust_p_err(p_e_all[*i], e_r, e_a));
-            p_c.push_back(amb_mu[type1_all[*i]][type2_all[*i]]);
+            p_e.push_back(this_p_e);
+            p_c.push_back(this_p_c);
+        }
+        
+        // If filtering removed all data for this cell, fall back to unfiltered
+        if (n.empty() && tetraploid_aware){
+            for (vector<int>::iterator i = ci->second.begin(); i != ci->second.end(); ++i){
+                n.push_back(n_all[*i]);
+                k.push_back(k_all[*i]);
+                p_e.push_back(adjust_p_err(p_e_all[*i], e_r, e_a));
+                p_c.push_back(amb_mu[type1_all[*i]][type2_all[*i]]);
+            }
         }
         optimML::brent_solver c_cell(ll_c, dll_dc, d2ll_dc2);
         if (num_threads > 1){
@@ -1313,6 +1389,26 @@ void contamFinder::compile_amb_prof_dat(bool solve_for_c,
                         else{
                             expected = adjust_p_err((double)(ac1->first.second + 
                                 ac2->first.second)/4.0, e_r, e_a);
+                        }
+                        
+                        // Tetraploid-aware filtering
+                        if (tetraploid_aware && is_comb){
+                            if (amb_mu_available){
+                                // Adaptive filter using estimated ambient profile
+                                double this_p_c = 0.0;
+                                if (amb_mu.count(ac1->first) > 0 && 
+                                    amb_mu[ac1->first].count(ac2->first) > 0){
+                                    this_p_c = amb_mu[ac1->first][ac2->first];
+                                }
+                                if (!category_passes_adaptive_filter(expected, this_p_c, min_signal_gap)){
+                                    continue;
+                                }
+                            } else {
+                                // Hard filter fallback
+                                if (!category_passes_hard_filter(true, ac1->first.second, ac2->first.second)){
+                                    continue;
+                                }
+                            }
                         }
                         
                         double ref = ac2->second.first;
@@ -2062,6 +2158,23 @@ bool contamFinder::reclassify_cells(){
     for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin(); 
         a != assn.end(); ++a){
         
+        // Tetraploid-aware: skip locked identities
+        if (tetraploid_aware && locked_identities.count(a->second) > 0){
+            continue;
+        }
+        
+        // Tetraploid-aware: for safe singlets, restrict reassignment candidates
+        // to other safe singlets only. Build a restricted allowed_ids2 for this cell.
+        set<int> cell_allowed_ids2;
+        set<int>* cell_allowed_ids2_ptr = &allowed_ids2;
+        if (tetraploid_aware && safe_singlets.count(a->second) > 0){
+            // Only allow reassignment to other safe singlets
+            for (set<int>::iterator ss = safe_singlets.begin(); ss != safe_singlets.end(); ++ss){
+                cell_allowed_ids2.insert(*ss);
+            }
+            cell_allowed_ids2_ptr = &cell_allowed_ids2;
+        }
+        
         // Get a table of log likelihood ratios between every possible
         // pair of identities
         map<int, map<int, double> > llrs;
@@ -2069,7 +2182,7 @@ bool contamFinder::reclassify_cells(){
         
         //c = contam_rate[a->first]; 
         bool success = populate_llr_table(indv_allelecounts[a->first], llrs, tab, n_samples, 
-            allowed_ids, allowed_ids2, doub_rate_table, e_r, e_a, priorweights_ptr,
+            allowed_ids, *cell_allowed_ids2_ptr, doub_rate_table, e_r, e_a, priorweights_ptr,
             true, contam_cell_prior, 0, &amb_mu);
 
         if (success){
@@ -2312,6 +2425,9 @@ void contamFinder::fit(){
     double dummy = -1.0;
     this->est_contam_cells_global();
     double loglik = this->update_amb_prof_mixture(false, dummy, true);
+    
+    // Ambient profile now available for adaptive filtering
+    this->amb_mu_available = true;
 
     // Once to set prior params
     this->est_contam_cells();
@@ -2325,8 +2441,13 @@ void contamFinder::fit(){
     //this->update_amb_prof_mixture(false, dummy, false);
     
     if (!skip_reassign){ 
-        // Update cell identities, considering contamination profile 
-        fprintf(stderr, "Reclassifying cells...\n");
+        // Update cell identities, considering contamination profile
+        if (tetraploid_aware){
+            fprintf(stderr, "Reclassifying cells (ploidy-aware: %lu locked, %lu safe singlets)...\n",
+                locked_identities.size(), safe_singlets.size());
+        } else {
+            fprintf(stderr, "Reclassifying cells...\n");
+        }
         bool reclassified = this->reclassify_cells();
         
         if (reclassified){

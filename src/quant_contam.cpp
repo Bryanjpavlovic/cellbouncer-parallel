@@ -31,8 +31,8 @@ using std::endl;
 using namespace std;
 
 // Version tracking
-const string QC_VERSION = "1.3";
-const string QC_VERSION_MSG = "Fixed contam_prof pollution from print loop; v1.2 contam_prof/idx2samp mismatch fix; .pass1.* output";
+const string QC_VERSION = "1.4";
+const string QC_VERSION_MSG = "Tetraploid-aware mode: adaptive signal filter, ploidy-aware reassignment, expected_lines support";
 
 // ===== Program to profile ambient RNA contamination in cells, =====
 //       given output of a demux_vcf run.
@@ -114,6 +114,15 @@ void help(int code){
     fprintf(stderr, "        Default behavior would be to give all cells assigned to the noise individual the\n");
     fprintf(stderr, "        same overall weight as all cells assigned to any other individual.\n"); 
     print_libname_help();
+    fprintf(stderr, "===== TETRAPLOID-AWARE MODE =====\n");
+    fprintf(stderr, "    --expected_lines -X Expected lines file (same format as demux_parallel -I).\n");
+    fprintf(stderr, "        Enables ploidy-aware reassignment and adaptive signal filtering.\n");
+    fprintf(stderr, "        Combo identities (A+B) in this file are locked from reassignment.\n");
+    fprintf(stderr, "        Singlet identities whose individual appears in any combo are also\n");
+    fprintf(stderr, "        locked (could be unresolved homotypic tetraploids).\n");
+    fprintf(stderr, "    --min_signal_gap  Minimum |p_e - p_c| for a SNP category to be used in\n");
+    fprintf(stderr, "        contamination estimation (default 0.10). Categories with smaller gaps\n");
+    fprintf(stderr, "        carry little information and bias the estimate upward.\n");
     fprintf(stderr, "===== OPTIONAL; FOR INFERRING GENE EXPRESSION =====\n");
     fprintf(stderr, "    --barcodes -B (Optionally gzipped) barcodes file, from MEX-format single cell gene\n");
     fprintf(stderr, "        expression data\n");
@@ -192,7 +201,13 @@ void infer_from_genotypes(string& output_prefix,
     string& libname,
     bool seurat,
     bool cellranger,
-    bool underscore){
+    bool underscore,
+    // Tetraploid-aware parameters (v1.4)
+    const set<int>& locked_identities,
+    const set<int>& safe_singlets,
+    bool tetraploid_aware,
+    double min_signal_gap,
+    bool ids_restricted){
     
     // Load conditional matching probabilities
     map<pair<int, int>, map<int, float> > exp_match_fracs;
@@ -259,7 +274,21 @@ all possible individuals\n", idfile_doublet.c_str());
         cf.set_doublet_rate(doublet_rate);
         cf.set_num_threads(num_threads);
         if (run_once){
-            //cf.no_reassign();
+            cf.no_reassign();
+        }
+        
+        // Tetraploid-aware mode (v1.4)
+        if (tetraploid_aware){
+            cf.set_tetraploid_aware(true);
+            cf.set_locked_identities(locked_identities);
+            cf.set_safe_singlets(safe_singlets);
+            cf.set_min_signal_gap(min_signal_gap);
+            cf.set_ids_restricted(ids_restricted);
+            if (nits == 0){
+                fprintf(stderr, "Tetraploid-aware mode: %lu locked identities, %lu safe singlets, "
+                    "min_signal_gap=%.2f\n", locked_identities.size(), safe_singlets.size(),
+                    min_signal_gap);
+            }
         }
 
         // Initialize to whatever was the final estimate last time,
@@ -691,6 +720,8 @@ int main(int argc, char *argv[]) {
        {"skip_genex_regex", required_argument, 0, 'G'},
        {"num_threads", required_argument, 0, 'T'},
        {"noround", no_argument, 0, 'R'},
+       {"expected_lines", required_argument, 0, 'X'},
+       {"min_signal_gap", required_argument, 0, 1001},
        {0, 0, 0, 0} 
        
     };
@@ -727,13 +758,17 @@ int main(int argc, char *argv[]) {
     string clustfile = "";
     bool round = true;
 
+    // Tetraploid-aware mode (v1.4)
+    string expected_lines_file = "";
+    double min_signal_gap = 0.10;
+
     int option_index = 0;
     int ch;
     
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "o:e:g:G:E:l:N:i:I:n:b:D:B:F:M:t:c:T:RrsCSUdwh", long_options, &option_index )) != -1){
+    while((ch = getopt_long(argc, argv, "o:e:g:G:E:l:N:i:I:n:b:D:B:F:M:t:c:T:X:RrsCSUdwh", long_options, &option_index )) != -1){
         switch(ch){
             case 0:
                 // This option set a flag. No need to do anything here.
@@ -743,6 +778,12 @@ int main(int argc, char *argv[]) {
                 break;
             case 'o':
                 output_prefix = optarg;
+                break;
+            case 'X':
+                expected_lines_file = optarg;
+                break;
+            case 1001:
+                min_signal_gap = atof(optarg);
                 break;
             case 'g':
                 skipgenesfile = optarg;
@@ -930,6 +971,84 @@ be less accurate if there is much cell type heterogeneity).\n");
     robin_hood::unordered_map<unsigned long, double> contam_rate;
     map<int, double> contam_prof;
     
+    // Parse expected_lines for tetraploid-aware mode (v1.4)
+    set<int> locked_identities;
+    set<int> safe_singlets;
+    bool tetraploid_aware = false;
+    bool ids_restricted = idfile_given || idfile_doublet_given;
+    
+    if (expected_lines_file != ""){
+        tetraploid_aware = true;
+        fprintf(stderr, "Tetraploid-aware mode: parsing %s\n", expected_lines_file.c_str());
+        
+        // Parse expected_lines file to identify combos and singlets
+        // Build name->index mapping from samples
+        map<string, int> name_to_idx;
+        for (int i = 0; i < (int)samples.size(); i++){
+            name_to_idx[samples[i]] = i;
+        }
+        
+        set<string> combo_individuals;  // individuals appearing in any combo
+        set<string> singlet_only;       // individuals appearing only as bare singlets
+        set<string> all_singlets;       // all bare singlet entries
+        
+        ifstream elf(expected_lines_file);
+        if (!elf.is_open()){
+            fprintf(stderr, "ERROR: cannot open expected_lines file: %s\n", expected_lines_file.c_str());
+            exit(1);
+        }
+        string el_line;
+        while (getline(elf, el_line)){
+            if (el_line.empty() || el_line[0] == '#') continue;
+            while (!el_line.empty() && (el_line.back() == '\r' || el_line.back() == '\n' || el_line.back() == ' '))
+                el_line.pop_back();
+            if (el_line.empty()) continue;
+            
+            size_t plus = el_line.find('+');
+            if (plus != string::npos){
+                string id1 = el_line.substr(0, plus);
+                string id2 = el_line.substr(plus + 1);
+                combo_individuals.insert(id1);
+                combo_individuals.insert(id2);
+                // Lock the combo identity index
+                if (name_to_idx.count(id1) > 0 && name_to_idx.count(id2) > 0){
+                    int idx1 = name_to_idx[id1];
+                    int idx2 = name_to_idx[id2];
+                    int combo_idx;
+                    if (idx1 < idx2) combo_idx = hap_comb_to_idx(idx1, idx2, samples.size());
+                    else combo_idx = hap_comb_to_idx(idx2, idx1, samples.size());
+                    locked_identities.insert(combo_idx);
+                }
+            } else {
+                all_singlets.insert(el_line);
+            }
+        }
+        
+        // Build locked and safe singlet sets
+        for (const auto& s : all_singlets){
+            if (name_to_idx.count(s) > 0){
+                int idx = name_to_idx[s];
+                if (combo_individuals.count(s) > 0){
+                    // This individual also appears in combos: LOCK (could be unresolved homotypic tet)
+                    locked_identities.insert(idx);
+                } else {
+                    // Pure diploid singlet: safe to reassign
+                    safe_singlets.insert(idx);
+                }
+            }
+        }
+        
+        // Also lock singlet indices for individuals in combos but NOT in singlet list
+        for (const auto& ci : combo_individuals){
+            if (name_to_idx.count(ci) > 0 && all_singlets.count(ci) == 0){
+                locked_identities.insert(name_to_idx[ci]);
+            }
+        }
+        
+        fprintf(stderr, "  Locked identities: %lu (combos + ambiguous singlets)\n", locked_identities.size());
+        fprintf(stderr, "  Safe singlets: %lu (pure diploids, reassignment allowed)\n", safe_singlets.size());
+    }
+    
     bool load_gex = (barcodesfile != "" && featuresfile != "" && matrixfile != "");
      
     if (file_exists(prof_name) && file_exists(rate_name)){
@@ -969,7 +1088,12 @@ provided. Nothing to do.\n");
             libname,
             seurat,
             cellranger,
-            underscore);
+            underscore,
+            locked_identities,
+            safe_singlets,
+            tetraploid_aware,
+            min_signal_gap,
+            ids_restricted);
     }
     
     if (load_gex){

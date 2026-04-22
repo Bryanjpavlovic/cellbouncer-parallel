@@ -102,6 +102,20 @@ class contamFinder{
         
         // Don't bother reassigning cell identities
         bool skip_reassign;
+        
+        // Tetraploid-aware mode (v1.4)
+        // Identities that must not be reassigned (combos + singlets with combo involvement)
+        std::set<int> locked_identities;
+        // Singlet identities that can be safely reassigned (pure diploids only)
+        std::set<int> safe_singlets;
+        // Whether tetraploid-aware filtering/reassignment is active
+        bool tetraploid_aware;
+        // Minimum |p_e - p_c| gap for a category to be informative (adaptive filter)
+        double min_signal_gap;
+        // Whether amb_mu has been estimated (enables adaptive filter vs hard filter)
+        bool amb_mu_available;
+        // Whether expected_lines restricted identity space (affects unexpected identity handling)
+        bool ids_restricted;
 
         // Wrangle data
         void compile_data(robin_hood::unordered_map<unsigned long, int>& assn,
@@ -201,6 +215,13 @@ class contamFinder{
         void no_weights();
         void set_num_threads(int nt);
         void no_reassign();
+        
+        // Tetraploid-aware mode (v1.4)
+        void set_locked_identities(const std::set<int>& locked);
+        void set_safe_singlets(const std::set<int>& safe);
+        void set_tetraploid_aware(bool enabled);
+        void set_min_signal_gap(double gap);
+        void set_ids_restricted(bool restricted);
 
         // Get variance on contamination profile by bootstrapping it and fitting
         // a Dirichlet distribution
