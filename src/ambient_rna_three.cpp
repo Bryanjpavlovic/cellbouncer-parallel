@@ -32,7 +32,7 @@ using namespace std;
 // Three-component contamination model for tetraploid cells
 //
 // Created in conversation: https://claude.ai/chat/this-conversation
-// Version: V1_R1
+// Version: V1_R2
 // ============================================================================
 
 const string AMBIENT_RNA_VERSION = "2.0-three";
@@ -502,6 +502,8 @@ contamFinder3::contamFinder3(robin_hood::unordered_map<unsigned long,
     
     this->weighted = false;
     
+    this->num_threads = 1;
+
     // Tetraploid-aware defaults (v1.4)
     this->tetraploid_aware = false;
     this->min_signal_gap = 0.10;
@@ -1271,9 +1273,16 @@ void contamFinder3::est_contam_cells(){
     // to use in calculating this mean & variance
     vector<double> cell_c_llr;
 
+    // Separate tracking for two-component (singlet/homotypic) c values only,
+    // used for the Empirical Bayes prior. Heterotypic BFGS estimates on the
+    // r/c likelihood ridge have inflated variance that would weaken the prior.
+    vector<double> twocomp_c_maps;
+    vector<double> twocomp_c_llr;
+
     // Track three-component stats for reporting
     int n_three_comp = 0;
     int n_two_comp = 0;
+    int n_bfgs_fallback = 0;
     vector<double> cell_r_maps;
 
     for (map<unsigned long, vector<int> >::iterator ci = cell_to_idx.begin(); 
@@ -1411,7 +1420,7 @@ void contamFinder3::est_contam_cells(){
 
         double c_cell_map = 1.0;
         double se = 0.0;
-        double ll = 0.0;
+        double ll = -INFINITY;
         double r_cell_map = 0.5;
         double r_se = 0.0;
 
@@ -1463,6 +1472,7 @@ void contamFinder3::est_contam_cells(){
             }
             catch (int exc){
                 // BFGS failed. Fall back to two-component estimate for this cell
+                n_bfgs_fallback++;
                 r_cell_map = 0.5;
                 optimML::brent_solver c_fallback(ll_c, dll_dc, d2ll_dc2);
                 c_fallback.add_data("n", n);
@@ -1562,21 +1572,45 @@ void contamFinder3::est_contam_cells(){
 
         contam_rate.emplace(ci->first, c_cell_map);
         cell_c_maps.push_back(c_cell_map);
+        if (!is_heterotypic){
+            twocomp_c_maps.push_back(c_cell_map);
+        }
         if (weighted){
             double weight = assn_llr[ci->first] / id_llrsum[assn[ci->first]];
             cell_c_llr.push_back(weight);
+            if (!is_heterotypic){
+                twocomp_c_llr.push_back(weight);
+            }
         }
         contam_rate_se.emplace(ci->first, se);
         contam_rate_ll.emplace(ci->first, ll);
     }
     
-    // Re-compute data set-wide distribution
+    // Re-compute data set-wide distribution (all cells, for reporting)
     pair<double, double> mu_var;
     if (weighted){
         mu_var = welford_weights(cell_c_maps, cell_c_llr, false);
     }
     else{
         mu_var = welford(cell_c_maps);
+    }
+
+    // Compute prior from two-component cells only (singlets + homotypic),
+    // to avoid heterotypic ridge-variance inflating the prior.
+    // Fall back to all-cell stats if there are too few two-component cells.
+    pair<double, double> prior_mu_var;
+    bool use_twocomp_prior = (twocomp_c_maps.size() >= 20);
+    if (use_twocomp_prior){
+        if (weighted && !twocomp_c_llr.empty()){
+            prior_mu_var = welford_weights(twocomp_c_maps, twocomp_c_llr, false);
+            if (prior_mu_var.second < 1e-3){
+                prior_mu_var = welford(twocomp_c_maps);
+            }
+        } else {
+            prior_mu_var = welford(twocomp_c_maps);
+        }
+    } else {
+        prior_mu_var = mu_var;
     }
 
     if (weighted && mu_var.second < 1e-3){
@@ -1592,14 +1626,23 @@ void contamFinder3::est_contam_cells(){
         fprintf(stderr, "  Mean: %f Std dev: %f\n", mu_var.first, sqrt(mu_var.second));
         fprintf(stderr, "  Three-component cells: %d  Two-component cells: %d\n",
             n_three_comp, n_two_comp);
+        if (n_bfgs_fallback > 0){
+            fprintf(stderr, "  BFGS fallbacks to Brent: %d / %d heterotypic cells\n",
+                n_bfgs_fallback, n_three_comp + n_bfgs_fallback);
+        }
         if (!cell_r_maps.empty()){
             pair<double, double> r_stats = welford(cell_r_maps);
             fprintf(stderr, "  Allele ratio (r) mean: %f Std dev: %f\n",
                 r_stats.first, sqrt(r_stats.second));
         }
         if (!user_prior_set){
-            contam_cell_prior = mu_var.first;
-            contam_cell_prior_var = mu_var.second;
+            contam_cell_prior = prior_mu_var.first;
+            contam_cell_prior_var = prior_mu_var.second;
+            if (use_twocomp_prior && n_three_comp > 0){
+                fprintf(stderr, "  Prior from two-component cells only (%lu cells): "
+                    "mean=%f var=%f\n", twocomp_c_maps.size(),
+                    prior_mu_var.first, prior_mu_var.second);
+            }
         }
     }
 
@@ -2745,6 +2788,19 @@ bool contamFinder3::reclassify_cells(){
                         contam_rate[a->first] = c_cell_map;
                         contam_rate_se[a->first] = c_cell.se;
                         contam_rate_ll[a->first] = c_cell.log_likelihood;
+                        // Clean up allele_ratio if new identity is not heterotypic
+                        if (a_new < n_samples){
+                            // Reassigned to singlet: r is meaningless
+                            allele_ratio.erase(a->first);
+                            allele_ratio_se.erase(a->first);
+                        } else {
+                            pair<int, int> new_combo = idx_to_hap_comb(a_new, n_samples);
+                            if (new_combo.first == new_combo.second){
+                                // Reassigned to homotypic combo: r is meaningless
+                                allele_ratio.erase(a->first);
+                                allele_ratio_se.erase(a->first);
+                            }
+                        }
                     }
                 }
             }
@@ -2769,6 +2825,8 @@ bool contamFinder3::reclassify_cells(){
         assn_llr.erase(*rm);
         contam_rate.erase(*rm);
         contam_rate_se.erase(*rm);
+        allele_ratio.erase(*rm);
+        allele_ratio_se.erase(*rm);
     }
     return changed;
 }
