@@ -679,7 +679,8 @@ void write_diagnostics_gz(
     
     // Header
     gzprintf(outf, "barcode\tassignment\tsinglet_doublet\tllr\tmin_margin\tworst_competitor\t"
-                   "n_close\ttotal_depth\thet_balance_var\tn_het_sites\thet_total_depth\n");
+                   "n_close\ttotal_depth\thet_balance_var\tn_het_sites\thet_total_depth\t"
+                   "posterior\tentropy\n");
     
     for (const auto& kv : assignments){
         unsigned long bc = kv.first;
@@ -704,7 +705,7 @@ void write_diagnostics_gz(
             worst_comp = idx2name(diag.worst_competitor, samples);
         }
         
-        gzprintf(outf, "%s\t%s\t%c\t%.4f\t%.4f\t%s\t%d\t%.2f\t%.6f\t%d\t%.2f\n",
+        gzprintf(outf, "%s\t%s\t%c\t%.4f\t%.4f\t%s\t%d\t%.2f\t%.6f\t%d\t%.2f\t%.6f\t%.4f\n",
             bc_str.c_str(),
             identity.c_str(),
             s_d,
@@ -715,7 +716,9 @@ void write_diagnostics_gz(
             diag.total_depth,
             diag.het_balance_var,
             diag.n_het_sites,
-            diag.het_total_depth);
+            diag.het_total_depth,
+            diag.posterior,
+            diag.entropy);
     }
     
     gzclose(outf);

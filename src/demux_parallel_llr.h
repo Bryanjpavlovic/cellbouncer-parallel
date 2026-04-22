@@ -46,10 +46,15 @@ struct CellDiagnostics {
     // Method used for het_balance computation
     HetBalanceMethod het_method;
     
+    // Posterior probability and entropy (v3)
+    double posterior;           // P(winner | data) via softmax over all identities
+    double entropy;             // Shannon entropy of posterior distribution (bits)
+    
     CellDiagnostics() 
         : min_margin(0.0), worst_competitor(-1), n_close(0), total_depth(0.0),
           het_balance_var(-1.0), n_het_sites(0), het_total_depth(0.0),
-          het_method(HetBalanceMethod::WELFORD) {}
+          het_method(HetBalanceMethod::WELFORD),
+          posterior(-1.0), entropy(-1.0) {}
 };
 
 /**
@@ -308,6 +313,24 @@ void compute_het_balance_welford(
  * Compute total depth from main demux counts
  */
 double compute_total_depth(const CellCounts& counts, int n_samples);
+
+/**
+ * Compute posterior probability and entropy from the pairwise LLR map.
+ * Must be called while llrs is still populated (before table destruction).
+ * 
+ * Reconstructs per-identity log-likelihoods relative to the winner,
+ * applies softmax to get posteriors, then computes Shannon entropy.
+ * 
+ * @param llrs The pairwise LLR map (llrs[i][j] = LL(i) - LL(j))
+ * @param winner The winning identity index
+ * @param n_samples Number of samples
+ * @param diag Output: posterior and entropy fields populated
+ */
+void compute_posterior_entropy(
+    const std::map<int, std::map<int, double> >& llrs,
+    int winner,
+    int n_samples,
+    CellDiagnostics& diag);
 
 // ============================================================================
 // HELPER FUNCTIONS

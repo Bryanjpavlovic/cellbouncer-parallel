@@ -1357,6 +1357,96 @@ double compute_total_depth(const CellCounts& counts, int n_samples){
     return total / n_samples;
 }
 
+// ============================================================================
+// POSTERIOR PROBABILITY AND ENTROPY COMPUTATION (v3)
+// ============================================================================
+
+void compute_posterior_entropy(
+    const map<int, map<int, double> >& llrs,
+    int winner,
+    int n_samples,
+    CellDiagnostics& diag) {
+    
+    if (winner < 0) {
+        diag.posterior = -1.0;
+        diag.entropy = -1.0;
+        return;
+    }
+    
+    // Step 1: Collect all identity indices from llrs
+    set<int> all_identities;
+    for (const auto& outer : llrs) {
+        all_identities.insert(outer.first);
+        for (const auto& inner : outer.second) {
+            all_identities.insert(inner.first);
+        }
+    }
+    
+    if (all_identities.size() <= 1) {
+        diag.posterior = 1.0;
+        diag.entropy = 0.0;
+        return;
+    }
+    
+    // Step 2: Compute LL(identity) relative to winner
+    // LL(winner) = 0 by definition
+    map<int, double> identity_ll;
+    identity_ll[winner] = 0.0;
+    
+    for (int id : all_identities) {
+        if (id == winner) continue;
+        
+        // Try direct lookup: llrs[winner][id] = LL(winner) - LL(id)
+        // So LL(id) = -llrs[winner][id]
+        auto winner_it = llrs.find(winner);
+        if (winner_it != llrs.end()) {
+            auto id_it = winner_it->second.find(id);
+            if (id_it != winner_it->second.end()) {
+                identity_ll[id] = -(id_it->second);
+                continue;
+            }
+        }
+        
+        // Try reverse: llrs[id][winner] = LL(id) - LL(winner), so LL(id) = llrs[id][winner]
+        auto id_outer = llrs.find(id);
+        if (id_outer != llrs.end()) {
+            auto winner_inner = id_outer->second.find(winner);
+            if (winner_inner != id_outer->second.end()) {
+                identity_ll[id] = winner_inner->second;
+                continue;
+            }
+        }
+        
+        // No direct comparison available; assign large negative
+        identity_ll[id] = -1000.0;
+    }
+    
+    // Step 3: Softmax with log-sum-exp for numerical stability
+    // All values are relative to winner (which is 0), so max is 0
+    double sum_exp = 0.0;
+    for (const auto& kv : identity_ll) {
+        sum_exp += exp(kv.second);  // kv.second <= 0 for all non-winners
+    }
+    
+    if (sum_exp <= 0.0) {
+        diag.posterior = 1.0;
+        diag.entropy = 0.0;
+        return;
+    }
+    
+    diag.posterior = 1.0 / sum_exp;
+    
+    // Step 4: Compute Shannon entropy (bits)
+    double entropy = 0.0;
+    for (const auto& kv : identity_ll) {
+        double p = exp(kv.second) / sum_exp;
+        if (p > 0.0) {
+            entropy -= p * log2(p);
+        }
+    }
+    diag.entropy = entropy;
+}
+
 /**
  * Compute het balance using per-site data (PERSITE method)
  */
@@ -1699,6 +1789,9 @@ void assign_ids_parallel_with_diagnostics(
                     get_diagnostics_from_llrs(llrs, tab, assn, llr_final, n_samples,
                         n_runner_ups, close_threshold, diag, runners);
                     
+                    // Compute posterior probability and entropy from llrs
+                    compute_posterior_entropy(llrs, assn, n_samples, diag);
+                    
                     // Compute total depth from main counts
                     diag.total_depth = compute_total_depth(counts, n_samples);
                     
@@ -1828,6 +1921,9 @@ void assign_ids_parallel_with_diagnostics_extended(
                 
                 get_diagnostics_from_llrs(llrs, tab, best_idx, best_llr,
                     n_samples, n_runner_ups, close_threshold, diag, runners);
+                
+                // Compute posterior probability and entropy from llrs
+                compute_posterior_entropy(llrs, best_idx, n_samples, diag);
                 
                 diag.total_depth = compute_total_depth(counts, n_samples);
                 
