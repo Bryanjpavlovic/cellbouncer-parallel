@@ -102,6 +102,17 @@ quant3_contam: src/quant3_contam.cpp src/ambient_rna_three.h src/common.h build/
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three.o build/ambient_rna_gex.o src/quant3_contam.cpp -o quant3_contam $(LFLAGS) $(DEPS) $(DEPS2)
 
 # ============================================================================
+# THREE-COMPONENT MODEL + AMBIENT PROFILE REFINEMENTS (quant3_contam_ap)
+# r-feedback and adaptive prior extensions
+# ============================================================================
+
+build/ambient_rna_three_ap.o: src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/common.h $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap.o
+
+quant3_contam_ap: src/quant3_contam_ap.cpp src/ambient_rna_three_ap.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o src/quant3_contam_ap.cpp -o quant3_contam_ap $(LFLAGS) $(DEPS) $(DEPS2)
+
+# ============================================================================
 # UTILITY TOOLS
 # ============================================================================
 
@@ -217,7 +228,7 @@ clean_build:
 clean_binaries:
 	rm -f demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops
 	rm -f demux_parallel vcf_loader_daemon tetra_refine
-	rm -f quant3_contam
+	rm -f quant3_contam quant3_contam_ap
 	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers
 	rm -f utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts
 	rm -f utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel
@@ -234,11 +245,11 @@ clean_all: clean clean_deps
 # INSTALL
 # ============================================================================
 
-install: all quant3_contam
+install: all quant3_contam quant3_contam_ap
 	mkdir -p $(PREFIX)/bin
 	cp demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops $(PREFIX)/bin/
 	cp demux_parallel vcf_loader_daemon tetra_refine $(PREFIX)/bin/
-	cp quant3_contam $(PREFIX)/bin/
+	cp quant3_contam quant3_contam_ap $(PREFIX)/bin/
 	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers $(PREFIX)/bin/
 	cp utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts $(PREFIX)/bin/
 	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
