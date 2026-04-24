@@ -2,8 +2,7 @@
 // ambient_rna_three.h
 // Three-component contamination model for tetraploid cells
 //
-// Created in conversation: https://claude.ai/chat/this-conversation
-// Version: V1_R2
+// Version: V1_R3
 //
 // For heterotypic tetraploid (A+B) cells, decomposes observed allele fractions
 // into three sources:
@@ -275,4 +274,5 @@ class contamFinder3{
 // V1_R1: Initial three-component model header
 // V1_R2: Fix ll init to -INFINITY, allele_ratio cleanup on reclassify,
 //        num_threads default, split Welford prior, BFGS fallback counter
+// V1_R3: Fix BFGS line search assertion failure (version bump to match .cpp)
 // ============================================================================

@@ -31,8 +31,7 @@ using namespace std;
 // ambient_rna_three.cpp
 // Three-component contamination model for tetraploid cells
 //
-// Created in conversation: https://claude.ai/chat/this-conversation
-// Version: V1_R2
+// Version: V1_R3
 // ============================================================================
 
 const string AMBIENT_RNA_VERSION = "2.0-three";
@@ -247,6 +246,12 @@ double ll_ambmu(const vector<double>& params, const map<string, double>& data_d,
     double p_c = params[amb_idx];
     double c = data_d.at("c");
     double binom_p = (1.0-c) * p_e + c*p_c;
+    if (binom_p < DBL_MIN*1e6){
+        binom_p = DBL_MIN*1e6;
+    }
+    else if (binom_p > 1.0 - DBL_MIN*1e6){
+        binom_p = 1.0 - DBL_MIN*1e6;
+    }
     return logbinom(n, k, binom_p); 
 }
 
@@ -265,7 +270,18 @@ void dll_ambmu(const vector<double>& params, const map<string, double>& data_d,
     double c = data_d.at("c");
     double binom_p = (1.0-c) * p_e + c*p_c;
 
+    // Clamp binom_p away from 0 and 1 to prevent division by zero in gradient
+    if (binom_p < DBL_MIN*1e6){
+        binom_p = DBL_MIN*1e6;
+    }
+    else if (binom_p > 1.0 - DBL_MIN*1e6){
+        binom_p = 1.0 - DBL_MIN*1e6;
+    }
+
     double dy_dp = (k-n*binom_p)/(binom_p - binom_p*binom_p);
+    if (!std::isfinite(dy_dp)){
+        return;
+    }
     results[amb_idx] = dy_dp * c;
 }
 
@@ -382,8 +398,25 @@ void dll_amb_prof_mixture(const vector<double>& params,
     double p_e = data_d.at("p_e");
     
     double binom_p = (1.0 - c) * p_e + c * p_c;
+
+    // Clamp binom_p away from 0 and 1 to prevent division by zero in gradient
+    if (binom_p < DBL_MIN*1e6){
+        binom_p = DBL_MIN*1e6;
+    }
+    else if (binom_p > 1.0 - DBL_MIN*1e6){
+        binom_p = 1.0 - DBL_MIN*1e6;
+    }
+    if (isnan(binom_p)){
+        binom_p = 0.5;
+    }
+
     double dy_dp = (k-n*binom_p)/(binom_p - binom_p*binom_p);
-    
+
+    // Guard against non-finite gradient (e.g., from degenerate data)
+    if (!std::isfinite(dy_dp)){
+        return;
+    }
+
     results[results.size()-1] += dy_dp * c;
     if (c_in_data){
         results[0] += dy_dp * (p_c - p_e);
@@ -1169,7 +1202,7 @@ void contamFinder3::est_contam_cells_global(){
     c_global.set_maxiter(-1);
     try {
         contam_cell_prior = c_global.solve(0,1);
-    } catch (int exc) {
+    } catch (...) {
         fprintf(stderr, "WARNING: global contamination rate solver failed; using initial estimate\n");
         contam_cell_prior = c_init > 0 ? c_init : 0.15;
     }
@@ -1470,7 +1503,7 @@ void contamFinder3::est_contam_cells(){
                     r_se = 0.0;
                 }
             }
-            catch (int exc){
+            catch (...){
                 // BFGS failed. Fall back to two-component estimate for this cell
                 n_bfgs_fallback++;
                 r_cell_map = 0.5;
@@ -1491,7 +1524,7 @@ void contamFinder3::est_contam_cells(){
                         ll = c_fallback.log_likelihood;
                         if (c_fallback.se_found) se = c_fallback.se;
                     }
-                } catch (int exc2) {
+                } catch (...) {
                     c_cell_map = 1.0;
                 }
             }
@@ -1522,7 +1555,7 @@ void contamFinder3::est_contam_cells(){
                         c_cell_map = solver_alt.results[1];
                         ll = solver_alt.log_likelihood;
                     }
-                } catch (int exc) {
+                } catch (...) {
                     // ignore
                 }
             }
@@ -1564,7 +1597,7 @@ void contamFinder3::est_contam_cells(){
                     }
                 }
             }
-            catch (int exc){
+            catch (...){
                 // pass
             }
             n_two_comp++;
@@ -1769,7 +1802,7 @@ double contamFinder3::update_ambient_profile(bool global_c){
     
     try {
         solver.solve();
-    } catch (int exc) {
+    } catch (...) {
         fprintf(stderr, "WARNING: ambient profile direct solver failed; keeping current profile\n");
         return -1e30;
     }
@@ -2000,12 +2033,16 @@ double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, 
 
         try {
             solver.solve();
-            any_solve_succeeded = true;
-            maxll = solver.log_likelihood;
-            lls.push_back(solver.log_likelihood);
-            mcs.push_back(solver.results_mixcomp);
-            cs.push_back(solver.results[0]);
-        } catch (int exc) {
+            if (std::isfinite(solver.log_likelihood) && std::isfinite(solver.results[0])){
+                any_solve_succeeded = true;
+                maxll = solver.log_likelihood;
+                lls.push_back(solver.log_likelihood);
+                mcs.push_back(solver.results_mixcomp);
+                cs.push_back(solver.results[0]);
+            } else {
+                fprintf(stderr, "WARNING: ambient profile mixture solver returned non-finite results on initial attempt\n");
+            }
+        } catch (...) {
             fprintf(stderr, "WARNING: ambient profile mixture solver failed on initial attempt\n");
         }
         
@@ -2016,15 +2053,17 @@ double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, 
             }
             solver.add_mixcomp_fracs(mptest);
             solver.solve();
-            any_solve_succeeded = true;
-            if (solver.log_likelihood > maxll){
-                maxll = solver.log_likelihood;
-                maxidx = lls.size();
+            if (std::isfinite(solver.log_likelihood) && std::isfinite(solver.results[0])){
+                any_solve_succeeded = true;
+                if (solver.log_likelihood > maxll){
+                    maxll = solver.log_likelihood;
+                    maxidx = lls.size();
+                }
+                lls.push_back(solver.log_likelihood);
+                mcs.push_back(solver.results_mixcomp);
+                cs.push_back(solver.results[0]);
             }
-            lls.push_back(solver.log_likelihood);
-            mcs.push_back(solver.results_mixcomp);
-            cs.push_back(solver.results[0]);
-        } catch (int exc) {
+        } catch (...) {
             // ignore, try other starting conditions
         }
 
@@ -2033,15 +2072,17 @@ double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, 
             try {
                 solver.randomize_mixcomps();
                 solver.solve();
-                any_solve_succeeded = true;
-                if (solver.log_likelihood > maxll){
-                    maxll = solver.log_likelihood;
-                    maxidx = lls.size();
-                    lls.push_back(solver.log_likelihood);
-                    mcs.push_back(solver.results_mixcomp);
-                    cs.push_back(solver.results[0]);
+                if (std::isfinite(solver.log_likelihood) && std::isfinite(solver.results[0])){
+                    any_solve_succeeded = true;
+                    if (solver.log_likelihood > maxll){
+                        maxll = solver.log_likelihood;
+                        maxidx = lls.size();
+                        lls.push_back(solver.log_likelihood);
+                        mcs.push_back(solver.results_mixcomp);
+                        cs.push_back(solver.results[0]);
+                    }
                 }
-            } catch (int exc) {
+            } catch (...) {
                 // ignore, try next starting condition
             }
         }
@@ -2071,10 +2112,14 @@ double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, 
         double maxll = -1e30;
         try {
             solver.solve();
-            maxres = solver.results_mixcomp;
-            maxll = solver.log_likelihood;
-            solve_ok = true;
-        } catch (int exc) {
+            if (std::isfinite(solver.log_likelihood)){
+                maxres = solver.results_mixcomp;
+                maxll = solver.log_likelihood;
+                solve_ok = true;
+            } else {
+                fprintf(stderr, "WARNING: ambient profile mixture solver returned non-finite LL (no-c path); keeping initial profile\n");
+            }
+        } catch (...) {
             fprintf(stderr, "WARNING: ambient profile mixture solver failed (no-c path); keeping initial profile\n");
         }
         /* 
@@ -2272,10 +2317,13 @@ void contamFinder3::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_
         
         try {
             solver.solve();
-            for (int x = 0; x < (int)solver.results_mixcomp.size(); ++x){
-                dirprops[x].push_back(solver.results_mixcomp[x]);
+            if (std::isfinite(solver.log_likelihood)){
+                for (int x = 0; x < (int)solver.results_mixcomp.size(); ++x){
+                    dirprops[x].push_back(solver.results_mixcomp[x]);
+                }
             }
-        } catch (int exc) {
+            // else: skip this bootstrap sample (non-finite LL)
+        } catch (...) {
             // Skip this bootstrap sample - solver failed on resampled data
         }
         
@@ -2612,7 +2660,7 @@ bool contamFinder3::reclassify_cells(){
             try {
                 c_cell_map = c_cell.solve(contam_rate[a->first],1);
                 solve_ok = true;
-            } catch (int exc) {
+            } catch (...) {
                 // Solver failed for this alternative identity - skip it
                 continue;
             }
@@ -2755,7 +2803,7 @@ bool contamFinder3::reclassify_cells(){
                     try {
                         c_cell_map = c_cell.solve(0,1);
                         rc_solve_ok = true;
-                    } catch (int exc) {
+                    } catch (...) {
                         // Solver failed for candidate reassignment - skip
                     }
                     
@@ -2900,8 +2948,8 @@ pair<double, double> contamFinder3::est_error_rates(bool init){
         this_e_a = solver.results[1];
     
     }
-    catch (int errcode){
-        fprintf(stderr, "Error inferring error rates (code %d); keeping initial values.\n", errcode);
+    catch (...){
+        fprintf(stderr, "Error inferring error rates; keeping initial values.\n");
     }
     return make_pair(this_e_r, this_e_a);
 }
@@ -3018,3 +3066,16 @@ void contamFinder3::fit(){
     */
 }
 
+// ============================================================================
+// Revision History
+// V1_R1: Initial three-component model implementation
+// V1_R2: Fix ll init to -INFINITY, allele_ratio cleanup on reclassify,
+//        num_threads default, split Welford prior, BFGS fallback counter
+// V1_R3: Fix BFGS line search assertion failure on pathological libraries.
+//        Clamp binom_p in dll_amb_prof_mixture, dll_ambmu, ll_ambmu to
+//        prevent NaN gradients from division by zero. Add isfinite guard
+//        on dy_dp in all gradient functions. Widen catch(int) to catch(...)
+//        on all solver.solve() calls. Add post-solve isfinite checks on
+//        solver.log_likelihood and solver.results to detect silent NaN
+//        propagation in NDEBUG builds.
+// ============================================================================

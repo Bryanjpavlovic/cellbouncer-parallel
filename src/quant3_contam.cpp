@@ -2,7 +2,6 @@
 // quant3_contam.cpp
 // Three-component contamination model driver
 //
-// Created in conversation: https://claude.ai/chat/this-conversation
 // Version: V1_R1
 //
 // Joint estimation of allele ratio (r) and contamination (c) for heterotypic
