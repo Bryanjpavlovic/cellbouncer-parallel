@@ -476,6 +476,10 @@ void help(int code){
     fprintf(stderr, "    --enable_pool_scoring -E  Enable pool-aware het scoring.\n");
     fprintf(stderr, "    --pool_combinations -L    TSV: library_id<tab>comma-separated identities.\n");
     fprintf(stderr, "    --min_pair_score -Q       Threshold for pair discrimination (default: 0.3).\n");
+    fprintf(stderr, "===== PAIRWISE FLOOR (optional) =====\n");
+    fprintf(stderr, "    --min_pairwise -W    Minimum pairwise distinguishing SNPs per individual pair.\n");
+    fprintf(stderr, "                         After clade-balanced selection, adds extra SNPs for any\n");
+    fprintf(stderr, "                         pair below this floor. Total output may exceed --num.\n");
     fprintf(stderr, "===== SPECIES OUTPUT (optional) =====\n");
     fprintf(stderr, "    --panel_metadata -P   TSV: indiv_id<tab>species.\n");
     fprintf(stderr, "    --species_output -S   Species discrimination output BCF.\n");
@@ -988,6 +992,7 @@ int main(int argc, char *argv[]) {
        {"species_num", required_argument, 0, 'R'},
        {"species_coverage", required_argument, 0, 'K'},
        {"min_pair_score", required_argument, 0, 'Q'},
+       {"min_pairwise", required_argument, 0, 'W'},
        {0, 0, 0, 0} 
     };
     
@@ -1012,6 +1017,7 @@ int main(int argc, char *argv[]) {
     int bin_size = 100000;
     float min_cov = 1.0f;
     float min_pair_score = 0.3f;
+    long min_pairwise = 0;  // 0 = disabled
     int n_threads = omp_get_max_threads();
     int seed = -1;
     bool annotate_only = false;
@@ -1023,7 +1029,7 @@ int main(int argc, char *argv[]) {
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "v:n:o:t:g:c:s:H:N:b:m:Aa:hC:P:L:EO:M:T:U:S:R:K:Q:", long_options, &option_index )) != -1){
+    while((ch = getopt_long(argc, argv, "v:n:o:t:g:c:s:H:N:b:m:Aa:hC:P:L:EO:M:T:U:S:R:K:Q:W:", long_options, &option_index )) != -1){
         switch(ch){
             case 0:
                 break;
@@ -1104,6 +1110,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 'Q':
                 min_pair_score = atof(optarg);
+                break;
+            case 'W':
+                min_pairwise = atol(optarg);
                 break;
             default:
                 help(0);
@@ -1212,6 +1221,9 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Using %d threads\n", n_threads);
     fprintf(stderr, "Bin size for evenness scoring: %d bp\n", bin_size);
     fprintf(stderr, "Minimum coverage threshold: %.1f\n", min_cov);
+    if (min_pairwise > 0) {
+        fprintf(stderr, "Pairwise floor: %ld distinguishing SNPs per individual pair\n", min_pairwise);
+    }
     if (annotate_only) {
         fprintf(stderr, "Mode: ANNOTATE ONLY (all sites will be annotated, no downsampling)\n");
     } else if (!annotate_all_file.empty()) {
@@ -2658,6 +2670,259 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "  Target: %d, Selected: %zu, Shortfall redistributed: %ld\n", 
         num, selected_variant_indices.size(), total_shortfall);
     fflush(stderr);
+
+    // ========================================================================
+    // PAIRWISE FLOOR ENFORCEMENT (if --min_pairwise set)
+    // After clade-balanced selection, check each individual pair's
+    // distinguishing SNP count. For deficit pairs, add unused variants
+    // that distinguish that pair, ranked by coverage score.
+    // ========================================================================
+    
+    if (min_pairwise > 0) {
+        fprintf(stderr, "\n========================================\n");
+        fprintf(stderr, "Pairwise Floor Enforcement (target: %ld per pair)...\n", min_pairwise);
+        start_time = chrono::high_resolution_clock::now();
+        
+        int ploidy = 2;
+        int n_pairs_total = (num_samples * (num_samples - 1)) / 2;
+        
+        // Step 1: Compute pairwise distinguishing counts for selected variants
+        fprintf(stderr, "  Computing pairwise counts for %zu selected variants across %d pairs...\n",
+            selected_variant_indices.size(), n_pairs_total);
+        
+        // Use a flat array for pair counts: pair(i,j) where i<j -> index = i*num_samples - i*(i+1)/2 + j - i - 1
+        vector<long> pair_counts(n_pairs_total, 0);
+        
+        auto pair_idx = [&](int i, int j) -> int {
+            // i < j required
+            return i * num_samples - i * (i + 1) / 2 + j - i - 1;
+        };
+        
+        long variants_scanned = 0;
+        for (size_t vi : selected_variant_indices) {
+            const StoredVariant& sv = all_variants[vi];
+            if (sv.genotypes.empty()) continue;
+            
+            // Compute alt_count per sample
+            vector<int> ac(num_samples, -1);
+            for (int s = 0; s < num_samples; s++) {
+                const int32_t* gt = sv.genotypes.data() + s * ploidy;
+                if (!bcf_gt_is_missing(gt[0]) && !bcf_gt_is_missing(gt[1])) {
+                    ac[s] = (bcf_gt_allele(gt[0]) > 0 ? 1 : 0) + (bcf_gt_allele(gt[1]) > 0 ? 1 : 0);
+                }
+            }
+            
+            for (int i = 0; i < num_samples; i++) {
+                if (ac[i] < 0) continue;
+                for (int j = i + 1; j < num_samples; j++) {
+                    if (ac[j] < 0) continue;
+                    if (ac[i] != ac[j]) {
+                        pair_counts[pair_idx(i, j)]++;
+                    }
+                }
+            }
+            
+            variants_scanned++;
+            if (variants_scanned % 1000000 == 0) {
+                fprintf(stderr, "    Scanned %ld / %zu selected variants...\r", 
+                    variants_scanned, selected_variant_indices.size());
+                fflush(stderr);
+            }
+        }
+        fprintf(stderr, "    Scanned %ld selected variants for pairwise counts\n", variants_scanned);
+        
+        // Step 2: Identify deficit pairs
+        vector<pair<int, int>> deficit_pairs; // (i, j) pairs below floor
+        long worst_count = min_pairwise;
+        int worst_i = -1, worst_j = -1;
+        
+        for (int i = 0; i < num_samples; i++) {
+            for (int j = i + 1; j < num_samples; j++) {
+                long cnt = pair_counts[pair_idx(i, j)];
+                if (cnt < min_pairwise) {
+                    deficit_pairs.push_back(make_pair(i, j));
+                }
+                if (cnt < worst_count) {
+                    worst_count = cnt;
+                    worst_i = i;
+                    worst_j = j;
+                }
+            }
+        }
+        
+        fprintf(stderr, "  %zu / %d pairs below floor of %ld\n", 
+            deficit_pairs.size(), n_pairs_total, min_pairwise);
+        if (worst_i >= 0) {
+            fprintf(stderr, "  Worst pair: %s vs %s (%ld distinguishing SNPs)\n",
+                samples[worst_i].c_str(), samples[worst_j].c_str(), worst_count);
+        }
+        
+        if (!deficit_pairs.empty()) {
+            // Step 3: For each deficit pair, find unused variants that distinguish them
+            // Sort deficit pairs by count ascending (worst first)
+            sort(deficit_pairs.begin(), deficit_pairs.end(),
+                [&](const pair<int,int>& a, const pair<int,int>& b) {
+                    return pair_counts[pair_idx(a.first, a.second)] < 
+                           pair_counts[pair_idx(b.first, b.second)];
+                });
+            
+            // Build a set of candidate variants not yet selected, with coverage scores
+            // We scan the full variant pool once and for each variant, check which
+            // deficit pairs it distinguishes
+            fprintf(stderr, "  Scanning variant pool for pairwise rescue candidates...\n");
+            
+            // For each deficit pair, collect (coverage_score, variant_idx) candidates
+            // Use a map from pair index to vector of candidates
+            map<int, vector<pair<float, size_t>>> pair_candidates;
+            for (auto& dp : deficit_pairs) {
+                pair_candidates[pair_idx(dp.first, dp.second)] = vector<pair<float, size_t>>();
+            }
+            
+            // Set of deficit pair indices for fast lookup
+            set<int> deficit_pair_indices;
+            for (auto& dp : deficit_pairs) {
+                deficit_pair_indices.insert(pair_idx(dp.first, dp.second));
+            }
+            
+            long candidates_found = 0;
+            for (size_t vi = 0; vi < all_variants.size(); vi++) {
+                if (selected_variant_indices.count(vi) > 0) continue; // already selected
+                
+                const StoredVariant& sv = all_variants[vi];
+                if (!sv.is_biallelic || !sv.passes_qc) continue;
+                if (sv.genotypes.empty()) continue;
+                
+                // Get coverage
+                string chrom = chroms[sv.chrom_idx];
+                float cov = 0.0f;
+                if (!coverage_map.empty()) {
+                    cov = get_coverage_score_fast(chrom, sv.pos, coverage_map);
+                }
+                if (cov < min_cov) continue;
+                
+                // Compute alt_count
+                vector<int> ac(num_samples, -1);
+                for (int s = 0; s < num_samples; s++) {
+                    const int32_t* gt = sv.genotypes.data() + s * ploidy;
+                    if (!bcf_gt_is_missing(gt[0]) && !bcf_gt_is_missing(gt[1])) {
+                        ac[s] = (bcf_gt_allele(gt[0]) > 0 ? 1 : 0) + (bcf_gt_allele(gt[1]) > 0 ? 1 : 0);
+                    }
+                }
+                
+                // Check which deficit pairs this variant distinguishes
+                for (auto& dp : deficit_pairs) {
+                    int a = dp.first, b = dp.second;
+                    if (ac[a] >= 0 && ac[b] >= 0 && ac[a] != ac[b]) {
+                        int pidx = pair_idx(a, b);
+                        pair_candidates[pidx].push_back(make_pair(cov, vi));
+                        candidates_found++;
+                    }
+                }
+                
+                if (vi % 5000000 == 0 && vi > 0) {
+                    fprintf(stderr, "    Scanned %zu / %zu variants, %ld candidates...\r",
+                        vi, all_variants.size(), candidates_found);
+                    fflush(stderr);
+                }
+            }
+            fprintf(stderr, "    Found %ld rescue candidates across %zu deficit pairs\n",
+                candidates_found, deficit_pairs.size());
+            
+            // Step 4: For each deficit pair, sort candidates by coverage descending,
+            // add top-N needed to close the gap
+            long total_added = 0;
+            long pairs_rescued = 0;
+            long pairs_partial = 0;
+            
+            for (auto& dp : deficit_pairs) {
+                int pidx = pair_idx(dp.first, dp.second);
+                long current = pair_counts[pidx];
+                long needed = min_pairwise - current;
+                if (needed <= 0) continue; // already met (from additions for other pairs)
+                
+                auto& candidates = pair_candidates[pidx];
+                
+                // Sort by coverage descending
+                sort(candidates.begin(), candidates.end(),
+                    [](const pair<float, size_t>& a, const pair<float, size_t>& b) {
+                        return a.first > b.first;
+                    });
+                
+                long added_this_pair = 0;
+                for (auto& cand : candidates) {
+                    if (added_this_pair >= needed) break;
+                    size_t vi = cand.second;
+                    
+                    // Check if already added by a previous deficit pair's rescue
+                    if (selected_variant_indices.count(vi) > 0) {
+                        // Already added; update this pair's count if it distinguishes
+                        // (it was added for another pair but helps this one too)
+                        continue;
+                    }
+                    
+                    selected_variant_indices.insert(vi);
+                    added_this_pair++;
+                    total_added++;
+                    
+                    // Update pairwise counts for ALL pairs this new variant distinguishes
+                    const StoredVariant& sv = all_variants[vi];
+                    vector<int> ac(num_samples, -1);
+                    for (int s = 0; s < num_samples; s++) {
+                        const int32_t* gt = sv.genotypes.data() + s * ploidy;
+                        if (!bcf_gt_is_missing(gt[0]) && !bcf_gt_is_missing(gt[1])) {
+                            ac[s] = (bcf_gt_allele(gt[0]) > 0 ? 1 : 0) + (bcf_gt_allele(gt[1]) > 0 ? 1 : 0);
+                        }
+                    }
+                    for (int i = 0; i < num_samples; i++) {
+                        if (ac[i] < 0) continue;
+                        for (int j = i + 1; j < num_samples; j++) {
+                            if (ac[j] < 0) continue;
+                            if (ac[i] != ac[j]) {
+                                pair_counts[pair_idx(i, j)]++;
+                            }
+                        }
+                    }
+                }
+                
+                long final_count = pair_counts[pidx];
+                if (final_count >= min_pairwise) {
+                    pairs_rescued++;
+                } else {
+                    pairs_partial++;
+                    fprintf(stderr, "  WARNING: %s vs %s: only reached %ld / %ld (pool exhausted)\n",
+                        samples[dp.first].c_str(), samples[dp.second].c_str(), 
+                        final_count, min_pairwise);
+                }
+            }
+            
+            fprintf(stderr, "  Added %ld rescue variants\n", total_added);
+            fprintf(stderr, "  Pairs fully rescued: %ld, partially rescued: %ld\n", 
+                pairs_rescued, pairs_partial);
+            fprintf(stderr, "  New total selected: %zu (was %d target)\n", 
+                selected_variant_indices.size(), num);
+        }
+        
+        // Print final pairwise summary (bottom 10)
+        vector<tuple<long, int, int>> all_pair_counts;
+        for (int i = 0; i < num_samples; i++) {
+            for (int j = i + 1; j < num_samples; j++) {
+                all_pair_counts.push_back(make_tuple(pair_counts[pair_idx(i, j)], i, j));
+            }
+        }
+        sort(all_pair_counts.begin(), all_pair_counts.end());
+        
+        fprintf(stderr, "\n  Bottom 10 pairwise counts (after rescue):\n");
+        for (int k = 0; k < min(10, (int)all_pair_counts.size()); k++) {
+            fprintf(stderr, "    %s vs %s: %ld\n",
+                samples[get<1>(all_pair_counts[k])].c_str(),
+                samples[get<2>(all_pair_counts[k])].c_str(),
+                get<0>(all_pair_counts[k]));
+        }
+        
+        end_time = chrono::high_resolution_clock::now();
+        duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+        fprintf(stderr, "\nPairwise floor enforcement complete in %ld seconds\n", duration.count());
+    }
 
     // ========================================================================
     // ATAC-DEMUX STRATIFIED SELECTION (if --atac_output set)
