@@ -213,6 +213,175 @@ float get_coverage_score(const string& chrom, int pos, tbx_t* tbx, htsFile* fp) 
 }
 
 // ============================================================================
+// PANEL METADATA AND POOL COMBINATIONS STRUCTURES
+// ============================================================================
+
+// Individual -> species mapping (from --panel_metadata)
+struct PanelMetadata {
+    map<string, string> indiv_to_species;   // e.g. "H28126" -> "H"
+    vector<string> species_list;            // unique species labels, sorted
+    map<string, vector<int>> species_to_sample_indices; // species -> VCF sample indices
+    
+    // Species pair enumeration
+    vector<pair<string, string>> species_pairs;   // all (n choose 2) pairs
+    map<pair<string, string>, int> pair_to_index; // pair -> index into species_pairs
+    int n_pairs;
+};
+
+PanelMetadata load_panel_metadata(const string& filename, 
+                                   const vector<string>& vcf_samples) {
+    PanelMetadata pm;
+    ifstream f(filename);
+    if (!f.is_open()) {
+        fprintf(stderr, "ERROR: Could not open panel metadata: %s\n", filename.c_str());
+        exit(1);
+    }
+    
+    string line;
+    getline(f, line); // skip header
+    
+    set<string> species_set;
+    map<string, int> sample_name_to_idx;
+    for (int i = 0; i < (int)vcf_samples.size(); i++) {
+        sample_name_to_idx[vcf_samples[i]] = i;
+    }
+    
+    while (getline(f, line)) {
+        if (line.empty()) continue;
+        size_t tab = line.find('\t');
+        if (tab == string::npos) continue;
+        string indiv_id = line.substr(0, tab);
+        string species = line.substr(tab + 1);
+        // trim whitespace
+        while (!species.empty() && (species.back() == '\r' || species.back() == ' '))
+            species.pop_back();
+        
+        pm.indiv_to_species[indiv_id] = species;
+        species_set.insert(species);
+        
+        if (sample_name_to_idx.count(indiv_id) > 0) {
+            pm.species_to_sample_indices[species].push_back(sample_name_to_idx[indiv_id]);
+        }
+    }
+    
+    pm.species_list.assign(species_set.begin(), species_set.end());
+    sort(pm.species_list.begin(), pm.species_list.end());
+    
+    // Enumerate all (n choose 2) species pairs
+    for (size_t i = 0; i < pm.species_list.size(); i++) {
+        for (size_t j = i + 1; j < pm.species_list.size(); j++) {
+            pair<string, string> p = make_pair(pm.species_list[i], pm.species_list[j]);
+            pm.pair_to_index[p] = pm.species_pairs.size();
+            pm.species_pairs.push_back(p);
+        }
+    }
+    pm.n_pairs = pm.species_pairs.size();
+    
+    fprintf(stderr, "Panel metadata: %zu individuals, %zu species, %d pairs\n",
+        pm.indiv_to_species.size(), pm.species_list.size(), pm.n_pairs);
+    for (auto& sp : pm.species_list) {
+        fprintf(stderr, "  %s: %zu individuals\n", sp.c_str(), pm.species_to_sample_indices[sp].size());
+    }
+    
+    return pm;
+}
+
+// Pool combinations: library -> list of cell identities
+struct PoolCombinations {
+    // Each identity is either a single indiv or a pair (heterotypic fusion)
+    struct CellIdentity {
+        vector<string> components; // 1 element = singlet/homotypic, 2 = heterotypic
+    };
+    
+    map<int, vector<CellIdentity>> lib_identities; // lib_num -> identities
+};
+
+PoolCombinations load_pool_combinations(const string& filename,
+                                         const vector<string>& vcf_samples) {
+    PoolCombinations pc;
+    
+    set<string> sample_set(vcf_samples.begin(), vcf_samples.end());
+    
+    ifstream f(filename);
+    if (!f.is_open()) {
+        fprintf(stderr, "ERROR: Could not open pool combinations: %s\n", filename.c_str());
+        exit(1);
+    }
+    
+    string line;
+    getline(f, line); // skip header
+    
+    while (getline(f, line)) {
+        if (line.empty()) continue;
+        size_t tab = line.find('\t');
+        if (tab == string::npos) continue;
+        
+        int lib_num = atoi(line.substr(0, tab).c_str());
+        string identities_str = line.substr(tab + 1);
+        // trim
+        while (!identities_str.empty() && (identities_str.back() == '\r' || identities_str.back() == ' '))
+            identities_str.pop_back();
+        
+        vector<PoolCombinations::CellIdentity> identities;
+        stringstream ss(identities_str);
+        string token;
+        while (getline(ss, token, ',')) {
+            PoolCombinations::CellIdentity ci;
+            size_t plus = token.find('+');
+            if (plus != string::npos) {
+                ci.components.push_back(token.substr(0, plus));
+                ci.components.push_back(token.substr(plus + 1));
+            } else {
+                ci.components.push_back(token);
+            }
+            
+            // Validate all components exist in VCF
+            bool valid = true;
+            for (auto& comp : ci.components) {
+                if (sample_set.count(comp) == 0) {
+                    fprintf(stderr, "ERROR: Identity component '%s' in library %d not found in VCF samples\n",
+                        comp.c_str(), lib_num);
+                    exit(1);
+                }
+            }
+            if (valid) {
+                identities.push_back(ci);
+            }
+        }
+        
+        pc.lib_identities[lib_num] = identities;
+    }
+    
+    fprintf(stderr, "Pool combinations: %zu libraries\n", pc.lib_identities.size());
+    return pc;
+}
+
+// ============================================================================
+// SPECIES CANDIDATE STRUCTURE
+// ============================================================================
+
+struct SpeciesCandidate {
+    string chrom;
+    int64_t pos;
+    int chrom_idx;
+    int bin_idx;
+    float cov_score;             // coverage used for selection (RNA or ATAC)
+    vector<float> pair_discrim;  // one per species pair
+    float max_pair_discrim;      // max across all pairs
+    float selection_score;       // max_pair_discrim * log2(cov+1)
+    int assigned_pair;           // index into species_pairs for best-fit assignment
+    string ref_allele;
+    string alt_allele;
+    vector<int32_t> genotypes;
+    int n_samples;
+    
+    // For sorting by selection_score descending
+    bool operator<(const SpeciesCandidate& other) const {
+        return selection_score > other.selection_score;
+    }
+};
+
+// ============================================================================
 // HET SITE CANDIDATE STRUCTURE
 // ============================================================================
 
@@ -227,6 +396,9 @@ struct HetCandidate {
     float annot_score;      // Annotation score (if GTF provided)
     float cov_score;        // Coverage score (if coverage provided)
     float demux_score;      // Clade rarity score (computed after Pass 1)
+    float atac_cov_score;   // ATAC coverage score (if --atac_cov set)
+    float pool_discrim_norm;// Pool discrimination score (if --enable_pool_scoring set)
+    float het_sel_score;    // Selection ranking score (for HET_SEL_SCORE INFO field)
     string ref_allele;
     string alt_allele;
     vector<int32_t> genotypes;  // Store genotypes for output
@@ -286,19 +458,32 @@ void help(int code){
     fprintf(stderr, "===== OPTIONAL =====\n");
     fprintf(stderr, "    --threads -t Number of threads (default: all available).\n");
     fprintf(stderr, "    --gtf -g     GTF annotation file. Adds ANNOT_SCORE INFO field.\n");
-    fprintf(stderr, "    --cov -c     Tabix-indexed bedgraph coverage file. Adds COV_SCORE INFO field.\n");
+    fprintf(stderr, "                 Required if --output or --het_output is set.\n");
+    fprintf(stderr, "    --cov -c     Tabix-indexed bedgraph coverage file (RNA). Adds COV_SCORE INFO field.\n");
     fprintf(stderr, "    --min_cov -m Minimum coverage threshold (default: 1.0). Sites below this are excluded.\n");
     fprintf(stderr, "    --seed -s    Random seed for reproducibility.\n");
     fprintf(stderr, "===== HET SITE SELECTION =====\n");
     fprintf(stderr, "    --het_output -H  Output file for het-enriched SNP set (optional).\n");
     fprintf(stderr, "    --het_num -N     Target number of het sites (default: half of --num).\n");
     fprintf(stderr, "    --bin_size -b    Bin size (bp) for evenness scoring (default: 100000).\n");
+    fprintf(stderr, "===== ATAC OUTPUTS (optional) =====\n");
+    fprintf(stderr, "    --atac_cov -C        ATAC coverage bedGraph (tabix-indexed).\n");
+    fprintf(stderr, "    --atac_output -O     ATAC-demux output BCF.\n");
+    fprintf(stderr, "    --atac_num -M        Target N for ATAC-demux. Required if --atac_output set.\n");
+    fprintf(stderr, "    --atac_het_output -T ATAC-het output BCF.\n");
+    fprintf(stderr, "    --atac_het_num -U    Target N for ATAC-het (default: atac_num/2).\n");
+    fprintf(stderr, "===== POOL-AWARE SCORING (optional) =====\n");
+    fprintf(stderr, "    --enable_pool_scoring -E  Enable pool-aware het scoring.\n");
+    fprintf(stderr, "    --pool_combinations -L    TSV: library_id<tab>comma-separated identities.\n");
+    fprintf(stderr, "    --min_pair_score -Q       Threshold for pair discrimination (default: 0.3).\n");
+    fprintf(stderr, "===== SPECIES OUTPUT (optional) =====\n");
+    fprintf(stderr, "    --panel_metadata -P   TSV: indiv_id<tab>species.\n");
+    fprintf(stderr, "    --species_output -S   Species discrimination output BCF.\n");
+    fprintf(stderr, "    --species_num -R      Target N for species set. Required if --species_output set.\n");
+    fprintf(stderr, "    --species_coverage -K Coverage source for species: 'rna' or 'atac' (default: rna).\n");
     fprintf(stderr, "===== ANNOTATION MODES =====\n");
     fprintf(stderr, "    --annotate_only  Annotate ALL sites with scores and exit (no downsampling).\n");
     fprintf(stderr, "    --annotate_all FILE  Annotate ALL sites first, save to FILE, then downsample.\n");
-    fprintf(stderr, "                         Produces both full annotated VCF and downsampled outputs.\n");
-    fprintf(stderr, "    INFO fields added: HET_FREQ, MISSING_FREQ, HET_SCORE, N_HET, N_CALLED,\n");
-    fprintf(stderr, "                       ANNOT_SCORE (if -g), COV_SCORE (if -c), BIN_ID\n");
     fprintf(stderr, "    --help -h    Display this message and exit.\n");
     exit(code);
 }
@@ -556,6 +741,167 @@ void merge_het_candidates(
         make_move_iterator(local.end()));
 }
 
+// Merge thread-local species candidates into global
+void merge_species_candidates(
+    vector<SpeciesCandidate>& global,
+    vector<SpeciesCandidate>& local,
+    mutex& mtx){
+    
+    lock_guard<mutex> lock(mtx);
+    global.insert(global.end(),
+        make_move_iterator(local.begin()),
+        make_move_iterator(local.end()));
+}
+
+// Compute pool discrimination score for a site (per section 4.1)
+// Returns pool_discrim_norm in [0, 1]
+float compute_pool_discrim(
+    const vector<int32_t>& genotypes,
+    int num_samples,
+    const PoolCombinations& pool_combos,
+    const map<string, int>& sample_name_to_idx,
+    float min_pair_score) {
+    
+    int ploidy = 2;
+    
+    // Compute alt_count per sample: 0/0=0, 0/1=1, 1/1=2, missing=-1
+    vector<int> alt_count(num_samples, -1);
+    for (int s = 0; s < num_samples; s++) {
+        const int32_t* gt = genotypes.data() + s * ploidy;
+        if (bcf_gt_is_missing(gt[0]) || bcf_gt_is_missing(gt[1])) {
+            alt_count[s] = -1;
+        } else {
+            int a1 = bcf_gt_allele(gt[0]);
+            int a2 = bcf_gt_allele(gt[1]);
+            alt_count[s] = (a1 > 0 ? 1 : 0) + (a2 > 0 ? 1 : 0);
+        }
+    }
+    
+    double total_pair_sum = 0.0;
+    int total_pair_count = 0;
+    
+    for (auto& lib_entry : pool_combos.lib_identities) {
+        const vector<PoolCombinations::CellIdentity>& identities = lib_entry.second;
+        
+        // Compute expected_alt for each valid identity
+        vector<float> expected_alts;
+        expected_alts.reserve(identities.size());
+        
+        for (auto& ci : identities) {
+            if (ci.components.size() == 2) {
+                // Heterotypic fusion
+                auto it_a = sample_name_to_idx.find(ci.components[0]);
+                auto it_b = sample_name_to_idx.find(ci.components[1]);
+                if (it_a == sample_name_to_idx.end() || it_b == sample_name_to_idx.end()) {
+                    continue; // unknown sample
+                }
+                int ac_a = alt_count[it_a->second];
+                int ac_b = alt_count[it_b->second];
+                if (ac_a < 0 || ac_b < 0) {
+                    continue; // either component missing -> skip entire fusion
+                }
+                expected_alts.push_back((ac_a + ac_b) / 4.0f);
+            } else {
+                // Singlet or homotypic
+                auto it = sample_name_to_idx.find(ci.components[0]);
+                if (it == sample_name_to_idx.end()) continue;
+                int ac = alt_count[it->second];
+                if (ac < 0) continue; // missing
+                expected_alts.push_back(ac / 2.0f);
+            }
+        }
+        
+        // Compute all unordered pairs
+        int n_valid = expected_alts.size();
+        if (n_valid < 2) {
+            // Still count potential pairs in denominator
+            int n_all = identities.size();
+            total_pair_count += (n_all * (n_all - 1)) / 2;
+            continue;
+        }
+        
+        int lib_pair_count = (n_valid * (n_valid - 1)) / 2;
+        total_pair_count += lib_pair_count;
+        
+        for (int i = 0; i < n_valid; i++) {
+            for (int j = i + 1; j < n_valid; j++) {
+                float diff = fabsf(expected_alts[i] - expected_alts[j]);
+                if (diff >= min_pair_score) {
+                    total_pair_sum += diff;
+                }
+            }
+        }
+    }
+    
+    if (total_pair_count == 0) return 0.0f;
+    return (float)(total_pair_sum / total_pair_count);
+}
+
+// Compute species pair discrimination for a site (per section 5.1)
+// Returns vector of pair_discrim values, one per species pair
+void compute_species_discrim(
+    const vector<int32_t>& genotypes,
+    int num_samples,
+    const PanelMetadata& panel,
+    vector<float>& pair_discrim_out) {
+    
+    int ploidy = 2;
+    pair_discrim_out.resize(panel.n_pairs, 0.0f);
+    
+    // Compute alt_count per sample
+    vector<int> alt_count(num_samples, -1);
+    for (int s = 0; s < num_samples; s++) {
+        const int32_t* gt = genotypes.data() + s * ploidy;
+        if (bcf_gt_is_missing(gt[0]) || bcf_gt_is_missing(gt[1])) {
+            alt_count[s] = -1;
+        } else {
+            int a1 = bcf_gt_allele(gt[0]);
+            int a2 = bcf_gt_allele(gt[1]);
+            alt_count[s] = (a1 > 0 ? 1 : 0) + (a2 > 0 ? 1 : 0);
+        }
+    }
+    
+    // For each species pair, compute discriminating fraction
+    for (int pi = 0; pi < panel.n_pairs; pi++) {
+        const string& sp_a = panel.species_pairs[pi].first;
+        const string& sp_b = panel.species_pairs[pi].second;
+        
+        auto it_a = panel.species_to_sample_indices.find(sp_a);
+        auto it_b = panel.species_to_sample_indices.find(sp_b);
+        if (it_a == panel.species_to_sample_indices.end() ||
+            it_b == panel.species_to_sample_indices.end()) {
+            pair_discrim_out[pi] = 0.0f;
+            continue;
+        }
+        
+        // Collect non-missing individuals for each species
+        vector<int> called_a, called_b;
+        for (int idx : it_a->second) {
+            if (alt_count[idx] >= 0) called_a.push_back(alt_count[idx]);
+        }
+        for (int idx : it_b->second) {
+            if (alt_count[idx] >= 0) called_b.push_back(alt_count[idx]);
+        }
+        
+        if (called_a.empty() || called_b.empty()) {
+            pair_discrim_out[pi] = 0.0f;
+            continue;
+        }
+        
+        // Count distinguishable pairs
+        int n_distinguishable = 0;
+        int total_pairs = called_a.size() * called_b.size();
+        
+        for (int ac_a : called_a) {
+            for (int ac_b : called_b) {
+                if (ac_a != ac_b) n_distinguishable++;
+            }
+        }
+        
+        pair_discrim_out[pi] = (float)n_distinguishable / total_pairs;
+    }
+}
+
 double brentfun(double param, const map<string, double>& data_d, const map<string, int>& data_i){
     int num = data_i.at("num");
     char buf[50];
@@ -630,6 +976,18 @@ int main(int argc, char *argv[]) {
        {"min_cov", required_argument, 0, 'm'},
        {"annotate_only", no_argument, 0, 'A'},
        {"annotate_all", required_argument, 0, 'a'},
+       {"atac_cov", required_argument, 0, 'C'},
+       {"panel_metadata", required_argument, 0, 'P'},
+       {"pool_combinations", required_argument, 0, 'L'},
+       {"enable_pool_scoring", no_argument, 0, 'E'},
+       {"atac_output", required_argument, 0, 'O'},
+       {"atac_num", required_argument, 0, 'M'},
+       {"atac_het_output", required_argument, 0, 'T'},
+       {"atac_het_num", required_argument, 0, 'U'},
+       {"species_output", required_argument, 0, 'S'},
+       {"species_num", required_argument, 0, 'R'},
+       {"species_coverage", required_argument, 0, 'K'},
+       {"min_pair_score", required_argument, 0, 'Q'},
        {0, 0, 0, 0} 
     };
     
@@ -638,14 +996,26 @@ int main(int argc, char *argv[]) {
     string gtf_file = "";
     string cov_file = "";
     string het_outfile = "";
-    string annotate_all_file = "";  // Output file for full annotated VCF
+    string annotate_all_file = "";
+    string atac_cov_file = "";
+    string panel_metadata_file = "";
+    string pool_combinations_file = "";
+    string atac_outfile = "";
+    string atac_het_outfile = "";
+    string species_outfile = "";
+    string species_coverage_mode = "rna";
     int num = -1;
-    int het_num = -1;  // Will default to num/2 if not specified
-    int bin_size = 100000;  // 100kb default
-    float min_cov = 1.0f;  // Minimum coverage threshold (hard filter)
+    int het_num = -1;
+    int atac_num = -1;
+    int atac_het_num = -1;
+    int species_num = -1;
+    int bin_size = 100000;
+    float min_cov = 1.0f;
+    float min_pair_score = 0.3f;
     int n_threads = omp_get_max_threads();
     int seed = -1;
     bool annotate_only = false;
+    bool enable_pool_scoring = false;
 
     int option_index = 0;
     int ch;
@@ -653,7 +1023,7 @@ int main(int argc, char *argv[]) {
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "v:n:o:t:g:c:s:H:N:b:m:Aa:h", long_options, &option_index )) != -1){
+    while((ch = getopt_long(argc, argv, "v:n:o:t:g:c:s:H:N:b:m:Aa:hC:P:L:EO:M:T:U:S:R:K:Q:", long_options, &option_index )) != -1){
         switch(ch){
             case 0:
                 break;
@@ -699,6 +1069,42 @@ int main(int argc, char *argv[]) {
             case 'a':
                 annotate_all_file = optarg;
                 break;
+            case 'C':
+                atac_cov_file = optarg;
+                break;
+            case 'P':
+                panel_metadata_file = optarg;
+                break;
+            case 'L':
+                pool_combinations_file = optarg;
+                break;
+            case 'E':
+                enable_pool_scoring = true;
+                break;
+            case 'O':
+                atac_outfile = optarg;
+                break;
+            case 'M':
+                atac_num = atoi(optarg);
+                break;
+            case 'T':
+                atac_het_outfile = optarg;
+                break;
+            case 'U':
+                atac_het_num = atoi(optarg);
+                break;
+            case 'S':
+                species_outfile = optarg;
+                break;
+            case 'R':
+                species_num = atoi(optarg);
+                break;
+            case 'K':
+                species_coverage_mode = optarg;
+                break;
+            case 'Q':
+                min_pair_score = atof(optarg);
+                break;
             default:
                 help(0);
                 break;
@@ -739,6 +1145,69 @@ int main(int argc, char *argv[]) {
             het_outfile += ".het.bcf";
         }
     }
+    
+    // Validate new flag dependencies
+    if ((!outfile.empty() || !het_outfile.empty()) && gtf_file.empty() && !annotate_only) {
+        fprintf(stderr, "ERROR: --gtf/-g is required when --output or --het_output is set\n");
+        exit(1);
+    }
+    
+    if (!atac_outfile.empty() || !atac_het_outfile.empty()) {
+        if (atac_cov_file.empty()) {
+            fprintf(stderr, "ERROR: --atac_cov/-C is required for ATAC outputs\n");
+            exit(1);
+        }
+    }
+    if (!atac_outfile.empty() && atac_num <= 0) {
+        fprintf(stderr, "ERROR: --atac_num/-M is required when --atac_output is set\n");
+        exit(1);
+    }
+    if (!atac_het_outfile.empty() && atac_het_num < 0) {
+        if (atac_num > 0) {
+            atac_het_num = atac_num / 2;
+        } else {
+            fprintf(stderr, "ERROR: --atac_het_num/-U is required when --atac_het_output is set\n");
+            exit(1);
+        }
+    }
+    
+    if (enable_pool_scoring && pool_combinations_file.empty()) {
+        fprintf(stderr, "ERROR: --pool_combinations/-L is required when --enable_pool_scoring is set\n");
+        exit(1);
+    }
+    
+    if (!species_outfile.empty()) {
+        if (panel_metadata_file.empty()) {
+            fprintf(stderr, "ERROR: --panel_metadata/-P is required when --species_output is set\n");
+            exit(1);
+        }
+        if (species_num <= 0) {
+            fprintf(stderr, "ERROR: --species_num/-R is required when --species_output is set\n");
+            exit(1);
+        }
+        if (species_coverage_mode != "rna" && species_coverage_mode != "atac") {
+            fprintf(stderr, "ERROR: --species_coverage must be 'rna' or 'atac'\n");
+            exit(1);
+        }
+        if (species_coverage_mode == "atac" && atac_cov_file.empty()) {
+            fprintf(stderr, "ERROR: --atac_cov/-C is required when --species_coverage is 'atac'\n");
+            exit(1);
+        }
+    }
+    
+    // Handle ATAC output file extensions
+    if (!atac_outfile.empty()) {
+        if (atac_outfile.rfind(".bcf") == string::npos && atac_outfile.rfind(".vcf") == string::npos)
+            atac_outfile += ".bcf";
+    }
+    if (!atac_het_outfile.empty()) {
+        if (atac_het_outfile.rfind(".bcf") == string::npos && atac_het_outfile.rfind(".vcf") == string::npos)
+            atac_het_outfile += ".bcf";
+    }
+    if (!species_outfile.empty()) {
+        if (species_outfile.rfind(".bcf") == string::npos && species_outfile.rfind(".vcf") == string::npos)
+            species_outfile += ".bcf";
+    }
 
     fprintf(stderr, "Using %d threads\n", n_threads);
     fprintf(stderr, "Bin size for evenness scoring: %d bp\n", bin_size);
@@ -764,8 +1233,15 @@ int main(int argc, char *argv[]) {
     // Load coverage into memory for fast lookup
     map<string, vector<CoverageInterval>> coverage_map;
     if (!cov_file.empty()) {
-        fprintf(stderr, "Loading coverage from %s...\n", cov_file.c_str());
+        fprintf(stderr, "Loading RNA coverage from %s...\n", cov_file.c_str());
         coverage_map = load_coverage(cov_file);
+    }
+    
+    // Load ATAC coverage if requested
+    map<string, vector<CoverageInterval>> atac_coverage_map;
+    if (!atac_cov_file.empty()) {
+        fprintf(stderr, "Loading ATAC coverage from %s...\n", atac_cov_file.c_str());
+        atac_coverage_map = load_coverage(atac_cov_file);
     }
 
     // ========================================================================
@@ -992,6 +1468,28 @@ int main(int argc, char *argv[]) {
     hts_close(bcf_reader);
 
     fprintf(stderr, "Found %d chromosomes, %d samples\n", (int)chroms.size(), num_samples);
+    
+    // Build sample name -> index map for pool/species lookups
+    map<string, int> sample_name_to_idx;
+    for (int i = 0; i < num_samples; i++) {
+        sample_name_to_idx[samples[i]] = i;
+    }
+    
+    // Load panel metadata if needed
+    PanelMetadata panel_metadata;
+    bool has_panel_metadata = false;
+    if (!panel_metadata_file.empty()) {
+        panel_metadata = load_panel_metadata(panel_metadata_file, samples);
+        has_panel_metadata = true;
+    }
+    
+    // Load pool combinations if needed
+    PoolCombinations pool_combos;
+    bool has_pool_combos = false;
+    if (!pool_combinations_file.empty()) {
+        pool_combos = load_pool_combinations(pool_combinations_file, samples);
+        has_pool_combos = true;
+    }
 
     // ========================================================================
     // Load VCF index (CSI required for parallel region queries)
@@ -1174,17 +1672,25 @@ int main(int argc, char *argv[]) {
     unordered_map<pair<bitset<NBITS>, bitset<NBITS>>, double> branchcounts_missing;
     unordered_map<bitset<NBITS>, bitset<NBITS>> miss2flip;
     vector<HetCandidate> all_het_candidates;  // Global het candidates
+    vector<SpeciesCandidate> all_species_candidates; // Global species candidates
     
-    mutex bc_mutex, bcm_mutex, m2f_mutex, het_mutex;
+    mutex bc_mutex, bcm_mutex, m2f_mutex, het_mutex, species_mutex;
     atomic<long> total_snps(0);
     atomic<long> total_het_candidates(0);
+    atomic<long> total_species_candidates(0);
     atomic<int> chroms_done(0);
 
     auto start_time = chrono::high_resolution_clock::now();
     
-    bool collect_het = !het_outfile.empty();
-    fprintf(stderr, "Pass 1: Counting mutations on branches%s (parallel, %d threads)...\n", 
-        collect_het ? " and collecting het candidates" : "", n_threads);
+    bool collect_het = !het_outfile.empty() || !atac_het_outfile.empty();
+    bool collect_species = !species_outfile.empty();
+    float species_prefilter = min_pair_score - 0.05f;
+    if (species_prefilter < 0.0f) species_prefilter = 0.0f;
+    
+    fprintf(stderr, "Pass 1: Counting mutations on branches%s%s (parallel, %d threads)...\n", 
+        collect_het ? " and collecting het candidates" : "",
+        collect_species ? " and collecting species candidates" : "",
+        n_threads);
 
     #pragma omp parallel num_threads(n_threads)
     {
@@ -1193,6 +1699,7 @@ int main(int argc, char *argv[]) {
         unordered_map<pair<bitset<NBITS>, bitset<NBITS>>, double> local_branchcounts_missing;
         unordered_map<bitset<NBITS>, bitset<NBITS>> local_miss2flip;
         vector<HetCandidate> local_het_candidates;
+        vector<SpeciesCandidate> local_species_candidates;
         
         #pragma omp for schedule(dynamic, 1)
         for (size_t c = 0; c < chroms.size(); c++){
@@ -1303,11 +1810,30 @@ int main(int argc, char *argv[]) {
                                 continue;  // Skip sites below coverage threshold
                             }
                             
+                            // Get ATAC coverage if available
+                            float atac_cov = 0.0f;
+                            if (!atac_coverage_map.empty()) {
+                                atac_cov = get_coverage_score_fast(chrom, sv.pos, atac_coverage_map);
+                            }
+                            
+                            // Compute pool discrimination if enabled
+                            float pool_dn = 0.0f;
+                            if (enable_pool_scoring && has_pool_combos) {
+                                pool_dn = compute_pool_discrim(sv.genotypes, num_samples,
+                                    pool_combos, sample_name_to_idx, min_pair_score);
+                            }
+                            
+                            // Compute final_het_score
+                            float final_het_score = het_freq;
+                            if (enable_pool_scoring) {
+                                final_het_score = het_freq + pool_dn;
+                            }
+                            
                             // New het scoring formula: het_freq dominates, then coverage, annotation is bonus
-                            // het_score = het_freq × (log2(cov+1) + 0.1 × annot_boost)
+                            // het_score = final_het_score * (log2(cov+1) + 0.1 * annot_boost)
                             float annot_boost = (annot_score >= 1.0f) ? 1.0f : 0.0f;
                             float selection_component = log2f(cov_score + 1.0f) + (0.1f * annot_boost);
-                            float het_score = het_freq * selection_component;
+                            float het_score = final_het_score * selection_component;
                             
                             HetCandidate hc;
                             hc.chrom = chrom;
@@ -1319,6 +1845,9 @@ int main(int argc, char *argv[]) {
                             hc.missing_freq = missing_freq;
                             hc.annot_score = annot_score;
                             hc.cov_score = cov_score;  // Store RAW coverage, same as demux
+                            hc.atac_cov_score = atac_cov;
+                            hc.pool_discrim_norm = pool_dn;
+                            hc.het_sel_score = het_score; // selection ranking score
                             hc.ref_allele = ref_allele;
                             hc.alt_allele = alt_allele;
                             hc.genotypes = sv.genotypes;  // Copy genotypes
@@ -1329,15 +1858,77 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
+            
+            // Collect species candidates if enabled
+            if (collect_species && !sv.genotypes.empty() && sv.is_biallelic) {
+                // Parse ref/alt
+                size_t comma_pos2 = sv.alleles.find(',');
+                string ref_a2 = sv.alleles.substr(0, comma_pos2);
+                string alt_a2 = sv.alleles.substr(comma_pos2 + 1);
+                
+                // Check alleles are valid single-base
+                bool sp_pass = true;
+                if (ref_a2.length() != 1 || alt_a2.length() != 1) {
+                    sp_pass = false;
+                } else {
+                    char r = ref_a2[0], a = alt_a2[0];
+                    if ((r != 'A' && r != 'C' && r != 'G' && r != 'T') ||
+                        (a != 'A' && a != 'C' && a != 'G' && a != 'T') || r == a) {
+                        sp_pass = false;
+                    }
+                }
+                
+                if (sp_pass) {
+                    // Get coverage for species eligibility
+                    float sp_cov = 0.0f;
+                    if (species_coverage_mode == "rna" && !coverage_map.empty()) {
+                        sp_cov = get_coverage_score_fast(chrom, sv.pos, coverage_map);
+                    } else if (species_coverage_mode == "atac" && !atac_coverage_map.empty()) {
+                        sp_cov = get_coverage_score_fast(chrom, sv.pos, atac_coverage_map);
+                    }
+                    
+                    if (sp_cov >= min_cov) {
+                        // Compute pair discrimination
+                        vector<float> pd;
+                        compute_species_discrim(sv.genotypes, num_samples, panel_metadata, pd);
+                        
+                        // Find max pair_discrim
+                        float max_pd = 0.0f;
+                        for (float v : pd) {
+                            if (v > max_pd) max_pd = v;
+                        }
+                        
+                        // Pre-filter: skip sites where max < species_prefilter
+                        if (max_pd >= species_prefilter) {
+                            SpeciesCandidate sc;
+                            sc.chrom = chrom;
+                            sc.pos = sv.pos;
+                            sc.chrom_idx = c;
+                            sc.bin_idx = get_bin_idx(sv.pos, bin_size);
+                            sc.cov_score = sp_cov;
+                            sc.pair_discrim = std::move(pd);
+                            sc.max_pair_discrim = max_pd;
+                            sc.selection_score = max_pd * log2f(sp_cov + 1.0f);
+                            sc.assigned_pair = -1;
+                            sc.ref_allele = ref_a2;
+                            sc.alt_allele = alt_a2;
+                            sc.genotypes = sv.genotypes;
+                            sc.n_samples = num_samples;
+                            
+                            local_species_candidates.push_back(std::move(sc));
+                        }
+                    }
+                }
             }
+            } // end per-variant for loop
             
             total_snps += local_snps;
             total_het_candidates += local_het;
             int done = ++chroms_done;
             
             if (local_snps > 0 || done % 100 == 0) {
-                fprintf(stderr, "  Chromosome %s: %ld SNPs, %ld het [%d/%zu]\n", 
-                    chrom.c_str(), local_snps, local_het, done, chroms.size());
+                fprintf(stderr, "  Chromosome %s: %ld SNPs, %ld het, %ld sp [%d/%zu]\n", 
+                    chrom.c_str(), local_snps, local_het, (long)local_species_candidates.size(), done, chroms.size());
             }
         }
         
@@ -1347,6 +1938,9 @@ int main(int argc, char *argv[]) {
         merge_miss2flip(miss2flip, local_miss2flip, m2f_mutex);
         if (collect_het) {
             merge_het_candidates(all_het_candidates, local_het_candidates, het_mutex);
+        }
+        if (collect_species) {
+            merge_species_candidates(all_species_candidates, local_species_candidates, species_mutex);
         }
     }
     
@@ -1359,6 +1953,9 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Found %lu unique clade patterns\n", branchcounts.size());
     if (collect_het) {
         fprintf(stderr, "Found %ld het candidates\n", total_het_candidates.load());
+    }
+    if (collect_species) {
+        fprintf(stderr, "Found %zu species candidates\n", all_species_candidates.size());
     }
     
     if (branchcounts.size() >= (size_t)num){
@@ -1421,6 +2018,137 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  Selected %zu het sites from %zu bins in %ld seconds\n", 
             selected_het_indices.size(), bins_selected.size(), duration.count());
         fprintf(stderr, "  (Het output will be written after DEMUX_SCORE computation)\n");
+    }
+
+    // ========================================================================
+    // ATAC-HET SITE SELECTION (if --atac_het_output set)
+    // Uses same het candidate pool but scored with ATAC coverage, no annot boost
+    // ========================================================================
+    
+    vector<size_t> selected_atac_het_indices;
+    set<pair<string, int64_t>> selected_atac_het_sites;
+    
+    if (!atac_het_outfile.empty() && !all_het_candidates.empty()) {
+        fprintf(stderr, "\n========================================\n");
+        fprintf(stderr, "Selecting ATAC-het sites...\n");
+        start_time = chrono::high_resolution_clock::now();
+        
+        // Create a score vector for ATAC-het ranking
+        // ATAC-het score = final_het_score * log2(atac_cov + 1) (no annot boost)
+        vector<pair<float, size_t>> atac_het_scored; // (score, index)
+        atac_het_scored.reserve(all_het_candidates.size());
+        
+        for (size_t i = 0; i < all_het_candidates.size(); i++) {
+            const HetCandidate& hc = all_het_candidates[i];
+            if (hc.atac_cov_score < min_cov) continue;
+            
+            float final_hs = hc.het_freq;
+            if (enable_pool_scoring) {
+                final_hs = hc.het_freq + hc.pool_discrim_norm;
+            }
+            float atac_sel = final_hs * log2f(hc.atac_cov_score + 1.0f);
+            atac_het_scored.push_back(make_pair(atac_sel, i));
+        }
+        
+        // Sort descending by score
+        sort(atac_het_scored.begin(), atac_het_scored.end(),
+            [](const pair<float, size_t>& a, const pair<float, size_t>& b) {
+                return a.first > b.first;
+            });
+        
+        // Greedy selection with bin tracking
+        map<pair<string, int>, int> atac_het_bins;
+        selected_atac_het_indices.reserve(atac_het_num);
+        
+        for (auto& scored : atac_het_scored) {
+            if ((int)selected_atac_het_indices.size() >= atac_het_num) break;
+            size_t idx = scored.second;
+            const HetCandidate& hc = all_het_candidates[idx];
+            
+            selected_atac_het_indices.push_back(idx);
+            selected_atac_het_sites.insert(make_pair(hc.chrom, hc.pos));
+            atac_het_bins[make_pair(hc.chrom, hc.bin_idx)]++;
+        }
+        
+        end_time = chrono::high_resolution_clock::now();
+        duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+        fprintf(stderr, "  Selected %zu ATAC-het sites from %zu bins in %ld seconds\n",
+            selected_atac_het_indices.size(), atac_het_bins.size(), duration.count());
+    }
+
+    // ========================================================================
+    // SPECIES SITE SELECTION (pair-bucketed best-fit, per design doc section 5.2)
+    // ========================================================================
+    
+    vector<size_t> selected_species_indices;
+    set<pair<string, int64_t>> selected_species_sites;
+    
+    if (collect_species && !all_species_candidates.empty()) {
+        fprintf(stderr, "\n========================================\n");
+        fprintf(stderr, "Selecting species sites with pair-bucketed best-fit...\n");
+        start_time = chrono::high_resolution_clock::now();
+        
+        int n_sp_pairs = panel_metadata.n_pairs;
+        long pair_target = (long)ceil((double)species_num / n_sp_pairs);
+        
+        fprintf(stderr, "  %zu candidates, %d pairs, target %ld per pair, %d total\n",
+            all_species_candidates.size(), n_sp_pairs, pair_target, species_num);
+        
+        // Sort candidates by selection_score (max pair_discrim * log2(cov+1)) descending
+        fprintf(stderr, "  Sorting %zu species candidates by score...\n", all_species_candidates.size());
+        sort(all_species_candidates.begin(), all_species_candidates.end());
+        
+        // Pair counts
+        vector<long> pair_counts(n_sp_pairs, 0);
+        map<pair<string, int>, int> sp_bins_selected;
+        
+        selected_species_indices.reserve(species_num);
+        
+        for (size_t i = 0; i < all_species_candidates.size() && (int)selected_species_indices.size() < species_num; i++) {
+            SpeciesCandidate& sc = all_species_candidates[i];
+            
+            // Find available pairs: above threshold AND with budget remaining
+            int best_pair = -1;
+            float best_val = -1.0f;
+            
+            for (int pi = 0; pi < n_sp_pairs; pi++) {
+                if (sc.pair_discrim[pi] >= min_pair_score && pair_counts[pi] < pair_target) {
+                    if (sc.pair_discrim[pi] > best_val) {
+                        best_val = sc.pair_discrim[pi];
+                        best_pair = pi;
+                    }
+                }
+            }
+            
+            if (best_pair < 0) continue; // no needy pair above threshold
+            
+            sc.assigned_pair = best_pair;
+            selected_species_indices.push_back(i);
+            pair_counts[best_pair]++;
+            selected_species_sites.insert(make_pair(sc.chrom, sc.pos));
+            
+            pair<string, int> bin_key = make_pair(sc.chrom, sc.bin_idx);
+            sp_bins_selected[bin_key]++;
+            
+            if ((selected_species_indices.size() % 100000) == 0) {
+                fprintf(stderr, "    Selected %zu species sites...\r", selected_species_indices.size());
+                fflush(stderr);
+            }
+        }
+        
+        end_time = chrono::high_resolution_clock::now();
+        duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+        fprintf(stderr, "  Selected %zu species sites from %zu bins in %ld seconds\n",
+            selected_species_indices.size(), sp_bins_selected.size(), duration.count());
+        
+        // Print per-pair summary
+        fprintf(stderr, "  Per-pair counts:\n");
+        for (int pi = 0; pi < n_sp_pairs; pi++) {
+            fprintf(stderr, "    %s-%s: %ld / %ld\n",
+                panel_metadata.species_pairs[pi].first.c_str(),
+                panel_metadata.species_pairs[pi].second.c_str(),
+                pair_counts[pi], pair_target);
+        }
     }
 
     // ========================================================================
@@ -1854,7 +2582,7 @@ int main(int argc, char *argv[]) {
     
     long total_shortfall = 0;
     long clades_with_shortfall = 0;
-    vector<pair<bitset<NBITS>, long>> clades_needing_more;  // (clade, extra_capacity)
+    vector<pair<bitset<NBITS>, long>> clades_with_surplus;  // (clade, extra_capacity)
     
     for (auto& kv : clade_to_variants) {
         const bitset<NBITS>& clade = kv.first;
@@ -1879,7 +2607,7 @@ int main(int argc, char *argv[]) {
             clades_with_shortfall++;
         } else if (available > slots) {
             // This clade has extra capacity for redistribution
-            clades_needing_more.push_back(make_pair(clade, available - slots));
+            clades_with_surplus.push_back(make_pair(clade, available - slots));
         }
     }
     
@@ -1888,19 +2616,19 @@ int main(int argc, char *argv[]) {
     fflush(stderr);
     
     // Step 3: Redistribute shortfall proportionally to clades with extra capacity
-    if (total_shortfall > 0 && !clades_needing_more.empty()) {
+    if (total_shortfall > 0 && !clades_with_surplus.empty()) {
         fprintf(stderr, "  Redistributing %ld shortfall slots...\n", total_shortfall);
         fflush(stderr);
         
         // Calculate total extra capacity
         long total_extra_capacity = 0;
-        for (auto& cn : clades_needing_more) {
+        for (auto& cn : clades_with_surplus) {
             total_extra_capacity += cn.second;
         }
         
         // Redistribute proportionally
         long redistributed = 0;
-        for (auto& cn : clades_needing_more) {
+        for (auto& cn : clades_with_surplus) {
             const bitset<NBITS>& clade = cn.first;
             long extra_capacity = cn.second;
             
@@ -1930,6 +2658,81 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "  Target: %d, Selected: %zu, Shortfall redistributed: %ld\n", 
         num, selected_variant_indices.size(), total_shortfall);
     fflush(stderr);
+
+    // ========================================================================
+    // ATAC-DEMUX STRATIFIED SELECTION (if --atac_output set)
+    // Same clade allocation, ranked by ATAC coverage (no annotation boost)
+    // ========================================================================
+    
+    set<size_t> selected_atac_demux_indices;
+    
+    if (!atac_outfile.empty() && !atac_coverage_map.empty()) {
+        fprintf(stderr, "\n========================================\n");
+        fprintf(stderr, "ATAC-Demux Stratified Selection...\n");
+        start_time = chrono::high_resolution_clock::now();
+        
+        // Reuse clade_slot_allocation from RNA-demux. Re-rank variants by ATAC coverage.
+        // Recompute atac_num slots if needed (use same Brent exponent as RNA)
+        unordered_map<bitset<NBITS>, long> atac_clade_slots;
+        
+        // Scale slot allocation proportionally to atac_num vs num
+        double atac_scale = (double)atac_num / (double)num;
+        for (auto& kv : clade_slot_allocation) {
+            long slots = (long)round(kv.second * atac_scale);
+            if (slots < 1) slots = 1;
+            atac_clade_slots[kv.first] = slots;
+        }
+        
+        // Group variants by clade with ATAC coverage scoring
+        unordered_map<bitset<NBITS>, vector<CladeCandidate>> atac_clade_variants;
+        long atac_grouped = 0;
+        
+        for (size_t vi = 0; vi < all_variants.size(); vi++) {
+            const StoredVariant& sv = all_variants[vi];
+            if (!sv.is_biallelic || !sv.passes_qc) continue;
+            if (sv.present.count() != (size_t)num_samples) continue;
+            
+            string chrom = chroms[sv.chrom_idx];
+            float atac_cov = get_coverage_score_fast(chrom, sv.pos, atac_coverage_map);
+            if (atac_cov < min_cov) continue;
+            
+            int ac = sv.alt.count();
+            int afc = sv.alt_flip.count();
+            bitset<NBITS> clade_key;
+            if (ac < afc || (ac == afc && sv.alt < sv.alt_flip)) {
+                clade_key = sv.alt;
+            } else {
+                clade_key = sv.alt_flip;
+            }
+            
+            if (atac_clade_slots.count(clade_key) > 0) {
+                CladeCandidate cc;
+                cc.variant_idx = vi;
+                cc.selection_score = log2f(atac_cov + 1.0f); // no annot boost for ATAC
+                atac_clade_variants[clade_key].push_back(cc);
+                atac_grouped++;
+            }
+        }
+        
+        fprintf(stderr, "  Grouped %ld variants into %zu clades for ATAC-demux\n",
+            atac_grouped, atac_clade_variants.size());
+        
+        // Select within each clade
+        for (auto& kv : atac_clade_variants) {
+            vector<CladeCandidate>& candidates = kv.second;
+            long slots = atac_clade_slots[kv.first];
+            sort(candidates.begin(), candidates.end());
+            long to_select = min(slots, (long)candidates.size());
+            for (long i = 0; i < to_select; i++) {
+                selected_atac_demux_indices.insert(candidates[i].variant_idx);
+            }
+        }
+        
+        end_time = chrono::high_resolution_clock::now();
+        duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+        fprintf(stderr, "  ATAC-demux: selected %zu variants in %ld seconds\n",
+            selected_atac_demux_indices.size(), duration.count());
+    }
 
     // ========================================================================
     // COMPUTE DEMUX_SCORE FOR HET CANDIDATES AND WRITE HET OUTPUT
@@ -2012,12 +2815,15 @@ int main(int argc, char *argv[]) {
         
         // Add INFO headers - ALL fields
         bcf_hdr_append(het_header, "##INFO=<ID=DEMUX_SCORE,Number=1,Type=Float,Description=\"Clade rarity score\">");
-        bcf_hdr_append(het_header, "##INFO=<ID=HET_SCORE,Number=1,Type=Float,Description=\"Combined het site quality score\">");
+        bcf_hdr_append(het_header, "##INFO=<ID=HET_SCORE,Number=1,Type=Float,Description=\"het_freq * (1 - missing_freq * 0.5)\">");
         bcf_hdr_append(het_header, "##INFO=<ID=HET_FREQ,Number=1,Type=Float,Description=\"Fraction of called individuals that are het\">");
         bcf_hdr_append(het_header, "##INFO=<ID=MISSING_FREQ,Number=1,Type=Float,Description=\"Fraction of individuals with missing genotype\">");
         bcf_hdr_append(het_header, "##INFO=<ID=ANNOT_SCORE,Number=1,Type=Float,Description=\"Annotation weight (1.0=genic, 0.1=intergenic)\">");
-        bcf_hdr_append(het_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"Normalized coverage score\">");
+        bcf_hdr_append(het_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"RNA coverage score\">");
         bcf_hdr_append(het_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index for evenness tracking\">");
+        if (enable_pool_scoring) {
+            bcf_hdr_append(het_header, "##INFO=<ID=HET_SEL_SCORE,Number=1,Type=Float,Description=\"Selection ranking score: final_het_score * (log2(cov+1) + 0.1*annot_boost)\">");
+        }
         if (bcf_hdr_sync(het_header) < 0) {
             fprintf(stderr, "ERROR: Failed to sync het header\n");
             exit(1);
@@ -2061,14 +2867,15 @@ int main(int argc, char *argv[]) {
             
             // Set INFO fields - ALL scores
             float demux_score = hc->demux_score;
-            float het_score = hc->het_score;
+            // HET_SCORE uses the INFO formula: het_freq * (1 - missing_freq * 0.5)
+            float het_score_info = hc->het_freq * (1.0f - hc->missing_freq * 0.5f);
             float het_freq = hc->het_freq;
             float missing_freq = hc->missing_freq;
             float annot = hc->annot_score;
             float cov = hc->cov_score;
             
             bcf_update_info_float(het_header, het_rec, "DEMUX_SCORE", &demux_score, 1);
-            bcf_update_info_float(het_header, het_rec, "HET_SCORE", &het_score, 1);
+            bcf_update_info_float(het_header, het_rec, "HET_SCORE", &het_score_info, 1);
             bcf_update_info_float(het_header, het_rec, "HET_FREQ", &het_freq, 1);
             bcf_update_info_float(het_header, het_rec, "MISSING_FREQ", &missing_freq, 1);
             bcf_update_info_float(het_header, het_rec, "ANNOT_SCORE", &annot, 1);
@@ -2076,6 +2883,11 @@ int main(int argc, char *argv[]) {
             
             string bin_id = make_bin_id(hc->chrom, hc->bin_idx);
             bcf_update_info_string(het_header, het_rec, "BIN_ID", bin_id.c_str());
+            
+            if (enable_pool_scoring) {
+                float sel_score = hc->het_sel_score;
+                bcf_update_info_float(het_header, het_rec, "HET_SEL_SCORE", &sel_score, 1);
+            }
             
             if (bcf_write(het_out, het_header, het_rec) < 0) {
                 fprintf(stderr, "ERROR: Failed to write het record\n");
@@ -2104,6 +2916,224 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Het output complete: %zu sites in %ld seconds\n", 
             selected_het_sites.size(), duration.count());
         fprintf(stderr, "Het output: %s\n", het_outfile.c_str());
+    }
+
+    // ========================================================================
+    // WRITE ATAC-HET OUTPUT (if --atac_het_output set)
+    // ========================================================================
+    
+    if (!atac_het_outfile.empty() && !selected_atac_het_indices.empty()) {
+        fprintf(stderr, "\n========================================\n");
+        fprintf(stderr, "Writing ATAC-het output to %s...\n", atac_het_outfile.c_str());
+        start_time = chrono::high_resolution_clock::now();
+        
+        htsFile* ahdr_reader = hts_open(vcf_file.c_str(), "r");
+        bcf_hdr_t* atac_het_header = bcf_hdr_read(ahdr_reader);
+        hts_close(ahdr_reader);
+        
+        bcf_hdr_append(atac_het_header, "##INFO=<ID=HET_SCORE,Number=1,Type=Float,Description=\"het_freq * (1 - missing_freq * 0.5)\">");
+        bcf_hdr_append(atac_het_header, "##INFO=<ID=HET_FREQ,Number=1,Type=Float,Description=\"Fraction of called individuals that are het\">");
+        bcf_hdr_append(atac_het_header, "##INFO=<ID=MISSING_FREQ,Number=1,Type=Float,Description=\"Fraction of individuals with missing genotype\">");
+        bcf_hdr_append(atac_het_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"ATAC coverage score\">");
+        bcf_hdr_append(atac_het_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index\">");
+        if (bcf_hdr_sync(atac_het_header) < 0) {
+            fprintf(stderr, "ERROR: Failed to sync ATAC-het header\n");
+            exit(1);
+        }
+        
+        htsFile* atac_het_out = hts_open(atac_het_outfile.c_str(), "wb");
+        hts_set_threads(atac_het_out, n_threads);
+        if (bcf_hdr_write(atac_het_out, atac_het_header) < 0) {
+            fprintf(stderr, "ERROR: Failed to write ATAC-het header\n");
+            exit(1);
+        }
+        
+        // Sort selected ATAC-het candidates by position
+        vector<HetCandidate*> atac_het_sorted;
+        for (size_t idx : selected_atac_het_indices) {
+            atac_het_sorted.push_back(&all_het_candidates[idx]);
+        }
+        sort(atac_het_sorted.begin(), atac_het_sorted.end(),
+            [](const HetCandidate* a, const HetCandidate* b) {
+                if (a->chrom_idx != b->chrom_idx) return a->chrom_idx < b->chrom_idx;
+                return a->pos < b->pos;
+            });
+        
+        bcf1_t* ah_rec = bcf_init();
+        for (const HetCandidate* hc : atac_het_sorted) {
+            bcf_clear(ah_rec);
+            ah_rec->rid = bcf_hdr_name2id(atac_het_header, hc->chrom.c_str());
+            ah_rec->pos = hc->pos;
+            ah_rec->qual = 0;
+            
+            string alleles_str = hc->ref_allele + "," + hc->alt_allele;
+            bcf_update_alleles_str(atac_het_header, ah_rec, alleles_str.c_str());
+            bcf_update_genotypes(atac_het_header, ah_rec, hc->genotypes.data(), hc->genotypes.size());
+            
+            float hs_info = hc->het_freq * (1.0f - hc->missing_freq * 0.5f);
+            float hf = hc->het_freq;
+            float mf = hc->missing_freq;
+            float ac = hc->atac_cov_score;
+            bcf_update_info_float(atac_het_header, ah_rec, "HET_SCORE", &hs_info, 1);
+            bcf_update_info_float(atac_het_header, ah_rec, "HET_FREQ", &hf, 1);
+            bcf_update_info_float(atac_het_header, ah_rec, "MISSING_FREQ", &mf, 1);
+            bcf_update_info_float(atac_het_header, ah_rec, "COV_SCORE", &ac, 1);
+            
+            string bin_id = make_bin_id(hc->chrom, hc->bin_idx);
+            bcf_update_info_string(atac_het_header, ah_rec, "BIN_ID", bin_id.c_str());
+            
+            if (bcf_write(atac_het_out, atac_het_header, ah_rec) < 0) {
+                fprintf(stderr, "ERROR: Failed to write ATAC-het record\n");
+                exit(1);
+            }
+        }
+        
+        bcf_destroy(ah_rec);
+        hts_close(atac_het_out);
+        bcf_hdr_destroy(atac_het_header);
+        
+        fprintf(stderr, "  Indexing ATAC-het output BCF...\n");
+        bcf_index_build(atac_het_outfile.c_str(), 14);
+        
+        end_time = chrono::high_resolution_clock::now();
+        duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+        fprintf(stderr, "ATAC-het output complete: %zu sites in %ld seconds\n",
+            selected_atac_het_sites.size(), duration.count());
+    }
+
+    // ========================================================================
+    // WRITE SPECIES OUTPUT
+    // ========================================================================
+    
+    if (collect_species && !selected_species_indices.empty()) {
+        fprintf(stderr, "\n========================================\n");
+        fprintf(stderr, "Writing species output to %s...\n", species_outfile.c_str());
+        start_time = chrono::high_resolution_clock::now();
+        
+        // Create output header
+        htsFile* sp_hdr_reader = hts_open(vcf_file.c_str(), "r");
+        bcf_hdr_t* sp_header = bcf_hdr_read(sp_hdr_reader);
+        hts_close(sp_hdr_reader);
+        
+        // Add INFO headers
+        bcf_hdr_append(sp_header, "##INFO=<ID=HET_FREQ,Number=1,Type=Float,Description=\"Fraction of called individuals that are het\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=MISSING_FREQ,Number=1,Type=Float,Description=\"Fraction of individuals with missing genotype\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"Coverage score used for selection\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=PAIR_ASSIGNED,Number=1,Type=String,Description=\"Species pair this site was assigned to during selection\">");
+        
+        // Add per-pair PAIR_DISCRIM fields
+        for (int pi = 0; pi < panel_metadata.n_pairs; pi++) {
+            string field_name = "PAIR_DISCRIM_" + panel_metadata.species_pairs[pi].first + 
+                                "_" + panel_metadata.species_pairs[pi].second;
+            string hdr_line = "##INFO=<ID=" + field_name + 
+                ",Number=1,Type=Float,Description=\"Pair discrimination score for species pair (" +
+                panel_metadata.species_pairs[pi].first + "," + 
+                panel_metadata.species_pairs[pi].second + ")\">";
+            bcf_hdr_append(sp_header, hdr_line.c_str());
+        }
+        
+        if (bcf_hdr_sync(sp_header) < 0) {
+            fprintf(stderr, "ERROR: Failed to sync species header\n");
+            exit(1);
+        }
+        
+        // Open output
+        htsFile* sp_out = hts_open(species_outfile.c_str(), "wb");
+        hts_set_threads(sp_out, n_threads);
+        if (bcf_hdr_write(sp_out, sp_header) < 0) {
+            fprintf(stderr, "ERROR: Failed to write species header\n");
+            exit(1);
+        }
+        
+        // Sort by position
+        vector<SpeciesCandidate*> sp_sorted;
+        for (size_t idx : selected_species_indices) {
+            sp_sorted.push_back(&all_species_candidates[idx]);
+        }
+        sort(sp_sorted.begin(), sp_sorted.end(),
+            [](const SpeciesCandidate* a, const SpeciesCandidate* b) {
+                if (a->chrom_idx != b->chrom_idx) return a->chrom_idx < b->chrom_idx;
+                return a->pos < b->pos;
+            });
+        
+        // Write records
+        bcf1_t* sp_rec = bcf_init();
+        for (const SpeciesCandidate* sc : sp_sorted) {
+            bcf_clear(sp_rec);
+            
+            sp_rec->rid = bcf_hdr_name2id(sp_header, sc->chrom.c_str());
+            sp_rec->pos = sc->pos;
+            sp_rec->qual = 0;
+            
+            string alleles_str = sc->ref_allele + "," + sc->alt_allele;
+            bcf_update_alleles_str(sp_header, sp_rec, alleles_str.c_str());
+            bcf_update_genotypes(sp_header, sp_rec, sc->genotypes.data(), sc->genotypes.size());
+            
+            // Compute het_freq and missing_freq for the record
+            int ploidy = 2;
+            int n_het = 0, n_called = 0, n_missing = 0;
+            for (int s = 0; s < sc->n_samples; s++) {
+                const int32_t* gt = sc->genotypes.data() + s * ploidy;
+                if (bcf_gt_is_missing(gt[0]) || bcf_gt_is_missing(gt[1])) {
+                    n_missing++;
+                } else {
+                    n_called++;
+                    if (bcf_gt_allele(gt[0]) != bcf_gt_allele(gt[1])) n_het++;
+                }
+            }
+            float hf = (n_called > 0) ? (float)n_het / n_called : 0.0f;
+            float mf = (float)n_missing / sc->n_samples;
+            float cv = sc->cov_score;
+            
+            bcf_update_info_float(sp_header, sp_rec, "HET_FREQ", &hf, 1);
+            bcf_update_info_float(sp_header, sp_rec, "MISSING_FREQ", &mf, 1);
+            bcf_update_info_float(sp_header, sp_rec, "COV_SCORE", &cv, 1);
+            
+            string bin_id = make_bin_id(sc->chrom, sc->bin_idx);
+            bcf_update_info_string(sp_header, sp_rec, "BIN_ID", bin_id.c_str());
+            
+            // PAIR_ASSIGNED
+            if (sc->assigned_pair >= 0) {
+                string pair_str = panel_metadata.species_pairs[sc->assigned_pair].first + 
+                                  "-" + panel_metadata.species_pairs[sc->assigned_pair].second;
+                bcf_update_info_string(sp_header, sp_rec, "PAIR_ASSIGNED", pair_str.c_str());
+            }
+            
+            // Per-pair PAIR_DISCRIM fields
+            for (int pi = 0; pi < panel_metadata.n_pairs; pi++) {
+                string field_name = "PAIR_DISCRIM_" + panel_metadata.species_pairs[pi].first +
+                                    "_" + panel_metadata.species_pairs[pi].second;
+                float pd = sc->pair_discrim[pi];
+                bcf_update_info_float(sp_header, sp_rec, field_name.c_str(), &pd, 1);
+            }
+            
+            if (bcf_write(sp_out, sp_header, sp_rec) < 0) {
+                fprintf(stderr, "ERROR: Failed to write species record\n");
+                exit(1);
+            }
+        }
+        
+        bcf_destroy(sp_rec);
+        hts_close(sp_out);
+        bcf_hdr_destroy(sp_header);
+        
+        // Index species output
+        fprintf(stderr, "  Indexing species output BCF...\n");
+        if (bcf_index_build(species_outfile.c_str(), 14) < 0) {
+            fprintf(stderr, "WARNING: Failed to create index for %s\n", species_outfile.c_str());
+        }
+        
+        // Free species candidates
+        all_species_candidates.clear();
+        all_species_candidates.shrink_to_fit();
+        selected_species_indices.clear();
+        
+        end_time = chrono::high_resolution_clock::now();
+        duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+        fprintf(stderr, "Species output complete: %zu sites in %ld seconds\n",
+            selected_species_sites.size(), duration.count());
+        fprintf(stderr, "Species output: %s\n", species_outfile.c_str());
     }
 
     // ========================================================================
@@ -2486,6 +3516,80 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Annotate_all output: %ld variants written to %s\n", annot_final_count, annotate_all_file.c_str());
     }
     
+    // ========================================================================
+    // ATAC-DEMUX OUTPUT (if --atac_output set)
+    // Write selected ATAC-demux variants directly from in-memory data
+    // ========================================================================
+    
+    if (!atac_outfile.empty() && !selected_atac_demux_indices.empty()) {
+        fprintf(stderr, "\nWriting ATAC-demux output...\n");
+        
+        htsFile* atac_hdr_reader = hts_open(vcf_file.c_str(), "r");
+        bcf_hdr_t* atac_out_header = bcf_hdr_read(atac_hdr_reader);
+        hts_close(atac_hdr_reader);
+        
+        bcf_hdr_append(atac_out_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"ATAC coverage score\">");
+        bcf_hdr_append(atac_out_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index\">");
+        if (bcf_hdr_sync(atac_out_header) < 0) {
+            fprintf(stderr, "ERROR: Failed to sync ATAC-demux header\n");
+            exit(1);
+        }
+        
+        htsFile* atac_outf = hts_open(atac_outfile.c_str(), "wb");
+        hts_set_threads(atac_outf, n_threads);
+        if (bcf_hdr_write(atac_outf, atac_out_header) < 0) {
+            fprintf(stderr, "ERROR: Failed to write ATAC-demux header\n");
+            exit(1);
+        }
+        
+        bcf1_t* atac_rec = bcf_init();
+        long atac_count = 0;
+        
+        // Iterate in chromosome order
+        for (size_t c = 0; c < chroms.size(); c++) {
+            size_t range_start = chrom_ranges[c].first;
+            size_t range_end = chrom_ranges[c].second;
+            
+            for (size_t vi = range_start; vi < range_end; vi++) {
+                if (selected_atac_demux_indices.count(vi) == 0) continue;
+                const StoredVariant& sv = all_variants[vi];
+                
+                bcf_clear(atac_rec);
+                atac_rec->rid = sv.chrom_idx;
+                atac_rec->pos = sv.pos;
+                atac_rec->qual = 0;
+                
+                if (!sv.alleles.empty()) {
+                    bcf_update_alleles_str(atac_out_header, atac_rec, sv.alleles.c_str());
+                }
+                if (!sv.genotypes.empty()) {
+                    bcf_update_genotypes(atac_out_header, atac_rec, sv.genotypes.data(), sv.genotypes.size());
+                }
+                
+                float atac_cov = get_coverage_score_fast(chroms[c], sv.pos, atac_coverage_map);
+                bcf_update_info_float(atac_out_header, atac_rec, "COV_SCORE", &atac_cov, 1);
+                
+                int bin_idx = get_bin_idx(sv.pos, bin_size);
+                string bid = make_bin_id(chroms[c], bin_idx);
+                bcf_update_info_string(atac_out_header, atac_rec, "BIN_ID", bid.c_str());
+                
+                if (bcf_write(atac_outf, atac_out_header, atac_rec) < 0) {
+                    fprintf(stderr, "ERROR: Failed to write ATAC-demux record\n");
+                    exit(1);
+                }
+                atac_count++;
+            }
+        }
+        
+        bcf_destroy(atac_rec);
+        hts_close(atac_outf);
+        bcf_hdr_destroy(atac_out_header);
+        
+        fprintf(stderr, "Indexing ATAC-demux output BCF...\n");
+        bcf_index_build(atac_outfile.c_str(), 14);
+        fprintf(stderr, "ATAC-demux output: %ld SNPs written to %s\n", atac_count, atac_outfile.c_str());
+    }
+    
     bcf_hdr_destroy(out_header);
     
     end_time = chrono::high_resolution_clock::now();
@@ -2500,6 +3604,15 @@ int main(int argc, char *argv[]) {
     }
     if (!het_outfile.empty()) {
         fprintf(stderr, "Het output: %s (%zu sites)\n", het_outfile.c_str(), selected_het_sites.size());
+    }
+    if (!species_outfile.empty()) {
+        fprintf(stderr, "Species output: %s (%zu sites)\n", species_outfile.c_str(), selected_species_sites.size());
+    }
+    if (!atac_outfile.empty()) {
+        fprintf(stderr, "ATAC-demux output: %s (%zu sites)\n", atac_outfile.c_str(), selected_atac_demux_indices.size());
+    }
+    if (!atac_het_outfile.empty()) {
+        fprintf(stderr, "ATAC-het output: %s (%zu sites)\n", atac_het_outfile.c_str(), selected_atac_het_sites.size());
     }
 
     return 0;
