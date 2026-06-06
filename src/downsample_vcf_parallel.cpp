@@ -2,6 +2,7 @@
 #include <argp.h>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <vector>
 #include <iterator>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include <map>
 #include <unordered_map>
 #include <set>
+#include <unordered_set>
 #include <bitset>
 #include <cstdlib>
 #include <random>
@@ -36,7 +38,7 @@
 #include <htswrapper/robin_hood/robin_hood.h>
 #include <iomanip>
 #include "common.h"
-#include "downsample_vcf.h"
+#include "downsample_vcf_parallel.h"
 #include <chrono>
 #include <omp.h>
 #include <mutex>
@@ -45,6 +47,149 @@
 using std::cout;
 using std::endl;
 using namespace std;
+
+// ============================================================================
+// PACKED GENOTYPE ACCESS
+// ============================================================================
+// Each sample has 2 alleles; each allele takes 2 bits.
+// Byte b in the packed vector holds 4 allele values: positions 0..3 within byte
+// b correspond to global allele index 4b..4b+3.
+//
+// For sample s, ploidy 2:
+//   allele 0 = global index 2s
+//   allele 1 = global index 2s + 1
+//   byte index = (2s + a) / 4
+//   bit shift  = ((2s + a) % 4) * 2
+//   value      = (packed[byte] >> shift) & 0x3
+//
+// Encoding per allele slot (2 bits):
+//   00 = ref (allele index 0)
+//   01 = alt (allele index 1)
+//   10 = missing (bcf_gt_is_missing was true)
+//   11 = reserved (unused)
+
+inline uint8_t gt_packed_get(const vector<uint8_t>& packed, int sample, int allele) {
+    int gi = 2 * sample + allele;
+    return (packed[gi / 4] >> ((gi % 4) * 2)) & 0x3;
+}
+inline bool gt_packed_is_missing(const vector<uint8_t>& packed, int sample, int allele) {
+    return gt_packed_get(packed, sample, allele) == 0x2;
+}
+inline int gt_packed_allele(const vector<uint8_t>& packed, int sample, int allele) {
+    // Returns 0 (ref), 1 (alt), or -1 (missing). For biallelic only.
+    uint8_t v = gt_packed_get(packed, sample, allele);
+    if (v == 0x2) return -1;
+    return (int)v;
+}
+inline void gt_packed_set(vector<uint8_t>& packed, int sample, int allele, uint8_t val) {
+    int gi = 2 * sample + allele;
+    int byte_idx = gi / 4;
+    int shift = (gi % 4) * 2;
+    packed[byte_idx] = (packed[byte_idx] & ~(0x3 << shift)) | ((val & 0x3) << shift);
+}
+
+// Pack htslib int32_t genotypes into 2-bit-per-allele form.
+// For multi-allelic sites (alt index > 1), stores 0x1 (alt) for any non-ref
+// non-missing allele. This is acceptable because multi-allelic sites are
+// filtered before genotypes are consumed for selection.
+inline void pack_genotypes(const int32_t* raw_gts, int n_samples, vector<uint8_t>& out) {
+    int n_alleles_total = n_samples * 2;
+    int n_bytes = (n_alleles_total + 3) / 4;
+    out.assign(n_bytes, 0);
+    for (int s = 0; s < n_samples; s++) {
+        for (int a = 0; a < 2; a++) {
+            int32_t gt_raw = raw_gts[s * 2 + a];
+            uint8_t val;
+            if (bcf_gt_is_missing(gt_raw)) {
+                val = 0x2; // missing
+            } else {
+                int allele_idx = bcf_gt_allele(gt_raw);
+                if (allele_idx == 0) {
+                    val = 0x0; // ref
+                } else {
+                    val = 0x1; // alt (any non-ref)
+                }
+            }
+            gt_packed_set(out, s, a, val);
+        }
+    }
+}
+
+// Unpack 2-bit genotypes back to htslib int32_t format for BCF output.
+// Produces phased-looking output matching bcf_gt_phased/bcf_gt_unphased conventions.
+inline void unpack_genotypes(const vector<uint8_t>& packed, int n_samples, vector<int32_t>& out) {
+    out.resize(n_samples * 2);
+    for (int s = 0; s < n_samples; s++) {
+        for (int a = 0; a < 2; a++) {
+            uint8_t v = gt_packed_get(packed, s, a);
+            if (v == 0x2) {
+                out[s * 2 + a] = bcf_gt_missing;
+            } else {
+                out[s * 2 + a] = bcf_gt_unphased((int)v);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HET STATS HELPER (C1)
+// ============================================================================
+struct HetStats {
+    int n_het;
+    int n_called;
+    int n_missing;
+    float het_freq;
+    float missing_freq;
+};
+
+HetStats compute_het_stats_packed(const vector<uint8_t>& packed, int n_samples) {
+    HetStats hs = {0, 0, 0, 0.0f, 0.0f};
+    for (int i = 0; i < n_samples; ++i) {
+        int a1 = gt_packed_allele(packed, i, 0);
+        int a2 = gt_packed_allele(packed, i, 1);
+        if (a1 < 0 || a2 < 0) {
+            hs.n_missing++;
+        } else {
+            hs.n_called++;
+            if ((a1 == 0 && a2 != 0) || (a1 != 0 && a2 == 0)) hs.n_het++;
+        }
+    }
+    hs.het_freq = (hs.n_called > 0) ? (float)hs.n_het / hs.n_called : 0.0f;
+    hs.missing_freq = (float)hs.n_missing / n_samples;
+    return hs;
+}
+
+// ============================================================================
+// DOSAGE FLIP HELPER (A3)
+// ============================================================================
+// Flips REF/ALT polarity under dosage-aware encoding.
+// 0/0 (0,0) -> 1/1 (1,1)
+// 0/1 (1,0) -> 0/1 (1,0)  [het unchanged]
+// 1/1 (1,1) -> 0/0 (0,0)
+// Missing stays (0,0) since it's guarded by present[i].
+void dosage_flip(const bitset<NBITS>& src, const bitset<NBITS>& present,
+                 int num_samples, bitset<NBITS>& dst) {
+    dst.reset();
+    for (int i = 0; i < num_samples; i++) {
+        if (!present[i]) continue;
+        bool alt_present = src[2*i];
+        bool homo_alt   = src[2*i + 1];
+        bool new_alt_present = !homo_alt;
+        bool new_homo_alt   = !alt_present;
+        if (new_alt_present) dst.set(2*i);
+        if (new_homo_alt)    dst.set(2*i + 1);
+    }
+}
+
+// Compute total_alt from a dosage-aware bitset (sum of bit-pair values)
+inline int compute_total_alt(const bitset<NBITS>& bs, int num_samples) {
+    int total = 0;
+    for (int i = 0; i < num_samples; i++) {
+        if (bs[2*i])     total++;
+        if (bs[2*i + 1]) total++;
+    }
+    return total;
+}
 
 // ============================================================================
 // BJPs ADDITIONS: GTF and Coverage support structures
@@ -78,6 +223,41 @@ void load_gtf(const string& gtf_file, map<string, vector<Interval>>& annotations
         sort(pair.second.begin(), pair.second.end());
     }
     fprintf(stderr, "Loaded annotations for %lu chromosomes.\n", annotations.size());
+}
+
+// B11: Load blacklist BED file (0-based half-open intervals)
+void load_bed(const string& bed_file, map<string, vector<Interval>>& blacklist) {
+    ifstream file(bed_file);
+    string line;
+    long count = 0;
+    while (getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        stringstream ss(line);
+        string seqname, start_s, end_s;
+        ss >> seqname >> start_s >> end_s;
+        try {
+            Interval iv = {stoi(start_s), stoi(end_s)};
+            blacklist[seqname].push_back(iv);
+            count++;
+        } catch (...) { continue; }
+    }
+    for (auto& pair : blacklist) {
+        sort(pair.second.begin(), pair.second.end());
+    }
+    fprintf(stderr, "Loaded %ld blacklist intervals for %lu chromosomes.\n", count, blacklist.size());
+}
+
+bool is_blacklisted(const string& chrom, int pos,
+                    const map<string, vector<Interval>>& bl) {
+    if (bl.count(chrom) == 0) return false;
+    const auto& ivs = bl.at(chrom);
+    auto it = lower_bound(ivs.begin(), ivs.end(), Interval{pos, pos});
+    if (it != ivs.end() && it->start <= pos && it->end > pos) return true;
+    if (it != ivs.begin()) {
+        auto prev = std::prev(it);
+        if (prev->start <= pos && prev->end > pos) return true;
+    }
+    return false;
 }
 
 float get_annot_score(const string& chrom, int pos, const map<string, vector<Interval>>& annotations) {
@@ -216,75 +396,7 @@ float get_coverage_score(const string& chrom, int pos, tbx_t* tbx, htsFile* fp) 
 // PANEL METADATA AND POOL COMBINATIONS STRUCTURES
 // ============================================================================
 
-// Individual -> species mapping (from --panel_metadata)
-struct PanelMetadata {
-    map<string, string> indiv_to_species;   // e.g. "H28126" -> "H"
-    vector<string> species_list;            // unique species labels, sorted
-    map<string, vector<int>> species_to_sample_indices; // species -> VCF sample indices
-    
-    // Species pair enumeration
-    vector<pair<string, string>> species_pairs;   // all (n choose 2) pairs
-    map<pair<string, string>, int> pair_to_index; // pair -> index into species_pairs
-    int n_pairs;
-};
-
-PanelMetadata load_panel_metadata(const string& filename, 
-                                   const vector<string>& vcf_samples) {
-    PanelMetadata pm;
-    ifstream f(filename);
-    if (!f.is_open()) {
-        fprintf(stderr, "ERROR: Could not open panel metadata: %s\n", filename.c_str());
-        exit(1);
-    }
-    
-    string line;
-    getline(f, line); // skip header
-    
-    set<string> species_set;
-    map<string, int> sample_name_to_idx;
-    for (int i = 0; i < (int)vcf_samples.size(); i++) {
-        sample_name_to_idx[vcf_samples[i]] = i;
-    }
-    
-    while (getline(f, line)) {
-        if (line.empty()) continue;
-        size_t tab = line.find('\t');
-        if (tab == string::npos) continue;
-        string indiv_id = line.substr(0, tab);
-        string species = line.substr(tab + 1);
-        // trim whitespace
-        while (!species.empty() && (species.back() == '\r' || species.back() == ' '))
-            species.pop_back();
-        
-        pm.indiv_to_species[indiv_id] = species;
-        species_set.insert(species);
-        
-        if (sample_name_to_idx.count(indiv_id) > 0) {
-            pm.species_to_sample_indices[species].push_back(sample_name_to_idx[indiv_id]);
-        }
-    }
-    
-    pm.species_list.assign(species_set.begin(), species_set.end());
-    sort(pm.species_list.begin(), pm.species_list.end());
-    
-    // Enumerate all (n choose 2) species pairs
-    for (size_t i = 0; i < pm.species_list.size(); i++) {
-        for (size_t j = i + 1; j < pm.species_list.size(); j++) {
-            pair<string, string> p = make_pair(pm.species_list[i], pm.species_list[j]);
-            pm.pair_to_index[p] = pm.species_pairs.size();
-            pm.species_pairs.push_back(p);
-        }
-    }
-    pm.n_pairs = pm.species_pairs.size();
-    
-    fprintf(stderr, "Panel metadata: %zu individuals, %zu species, %d pairs\n",
-        pm.indiv_to_species.size(), pm.species_list.size(), pm.n_pairs);
-    for (auto& sp : pm.species_list) {
-        fprintf(stderr, "  %s: %zu individuals\n", sp.c_str(), pm.species_to_sample_indices[sp].size());
-    }
-    
-    return pm;
-}
+// PanelMetadata struct and load_panel_metadata() are in common.h / common.cpp
 
 // Pool combinations: library -> list of cell identities
 struct PoolCombinations {
@@ -366,14 +478,26 @@ struct SpeciesCandidate {
     int chrom_idx;
     int bin_idx;
     float cov_score;             // coverage used for selection (RNA or ATAC)
-    vector<float> pair_discrim;  // one per species pair
-    float max_pair_discrim;      // max across all pairs
-    float selection_score;       // max_pair_discrim * log2(cov+1)
+    vector<float> pair_score;    // legacy multiplicative score per species pair (recorded only)
+    vector<float> pair_discrim;  // PRIMARY ranking score per pair
+    float max_pair_score;        // max across all pairs (legacy)
+    float max_pair_discrim;      // max pair_discrim across all pairs (primary ranking)
+    float selection_score;       // max_pair_score * min(log2(cov+1), cov_cap) (legacy, retained)
     int assigned_pair;           // index into species_pairs for best-fit assignment
     string ref_allele;
     string alt_allele;
-    vector<int32_t> genotypes;
+    size_t variant_idx;          // index into all_variants for deferred genotype fetch
     int n_samples;
+    
+    // Per-pair dosage separation (closed-form): |sp_mean_alt[A] - sp_mean_alt[B]| / 2
+    // Used as the multi-pair contribution weight in global utility scoring.
+    vector<float> pair_dosage_sep;
+    
+    // Per-species stats for output/audit
+    vector<float> sp_mean_alt;            // weighted mean alt dosage per species
+    vector<float> sp_major_dosage_frac;   // within-species consistency (weighted)
+    vector<float> sp_call_rate;           // call rate per species (weighted)
+    vector<int>   sp_n_called;            // unweighted count of called individuals per species
     
     // For sorting by selection_score descending
     bool operator<(const SpeciesCandidate& other) const {
@@ -401,7 +525,7 @@ struct HetCandidate {
     float het_sel_score;    // Selection ranking score (for HET_SEL_SCORE INFO field)
     string ref_allele;
     string alt_allele;
-    vector<int32_t> genotypes;  // Store genotypes for output
+    size_t variant_idx;     // index into all_variants for deferred genotype fetch
     int n_samples;
     
     // For sorting by het_score descending
@@ -418,15 +542,19 @@ struct StoredVariant {
     int chrom_idx;              // bcf_record->rid
     int64_t pos;                // bcf_record->pos
     int n_alleles;              // bcf_record->n_allele
+    float qual;                 // bcf_record->qual (preserved for output)
     string alleles;             // All alleles comma-separated: "A,T" or "A,T,C"
-    vector<int32_t> genotypes;  // Raw genotypes (num_samples * 2)
+    vector<uint8_t> genotypes_packed;  // Packed 2-bit-per-allele genotypes
+    vector<int32_t> genotypes_raw;     // Raw genotypes for non-biallelic (annotate_all only)
     
     // Precomputed by proc_bcf_record logic (only valid for biallelic)
     bool is_biallelic;          // n_alleles == 2
     bool passes_qc;             // What proc_bcf_record would return
-    bitset<NBITS> alt;          // From proc_bcf_record
-    bitset<NBITS> alt_flip;     // From proc_bcf_record  
-    bitset<NBITS> present;      // From proc_bcf_record
+    bitset<NBITS> alt;          // Dosage-aware: bit 2i = alt_present, bit 2i+1 = homo_alt
+    bitset<NBITS> alt_flip;     // Dosage-flipped version of alt
+    bitset<NBITS> present;      // 1-bit-per-sample at position i
+    int16_t total_alt;          // Total alt allele count across called samples
+    int16_t total_alt_flip;     // Total alt allele count for flipped polarity
     
     // For stratified selection (Option C)
     size_t variant_idx;         // Index into all_variants for back-reference
@@ -455,36 +583,53 @@ void help(int code){
     fprintf(stderr, "    --vcf -v     A VCF/BCF file listing variants (must be indexed).\n");
     fprintf(stderr, "    --output -o  Output VCF file name. Will be gzipped.\n");
     fprintf(stderr, "    --num -n     Desired final number of SNPs (not required with --annotate_only).\n");
+    fprintf(stderr, "                 Recommend > 1M for good clade coverage.\n");
     fprintf(stderr, "===== OPTIONAL =====\n");
     fprintf(stderr, "    --threads -t Number of threads (default: all available).\n");
     fprintf(stderr, "    --gtf -g     GTF annotation file. Adds ANNOT_SCORE INFO field.\n");
     fprintf(stderr, "                 Required if --output or --het_output is set.\n");
     fprintf(stderr, "    --cov -c     Tabix-indexed bedgraph coverage file (RNA). Adds COV_SCORE INFO field.\n");
     fprintf(stderr, "    --min_cov -m Minimum coverage threshold (default: 1.0). Sites below this are excluded.\n");
-    fprintf(stderr, "    --seed -s    Random seed for reproducibility.\n");
+    fprintf(stderr, "    --seed -s    Random seed (currently unused; selection is deterministic).\n");
+    fprintf(stderr, "    --blacklist  BED file of regions to exclude (0-based half-open).\n");
     fprintf(stderr, "===== HET SITE SELECTION =====\n");
     fprintf(stderr, "    --het_output -H  Output file for het-enriched SNP set (optional).\n");
     fprintf(stderr, "    --het_num -N     Target number of het sites (default: half of --num).\n");
     fprintf(stderr, "    --bin_size -b    Bin size (bp) for evenness scoring (default: 100000).\n");
+    fprintf(stderr, "    --het_max_excess_z  Excess-het z-score threshold (default: 3.0). Sites above are excluded.\n");
     fprintf(stderr, "===== ATAC OUTPUTS (optional) =====\n");
     fprintf(stderr, "    --atac_cov -C        ATAC coverage bedGraph (tabix-indexed).\n");
     fprintf(stderr, "    --atac_output -O     ATAC-demux output BCF.\n");
     fprintf(stderr, "    --atac_num -M        Target N for ATAC-demux. Required if --atac_output set.\n");
     fprintf(stderr, "    --atac_het_output -T ATAC-het output BCF.\n");
     fprintf(stderr, "    --atac_het_num -U    Target N for ATAC-het (default: atac_num/2).\n");
+    fprintf(stderr, "    --atac_min_cov       Minimum ATAC coverage threshold (default: same as --min_cov).\n");
     fprintf(stderr, "===== POOL-AWARE SCORING (optional) =====\n");
     fprintf(stderr, "    --enable_pool_scoring -E  Enable pool-aware het scoring.\n");
     fprintf(stderr, "    --pool_combinations -L    TSV: library_id<tab>comma-separated identities.\n");
     fprintf(stderr, "    --min_pair_score -Q       Threshold for pair discrimination (default: 0.3).\n");
+    fprintf(stderr, "    --het_pool_weight         Weight on pool_discrim_norm when --enable_pool_scoring (default: 0.3).\n");
+    fprintf(stderr, "                              Final het component = (1-w)*het_freq + w*pool_discrim_norm.\n");
     fprintf(stderr, "===== PAIRWISE FLOOR (optional) =====\n");
     fprintf(stderr, "    --min_pairwise -W    Minimum pairwise distinguishing SNPs per individual pair.\n");
     fprintf(stderr, "                         After clade-balanced selection, adds extra SNPs for any\n");
     fprintf(stderr, "                         pair below this floor. Total output may exceed --num.\n");
+    fprintf(stderr, "    --max_pairwise_rescue  Hard cap on total rescue variants (default: num/10).\n");
+    fprintf(stderr, "    --pairwise_rescue_max_per_bin  Bin-spacing for rescue (default: species_max_per_bin).\n");
+    fprintf(stderr, "    --pairwise_rescue_min_call_rate  Call-rate floor for rescue candidates (default: 0.5).\n");
     fprintf(stderr, "===== SPECIES OUTPUT (optional) =====\n");
     fprintf(stderr, "    --panel_metadata -P   TSV: indiv_id<tab>species.\n");
     fprintf(stderr, "    --species_output -S   Species discrimination output BCF.\n");
     fprintf(stderr, "    --species_num -R      Target N for species set. Required if --species_output set.\n");
     fprintf(stderr, "    --species_coverage -K Coverage source for species: 'rna' or 'atac' (default: rna).\n");
+    fprintf(stderr, "    --species_min_pair_score  DEPRECATED: alias for --species_min_pair_discrim.\n");
+    fprintf(stderr, "    --species_min_pair_discrim  Minimum pair_discrim for species selection (default: 0.5). Primary ranking score.\n");
+    fprintf(stderr, "    --species_major_dosage_frac_floor  Per-species major-dosage-fraction floor (default: 0.7).\n");
+    fprintf(stderr, "    --species_call_rate_floor          Per-species call-rate floor (default: 0.7).\n");
+    fprintf(stderr, "    --species_min_called      Per-species floor on called individuals (default: 1; capped at n_in_species so singleton species can pass).\n");
+    fprintf(stderr, "    --species_cov_cap         Coverage score cap (log2) for species ranking (default: 5.0).\n");
+    fprintf(stderr, "    --species_max_per_bin     Max species sites per genomic bin (default: 5, 0 = unlimited).\n");
+    fprintf(stderr, "    --max_het_per_bin         Max het sites per genomic bin (default: 10, 0 = unlimited).\n");
     fprintf(stderr, "===== ANNOTATION MODES =====\n");
     fprintf(stderr, "    --annotate_only  Annotate ALL sites with scores and exit (no downsampling).\n");
     fprintf(stderr, "    --annotate_all FILE  Annotate ALL sites first, save to FILE, then downsample.\n");
@@ -492,153 +637,17 @@ void help(int code){
     exit(code);
 }
 
-bool proc_bcf_record(bcf1_t* bcf_record,
-    bcf_hdr_t* bcf_header,
-    int num_samples,
-    bitset<NBITS>& alt,
-    bitset<NBITS>& alt_flip,
-    bitset<NBITS>& present,
-    bool& pass){
-
-    alt.reset();
-    alt_flip.reset();
-    present.reset();
-
-    bcf_unpack(bcf_record, BCF_UN_STR);
-    pass = true;
-    
-    for (int i = 0; i < bcf_record->n_allele; ++i){
-        if (strcmp(bcf_record->d.allele[i], "A") != 0 &&
-            strcmp(bcf_record->d.allele[i], "C") != 0 &&
-            strcmp(bcf_record->d.allele[i], "G") != 0 && 
-            strcmp(bcf_record->d.allele[i], "T") != 0){
-            pass = false;
-            break;
-        }
-    }
-    if (bcf_record->d.allele[0][0] == bcf_record->d.allele[1][0]){
-        pass = false;
-    }
-    if (pass){
-        int32_t* gts = NULL;
-        int n_gts = 0;
-        int num_loaded = bcf_get_genotypes(bcf_header, bcf_record, &gts, &n_gts);
-        if (num_loaded <= 0){
-            free(gts);
-            return false;
-        }
-        
-        int ploidy = 2;
-        int nref = 0;
-        int nalt = 0;
-         
-        for (int i = 0; i < num_samples; ++i){
-            int32_t* gtptr = gts + i*ploidy;
-            
-            if (!bcf_gt_is_missing(gtptr[0])){
-                present.set(i);
-                alt_flip.set(i);
-                
-                if (bcf_gt_allele(gtptr[0]) != 0 || bcf_gt_allele(gtptr[1]) != 0){
-                    alt.set(i);
-                    alt_flip.reset(i);
-                    nalt++;
-                } 
-                else{
-                    nref++;
-                }
-            }    
-        }
-        
-        free(gts);
-     
-        if (nref == 0 || nalt == 0){
-            pass = false;
-            return false;
-        } 
-        return true;
-    }
-    return false;
-}
-
-// Process BCF record and compute het statistics
-// Returns true if site has het individuals, false otherwise
-bool proc_bcf_record_het(bcf1_t* bcf_record,
-    bcf_hdr_t* bcf_header,
-    int num_samples,
-    int& n_het,          // Output: count of het individuals
-    int& n_called,       // Output: count of called (non-missing) individuals
-    int& n_missing,      // Output: count of missing individuals
-    vector<int32_t>& gt_copy, // Output: copy of genotypes for later use
-    bool& pass){
-
-    bcf_unpack(bcf_record, BCF_UN_STR);
-    pass = true;
-    n_het = 0;
-    n_called = 0;
-    n_missing = 0;
-    gt_copy.clear();
-    
-    // Check alleles are valid ACGT
-    for (int i = 0; i < bcf_record->n_allele; ++i){
-        if (strcmp(bcf_record->d.allele[i], "A") != 0 &&
-            strcmp(bcf_record->d.allele[i], "C") != 0 &&
-            strcmp(bcf_record->d.allele[i], "G") != 0 && 
-            strcmp(bcf_record->d.allele[i], "T") != 0){
-            pass = false;
-            break;
-        }
-    }
-    if (bcf_record->d.allele[0][0] == bcf_record->d.allele[1][0]){
-        pass = false;
-    }
-    
-    if (!pass) return false;
-    
-    int32_t* gts = NULL;
-    int n_gts = 0;
-    int num_loaded = bcf_get_genotypes(bcf_header, bcf_record, &gts, &n_gts);
-    if (num_loaded <= 0){
-        free(gts);
-        return false;
-    }
-    
-    int ploidy = 2;
-    
-    // Copy genotypes and count het
-    gt_copy.resize(num_samples * ploidy);
-    for (int i = 0; i < num_samples * ploidy; ++i) {
-        gt_copy[i] = gts[i];
-    }
-    
-    for (int i = 0; i < num_samples; ++i){
-        int32_t* gtptr = gts + i*ploidy;
-        
-        if (bcf_gt_is_missing(gtptr[0]) || bcf_gt_is_missing(gtptr[1])){
-            n_missing++;
-        } else {
-            n_called++;
-            int a1 = bcf_gt_allele(gtptr[0]);
-            int a2 = bcf_gt_allele(gtptr[1]);
-            // Het = one ref and one alt (0/1 or 1/0)
-            if ((a1 == 0 && a2 != 0) || (a1 != 0 && a2 == 0)){
-                n_het++;
-            }
-        }
-    }
-    
-    free(gts);
-    return (n_het > 0);  // Only return true if at least one het individual
-}
+// proc_bcf_record() and proc_bcf_record_het() removed: all call sites now use
+// precomputed dosage-aware bitsets from StoredVariant (loaded at VCF ingest time).
 
 void count_branch(unordered_map<bitset<NBITS>, double>& branchcounts,
     bitset<NBITS>& clade,
     bitset<NBITS>& clade_flip,
-    int cladecount,
-    int cladecount_flip,
+    int total_alt,
+    int total_alt_flip,
     double count){
    
-    if (cladecount < cladecount_flip || (cladecount == cladecount_flip && clade < clade_flip)){
+    if (total_alt < total_alt_flip || (total_alt == total_alt_flip && clade < clade_flip)){
         if (branchcounts.count(clade) == 0){
             branchcounts.insert(make_pair(clade, count));
         }
@@ -661,13 +670,13 @@ void count_branch_missing(unordered_map<pair<bitset<NBITS>, bitset<NBITS> >, dou
     bitset<NBITS>& present,
     bitset<NBITS>& clade,
     bitset<NBITS>& clade_flip,
-    int cladecount,
-    int cladecount_flip,
+    int total_alt,
+    int total_alt_flip,
     double count){
     
     pair<bitset<NBITS>, bitset<NBITS> > key;
     
-    if (cladecount < cladecount_flip || (cladecount == cladecount_flip && clade < clade_flip)){
+    if (total_alt < total_alt_flip || (total_alt == total_alt_flip && clade < clade_flip)){
         key = make_pair(present, clade);
         if (miss2flip.count(clade) == 0){
             miss2flip.insert(make_pair(clade, clade_flip));
@@ -760,23 +769,20 @@ void merge_species_candidates(
 // Compute pool discrimination score for a site (per section 4.1)
 // Returns pool_discrim_norm in [0, 1]
 float compute_pool_discrim(
-    const vector<int32_t>& genotypes,
+    const vector<uint8_t>& genotypes_packed,
     int num_samples,
     const PoolCombinations& pool_combos,
     const map<string, int>& sample_name_to_idx,
     float min_pair_score) {
     
-    int ploidy = 2;
-    
     // Compute alt_count per sample: 0/0=0, 0/1=1, 1/1=2, missing=-1
     vector<int> alt_count(num_samples, -1);
     for (int s = 0; s < num_samples; s++) {
-        const int32_t* gt = genotypes.data() + s * ploidy;
-        if (bcf_gt_is_missing(gt[0]) || bcf_gt_is_missing(gt[1])) {
+        int a1 = gt_packed_allele(genotypes_packed, s, 0);
+        int a2 = gt_packed_allele(genotypes_packed, s, 1);
+        if (a1 < 0 || a2 < 0) {
             alt_count[s] = -1;
         } else {
-            int a1 = bcf_gt_allele(gt[0]);
-            int a2 = bcf_gt_allele(gt[1]);
             alt_count[s] = (a1 > 0 ? 1 : 0) + (a2 > 0 ? 1 : 0);
         }
     }
@@ -841,68 +847,146 @@ float compute_pool_discrim(
     return (float)(total_pair_sum / total_pair_count);
 }
 
-// Compute species pair discrimination for a site (per section 5.1)
-// Returns vector of pair_discrim values, one per species pair
+// Compute species pair discrimination for a site.
+// New scoring: pair_score = abs(mean_alt_A - mean_alt_B)/2
+//              * call_rate_A * call_rate_B
+//              * major_dosage_frac_A * major_dosage_frac_B
+//
+// Also outputs per-species stats for audit and the legacy raw pairwise fraction.
 void compute_species_discrim(
-    const vector<int32_t>& genotypes,
+    const vector<uint8_t>& genotypes_packed,
     int num_samples,
     const PanelMetadata& panel,
-    vector<float>& pair_discrim_out) {
+    const vector<int>& min_called_per_species,
+    float major_dosage_frac_floor,
+    float call_rate_floor,
+    vector<float>& pair_score_out,
+    vector<float>& pair_discrim_out,
+    vector<float>& sp_mean_alt_out,
+    vector<float>& sp_major_dosage_frac_out,
+    vector<float>& sp_call_rate_out,
+    vector<int>&   sp_n_called_out) {
     
-    int ploidy = 2;
-    pair_discrim_out.resize(panel.n_pairs, 0.0f);
-    
-    // Compute alt_count per sample
+    int n_sp = (int)panel.species_list.size();
+    pair_score_out.assign(panel.n_pairs, 0.0f);
+    pair_discrim_out.assign(panel.n_pairs, 0.0f);
+    sp_mean_alt_out.assign(n_sp, 0.0f);
+    sp_major_dosage_frac_out.assign(n_sp, 0.0f);
+    sp_call_rate_out.assign(n_sp, 0.0f);
+    sp_n_called_out.assign(n_sp, 0);
+
+    // Per-sample alt count (-1 = missing). HALF-MISSING TREATED AS MISSING.
     vector<int> alt_count(num_samples, -1);
     for (int s = 0; s < num_samples; s++) {
-        const int32_t* gt = genotypes.data() + s * ploidy;
-        if (bcf_gt_is_missing(gt[0]) || bcf_gt_is_missing(gt[1])) {
+        int a1 = gt_packed_allele(genotypes_packed, s, 0);
+        int a2 = gt_packed_allele(genotypes_packed, s, 1);
+        if (a1 < 0 || a2 < 0) {
             alt_count[s] = -1;
         } else {
-            int a1 = bcf_gt_allele(gt[0]);
-            int a2 = bcf_gt_allele(gt[1]);
             alt_count[s] = (a1 > 0 ? 1 : 0) + (a2 > 0 ? 1 : 0);
         }
     }
-    
-    // For each species pair, compute discriminating fraction
+
+    // Per-species WEIGHTED statistics using PanelMetadata::get_weight().
+    // Per-species weighted dosage counts are retained so the pair_discrim
+    // computation below can use a closed-form O(3x3) calculation instead of
+    // an O(N_a * N_b) double loop over individuals.
+    vector<float> sp_total_weight(n_sp, 0.0f);
+    vector<array<double, 3>> sp_wdc(n_sp, {0.0, 0.0, 0.0});  // weighted dosage counts per species
+    for (int si = 0; si < n_sp; si++) {
+        const string& sp = panel.species_list[si];
+        auto it = panel.species_to_sample_indices.find(sp);
+        if (it == panel.species_to_sample_indices.end()) continue;
+
+        double weight_total = 0.0;
+        double weight_called = 0.0;
+        double weighted_alt_sum = 0.0;
+        double weighted_dosage_counts[3] = {0.0, 0.0, 0.0};
+        int    n_called_int = 0;
+
+        for (int idx : it->second) {
+            double w = panel.get_weight(sp, idx);
+            weight_total += w;
+            if (alt_count[idx] >= 0) {
+                weight_called   += w;
+                weighted_alt_sum += w * alt_count[idx];
+                weighted_dosage_counts[alt_count[idx]] += w;
+                n_called_int++;
+            }
+        }
+
+        sp_total_weight[si] = (float)weight_total;
+        sp_n_called_out[si] = n_called_int;
+        sp_wdc[si][0] = weighted_dosage_counts[0];
+        sp_wdc[si][1] = weighted_dosage_counts[1];
+        sp_wdc[si][2] = weighted_dosage_counts[2];
+
+        if (weight_called > 0.0) {
+            sp_mean_alt_out[si] = (float)(weighted_alt_sum / weight_called);
+            double mx = max({weighted_dosage_counts[0],
+                             weighted_dosage_counts[1],
+                             weighted_dosage_counts[2]});
+            sp_major_dosage_frac_out[si] = (float)(mx / weight_called);
+        }
+        sp_call_rate_out[si] = (weight_total > 0.0)
+                               ? (float)(weight_called / weight_total) : 0.0f;
+    }
+
+    // For each species pair: compute pair_discrim (primary score) and
+    // legacy multiplicative pair_score (recorded only). Apply per-species
+    // gates: n_called >= min_called_per_species[si], call_rate >= floor,
+    // major_dosage_frac >= floor.
     for (int pi = 0; pi < panel.n_pairs; pi++) {
         const string& sp_a = panel.species_pairs[pi].first;
         const string& sp_b = panel.species_pairs[pi].second;
-        
+
+        int si_a = -1, si_b = -1;
+        for (int si = 0; si < n_sp; si++) {
+            if (panel.species_list[si] == sp_a) si_a = si;
+            if (panel.species_list[si] == sp_b) si_b = si;
+        }
+        if (si_a < 0 || si_b < 0) continue;
+
+        // Hard gates
+        if (sp_n_called_out[si_a] < min_called_per_species[si_a]) continue;
+        if (sp_n_called_out[si_b] < min_called_per_species[si_b]) continue;
+        if (sp_call_rate_out[si_a] < call_rate_floor) continue;
+        if (sp_call_rate_out[si_b] < call_rate_floor) continue;
+        if (sp_major_dosage_frac_out[si_a] < major_dosage_frac_floor) continue;
+        if (sp_major_dosage_frac_out[si_b] < major_dosage_frac_floor) continue;
+
+        // pair_discrim: weighted fraction of cross-species (A,B) individual
+        // pairs that are distinguishable (different alt counts).
+        // Closed form: sum_{i,j in {0,1,2}, i!=j} wdc_A[i] * wdc_B[j]
+        //              divided by (sum wdc_A) * (sum wdc_B).
+        // This is mathematically identical to the O(N_a * N_b) double loop
+        // (each individual contributes its weight to exactly one dosage bin)
+        // but runs in O(3 * 3) per pair instead of O(N_a * N_b).
         auto it_a = panel.species_to_sample_indices.find(sp_a);
         auto it_b = panel.species_to_sample_indices.find(sp_b);
         if (it_a == panel.species_to_sample_indices.end() ||
-            it_b == panel.species_to_sample_indices.end()) {
-            pair_discrim_out[pi] = 0.0f;
-            continue;
-        }
-        
-        // Collect non-missing individuals for each species
-        vector<int> called_a, called_b;
-        for (int idx : it_a->second) {
-            if (alt_count[idx] >= 0) called_a.push_back(alt_count[idx]);
-        }
-        for (int idx : it_b->second) {
-            if (alt_count[idx] >= 0) called_b.push_back(alt_count[idx]);
-        }
-        
-        if (called_a.empty() || called_b.empty()) {
-            pair_discrim_out[pi] = 0.0f;
-            continue;
-        }
-        
-        // Count distinguishable pairs
-        int n_distinguishable = 0;
-        int total_pairs = called_a.size() * called_b.size();
-        
-        for (int ac_a : called_a) {
-            for (int ac_b : called_b) {
-                if (ac_a != ac_b) n_distinguishable++;
+            it_b == panel.species_to_sample_indices.end()) continue;
+
+        double num = 0.0;
+        double denom = 0.0;
+        for (int i = 0; i < 3; i++) {
+            double wa_i = sp_wdc[si_a][i];
+            if (wa_i <= 0.0) continue;
+            for (int j = 0; j < 3; j++) {
+                double wb_j = sp_wdc[si_b][j];
+                if (wb_j <= 0.0) continue;
+                double w = wa_i * wb_j;
+                denom += w;
+                if (i != j) num += w;
             }
         }
-        
-        pair_discrim_out[pi] = (float)n_distinguishable / total_pairs;
+        pair_discrim_out[pi] = (denom > 0.0) ? (float)(num / denom) : 0.0f;
+
+        // Legacy multiplicative score (recorded for backward-compat output)
+        float between = fabsf(sp_mean_alt_out[si_a] - sp_mean_alt_out[si_b]) / 2.0f;
+        float consistency = sp_major_dosage_frac_out[si_a] * sp_major_dosage_frac_out[si_b];
+        float callrate = sp_call_rate_out[si_a] * sp_call_rate_out[si_b];
+        pair_score_out[pi] = between * consistency * callrate;
     }
 }
 
@@ -912,7 +996,7 @@ double brentfun(double param, const map<string, double>& data_d, const map<strin
     string bufstr;
     double sum = 0.0;
     for (int i = 0; i < num; ++i){
-        sprintf(&buf[0], "x%d", i);
+        snprintf(buf, sizeof(buf), "x%d", i);
         bufstr = buf;
         double count = data_d.at(bufstr);
         sum += pow(count, param);
@@ -926,7 +1010,7 @@ double dbrentfun(double param, const map<string, double>& data_d, const map<stri
     string bufstr;
     double d_df = 0.0;
     for (int i = 0; i < num; ++i){
-        sprintf(&buf[0], "x%d", i);
+        snprintf(buf, sizeof(buf), "x%d", i);
         bufstr = buf;
         double count = data_d.at(bufstr);
         d_df += pow(count, param) * log(count);
@@ -988,11 +1072,26 @@ int main(int argc, char *argv[]) {
        {"atac_num", required_argument, 0, 'M'},
        {"atac_het_output", required_argument, 0, 'T'},
        {"atac_het_num", required_argument, 0, 'U'},
+       {"atac_min_cov", required_argument, 0, 1204},
        {"species_output", required_argument, 0, 'S'},
        {"species_num", required_argument, 0, 'R'},
        {"species_coverage", required_argument, 0, 'K'},
+       {"species_min_pair_score", required_argument, 0, 1100},
+       {"species_min_pair_discrim", required_argument, 0, 1106},
+       {"species_major_dosage_frac_floor", required_argument, 0, 1104},
+       {"species_call_rate_floor", required_argument, 0, 1105},
+       {"species_min_called", required_argument, 0, 1101},
+       {"species_cov_cap", required_argument, 0, 1102},
+       {"species_max_per_bin", required_argument, 0, 1103},
+       {"max_het_per_bin", required_argument, 0, 1200},
+       {"blacklist", required_argument, 0, 1203},
+       {"het_pool_weight", required_argument, 0, 1201},
+       {"het_max_excess_z", required_argument, 0, 1202},
        {"min_pair_score", required_argument, 0, 'Q'},
        {"min_pairwise", required_argument, 0, 'W'},
+       {"max_pairwise_rescue", required_argument, 0, 1300},
+       {"pairwise_rescue_max_per_bin", required_argument, 0, 1301},
+       {"pairwise_rescue_min_call_rate", required_argument, 0, 1302},
        {0, 0, 0, 0} 
     };
     
@@ -1008,6 +1107,7 @@ int main(int argc, char *argv[]) {
     string atac_outfile = "";
     string atac_het_outfile = "";
     string species_outfile = "";
+    string blacklist_file = "";  // B11
     string species_coverage_mode = "rna";
     int num = -1;
     int het_num = -1;
@@ -1016,8 +1116,22 @@ int main(int argc, char *argv[]) {
     int species_num = -1;
     int bin_size = 100000;
     float min_cov = 1.0f;
+    float atac_min_cov = -1.0f;  // B14: -1 = default to min_cov
     float min_pair_score = 0.3f;
+    float species_min_pair_score = 0.05f;
+    float species_min_pair_discrim = 0.5f;
+    float species_major_dosage_frac_floor = 0.7f;
+    float species_call_rate_floor = 0.7f;
+    int species_min_called = 1;
+    float species_cov_cap = 5.0f;
+    int species_max_per_bin = 5;  // nonzero default avoids dense regional clusters
+    int max_het_per_bin = 10;     // het bin cap (0 = unlimited)
+    float het_pool_weight = 0.3f; // weight on pool_discrim_norm in het score
+    float het_max_excess_z = 3.0f; // B7: excess-het z-score filter threshold
     long min_pairwise = 0;  // 0 = disabled
+    long max_pairwise_rescue = -1;  // B8: -1 = default to num/10
+    int pairwise_rescue_max_per_bin = -1;  // B8: -1 = use species_max_per_bin
+    float pairwise_rescue_min_call_rate = 0.5f;  // B8
     int n_threads = omp_get_max_threads();
     int seed = -1;
     bool annotate_only = false;
@@ -1099,6 +1213,9 @@ int main(int argc, char *argv[]) {
             case 'U':
                 atac_het_num = atoi(optarg);
                 break;
+            case 1204:
+                atac_min_cov = atof(optarg);
+                break;
             case 'S':
                 species_outfile = optarg;
                 break;
@@ -1108,11 +1225,62 @@ int main(int argc, char *argv[]) {
             case 'K':
                 species_coverage_mode = optarg;
                 break;
+            case 1100:
+                species_min_pair_score = atof(optarg);
+                species_min_pair_discrim = atof(optarg);
+                fprintf(stderr,
+                    "WARNING: --species_min_pair_score is deprecated; use "
+                    "--species_min_pair_discrim. Both set the same threshold.\n");
+                break;
+            case 1101:
+                species_min_called = atoi(optarg);
+                break;
+            case 1102:
+                species_cov_cap = atof(optarg);
+                break;
+            case 1103:
+                species_max_per_bin = atoi(optarg);
+                break;
+            case 1104:
+                species_major_dosage_frac_floor = atof(optarg);
+                break;
+            case 1105:
+                species_call_rate_floor = atof(optarg);
+                break;
+            case 1106:
+                species_min_pair_discrim = atof(optarg);
+                break;
+            case 1200:
+                max_het_per_bin = atoi(optarg);
+                break;
+            case 1203:
+                blacklist_file = optarg;
+                break;
+            case 1201:
+                het_pool_weight = atof(optarg);
+                // C10: het_pool_weight is clamped to [0, 1]. pool_discrim_norm is bounded
+                // in [0, 1] because each contributing |expected_alts[i] - expected_alts[j]|
+                // is bounded by 1 for biallelic dosage (max diff = |0 - 1| = 1).
+                if (het_pool_weight < 0.0f) het_pool_weight = 0.0f;
+                if (het_pool_weight > 1.0f) het_pool_weight = 1.0f;
+                break;
+            case 1202:
+                het_max_excess_z = atof(optarg);
+                break;
             case 'Q':
                 min_pair_score = atof(optarg);
                 break;
             case 'W':
                 min_pairwise = atol(optarg);
+                break;
+            case 1300:
+                max_pairwise_rescue = atol(optarg);
+                break;
+            case 1301:
+                pairwise_rescue_max_per_bin = atoi(optarg);
+                break;
+            case 1302:
+                pairwise_rescue_min_call_rate = atof(optarg);
                 break;
             default:
                 help(0);
@@ -1125,8 +1293,12 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     if (num <= 0 && !annotate_only){
-        fprintf(stderr, "ERROR: --num/-n must be positive (Recommend > 1M)\n");
+        fprintf(stderr, "ERROR: --num/-n must be positive\n");
         exit(1);
+    }
+    if (num > 0 && num < 100000 && !annotate_only) {
+        fprintf(stderr, "WARNING: --num=%d is quite small; recommend > 100K for adequate "
+            "clade coverage. Continue at your own risk.\n", num);
     }
     if (outfile == ""){
         fprintf(stderr, "ERROR: --output/-o is required.\n");
@@ -1180,6 +1352,20 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    // D8: Require --cov when RNA outputs are requested and min_cov > 0
+    // annotate_only mode can annotate without coverage (fields will be 0/absent)
+    bool wants_rna_output = !annotate_only
+                           && (!outfile.empty()
+                               || !het_outfile.empty()
+                               || (!species_outfile.empty() && species_coverage_mode == "rna"));
+    if (wants_rna_output && min_cov > 0.0f && cov_file.empty()) {
+        fprintf(stderr,
+            "ERROR: --cov/-c is required when --output, --het_output, or RNA-mode "
+            "--species_output is set and --min_cov > 0.\n"
+            "       To run without RNA coverage filtering, pass --min_cov 0.\n");
+        exit(1);
+    }
+    
     if (enable_pool_scoring && pool_combinations_file.empty()) {
         fprintf(stderr, "ERROR: --pool_combinations/-L is required when --enable_pool_scoring is set\n");
         exit(1);
@@ -1221,8 +1407,18 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Using %d threads\n", n_threads);
     fprintf(stderr, "Bin size for evenness scoring: %d bp\n", bin_size);
     fprintf(stderr, "Minimum coverage threshold: %.1f\n", min_cov);
+    if (atac_min_cov < 0.0f) atac_min_cov = min_cov;  // B14: default to min_cov
+    if (seed != -1) {
+        fprintf(stderr, "WARNING: --seed is currently unused; selection is fully "
+            "deterministic regardless of seed value.\n");
+    }
     if (min_pairwise > 0) {
         fprintf(stderr, "Pairwise floor: %ld distinguishing SNPs per individual pair\n", min_pairwise);
+        // B8: Set defaults for rescue caps
+        if (max_pairwise_rescue < 0) max_pairwise_rescue = num / 10;
+        if (pairwise_rescue_max_per_bin < 0) pairwise_rescue_max_per_bin = species_max_per_bin;
+        fprintf(stderr, "  Rescue caps: max_total=%ld, max_per_bin=%d, min_call_rate=%.2f\n",
+            max_pairwise_rescue, pairwise_rescue_max_per_bin, pairwise_rescue_min_call_rate);
     }
     if (annotate_only) {
         fprintf(stderr, "Mode: ANNOTATE ONLY (all sites will be annotated, no downsampling)\n");
@@ -1240,6 +1436,12 @@ int main(int argc, char *argv[]) {
     map<string, vector<Interval>> annotations;
     if (!gtf_file.empty()) {
         load_gtf(gtf_file, annotations);
+    }
+
+    // B11: Load blacklist BED if provided
+    map<string, vector<Interval>> blacklist;
+    if (!blacklist_file.empty()) {
+        load_bed(blacklist_file, blacklist);
     }
 
     // Load coverage into memory for fast lookup
@@ -1289,6 +1491,7 @@ int main(int argc, char *argv[]) {
         bcf_hdr_append(hdr, "##INFO=<ID=HET_SCORE,Number=1,Type=Float,Description=\"Combined het score: het_freq * (1 - missing_freq * 0.5)\">");
         bcf_hdr_append(hdr, "##INFO=<ID=N_HET,Number=1,Type=Integer,Description=\"Number of heterozygous individuals\">");
         bcf_hdr_append(hdr, "##INFO=<ID=N_CALLED,Number=1,Type=Integer,Description=\"Number of individuals with called genotype\">");
+        bcf_hdr_append(hdr, "##INFO=<ID=HET_SEL_SCORE,Number=1,Type=Float,Description=\"Selection ranking score (annotation-only estimate)\">");
         if (!annotations.empty()) {
             bcf_hdr_append(hdr, "##INFO=<ID=ANNOT_SCORE,Number=1,Type=Float,Description=\"Annotation weight (1.0=genic, 0.1=intergenic)\">");
         }
@@ -1376,10 +1579,28 @@ int main(int argc, char *argv[]) {
             bcf_update_info_int32(hdr, rec, "N_HET", &n_het, 1);
             bcf_update_info_int32(hdr, rec, "N_CALLED", &n_called, 1);
             
+            // C5: HET_SEL_SCORE parity with main pipeline
+            {
+                float call_rate_ao = 1.0f - missing_freq;
+                float cov_ao = 0.0f;
+                if (!coverage_map.empty()) {
+                    const char* chrom_ao = bcf_hdr_id2name(hdr, rec->rid);
+                    cov_ao = get_coverage_score_fast(chrom_ao, rec->pos, coverage_map);
+                }
+                float annot_ao = 0.1f;
+                if (!annotations.empty()) {
+                    const char* chrom_ao2 = bcf_hdr_id2name(hdr, rec->rid);
+                    annot_ao = get_annot_score(chrom_ao2, rec->pos + 1, annotations);
+                }
+                float annot_boost_ao = (annot_ao >= 1.0f) ? 1.0f : 0.0f;
+                float sel_score_ao = het_freq * call_rate_ao * (log2f(cov_ao + 1.0f) + 0.1f * annot_boost_ao);
+                bcf_update_info_float(hdr, rec, "HET_SEL_SCORE", &sel_score_ao, 1);
+            }
+            
             // Add ANNOT_SCORE if GTF provided
             if (!annotations.empty()) {
                 const char* chrom = bcf_hdr_id2name(hdr, rec->rid);
-                float annot_score = get_annot_score(chrom, rec->pos, annotations);
+                float annot_score = get_annot_score(chrom, rec->pos + 1, annotations);
                 bcf_update_info_float(hdr, rec, "ANNOT_SCORE", &annot_score, 1);
             }
             
@@ -1459,9 +1680,9 @@ int main(int argc, char *argv[]) {
         samples.push_back(bcf_header->samples[i]);
     }
     
-    if (samples.size() * 2 > NBITS){
+    if (samples.size() * 4 > NBITS){
         fprintf(stderr, "ERROR: too many samples in VCF. Please recompile with NBITS = %ld or higher.\n",
-            samples.size() * 2);
+            samples.size() * 4);
         exit(1); 
     }
 
@@ -1490,9 +1711,39 @@ int main(int argc, char *argv[]) {
     // Load panel metadata if needed
     PanelMetadata panel_metadata;
     bool has_panel_metadata = false;
+    vector<int> species_min_called_per_species;
     if (!panel_metadata_file.empty()) {
         panel_metadata = load_panel_metadata(panel_metadata_file, samples);
         has_panel_metadata = true;
+        
+        // CHANGE 1: Compute per-species minimum-called thresholds.
+        // For singleton species (n_in_sp == 1), require min_called=1 instead of
+        // the previous max(2, ceil(0.5 * n_in_sp)) which made singletons impossible.
+        int n_sp_local = (int)panel_metadata.species_list.size();
+        species_min_called_per_species.resize(n_sp_local, 1);
+        for (int si = 0; si < n_sp_local; si++) {
+            const string& sp = panel_metadata.species_list[si];
+            auto it = panel_metadata.species_to_sample_indices.find(sp);
+            int n_in_sp = (it != panel_metadata.species_to_sample_indices.end())
+                          ? (int)it->second.size() : 0;
+            int per_species_min;
+            if (n_in_sp <= 1) {
+                per_species_min = 1;
+                fprintf(stderr, "  WARNING: species %s has only %d individual(s); "
+                    "--species_min_called is forced to 1 for this species "
+                    "(low-confidence diagnostic markers).\n",
+                    sp.c_str(), n_in_sp);
+            } else {
+                per_species_min = max(1, (int)ceil(0.5 * n_in_sp));
+                // The user-supplied --species_min_called acts as an additional floor,
+                // but is capped at n_in_sp so it cannot make the species impossible.
+                int user_floor = min(n_in_sp, species_min_called);
+                if (user_floor > per_species_min) per_species_min = user_floor;
+            }
+            species_min_called_per_species[si] = per_species_min;
+            fprintf(stderr, "  Species %s: n_in_panel=%d, min_called_required=%d\n",
+                sp.c_str(), n_in_sp, per_species_min);
+        }
     }
     
     // Load pool combinations if needed
@@ -1552,6 +1803,7 @@ int main(int argc, char *argv[]) {
         sv.n_alleles = load_rec->n_allele;
         sv.is_biallelic = (load_rec->n_allele == 2);
         sv.passes_qc = false;
+        sv.qual = load_rec->qual;
         
         // Get alleles - store ALL alleles for ALL variants
         bcf_unpack(load_rec, BCF_UN_STR);
@@ -1569,15 +1821,20 @@ int main(int argc, char *argv[]) {
         // Get genotypes
         int num_loaded_gt = bcf_get_genotypes(load_hdr, load_rec, &load_gts, &load_n_gts);
         if (num_loaded_gt > 0) {
-            // Store raw genotypes
-            sv.genotypes.assign(load_gts, load_gts + num_loaded_gt);
+            // Pack raw genotypes into 2-bit-per-allele storage
+            pack_genotypes(load_gts, num_samples, sv.genotypes_packed);
             
-            // For biallelic variants, precompute what proc_bcf_record would compute
-            // EXACTLY matching proc_bcf_record logic
+            // For non-biallelic records, also keep raw genotypes so annotate_all
+            // can write them without the biallelic-collapsing data loss (Fix 3).
+            if (!sv.is_biallelic && !annotate_all_file.empty()) {
+                sv.genotypes_raw.assign(load_gts, load_gts + num_loaded_gt);
+            }
+            
+            // For biallelic variants, precompute dosage-aware bitsets
             if (sv.is_biallelic) {
                 bool pass = true;
                 
-                // Check alleles are valid A/C/G/T (exactly as proc_bcf_record does)
+                // Check alleles are valid A/C/G/T
                 for (int i = 0; i < load_rec->n_allele; ++i) {
                     if (strcmp(load_rec->d.allele[i], "A") != 0 &&
                         strcmp(load_rec->d.allele[i], "C") != 0 &&
@@ -1587,41 +1844,50 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                 }
-                // Check ref != alt (exactly as proc_bcf_record does)
+                // Check ref != alt
                 if (load_rec->d.allele[0][0] == load_rec->d.allele[1][0]) {
                     pass = false;
                 }
                 
                 if (pass) {
-                    // Compute bitsets exactly as proc_bcf_record does
+                    // Dosage-aware bitset encoding (A1/A5):
+                    // bit 2i     = 1 iff sample i is called AND carries >= 1 alt allele
+                    // bit 2i + 1 = 1 iff sample i is called AND is homozygous alt
                     sv.alt.reset();
                     sv.alt_flip.reset();
                     sv.present.reset();
                     
-                    int ploidy = 2;  // Hardcoded as in proc_bcf_record
                     int nref = 0;
                     int nalt = 0;
+                    int total_alt_val = 0;
                     
                     for (int i = 0; i < num_samples; ++i) {
-                        int32_t* gtptr = load_gts + i * ploidy;
+                        bool miss_a = gt_packed_is_missing(sv.genotypes_packed, i, 0);
+                        bool miss_b = gt_packed_is_missing(sv.genotypes_packed, i, 1);
                         
-                        // proc_bcf_record only checks gtptr[0] for missing
-                        if (!bcf_gt_is_missing(gtptr[0])) {
+                        if (!miss_a && !miss_b) {
                             sv.present.set(i);
-                            sv.alt_flip.set(i);
+                            int a1 = gt_packed_allele(sv.genotypes_packed, i, 0);
+                            int a2 = gt_packed_allele(sv.genotypes_packed, i, 1);
+                            int dosage = (a1 != 0 ? 1 : 0) + (a2 != 0 ? 1 : 0);
                             
-                            // proc_bcf_record: alt if EITHER allele is non-zero
-                            if (bcf_gt_allele(gtptr[0]) != 0 || bcf_gt_allele(gtptr[1]) != 0) {
-                                sv.alt.set(i);
-                                sv.alt_flip.reset(i);
-                                nalt++;
-                            } else {
-                                nref++;
-                            }
+                            if (dosage >= 1) sv.alt.set(2 * i);
+                            if (dosage == 2) sv.alt.set(2 * i + 1);
+                            
+                            total_alt_val += dosage;
+                            
+                            if (dosage > 0) nalt++; else nref++;
                         }
                     }
                     
-                    // proc_bcf_record returns true only if nref > 0 AND nalt > 0
+                    // Build alt_flip using dosage_flip helper
+                    dosage_flip(sv.alt, sv.present, num_samples, sv.alt_flip);
+                    
+                    // Store total_alt and total_alt_flip (A6)
+                    int n_called = (int)sv.present.count();
+                    sv.total_alt = (int16_t)total_alt_val;
+                    sv.total_alt_flip = (int16_t)(n_called * 2 - total_alt_val);
+                    
                     if (nref > 0 && nalt > 0) {
                         sv.passes_qc = true;
                         n_pass_qc++;
@@ -1647,7 +1913,9 @@ int main(int argc, char *argv[]) {
     bcf_hdr_destroy(load_hdr);
     hts_close(load_fp);
     
-    all_variants.shrink_to_fit();
+    // all_variants.shrink_to_fit() removed: at 150M variants the reallocation
+    // copy spike can exceed available memory. The reserve(150M) overshoot is
+    // a smaller cost than a transient 2x peak.
     
     auto load_end = chrono::high_resolution_clock::now();
     auto load_duration = chrono::duration_cast<chrono::seconds>(load_end - load_start);
@@ -1696,8 +1964,6 @@ int main(int argc, char *argv[]) {
     
     bool collect_het = !het_outfile.empty() || !atac_het_outfile.empty();
     bool collect_species = !species_outfile.empty();
-    float species_prefilter = min_pair_score - 0.05f;
-    if (species_prefilter < 0.0f) species_prefilter = 0.0f;
     
     fprintf(stderr, "Pass 1: Counting mutations on branches%s%s (parallel, %d threads)...\n", 
         collect_het ? " and collecting het candidates" : "",
@@ -1743,28 +2009,28 @@ int main(int argc, char *argv[]) {
                     bitset<NBITS> alt_flip = sv.alt_flip;
                     bitset<NBITS> present = sv.present;
                     
-                    int ac = alt.count();
-                    int afc = alt_flip.count();
+                    int ta = sv.total_alt;
+                    int ta_flip = sv.total_alt_flip;
                 
                     if (present.count() == (size_t)num_samples){
-                        count_branch(local_branchcounts, alt, alt_flip, ac, afc, 1.0);
+                        count_branch(local_branchcounts, alt, alt_flip, ta, ta_flip, 1.0);
                     }
                     else{
                         count_branch_missing(local_branchcounts_missing, local_miss2flip, 
-                            present, alt, alt_flip, ac, afc, 1.0);
+                            present, alt, alt_flip, ta, ta_flip, 1.0);
                     }
                     local_snps++;
                 }
                 
                 // Collect het candidates if enabled
-                // Using EXACT same logic as proc_bcf_record_het
-                if (collect_het && !sv.genotypes.empty() && sv.is_biallelic) {
+                // Using packed genotype accessors
+                if (collect_het && !sv.genotypes_packed.empty() && sv.is_biallelic) {
                     // Parse ref and alt from alleles string
                     size_t comma_pos = sv.alleles.find(',');
                     string ref_allele = sv.alleles.substr(0, comma_pos);
                     string alt_allele = sv.alleles.substr(comma_pos + 1);
                     
-                    // Check alleles are valid (same check as proc_bcf_record_het)
+                    // Check alleles are valid
                     bool het_pass = true;
                     if (ref_allele.length() != 1 || alt_allele.length() != 1) {
                         het_pass = false;
@@ -1779,47 +2045,61 @@ int main(int argc, char *argv[]) {
                     }
                     
                     if (het_pass) {
-                        int ploidy = 2;  // Hardcoded as in proc_bcf_record_het
-                        int n_het = 0;
-                        int n_called = 0;
-                        int n_missing = 0;
+                        // B11: Blacklist filter
+                        if (!blacklist.empty() && is_blacklisted(chrom, sv.pos, blacklist)) {
+                            het_pass = false;
+                        }
+                    }
+                    
+                    if (het_pass) {
+                        HetStats hs = compute_het_stats_packed(sv.genotypes_packed, num_samples);
+                        int n_het = hs.n_het;
+                        int n_called = hs.n_called;
+                        int n_missing = hs.n_missing;
                         
-                        // EXACT same loop as proc_bcf_record_het
-                        for (int i = 0; i < num_samples; ++i) {
-                            const int32_t* gtptr = sv.genotypes.data() + i * ploidy;
-                            
-                            // proc_bcf_record_het checks BOTH alleles for missing
-                            if (bcf_gt_is_missing(gtptr[0]) || bcf_gt_is_missing(gtptr[1])) {
-                                n_missing++;
-                            } else {
-                                n_called++;
-                                int a1 = bcf_gt_allele(gtptr[0]);
-                                int a2 = bcf_gt_allele(gtptr[1]);
-                                // Het = one ref and one alt (0/1 or 1/0)
-                                if ((a1 == 0 && a2 != 0) || (a1 != 0 && a2 == 0)) {
-                                    n_het++;
+                        // Only proceed if at least one het
+                        if (n_het > 0) {
+                            // B7: Excess-het filter (Hardy-Weinberg z-score)
+                            if (n_called >= 5) {
+                                float n_alt_alleles_b7 = 0;
+                                for (int ii = 0; ii < num_samples; ++ii) {
+                                    int aa1 = gt_packed_allele(sv.genotypes_packed, ii, 0);
+                                    int aa2 = gt_packed_allele(sv.genotypes_packed, ii, 1);
+                                    if (aa1 < 0 || aa2 < 0) continue;
+                                    if (aa1 > 0) n_alt_alleles_b7 += 1;
+                                    if (aa2 > 0) n_alt_alleles_b7 += 1;
+                                }
+                                float p_af = n_alt_alleles_b7 / (2.0f * n_called);
+                                float expected_het_hw = 2.0f * p_af * (1.0f - p_af);
+                                float observed_het_hw = (float)n_het / n_called;
+                                float var_het_hw = expected_het_hw * (1.0f - expected_het_hw) / n_called;
+                                if (var_het_hw > 0) {
+                                    float z_hw = (observed_het_hw - expected_het_hw) / sqrtf(var_het_hw);
+                                    if (z_hw > het_max_excess_z) continue;
                                 }
                             }
-                        }
-                        
-                        // Only proceed if at least one het (same as proc_bcf_record_het return)
-                        if (n_het > 0) {
-                            float het_freq = (n_called > 0) ? (float)n_het / n_called : 0.0f;
-                            float missing_freq = (float)n_missing / num_samples;
+                            
+                            float het_freq = hs.het_freq;
+                            float missing_freq = hs.missing_freq;
                             
                             // Get annotation and coverage scores FRESH (same as original)
                             float annot_score = 0.1f;
                             if (!annotations.empty()) {
-                                annot_score = get_annot_score(chrom, sv.pos, annotations);
+                                annot_score = get_annot_score(chrom, sv.pos + 1, annotations);
                             }
                             float cov_score = 0.0f;
                             if (!coverage_map.empty()) {
                                 cov_score = get_coverage_score_fast(chrom, sv.pos, coverage_map);
                             }
                             
-                            // Apply min_cov hard filter for het sites
-                            if (cov_score < min_cov) {
-                                continue;  // Skip sites below coverage threshold
+                            // D9: Do NOT hard-filter here. A candidate is eligible if RNA cov OR ATAC cov
+                            // passes its respective threshold; downstream selectors apply their own gate.
+                            bool rna_pass = (cov_score >= min_cov);
+                            bool atac_pass = (atac_coverage_map.empty())
+                                             ? false
+                                             : (get_coverage_score_fast(chrom, sv.pos, atac_coverage_map) >= atac_min_cov);
+                            if (!rna_pass && !atac_pass) {
+                                continue;  // Skip only if neither modality clears the threshold
                             }
                             
                             // Get ATAC coverage if available
@@ -1831,21 +2111,27 @@ int main(int argc, char *argv[]) {
                             // Compute pool discrimination if enabled
                             float pool_dn = 0.0f;
                             if (enable_pool_scoring && has_pool_combos) {
-                                pool_dn = compute_pool_discrim(sv.genotypes, num_samples,
+                                pool_dn = compute_pool_discrim(sv.genotypes_packed, num_samples,
                                     pool_combos, sample_name_to_idx, min_pair_score);
                             }
                             
-                            // Compute final_het_score
+                            // Compute final_het_score with weighted pool combination
+                            // (Item F): final = (1 - w) * het_freq + w * pool_discrim_norm
+                            // bounded in [0, 1+] but each summand is approximately [0,1].
                             float final_het_score = het_freq;
                             if (enable_pool_scoring) {
-                                final_het_score = het_freq + pool_dn;
+                                final_het_score = (1.0f - het_pool_weight) * het_freq
+                                                + het_pool_weight * pool_dn;
                             }
                             
-                            // New het scoring formula: het_freq dominates, then coverage, annotation is bonus
-                            // het_score = final_het_score * (log2(cov+1) + 0.1 * annot_boost)
+                            // Het scoring with call-rate penalty (Item F):
+                            // het_score = final_het_score * call_rate * (log2(cov+1) + 0.1 * annot_boost)
+                            // Penalizes sites called in few individuals so they cannot dominate
+                            // simply by having high het_freq among a tiny called set.
+                            float call_rate = 1.0f - missing_freq;
                             float annot_boost = (annot_score >= 1.0f) ? 1.0f : 0.0f;
                             float selection_component = log2f(cov_score + 1.0f) + (0.1f * annot_boost);
-                            float het_score = final_het_score * selection_component;
+                            float het_score = final_het_score * call_rate * selection_component;
                             
                             HetCandidate hc;
                             hc.chrom = chrom;
@@ -1862,7 +2148,7 @@ int main(int argc, char *argv[]) {
                             hc.het_sel_score = het_score; // selection ranking score
                             hc.ref_allele = ref_allele;
                             hc.alt_allele = alt_allele;
-                            hc.genotypes = sv.genotypes;  // Copy genotypes
+                            hc.variant_idx = vi;  // deferred genotype fetch from all_variants
                             hc.n_samples = num_samples;
                             
                             local_het_candidates.push_back(std::move(hc));
@@ -1872,7 +2158,7 @@ int main(int argc, char *argv[]) {
                 }
             
             // Collect species candidates if enabled
-            if (collect_species && !sv.genotypes.empty() && sv.is_biallelic) {
+            if (collect_species && !sv.genotypes_packed.empty() && sv.is_biallelic) {
                 // Parse ref/alt
                 size_t comma_pos2 = sv.alleles.find(',');
                 string ref_a2 = sv.alleles.substr(0, comma_pos2);
@@ -1891,6 +2177,13 @@ int main(int argc, char *argv[]) {
                 }
                 
                 if (sp_pass) {
+                    // B11: Blacklist filter
+                    if (!blacklist.empty() && is_blacklisted(chrom, sv.pos, blacklist)) {
+                        sp_pass = false;
+                    }
+                }
+                
+                if (sp_pass) {
                     // Get coverage for species eligibility
                     float sp_cov = 0.0f;
                     if (species_coverage_mode == "rna" && !coverage_map.empty()) {
@@ -1899,34 +2192,71 @@ int main(int argc, char *argv[]) {
                         sp_cov = get_coverage_score_fast(chrom, sv.pos, atac_coverage_map);
                     }
                     
-                    if (sp_cov >= min_cov) {
-                        // Compute pair discrimination
-                        vector<float> pd;
-                        compute_species_discrim(sv.genotypes, num_samples, panel_metadata, pd);
-                        
-                        // Find max pair_discrim
+                    float species_cov_min = (species_coverage_mode == "atac")
+                                           ? atac_min_cov : min_cov;
+                    if (sp_cov >= species_cov_min) {
+                        // Compute pair discrimination (primary) and recorded legacy fields
+                        vector<float> ps, pd, sp_ma, sp_mdf, sp_cr;
+                        vector<int> sp_nc;
+                        compute_species_discrim(
+                            sv.genotypes_packed, num_samples, panel_metadata,
+                            species_min_called_per_species,
+                            species_major_dosage_frac_floor,
+                            species_call_rate_floor,
+                            ps, pd, sp_ma, sp_mdf, sp_cr, sp_nc
+                        );
+
+                        // Find max pair_discrim (primary ranking) and max pair_score (legacy)
                         float max_pd = 0.0f;
-                        for (float v : pd) {
-                            if (v > max_pd) max_pd = v;
-                        }
-                        
-                        // Pre-filter: skip sites where max < species_prefilter
-                        if (max_pd >= species_prefilter) {
+                        float max_ps = 0.0f;
+                        for (float v : pd) { if (v > max_pd) max_pd = v; }
+                        for (float v : ps) { if (v > max_ps) max_ps = v; }
+
+                        // Pre-filter using pair_discrim (primary). Permissive gate at half threshold.
+                        // Note: this pre-filter is intentionally permissive so backfill candidates
+                        // remain available for the global utility pass (see species selection block).
+                        if (max_pd >= species_min_pair_discrim * 0.5f) {
+                            float cov_term = min(log2f(sp_cov + 1.0f), species_cov_cap);
+                            
+                            // Compute per-pair dosage separation while sp_ma is still local.
+                            // dosage_sep[pi] = |mean_alt[A] - mean_alt[B]| / 2 in [0, 1].
+                            // Used as multi-pair contribution weight in global utility (Item A).
+                            int n_pairs_local = (int)pd.size();
+                            vector<float> pds(n_pairs_local, 0.0f);
+                            for (int pi = 0; pi < n_pairs_local; pi++) {
+                                const string& spa = panel_metadata.species_pairs[pi].first;
+                                const string& spb = panel_metadata.species_pairs[pi].second;
+                                int sai = -1, sbi = -1;
+                                for (int si = 0; si < (int)panel_metadata.species_list.size(); si++) {
+                                    if (panel_metadata.species_list[si] == spa) sai = si;
+                                    if (panel_metadata.species_list[si] == spb) sbi = si;
+                                }
+                                if (sai >= 0 && sbi >= 0) {
+                                    pds[pi] = fabsf(sp_ma[sai] - sp_ma[sbi]) / 2.0f;
+                                }
+                            }
+                            
                             SpeciesCandidate sc;
                             sc.chrom = chrom;
                             sc.pos = sv.pos;
                             sc.chrom_idx = c;
                             sc.bin_idx = get_bin_idx(sv.pos, bin_size);
                             sc.cov_score = sp_cov;
+                            sc.pair_score = std::move(ps);
                             sc.pair_discrim = std::move(pd);
+                            sc.pair_dosage_sep = std::move(pds);
+                            sc.max_pair_score = max_ps;
                             sc.max_pair_discrim = max_pd;
-                            sc.selection_score = max_pd * log2f(sp_cov + 1.0f);
+                            sc.selection_score = max_ps * cov_term;  // legacy field, retained
                             sc.assigned_pair = -1;
                             sc.ref_allele = ref_a2;
                             sc.alt_allele = alt_a2;
-                            sc.genotypes = sv.genotypes;
+                            sc.variant_idx = vi;  // deferred genotype fetch from all_variants
                             sc.n_samples = num_samples;
-                            
+                            sc.sp_mean_alt = std::move(sp_ma);
+                            sc.sp_major_dosage_frac = std::move(sp_mdf);
+                            sc.sp_call_rate = std::move(sp_cr);
+                            sc.sp_n_called = std::move(sp_nc);
                             local_species_candidates.push_back(std::move(sc));
                         }
                     }
@@ -1939,8 +2269,11 @@ int main(int argc, char *argv[]) {
             int done = ++chroms_done;
             
             if (local_snps > 0 || done % 100 == 0) {
+                #pragma omp critical(stderr_log)
+                {
                 fprintf(stderr, "  Chromosome %s: %ld SNPs, %ld het, %ld sp [%d/%zu]\n", 
                     chrom.c_str(), local_snps, local_het, (long)local_species_candidates.size(), done, chroms.size());
+                }
             }
         }
         
@@ -1956,7 +2289,25 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // vcf_idx still available for any code that needs it
+    // Stable sort by genomic position for reproducibility across runs
+    if (collect_het) {
+        sort(all_het_candidates.begin(), all_het_candidates.end(),
+            [](const HetCandidate& a, const HetCandidate& b) {
+                if (a.chrom_idx != b.chrom_idx) return a.chrom_idx < b.chrom_idx;
+                return a.pos < b.pos;
+            });
+    }
+    if (collect_species) {
+        sort(all_species_candidates.begin(), all_species_candidates.end(),
+            [](const SpeciesCandidate& a, const SpeciesCandidate& b) {
+                if (a.chrom_idx != b.chrom_idx) return a.chrom_idx < b.chrom_idx;
+                return a.pos < b.pos;
+            });
+    }
+    
+    // vcf_idx no longer needed after Pass 1 (C4: free early)
+    hts_idx_destroy(vcf_idx);
+    vcf_idx = NULL;
     
     auto end_time = chrono::high_resolution_clock::now();
     auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
@@ -1970,12 +2321,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Found %zu species candidates\n", all_species_candidates.size());
     }
     
-    if (branchcounts.size() >= (size_t)num){
-        fprintf(stderr, "ERROR: %zu distinct allele sharing patterns found, but %d SNPs requested.\n", 
-            branchcounts.size(), num);
-        fprintf(stderr, "  Please set sample size to at least %zu.\n", branchcounts.size());
-        exit(1);
-    }
+    // B3: too-many-clades handling is implemented in the slot allocation section below,
+    // where it allocates 1 slot per clade for the top num most-common clades.
 
     // ========================================================================
     // HET SITE SELECTION WITH BIN BALANCING
@@ -1990,9 +2337,14 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Selecting het sites with bin balancing...\n");
         start_time = chrono::high_resolution_clock::now();
         
-        // Sort candidates by het_score descending
+        // Sort candidates by het_score descending with stable (chrom_idx, pos) tiebreaker
         fprintf(stderr, "  Sorting %zu het candidates by score...\n", all_het_candidates.size());
-        sort(all_het_candidates.begin(), all_het_candidates.end());
+        sort(all_het_candidates.begin(), all_het_candidates.end(),
+            [](const HetCandidate& a, const HetCandidate& b) {
+                if (a.het_score != b.het_score) return a.het_score > b.het_score;
+                if (a.chrom_idx != b.chrom_idx) return a.chrom_idx < b.chrom_idx;
+                return a.pos < b.pos;
+            });
         
         // Bin tracking: map from (chrom, bin_idx) -> count of selected SNPs
         map<pair<string, int>, int> bins_selected;
@@ -2000,25 +2352,25 @@ int main(int argc, char *argv[]) {
         // Greedy selection with bin balancing
         selected_het_indices.reserve(het_num);
         
-        fprintf(stderr, "  Selecting up to %d het sites...\n", het_num);
-        
+        fprintf(stderr, "  Selecting up to %d het sites (max %d per bin)...\n",
+            het_num, max_het_per_bin);
+
         for (size_t i = 0; i < all_het_candidates.size() && (int)selected_het_indices.size() < het_num; ++i) {
             const HetCandidate& hc = all_het_candidates[i];
+
+            // D9: apply RNA cov_score filter here (was previously applied at candidate
+            // creation, which broke ATAC-het output if --cov was not provided).
+            if (hc.cov_score < min_cov) continue;
+
             pair<string, int> bin_key = make_pair(hc.chrom, hc.bin_idx);
-            
-            // Compute evenness score
-            int snps_in_bin = bins_selected[bin_key];
-            float evenness_score = 1.0f / (1.0f + snps_in_bin);
-            
-            // Adjusted score (for potential replacement logic, not used currently)
-            float adjusted_score = hc.het_score * evenness_score;
-            (void)adjusted_score;  // Suppress unused warning
-            
-            // Select this candidate
+
+            // D7: hard bin cap (replaces dead evenness_score code)
+            if (max_het_per_bin > 0 && bins_selected[bin_key] >= max_het_per_bin) continue;
+
             selected_het_indices.push_back(i);
             bins_selected[bin_key]++;
             selected_het_sites.insert(make_pair(hc.chrom, hc.pos));
-            
+
             if ((selected_het_indices.size() % 100000) == 0) {
                 fprintf(stderr, "    Selected %zu het sites...\r", selected_het_indices.size());
                 fflush(stderr);
@@ -2045,20 +2397,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Selecting ATAC-het sites...\n");
         start_time = chrono::high_resolution_clock::now();
         
-        // Create a score vector for ATAC-het ranking
-        // ATAC-het score = final_het_score * log2(atac_cov + 1) (no annot boost)
+        // Create a score vector for ATAC-het ranking with call-rate penalty
+        // and weighted pool combination, consistent with RNA-het scoring (Item F).
+        // ATAC-het score = final_hs * call_rate * log2(atac_cov + 1)
         vector<pair<float, size_t>> atac_het_scored; // (score, index)
         atac_het_scored.reserve(all_het_candidates.size());
         
         for (size_t i = 0; i < all_het_candidates.size(); i++) {
             const HetCandidate& hc = all_het_candidates[i];
-            if (hc.atac_cov_score < min_cov) continue;
+            if (hc.atac_cov_score < atac_min_cov) continue;
             
             float final_hs = hc.het_freq;
             if (enable_pool_scoring) {
-                final_hs = hc.het_freq + hc.pool_discrim_norm;
+                final_hs = (1.0f - het_pool_weight) * hc.het_freq
+                         + het_pool_weight * hc.pool_discrim_norm;
             }
-            float atac_sel = final_hs * log2f(hc.atac_cov_score + 1.0f);
+            float call_rate = 1.0f - hc.missing_freq;
+            float atac_sel = final_hs * call_rate * log2f(hc.atac_cov_score + 1.0f);
             atac_het_scored.push_back(make_pair(atac_sel, i));
         }
         
@@ -2068,7 +2423,7 @@ int main(int argc, char *argv[]) {
                 return a.first > b.first;
             });
         
-        // Greedy selection with bin tracking
+        // Greedy selection with bin tracking and bin cap enforcement (Item G)
         map<pair<string, int>, int> atac_het_bins;
         selected_atac_het_indices.reserve(atac_het_num);
         
@@ -2076,10 +2431,12 @@ int main(int argc, char *argv[]) {
             if ((int)selected_atac_het_indices.size() >= atac_het_num) break;
             size_t idx = scored.second;
             const HetCandidate& hc = all_het_candidates[idx];
+            pair<string,int> bin_key = make_pair(hc.chrom, hc.bin_idx);
+            if (max_het_per_bin > 0 && atac_het_bins[bin_key] >= max_het_per_bin) continue;
             
             selected_atac_het_indices.push_back(idx);
             selected_atac_het_sites.insert(make_pair(hc.chrom, hc.pos));
-            atac_het_bins[make_pair(hc.chrom, hc.bin_idx)]++;
+            atac_het_bins[bin_key]++;
         }
         
         end_time = chrono::high_resolution_clock::now();
@@ -2089,63 +2446,456 @@ int main(int argc, char *argv[]) {
     }
 
     // ========================================================================
-    // SPECIES SITE SELECTION (pair-bucketed best-fit, per design doc section 5.2)
+    // SPECIES SITE SELECTION (Items A, B, C in redesign)
+    //
+    // Replaces the previous per-pair-queue approach with a deficit-weighted
+    // greedy global optimization. At each step the candidate maximizing
+    //
+    //   utility(c) = [ sum_pi max(0, deficit[pi]) * pair_discrim[c][pi]
+    //                                            * pair_dosage_sep[c][pi] ]
+    //              * coverage_term(c)
+    //              * spacing_penalty(c)
+    //
+    // is selected, deficits are decremented for every pair the candidate
+    // satisfies above species_min_pair_discrim, and the loop continues until
+    // species_num candidates have been chosen or no more candidates exist.
+    //
+    // After per-pair deficits are exhausted, the utility falls back to a
+    // pure coverage * dosage * max_pair_discrim "global utility" term so the
+    // loop continues backfilling to species_num (Item A backfill).
+    //
+    // Pair-target allocation (Item B): when species_num >= n_pairs every
+    // pair gets a Hamilton-apportioned share; when species_num < n_pairs
+    // only the pairs with the most strong candidates receive nonzero targets.
+    //
+    // strong_threshold (Item C): min(1.0f, species_min_pair_discrim + 0.25f).
     // ========================================================================
     
     vector<size_t> selected_species_indices;
-    set<pair<string, int64_t>> selected_species_sites;
+    unordered_set<size_t> selected_species_sites;  // keyed by variant_idx
     
     if (collect_species && !all_species_candidates.empty()) {
         fprintf(stderr, "\n========================================\n");
-        fprintf(stderr, "Selecting species sites with pair-bucketed best-fit...\n");
+        fprintf(stderr, "Selecting species sites (two-pass sort-scan deficit/backfill)...\n");
         start_time = chrono::high_resolution_clock::now();
         
         int n_sp_pairs = panel_metadata.n_pairs;
-        long pair_target = (long)ceil((double)species_num / n_sp_pairs);
+        int n_sp = (int)panel_metadata.species_list.size();
         
-        fprintf(stderr, "  %zu candidates, %d pairs, target %ld per pair, %d total\n",
-            all_species_candidates.size(), n_sp_pairs, pair_target, species_num);
+        // ----- Item C: adaptive strong_threshold capped at 1.0 -----
+        float strong_threshold = std::min(1.0f, species_min_pair_discrim + 0.25f);
         
-        // Sort candidates by selection_score (max pair_discrim * log2(cov+1)) descending
-        fprintf(stderr, "  Sorting %zu species candidates by score...\n", all_species_candidates.size());
-        sort(all_species_candidates.begin(), all_species_candidates.end());
+        // Count strong candidates per pair for proportional target allocation
+        vector<long> pair_strong_count(n_sp_pairs, 0);
+        for (const auto& sc : all_species_candidates) {
+            for (int pi = 0; pi < n_sp_pairs; pi++) {
+                if (sc.pair_discrim[pi] >= strong_threshold) pair_strong_count[pi]++;
+            }
+        }
+        long total_strong = 0;
+        for (long v : pair_strong_count) total_strong += v;
         
-        // Pair counts
-        vector<long> pair_counts(n_sp_pairs, 0);
-        map<pair<string, int>, int> sp_bins_selected;
+        // If no pair has any candidate above strong_threshold, fall back to
+        // the 90th-percentile pair_discrim per pair as a softer strong cutoff.
+        if (total_strong == 0) {
+            fprintf(stderr, "  No candidates above strong_threshold=%.4f; "
+                "falling back to per-pair 90th-percentile pair_discrim.\n",
+                strong_threshold);
+            for (int pi = 0; pi < n_sp_pairs; pi++) {
+                vector<float> vals;
+                vals.reserve(all_species_candidates.size());
+                for (const auto& sc : all_species_candidates) {
+                    if (sc.pair_discrim[pi] > 0.0f) vals.push_back(sc.pair_discrim[pi]);
+                }
+                if (vals.empty()) continue;
+                sort(vals.begin(), vals.end());
+                size_t p90 = (size_t)(vals.size() * 0.9);
+                if (p90 >= vals.size()) p90 = vals.size() - 1;
+                float thr = vals[p90];
+                for (const auto& sc : all_species_candidates) {
+                    if (sc.pair_discrim[pi] >= thr) pair_strong_count[pi]++;
+                }
+                total_strong += pair_strong_count[pi];
+            }
+        }
+        
+        // ----- Item B: budget-feasible pair-target allocation -----
+        vector<long> pair_target(n_sp_pairs, 0);
+        if (species_num >= n_sp_pairs) {
+            // Hamilton apportionment: every pair gets floor(species_num / n_pairs)
+            // and the remainder is distributed by strong-count rank.
+            long base = species_num / n_sp_pairs;
+            long remainder = species_num - base * n_sp_pairs;
+            for (int pi = 0; pi < n_sp_pairs; pi++) pair_target[pi] = base;
+            
+            // Distribute remainder to pairs with the most strong candidates
+            vector<int> order(n_sp_pairs);
+            for (int i = 0; i < n_sp_pairs; i++) order[i] = i;
+            sort(order.begin(), order.end(), [&](int a, int b){
+                if (pair_strong_count[a] != pair_strong_count[b])
+                    return pair_strong_count[a] > pair_strong_count[b];
+                return a < b;  // deterministic
+            });
+            for (long k = 0; k < remainder && k < n_sp_pairs; k++) {
+                pair_target[order[(size_t)k]]++;
+            }
+        } else {
+            // species_num < n_sp_pairs: targets cannot cover every pair.
+            // Only the top species_num pairs (by strong count) get target=1;
+            // the rest get target=0 and participate in backfill only.
+            vector<int> order(n_sp_pairs);
+            for (int i = 0; i < n_sp_pairs; i++) order[i] = i;
+            sort(order.begin(), order.end(), [&](int a, int b){
+                if (pair_strong_count[a] != pair_strong_count[b])
+                    return pair_strong_count[a] > pair_strong_count[b];
+                return a < b;
+            });
+            for (int k = 0; k < species_num; k++) {
+                pair_target[order[(size_t)k]] = 1;
+            }
+            fprintf(stderr, "  NOTE: species_num (%d) < n_sp_pairs (%d); "
+                "%d pair(s) start with target=0 and rely on multi-pair credit "
+                "or backfill.\n", species_num, n_sp_pairs,
+                n_sp_pairs - species_num);
+        }
+        
+        // Sanity: targets must sum to <= species_num
+        long target_sum = 0;
+        for (long v : pair_target) target_sum += v;
+        if (target_sum > species_num) {
+            // Should not happen with the above allocation, but trim defensively.
+            long excess = target_sum - species_num;
+            for (int pi = n_sp_pairs - 1; pi >= 0 && excess > 0; pi--) {
+                long take = std::min(excess, pair_target[pi]);
+                pair_target[pi] -= take;
+                excess -= take;
+            }
+        }
+        
+        // B9: Precompute pair confidence (singleton species downweighted)
+        vector<float> species_confidence(n_sp, 1.0f);
+        for (int si = 0; si < n_sp; si++) {
+            const string& sp = panel_metadata.species_list[si];
+            auto it = panel_metadata.species_to_sample_indices.find(sp);
+            int n_in_sp = (it != panel_metadata.species_to_sample_indices.end())
+                          ? (int)it->second.size() : 0;
+            if (n_in_sp <= 1) {
+                species_confidence[si] = 0.5f;
+            } else {
+                species_confidence[si] = std::min(1.0f, sqrtf((float)n_in_sp / 3.0f));
+            }
+        }
+        vector<float> pair_confidence(n_sp_pairs, 1.0f);
+        for (int pi = 0; pi < n_sp_pairs; pi++) {
+            const string& spa = panel_metadata.species_pairs[pi].first;
+            const string& spb = panel_metadata.species_pairs[pi].second;
+            int si_a_conf = -1, si_b_conf = -1;
+            for (int si = 0; si < n_sp; si++) {
+                if (panel_metadata.species_list[si] == spa) si_a_conf = si;
+                if (panel_metadata.species_list[si] == spb) si_b_conf = si;
+            }
+            if (si_a_conf >= 0 && si_b_conf >= 0) {
+                pair_confidence[pi] = species_confidence[si_a_conf] * species_confidence[si_b_conf];
+            }
+        }
+        
+        fprintf(stderr, "  %zu candidates, %d species, %d pairs, total budget %d\n",
+            all_species_candidates.size(), n_sp, n_sp_pairs, species_num);
+        fprintf(stderr, "  Strong threshold: %.4f (total strong candidates: %ld)\n",
+            strong_threshold, total_strong);
+        fprintf(stderr, "  Pair targets (budget-feasible, sum=%ld):\n", target_sum);
+        for (int pi = 0; pi < n_sp_pairs; pi++) {
+            fprintf(stderr, "    %s-%s: target=%ld (strong=%ld)\n",
+                panel_metadata.species_pairs[pi].first.c_str(),
+                panel_metadata.species_pairs[pi].second.c_str(),
+                pair_target[pi], pair_strong_count[pi]);
+        }
+        fprintf(stderr, "  species_min_pair_discrim=%.4f, species_cov_cap=%.1f, "
+            "species_max_per_bin=%d\n",
+            species_min_pair_discrim, species_cov_cap, species_max_per_bin);
+        
+        // Tracking
+        vector<long> pair_counts(n_sp_pairs, 0);              // satisfaction count per pair
+        vector<long> pair_credited(n_sp_pairs, 0);            // total credited (audit)
+        unordered_map<uint64_t, int> sp_bins_selected;        // key = (chrom_idx << 32) | bin_idx
         
         selected_species_indices.reserve(species_num);
         
-        for (size_t i = 0; i < all_species_candidates.size() && (int)selected_species_indices.size() < species_num; i++) {
+        // ----- Sort-then-scan with two-pass deficit/backfill -----
+        //
+        // Replaces the O(species_num * n_candidates) full-rescan greedy loop
+        // that became intractable at 54M candidates x 20M target.
+        //
+        // Structure:
+        //   1. Compute a stable priority score per candidate.
+        //   2. Sort by priority descending with deterministic tiebreaks.
+        //   3. Pass A (deficit fill): scan sorted list once, accept only
+        //      candidates that help at least one pair with positive deficit.
+        //   4. Pass B (backfill): scan sorted list again, accept remaining
+        //      best candidates regardless of deficit, up to species_num.
+        //
+        // Complexity: O(n log n + 2 * n * n_pairs), vs previous O(k * n * n_pairs)
+        // where k = species_num.
+        
+        // Helper: pack (chrom_idx, bin_idx) into uint64_t key
+        auto bin_key = [](int chrom_idx, int bin_idx) -> uint64_t {
+            return ((uint64_t)(unsigned)chrom_idx << 32) | (uint64_t)(unsigned)bin_idx;
+        };
+        
+        // Step 1: compute priority score for sorting.
+        // priority = max_pi(pair_discrim[pi] * dosage_sep[pi] * pair_confidence[pi])
+        //          * min(log2(cov_score + 1), species_cov_cap)
+        fprintf(stderr, "  Computing priority scores for %zu candidates...\n",
+            all_species_candidates.size());
+        
+        vector<float> priority_scores(all_species_candidates.size());
+        for (size_t i = 0; i < all_species_candidates.size(); i++) {
+            const SpeciesCandidate& sc = all_species_candidates[i];
+            float best_contrib = 0.0f;
+            for (int pi = 0; pi < n_sp_pairs; pi++) {
+                float pd = sc.pair_discrim[pi];
+                if (pd < species_min_pair_discrim) continue;
+                float ds = (pi < (int)sc.pair_dosage_sep.size())
+                           ? sc.pair_dosage_sep[pi] : 0.0f;
+                float v = pd * ds * pair_confidence[pi];
+                if (v > best_contrib) best_contrib = v;
+            }
+            float cov_term = std::min(log2f(sc.cov_score + 1.0f), species_cov_cap);
+            priority_scores[i] = best_contrib * cov_term;
+        }
+        
+        // Step 2: build index array and sort by priority descending.
+        // Deterministic tiebreaks: priority desc, then chrom_idx asc, pos asc, variant_idx asc.
+        fprintf(stderr, "  Sorting %zu species candidates by priority score...\n",
+            all_species_candidates.size());
+        
+        vector<size_t> sorted_idx(all_species_candidates.size());
+        for (size_t i = 0; i < sorted_idx.size(); i++) sorted_idx[i] = i;
+        sort(sorted_idx.begin(), sorted_idx.end(), [&](size_t a, size_t b) {
+            if (priority_scores[a] != priority_scores[b])
+                return priority_scores[a] > priority_scores[b];
+            const SpeciesCandidate& sa = all_species_candidates[a];
+            const SpeciesCandidate& sb = all_species_candidates[b];
+            if (sa.chrom_idx != sb.chrom_idx) return sa.chrom_idx < sb.chrom_idx;
+            if (sa.pos != sb.pos) return sa.pos < sb.pos;
+            return sa.variant_idx < sb.variant_idx;
+        });
+        
+        // Pre-selection feasibility check: estimate max selectable sites
+        // given species_max_per_bin constraint.
+        if (species_max_per_bin > 0) {
+            unordered_set<uint64_t> eligible_bins;
+            for (size_t i = 0; i < all_species_candidates.size(); i++) {
+                if (priority_scores[i] <= 0.0f) continue;
+                const SpeciesCandidate& sc = all_species_candidates[i];
+                eligible_bins.insert(bin_key(sc.chrom_idx, sc.bin_idx));
+            }
+            long max_possible = (long)eligible_bins.size() * species_max_per_bin;
+            fprintf(stderr, "  Feasibility: %zu eligible bins x %d max_per_bin = %ld max possible\n",
+                eligible_bins.size(), species_max_per_bin, max_possible);
+            if (species_num > (int)max_possible) {
+                fprintf(stderr, "  WARNING: species_num=%d exceeds bin-cap maximum %ld. "
+                    "Selection will stop at %ld. Consider raising --species_max_per_bin.\n",
+                    species_num, max_possible, max_possible);
+            }
+        }
+        
+        // Step 3: two-pass selection.
+        fprintf(stderr, "  Pass A: deficit fill...\n");
+        
+        long blocked_by_bin = 0;
+        long skipped_no_eligible = 0;
+        vector<char> used_candidates(all_species_candidates.size(), 0);
+        
+        // Pass A: accept only candidates that help at least one pair with
+        // positive remaining deficit. This ensures rare/weak pairs get
+        // filled before the budget is consumed by already-satisfied pairs.
+        for (size_t rank = 0; rank < sorted_idx.size() &&
+             (int)selected_species_indices.size() < species_num; rank++) {
+            
+            size_t i = sorted_idx[rank];
             SpeciesCandidate& sc = all_species_candidates[i];
             
-            // Find available pairs: above threshold AND with budget remaining
-            int best_pair = -1;
-            float best_val = -1.0f;
+            if (priority_scores[i] <= 0.0f) break;
             
-            for (int pi = 0; pi < n_sp_pairs; pi++) {
-                if (sc.pair_discrim[pi] >= min_pair_score && pair_counts[pi] < pair_target) {
-                    if (sc.pair_discrim[pi] > best_val) {
-                        best_val = sc.pair_discrim[pi];
-                        best_pair = pi;
-                    }
+            // Duplicate-site guard (keyed by variant_idx)
+            if (selected_species_sites.count(sc.variant_idx) > 0) {
+                used_candidates[i] = 1;
+                continue;
+            }
+            
+            // Bin cap enforcement
+            if (species_max_per_bin > 0) {
+                uint64_t bk = bin_key(sc.chrom_idx, sc.bin_idx);
+                auto it_bin = sp_bins_selected.find(bk);
+                if (it_bin != sp_bins_selected.end() &&
+                    it_bin->second >= species_max_per_bin) {
+                    blocked_by_bin++;
+                    continue;
                 }
             }
             
-            if (best_pair < 0) continue; // no needy pair above threshold
+            // Check if this candidate helps any pair with positive deficit.
+            // Find the eligible pair with the largest remaining deficit.
+            int best_pi = -1;
+            long best_deficit = 0;
+            float best_score_for_tie = -1.0f;
+            bool helps_any_deficit = false;
             
-            sc.assigned_pair = best_pair;
+            for (int pi = 0; pi < n_sp_pairs; pi++) {
+                float pd = sc.pair_discrim[pi];
+                if (pd < species_min_pair_discrim) continue;
+                
+                long d = pair_target[pi] - pair_counts[pi];
+                if (d <= 0) continue;  // Pass A: skip satisfied pairs entirely
+                
+                helps_any_deficit = true;
+                float tie_score = pd * pair_confidence[pi];
+                
+                if (d > best_deficit || (d == best_deficit && tie_score > best_score_for_tie)) {
+                    best_deficit = d;
+                    best_pi = pi;
+                    best_score_for_tie = tie_score;
+                }
+            }
+            
+            if (!helps_any_deficit) continue;  // Pass A: defer to backfill
+            
+            // Accept candidate
+            sc.assigned_pair = best_pi;
+            used_candidates[i] = 1;
             selected_species_indices.push_back(i);
-            pair_counts[best_pair]++;
-            selected_species_sites.insert(make_pair(sc.chrom, sc.pos));
+            selected_species_sites.insert(sc.variant_idx);
+            sp_bins_selected[bin_key(sc.chrom_idx, sc.bin_idx)]++;
             
-            pair<string, int> bin_key = make_pair(sc.chrom, sc.bin_idx);
-            sp_bins_selected[bin_key]++;
+            // Multi-pair credit: increment for every pair above threshold
+            for (int pj = 0; pj < n_sp_pairs; pj++) {
+                if (sc.pair_discrim[pj] >= species_min_pair_discrim) {
+                    pair_counts[pj]++;
+                    pair_credited[pj]++;
+                }
+            }
             
-            if ((selected_species_indices.size() % 100000) == 0) {
-                fprintf(stderr, "    Selected %zu species sites...\r", selected_species_indices.size());
+            if ((selected_species_indices.size() % 1000000) == 0) {
+                fprintf(stderr, "    [deficit] Selected %zu / %d species sites...\r",
+                    selected_species_indices.size(), species_num);
                 fflush(stderr);
             }
+            
+            // Check if all deficits are now satisfied
+            bool all_satisfied = true;
+            for (int pi = 0; pi < n_sp_pairs; pi++) {
+                if (pair_counts[pi] < pair_target[pi]) { all_satisfied = false; break; }
+            }
+            if (all_satisfied) {
+                fprintf(stderr, "    All pair deficits satisfied at %zu selected sites. "
+                    "Switching to backfill.\n", selected_species_indices.size());
+                break;
+            }
+        }
+        
+        long deficit_fill_count = (long)selected_species_indices.size();
+        fprintf(stderr, "  Pass A complete: %ld sites selected (deficit fill)\n", deficit_fill_count);
+        
+        // Per-pair deficit status after pass A
+        for (int pi = 0; pi < n_sp_pairs; pi++) {
+            long remaining = pair_target[pi] - pair_counts[pi];
+            if (remaining > 0) {
+                fprintf(stderr, "    %s-%s: deficit remaining %ld / %ld\n",
+                    panel_metadata.species_pairs[pi].first.c_str(),
+                    panel_metadata.species_pairs[pi].second.c_str(),
+                    remaining, pair_target[pi]);
+            }
+        }
+        
+        // Pass B: backfill. Scan the same sorted list again and accept
+        // remaining best candidates regardless of deficit status.
+        if ((int)selected_species_indices.size() < species_num) {
+            fprintf(stderr, "  Pass B: backfill (%d remaining)...\n",
+                species_num - (int)selected_species_indices.size());
+            
+            long backfill_blocked_by_bin = 0;
+            
+            for (size_t rank = 0; rank < sorted_idx.size() &&
+                 (int)selected_species_indices.size() < species_num; rank++) {
+                
+                size_t i = sorted_idx[rank];
+                if (used_candidates[i]) continue;
+                
+                SpeciesCandidate& sc = all_species_candidates[i];
+                
+                if (priority_scores[i] <= 0.0f) break;
+                
+                // Duplicate-site guard
+                if (selected_species_sites.count(sc.variant_idx) > 0) {
+                    used_candidates[i] = 1;
+                    continue;
+                }
+                
+                // Bin cap enforcement
+                if (species_max_per_bin > 0) {
+                    uint64_t bk = bin_key(sc.chrom_idx, sc.bin_idx);
+                    auto it_bin = sp_bins_selected.find(bk);
+                    if (it_bin != sp_bins_selected.end() &&
+                        it_bin->second >= species_max_per_bin) {
+                        backfill_blocked_by_bin++;
+                        continue;
+                    }
+                }
+                
+                // Find best eligible pair by discrim * confidence (no deficit filter)
+                int best_pi = -1;
+                float best_score = -1.0f;
+                
+                for (int pi = 0; pi < n_sp_pairs; pi++) {
+                    float pd = sc.pair_discrim[pi];
+                    if (pd < species_min_pair_discrim) continue;
+                    float tie_score = pd * pair_confidence[pi];
+                    if (tie_score > best_score) {
+                        best_score = tie_score;
+                        best_pi = pi;
+                    }
+                }
+                
+                if (best_pi < 0) {
+                    skipped_no_eligible++;
+                    continue;
+                }
+                
+                // Accept candidate
+                sc.assigned_pair = best_pi;
+                used_candidates[i] = 1;
+                selected_species_indices.push_back(i);
+                selected_species_sites.insert(sc.variant_idx);
+                sp_bins_selected[bin_key(sc.chrom_idx, sc.bin_idx)]++;
+                
+                for (int pj = 0; pj < n_sp_pairs; pj++) {
+                    if (sc.pair_discrim[pj] >= species_min_pair_discrim) {
+                        pair_counts[pj]++;
+                        pair_credited[pj]++;
+                    }
+                }
+                
+                if ((selected_species_indices.size() % 1000000) == 0) {
+                    fprintf(stderr, "    [backfill] Selected %zu / %d species sites...\r",
+                        selected_species_indices.size(), species_num);
+                    fflush(stderr);
+                }
+            }
+            
+            blocked_by_bin += backfill_blocked_by_bin;
+            fprintf(stderr, "  Pass B complete: %zu sites selected (%zu backfill)\n",
+                selected_species_indices.size(),
+                selected_species_indices.size() - (size_t)deficit_fill_count);
+        }
+        
+        if (blocked_by_bin > 0) {
+            fprintf(stderr, "  %ld candidates blocked by species_max_per_bin=%d\n",
+                blocked_by_bin, species_max_per_bin);
+        }
+        if (skipped_no_eligible > 0) {
+            fprintf(stderr, "  %ld candidates skipped (no pair above species_min_pair_discrim=%.4f)\n",
+                skipped_no_eligible, species_min_pair_discrim);
         }
         
         end_time = chrono::high_resolution_clock::now();
@@ -2153,13 +2903,87 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  Selected %zu species sites from %zu bins in %ld seconds\n",
             selected_species_indices.size(), sp_bins_selected.size(), duration.count());
         
-        // Print per-pair summary
-        fprintf(stderr, "  Per-pair counts:\n");
+        if ((int)selected_species_indices.size() < species_num) {
+            fprintf(stderr, "  WARNING: selected only %zu / %d species SNPs.\n",
+                selected_species_indices.size(), species_num);
+        }
+        
+        // Per-pair summary (both assigned and credited counts; Item from review section H)
+        fprintf(stderr, "\n  Per-pair counts (assigned / credited / target):\n");
+        // Recompute assigned counts (since we may have changed assignment logic)
+        vector<long> pair_assigned(n_sp_pairs, 0);
+        for (size_t idx : selected_species_indices) {
+            int ap = all_species_candidates[idx].assigned_pair;
+            if (ap >= 0 && ap < n_sp_pairs) pair_assigned[ap]++;
+        }
         for (int pi = 0; pi < n_sp_pairs; pi++) {
-            fprintf(stderr, "    %s-%s: %ld / %ld\n",
+            float fill_pct = pair_target[pi] > 0
+                ? 100.0f * pair_credited[pi] / pair_target[pi] : 0.0f;
+            fprintf(stderr, "    %s-%s: assigned=%ld credited=%ld target=%ld (%.1f%%)\n",
                 panel_metadata.species_pairs[pi].first.c_str(),
                 panel_metadata.species_pairs[pi].second.c_str(),
-                pair_counts[pi], pair_target);
+                pair_assigned[pi], pair_credited[pi], pair_target[pi], fill_pct);
+        }
+        
+        // Post-selection species-balance audit (counts BOTH assigned and credited)
+        fprintf(stderr, "\n  Species-balance audit:\n");
+        map<string, long> species_site_counts_assigned;
+        map<string, long> species_site_counts_credited;
+        for (const string& sp : panel_metadata.species_list) {
+            species_site_counts_assigned[sp] = 0;
+            species_site_counts_credited[sp] = 0;
+        }
+        for (size_t idx : selected_species_indices) {
+            const SpeciesCandidate& sc = all_species_candidates[idx];
+            if (sc.assigned_pair >= 0) {
+                species_site_counts_assigned[panel_metadata.species_pairs[sc.assigned_pair].first]++;
+                species_site_counts_assigned[panel_metadata.species_pairs[sc.assigned_pair].second]++;
+            }
+            for (int pi = 0; pi < n_sp_pairs; pi++) {
+                if (sc.pair_discrim[pi] >= species_min_pair_discrim) {
+                    species_site_counts_credited[panel_metadata.species_pairs[pi].first]++;
+                    species_site_counts_credited[panel_metadata.species_pairs[pi].second]++;
+                }
+            }
+        }
+        for (const string& sp : panel_metadata.species_list) {
+            float pct_a = selected_species_indices.empty() ? 0.0f :
+                100.0f * species_site_counts_assigned[sp] / selected_species_indices.size();
+            float pct_c = selected_species_indices.empty() ? 0.0f :
+                100.0f * species_site_counts_credited[sp] / selected_species_indices.size();
+            fprintf(stderr, "    %s: %ld assigned (%.1f%%) / %ld credited (%.1f%%)\n",
+                sp.c_str(),
+                species_site_counts_assigned[sp], pct_a,
+                species_site_counts_credited[sp], pct_c);
+        }
+        
+        // Warn if any pair (with nonzero target) is severely underfilled
+        for (int pi = 0; pi < n_sp_pairs; pi++) {
+            if (pair_target[pi] > 0 && pair_credited[pi] < (long)(pair_target[pi] * 0.5)) {
+                fprintf(stderr, "  WARNING: %s-%s is below 50%% of target (credited %ld / %ld)\n",
+                    panel_metadata.species_pairs[pi].first.c_str(),
+                    panel_metadata.species_pairs[pi].second.c_str(),
+                    pair_credited[pi], pair_target[pi]);
+            }
+        }
+        
+        // Top 10 most-dense bins
+        if (!sp_bins_selected.empty()) {
+            vector<pair<int, uint64_t>> bin_ranked;
+            bin_ranked.reserve(sp_bins_selected.size());
+            for (auto& kv : sp_bins_selected) {
+                bin_ranked.push_back(make_pair(kv.second, kv.first));
+            }
+            sort(bin_ranked.rbegin(), bin_ranked.rend());
+            fprintf(stderr, "\n  Top 10 densest bins:\n");
+            for (int i = 0; i < min(10, (int)bin_ranked.size()); i++) {
+                int ci = (int)(bin_ranked[i].second >> 32);
+                int bi = (int)(bin_ranked[i].second & 0xFFFFFFFF);
+                const string& cname = (ci >= 0 && ci < (int)chroms.size())
+                                      ? chroms[ci] : string("?");
+                fprintf(stderr, "    %s:%d -> %d sites\n",
+                    cname.c_str(), bi, bin_ranked[i].first);
+            }
         }
     }
 
@@ -2168,21 +2992,27 @@ int main(int argc, char *argv[]) {
     // (Same as original - this is fast)
     // ========================================================================
     
-    map<int, vector<bitset<NBITS>>> size2clades;
+    // Under dosage encoding, index by total_alt instead of popcount.
+    // A missing-data clade with total_alt = T and m missing samples can be
+    // a parent of any fully-genotyped clade with total_alt in [T, T + 2m].
+    map<int, vector<bitset<NBITS>>> total_alt2clades;
     for (auto& bc : branchcounts){
-        for (int i = 1; i <= (int)bc.first.count(); ++i){
-            if (size2clades.count(i) == 0){
-                vector<bitset<NBITS>> v;
-                size2clades.insert(make_pair(i, v));
-            }
-            size2clades[i].push_back(bc.first);
-        }
+        int ta = compute_total_alt(bc.first, num_samples);
+        total_alt2clades[ta].push_back(bc.first);
     }
     
+    // NOTE: Missing-genotype sites contribute to clade SLOT ALLOCATION through
+    // branchcounts_missing (the count_branch_missing pass distributes fractional
+    // weight across compatible parent clades), but are skipped during the per-clade
+    // candidate SELECTION pass below (only fully-genotyped sites enter
+    // clade_to_variants). This is intentional: allocation uses fractional weights
+    // to avoid undercounting common patterns, while selection requires unambiguous
+    // assignment. The asymmetry produces shortfalls when missing-data sites are
+    // abundant, which the redistribution step below corrects by shifting unused
+    // slots to clades with surplus candidates.
     fprintf(stderr, "Adjusting counts using data from sites with missing genotypes (%zu entries)...\n", branchcounts_missing.size());
     fflush(stderr);
     
-    unordered_map<bitset<NBITS>, vector<bitset<NBITS>>> keyuniqparent;
     unordered_map<bitset<NBITS>, float> to_add;
     unordered_map<pair<bitset<NBITS>, bitset<NBITS>>, unordered_map<bitset<NBITS>, float>> miss_clade_probs;
     
@@ -2197,58 +3027,55 @@ int main(int argc, char *argv[]) {
         miss_clade_probs.insert(make_pair(bcm.first, mx));
         double parent_tot = 0.0;
 
-        int k = bcm.first.second.count();
-        if (keyuniqparent.count(bcm.first.second) > 0){
-            for (auto& v : keyuniqparent[bcm.first.second]){
-                if ((v & bcm.first.first).count() == k){
-                    double cladecount = branchcounts[v];
-                    parent_tot += cladecount;
-                    miss_clade_probs[bcm.first].insert(make_pair(v, (float)cladecount));
-                }
+        // bcm.first.first = present bitset (1-bit-per-sample)
+        // bcm.first.second = canonical clade (dosage-aware, 2-bits-per-sample)
+        // Build observed_mask: for each present sample i, set bits 2i and 2i+1
+        bitset<NBITS> observed_mask;
+        int n_missing_samples = 0;
+        for (int i = 0; i < num_samples; i++) {
+            if (bcm.first.first[i]) {
+                observed_mask.set(2*i);
+                observed_mask.set(2*i + 1);
+            } else {
+                n_missing_samples++;
             }
         }
-        else{
-            for (auto& v : size2clades[k]){
-                if ((v & bcm.first.second).count() == k){
-                    if (keyuniqparent.count(bcm.first.second) == 0){
-                        vector<bitset<NBITS>> vec;
-                        keyuniqparent.insert(make_pair(bcm.first.second, vec));
-                    }
-                    keyuniqparent[bcm.first.second].push_back(v);
-                    if ((v & bcm.first.first).count() == k){
-                        double cladecount = branchcounts[v];
-                        parent_tot += cladecount;
-                        miss_clade_probs[bcm.first].insert(make_pair(v, (float)cladecount));
-                    }
-                }
+        bitset<NBITS> observed_clade = bcm.first.second & observed_mask;
+        int ta_observed = compute_total_alt(bcm.first.second, num_samples);
+
+        // A compatible parent P must match on observed positions.
+        // Its total_alt can be in [ta_observed, ta_observed + 2*n_missing_samples].
+        // Search total_alt2clades for each possible total_alt value.
+        auto check_parent = [&](const bitset<NBITS>& v) {
+            if ((v & observed_mask) == observed_clade) {
+                double cladecount = branchcounts[v];
+                parent_tot += cladecount;
+                miss_clade_probs[bcm.first].insert(make_pair(v, (float)cladecount));
+            }
+        };
+
+        for (int ta_try = ta_observed; ta_try <= ta_observed + 2 * n_missing_samples; ta_try++) {
+            auto it = total_alt2clades.find(ta_try);
+            if (it == total_alt2clades.end()) continue;
+            for (auto& v : it->second) {
+                check_parent(v);
             }
         }
 
+        // Also check flipped polarity parents
         if (miss2flip.count(bcm.first.second) > 0){
-            bitset<NBITS> flipped = (miss2flip[bcm.first.second] & bcm.first.first);
-            k = flipped.count();
-            if (keyuniqparent.count(flipped) > 0){
-                for (auto& v : keyuniqparent[flipped]){
-                    if ((v & bcm.first.first).count() == k){
+            bitset<NBITS> flipped_clade = miss2flip[bcm.first.second];
+            bitset<NBITS> observed_flipped = flipped_clade & observed_mask;
+            int ta_flip_observed = compute_total_alt(flipped_clade, num_samples);
+
+            for (int ta_try = ta_flip_observed; ta_try <= ta_flip_observed + 2 * n_missing_samples; ta_try++) {
+                auto it = total_alt2clades.find(ta_try);
+                if (it == total_alt2clades.end()) continue;
+                for (auto& v : it->second) {
+                    if ((v & observed_mask) == observed_flipped) {
                         double cladecount = branchcounts[v];
                         parent_tot += cladecount;
                         miss_clade_probs[bcm.first].insert(make_pair(v, (float)cladecount));
-                    }
-                }
-            }
-            else{
-                for (auto& v : size2clades[k]){
-                    if ((v & flipped).count() == k){
-                        if (keyuniqparent.count(flipped) == 0){
-                            vector<bitset<NBITS>> vec;
-                            keyuniqparent.insert(make_pair(flipped, vec));
-                        }
-                        keyuniqparent[flipped].push_back(v);
-                        if ((v & bcm.first.first).count() == k){
-                            double cladecount = branchcounts[v];
-                            parent_tot += cladecount;
-                            miss_clade_probs[bcm.first].insert(make_pair(v, (float)cladecount));
-                        }
                     }
                 }
             }
@@ -2310,6 +3137,9 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "%f total clade counts\n", allbc2);
     fflush(stderr);
     
+    // Track whether we're in keep-all mode (total variants <= target)
+    bool keep_all = false;
+    
     if (allbc2 > (double)num){
         fprintf(stderr, "Sorting %zu clade counts...\n", clcountsort.size());
         fflush(stderr);
@@ -2322,6 +3152,26 @@ int main(int argc, char *argv[]) {
         for (size_t i = 0; i < clcountsort.size(); i++) {
             counts[i] = -clcountsort[i].first;
         }
+        
+        // B3: Too many distinct clades for requested target.
+        // Allocate 1 slot to the top num most-common clades and skip Brent optimization.
+        if (clcountsort.size() >= (size_t)num) {
+            fprintf(stderr,
+                "WARNING: %zu distinct allele sharing patterns found, but %d SNPs requested.\n",
+                clcountsort.size(), num);
+            fprintf(stderr,
+                "  Allocating 1 slot per clade for the top %d most-common clades; rare clades dropped.\n",
+                num);
+
+            for (int i = 0; i < num && i < (int)clcountsort.size(); ++i) {
+                const bitset<NBITS>& key = bs_idx[clcountsort[i].second];
+                clade_slot_allocation[key] = 1;
+                downsample_prob[key] = 1.0 / (-clcountsort[i].first);
+            }
+
+            brent_exponent = 0.0;
+        } else {
+        // Normal Brent/bisection optimization path
         
         // Pre-compute cumulative sums
         fprintf(stderr, "Computing cumulative sums...\n");
@@ -2422,25 +3272,59 @@ int main(int argc, char *argv[]) {
                         final_n_hi = n_hi;
                         
                         // Build slot allocation map (Option C: integer slot counts)
-                        // Also keep probability for DEMUX_SCORE reporting
+                        // Hamilton apportionment (Item H): floor each slots_float, then
+                        // distribute the remaining (target - sum_floor) slots to clades
+                        // with the largest fractional remainders. This eliminates the
+                        // floor-only undershoot of the previous implementation.
                         fprintf(stderr, "Building slot allocation map for %d clades...\n", n_hi);
                         fflush(stderr);
                         
-                        long total_slots_allocated = 0;
+                        // First pass: floor each clade's slot count and record the remainder.
+                        vector<pair<double, int>> remainders;  // (remainder, clade index in counts/clcountsort)
+                        remainders.reserve(n_hi);
+                        vector<long> slots_vec(n_hi, 0);
+                        long sum_floor = 0;
                         for (int i = 0; i < n_hi; ++i){
                             double slots_float = pow(counts[i], res);
-                            long slots = (long)floor(slots_float);  // Floor to get integer slots
+                            long slots = (long)floor(slots_float);
                             if (slots < 1) slots = 1;  // Minimum 1 slot per clade
-                            
-                            clade_slot_allocation.insert(make_pair(bs_idx[clcountsort[i].second], slots));
-                            total_slots_allocated += slots;
+                            slots_vec[i] = slots;
+                            sum_floor += slots;
+                            double rem = slots_float - floor(slots_float);
+                            remainders.push_back(make_pair(rem, i));
                             
                             // Also compute probability for DEMUX_SCORE
                             double dsp = pow(counts[i], res) / counts[i];
                             downsample_prob.insert(make_pair(bs_idx[clcountsort[i].second], dsp));
                         }
-                        fprintf(stderr, "  Allocated %ld initial slots across %zu clades\n", 
-                            total_slots_allocated, clade_slot_allocation.size());
+                        
+                        // Hamilton apportionment: distribute leftover slots (target rounded
+                        // to long) to the clades with the largest fractional remainders.
+                        long target_long = (long)round(target);
+                        long leftover = target_long - sum_floor;
+                        if (leftover > 0) {
+                            sort(remainders.begin(), remainders.end(),
+                                [](const pair<double,int>& a, const pair<double,int>& b) {
+                                    return a.first > b.first;
+                                });
+                            long k = 0;
+                            for (auto& r : remainders) {
+                                if (k >= leftover) break;
+                                slots_vec[r.second] += 1;
+                                k++;
+                            }
+                        }
+                        
+                        long total_slots_allocated = 0;
+                        for (int i = 0; i < n_hi; ++i) {
+                            clade_slot_allocation.insert(make_pair(bs_idx[clcountsort[i].second],
+                                                                   slots_vec[i]));
+                            total_slots_allocated += slots_vec[i];
+                        }
+                        fprintf(stderr, "  Allocated %ld initial slots across %zu clades "
+                            "(Hamilton remainder added %ld)\n",
+                            total_slots_allocated, clade_slot_allocation.size(),
+                            max(0L, leftover));
                         fflush(stderr);
                         break;
                     }
@@ -2456,10 +3340,17 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+        } // end B3 else (normal Brent/bisection path)
     }
     else{
-        fprintf(stderr, "%f total clade counts; no downsampling needed\n", allbc2);
-        return 0;
+        fprintf(stderr, "%f total clade counts; allocating all sites (no downsampling).\n", allbc2);
+        keep_all = true;
+        for (size_t i = 0; i < bs_idx.size(); i++) {
+            double count = -clcountsort[i].first;
+            clade_slot_allocation[bs_idx[clcountsort[i].second]] = (long)count;
+            downsample_prob[bs_idx[clcountsort[i].second]] = 1.0;
+        }
+        brent_exponent = 1.0;
     }
     
     // Compute downsample probabilities for missing genotype sites
@@ -2469,21 +3360,19 @@ int main(int argc, char *argv[]) {
     unordered_map<pair<bitset<NBITS>, bitset<NBITS>>, double> downsample_miss_prob;
 
     long miss_count = 0;
-    for (auto mcp = miss_clade_probs.begin(); mcp != miss_clade_probs.end(); ){
+    for (auto& mcp_entry : miss_clade_probs){
         double p = 0.0;
-        for (auto mcp2 = mcp->second.begin(); mcp2 != mcp->second.end(); ){
-            if (downsample_prob.count(mcp2->first) > 0){
-                p += mcp2->second * downsample_prob[mcp2->first];
+        for (auto& mcp2 : mcp_entry.second){
+            if (downsample_prob.count(mcp2.first) > 0){
+                p += mcp2.second * downsample_prob[mcp2.first];
             }
             else{
-                p += mcp2->second;
+                p += mcp2.second;
             }
-            mcp->second.erase(mcp2++);
         }
         if (p < 1.0){
-            downsample_miss_prob.insert(make_pair(mcp->first, p));
+            downsample_miss_prob.insert(make_pair(mcp_entry.first, p));
         }
-        miss_clade_probs.erase(mcp++);
         miss_count++;
         if (miss_count % 100000 == 0) {
             fprintf(stderr, "  Processed %ld missing entries...\r", miss_count);
@@ -2507,12 +3396,36 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Stratified Selection: Selecting top SNPs within each clade...\n");
     start_time = chrono::high_resolution_clock::now();
     
-    // Step 1: Group all QC-passing biallelic SNPs by their clade
+    // Set of selected variant indices (used by Pass 2)
+    set<size_t> selected_variant_indices;
+    
     // Map from clade bitset -> vector of (variant_idx, selection_score)
     unordered_map<bitset<NBITS>, vector<CladeCandidate>> clade_to_variants;
     
-    // Also need to handle missing genotype sites - map to their probable parent clades
-    // For simplicity, we'll use the same parent-mapping logic as the probability computation
+    if (keep_all) {
+        // Fix 4: True keep-all path. Total eligible variants <= target, so bypass
+        // clade-based stratified selection entirely. Insert every QC-passing,
+        // coverage-passing, non-blacklisted biallelic variant.
+        fprintf(stderr, "  keep_all mode: inserting all eligible variants directly...\n");
+        long keep_all_count = 0;
+        for (size_t vi = 0; vi < all_variants.size(); vi++) {
+            const StoredVariant& sv = all_variants[vi];
+            if (!sv.is_biallelic || !sv.passes_qc) continue;
+            
+            string chrom = chroms[sv.chrom_idx];
+            float cov_score = 0.0f;
+            if (!coverage_map.empty()) {
+                cov_score = get_coverage_score_fast(chrom, sv.pos, coverage_map);
+            }
+            if (cov_score < min_cov) continue;
+            if (!blacklist.empty() && is_blacklisted(chrom, sv.pos, blacklist)) continue;
+            
+            selected_variant_indices.insert(vi);
+            keep_all_count++;
+        }
+        fprintf(stderr, "  Inserted %ld variants in keep_all mode\n", keep_all_count);
+    } else {
+    // Normal stratified selection path
     
     fprintf(stderr, "  Grouping %zu variants by clade...\n", all_variants.size());
     fflush(stderr);
@@ -2538,7 +3451,7 @@ int main(int argc, char *argv[]) {
         // Get annotation score FRESH
         float annot_score = 0.1f;
         if (!annotations.empty()) {
-            annot_score = get_annot_score(chrom, sv.pos, annotations);
+            annot_score = get_annot_score(chrom, sv.pos + 1, annotations);
         }
         
         // Apply min_cov hard filter
@@ -2547,23 +3460,61 @@ int main(int argc, char *argv[]) {
             continue;
         }
         
-        // Determine the canonical clade bitset
-        int ac = sv.alt.count();
-        int afc = sv.alt_flip.count();
+        // B11: Blacklist filter
+        if (!blacklist.empty() && is_blacklisted(chrom, sv.pos, blacklist)) continue;
+        
+        // Determine the canonical clade bitset (dosage-aware: A8)
+        int ta = sv.total_alt;
+        int ta_flip = sv.total_alt_flip;
         bitset<NBITS> clade_key;
         
         if (sv.present.count() == (size_t)num_samples) {
             // No missing data - use direct clade
-            if (ac < afc || (ac == afc && sv.alt < sv.alt_flip)) {
+            if (ta < ta_flip || (ta == ta_flip && sv.alt < sv.alt_flip)) {
                 clade_key = sv.alt;
             } else {
                 clade_key = sv.alt_flip;
             }
         } else {
-            // Has missing data - need to find parent clade
-            // For now, skip sites with missing data in stratified selection
-            // (they contribute fractionally to multiple parent clades, complex to handle)
-            continue;
+            // Has missing data: assign to most-likely parent clade (B5)
+            bitset<NBITS> observed_mask_sel;
+            for (int ii = 0; ii < num_samples; ii++) {
+                if (sv.present[ii]) {
+                    observed_mask_sel.set(2*ii);
+                    observed_mask_sel.set(2*ii + 1);
+                }
+            }
+            int ta_miss = sv.total_alt;
+            int ta_miss_flip = sv.total_alt_flip;
+            bitset<NBITS> miss_clade_canonical;
+            if (ta_miss < ta_miss_flip ||
+                (ta_miss == ta_miss_flip && sv.alt < sv.alt_flip)) {
+                miss_clade_canonical = sv.alt;
+            } else {
+                miss_clade_canonical = sv.alt_flip;
+            }
+            auto miss_key = make_pair(sv.present, miss_clade_canonical);
+            auto mcp_it = miss_clade_probs.find(miss_key);
+            if (mcp_it == miss_clade_probs.end()) continue;  // no compatible parent
+            // Find max-weight parent
+            bitset<NBITS> best_parent;
+            float best_weight = -1.0f;
+            for (auto& pp : mcp_it->second) {
+                if (pp.second > best_weight) {
+                    best_weight = pp.second;
+                    best_parent = pp.first;
+                }
+            }
+            if (clade_slot_allocation.count(best_parent) > 0) {
+                CladeCandidate cc;
+                cc.variant_idx = vi;
+                float present_fraction = (float)sv.present.count() / num_samples;
+                cc.selection_score = compute_selection_score(cov_score, annot_score)
+                                    * present_fraction;  // missingness penalty
+                clade_to_variants[best_parent].push_back(cc);
+                grouped_count++;
+            }
+            continue;  // Fix 6: do not fall through to fully-genotyped clade block
         }
         
         // Only add if this clade has a slot allocation
@@ -2588,9 +3539,6 @@ int main(int argc, char *argv[]) {
     // Step 2: Sort each clade's variants by selection score and select top N
     fprintf(stderr, "  Selecting top variants within each clade...\n");
     fflush(stderr);
-    
-    // Set of selected variant indices
-    set<size_t> selected_variant_indices;
     
     long total_shortfall = 0;
     long clades_with_shortfall = 0;
@@ -2671,6 +3619,41 @@ int main(int argc, char *argv[]) {
         num, selected_variant_indices.size(), total_shortfall);
     fflush(stderr);
 
+    // A11: Write clade audit table
+    {
+        string audit_path = outfile + ".clade_audit.tsv";
+        FILE* audit_fp = fopen(audit_path.c_str(), "w");
+        if (audit_fp) {
+            fprintf(audit_fp, "clade_idx\ttotal_alt\tn_called_samples\tslots_allocated\t"
+                "candidates_available\tselected\tmean_selection_score\n");
+            int clade_idx = 0;
+            for (auto& kv : clade_to_variants) {
+                const bitset<NBITS>& ck = kv.first;
+                const vector<CladeCandidate>& cands = kv.second;
+                long slots = 0;
+                if (clade_slot_allocation.count(ck) > 0) slots = clade_slot_allocation[ck];
+                long sel = min(slots, (long)cands.size());
+                int ta_audit = compute_total_alt(ck, num_samples);
+                // Count called samples from the clade key: a sample is "called" if
+                // any of its two bits is set or it appears in a present mask. For
+                // fully-genotyped clades, n_called = num_samples.
+                int n_called_audit = num_samples; // approximation for fully-genotyped
+                double mean_score = 0.0;
+                for (long i = 0; i < sel; i++) mean_score += cands[i].selection_score;
+                if (sel > 0) mean_score /= sel;
+                fprintf(audit_fp, "%d\t%d\t%d\t%ld\t%zu\t%ld\t%.4f\n",
+                    clade_idx, ta_audit, n_called_audit, slots, cands.size(), sel, mean_score);
+                clade_idx++;
+            }
+            fclose(audit_fp);
+            fprintf(stderr, "  Clade audit: %d clades written to %s\n", clade_idx, audit_path.c_str());
+        } else {
+            fprintf(stderr, "  WARNING: Could not open %s for clade audit\n", audit_path.c_str());
+        }
+    }
+
+    } // end else (normal stratified selection, not keep_all)
+
     // ========================================================================
     // PAIRWISE FLOOR ENFORCEMENT (if --min_pairwise set)
     // After clade-balanced selection, check each individual pair's
@@ -2701,14 +3684,15 @@ int main(int argc, char *argv[]) {
         long variants_scanned = 0;
         for (size_t vi : selected_variant_indices) {
             const StoredVariant& sv = all_variants[vi];
-            if (sv.genotypes.empty()) continue;
+            if (sv.genotypes_packed.empty()) continue;
             
             // Compute alt_count per sample
             vector<int> ac(num_samples, -1);
             for (int s = 0; s < num_samples; s++) {
-                const int32_t* gt = sv.genotypes.data() + s * ploidy;
-                if (!bcf_gt_is_missing(gt[0]) && !bcf_gt_is_missing(gt[1])) {
-                    ac[s] = (bcf_gt_allele(gt[0]) > 0 ? 1 : 0) + (bcf_gt_allele(gt[1]) > 0 ? 1 : 0);
+                int a1 = gt_packed_allele(sv.genotypes_packed, s, 0);
+                int a2 = gt_packed_allele(sv.genotypes_packed, s, 1);
+                if (a1 >= 0 && a2 >= 0) {
+                    ac[s] = (a1 > 0 ? 1 : 0) + (a2 > 0 ? 1 : 0);
                 }
             }
             
@@ -2766,17 +3750,22 @@ int main(int argc, char *argv[]) {
                            pair_counts[pair_idx(b.first, b.second)];
                 });
             
-            // Build a set of candidate variants not yet selected, with coverage scores
-            // We scan the full variant pool once and for each variant, check which
-            // deficit pairs it distinguishes
+            // Build a set of candidate variants not yet selected.
+            // For each variant, store (rescue_score, variant_idx) per deficit pair where
+            // rescue_score = coverage * num_deficit_pairs_helped * dosage_difference_at_this_pair.
+            // (Item J): adds multi-pair utility and dosage strength to the scoring,
+            // replacing pure-coverage ranking.
             fprintf(stderr, "  Scanning variant pool for pairwise rescue candidates...\n");
             
-            // For each deficit pair, collect (coverage_score, variant_idx) candidates
-            // Use a map from pair index to vector of candidates
-            map<int, vector<pair<float, size_t>>> pair_candidates;
-            for (auto& dp : deficit_pairs) {
-                pair_candidates[pair_idx(dp.first, dp.second)] = vector<pair<float, size_t>>();
-            }
+            // First pass: for each variant, determine which deficit pairs it distinguishes
+            // and the dosage difference at each. Cache results so we don't recompute below.
+            struct RescueVariantInfo {
+                size_t vi;
+                float cov;
+                vector<pair<int, int>> distinguished_pairs;  // (pidx, dosage_diff)
+            };
+            vector<RescueVariantInfo> variant_info_cache;
+            variant_info_cache.reserve(all_variants.size() / 10);  // estimate
             
             // Set of deficit pair indices for fast lookup
             set<int> deficit_pair_indices;
@@ -2790,7 +3779,7 @@ int main(int argc, char *argv[]) {
                 
                 const StoredVariant& sv = all_variants[vi];
                 if (!sv.is_biallelic || !sv.passes_qc) continue;
-                if (sv.genotypes.empty()) continue;
+                if (sv.genotypes_packed.empty()) continue;
                 
                 // Get coverage
                 string chrom = chroms[sv.chrom_idx];
@@ -2800,23 +3789,42 @@ int main(int argc, char *argv[]) {
                 }
                 if (cov < min_cov) continue;
                 
+                // B8: call-rate floor for rescue candidates
+                int n_called_rescue = 0;
+                for (int s = 0; s < num_samples; s++) {
+                    if (gt_packed_allele(sv.genotypes_packed, s, 0) >= 0 &&
+                        gt_packed_allele(sv.genotypes_packed, s, 1) >= 0) {
+                        n_called_rescue++;
+                    }
+                }
+                float call_rate_rescue = (float)n_called_rescue / num_samples;
+                if (call_rate_rescue < pairwise_rescue_min_call_rate) continue;
+                
                 // Compute alt_count
                 vector<int> ac(num_samples, -1);
                 for (int s = 0; s < num_samples; s++) {
-                    const int32_t* gt = sv.genotypes.data() + s * ploidy;
-                    if (!bcf_gt_is_missing(gt[0]) && !bcf_gt_is_missing(gt[1])) {
-                        ac[s] = (bcf_gt_allele(gt[0]) > 0 ? 1 : 0) + (bcf_gt_allele(gt[1]) > 0 ? 1 : 0);
+                    int a1 = gt_packed_allele(sv.genotypes_packed, s, 0);
+                    int a2 = gt_packed_allele(sv.genotypes_packed, s, 1);
+                    if (a1 >= 0 && a2 >= 0) {
+                        ac[s] = (a1 > 0 ? 1 : 0) + (a2 > 0 ? 1 : 0);
                     }
                 }
                 
                 // Check which deficit pairs this variant distinguishes
+                RescueVariantInfo info;
+                info.vi = vi;
+                info.cov = cov;
                 for (auto& dp : deficit_pairs) {
                     int a = dp.first, b = dp.second;
                     if (ac[a] >= 0 && ac[b] >= 0 && ac[a] != ac[b]) {
                         int pidx = pair_idx(a, b);
-                        pair_candidates[pidx].push_back(make_pair(cov, vi));
+                        int dosage_diff = std::abs(ac[a] - ac[b]);  // 1 or 2
+                        info.distinguished_pairs.push_back(make_pair(pidx, dosage_diff));
                         candidates_found++;
                     }
+                }
+                if (!info.distinguished_pairs.empty()) {
+                    variant_info_cache.push_back(std::move(info));
                 }
                 
                 if (vi % 5000000 == 0 && vi > 0) {
@@ -2828,13 +3836,33 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "    Found %ld rescue candidates across %zu deficit pairs\n",
                 candidates_found, deficit_pairs.size());
             
-            // Step 4: For each deficit pair, sort candidates by coverage descending,
+            // For each deficit pair, build a scored candidate list:
+            //   score = cov * num_deficit_pairs_helped * dosage_diff_at_this_pair
+            map<int, vector<pair<float, size_t>>> pair_candidates;
+            for (auto& dp : deficit_pairs) {
+                pair_candidates[pair_idx(dp.first, dp.second)] = vector<pair<float, size_t>>();
+            }
+            for (const auto& info : variant_info_cache) {
+                int n_helped = (int)info.distinguished_pairs.size();
+                for (const auto& kv : info.distinguished_pairs) {
+                    int pidx = kv.first;
+                    int dosage_diff = kv.second;
+                    float score = info.cov * (float)n_helped * (float)dosage_diff;
+                    pair_candidates[pidx].push_back(make_pair(score, info.vi));
+                }
+            }
+            
+            // Step 4: For each deficit pair, sort candidates by rescue score descending,
             // add top-N needed to close the gap
             long total_added = 0;
             long pairs_rescued = 0;
             long pairs_partial = 0;
+            map<pair<string, int>, int> rescue_bins;  // B8: bin tracking for rescue
             
             for (auto& dp : deficit_pairs) {
+                // B8: global rescue cap
+                if (total_added >= max_pairwise_rescue) break;
+                
                 int pidx = pair_idx(dp.first, dp.second);
                 long current = pair_counts[pidx];
                 long needed = min_pairwise - current;
@@ -2842,7 +3870,7 @@ int main(int argc, char *argv[]) {
                 
                 auto& candidates = pair_candidates[pidx];
                 
-                // Sort by coverage descending
+                // Sort by rescue score descending
                 sort(candidates.begin(), candidates.end(),
                     [](const pair<float, size_t>& a, const pair<float, size_t>& b) {
                         return a.first > b.first;
@@ -2851,26 +3879,43 @@ int main(int argc, char *argv[]) {
                 long added_this_pair = 0;
                 for (auto& cand : candidates) {
                     if (added_this_pair >= needed) break;
+                    if (total_added >= max_pairwise_rescue) break;
                     size_t vi = cand.second;
                     
                     // Check if already added by a previous deficit pair's rescue
                     if (selected_variant_indices.count(vi) > 0) {
-                        // Already added; update this pair's count if it distinguishes
-                        // (it was added for another pair but helps this one too)
                         continue;
+                    }
+                    
+                    // B8: bin-spacing constraint for rescue
+                    if (pairwise_rescue_max_per_bin > 0) {
+                        const StoredVariant& sv_check = all_variants[vi];
+                        string rc = chroms[sv_check.chrom_idx];
+                        int rb = get_bin_idx(sv_check.pos, bin_size);
+                        auto rbk = make_pair(rc, rb);
+                        if (rescue_bins[rbk] >= pairwise_rescue_max_per_bin) continue;
                     }
                     
                     selected_variant_indices.insert(vi);
                     added_this_pair++;
                     total_added++;
                     
+                    // B8: update rescue bin tracking
+                    {
+                        const StoredVariant& sv_bin = all_variants[vi];
+                        string rbc = chroms[sv_bin.chrom_idx];
+                        int rbb = get_bin_idx(sv_bin.pos, bin_size);
+                        rescue_bins[make_pair(rbc, rbb)]++;
+                    }
+                    
                     // Update pairwise counts for ALL pairs this new variant distinguishes
                     const StoredVariant& sv = all_variants[vi];
                     vector<int> ac(num_samples, -1);
                     for (int s = 0; s < num_samples; s++) {
-                        const int32_t* gt = sv.genotypes.data() + s * ploidy;
-                        if (!bcf_gt_is_missing(gt[0]) && !bcf_gt_is_missing(gt[1])) {
-                            ac[s] = (bcf_gt_allele(gt[0]) > 0 ? 1 : 0) + (bcf_gt_allele(gt[1]) > 0 ? 1 : 0);
+                        int a1 = gt_packed_allele(sv.genotypes_packed, s, 0);
+                        int a2 = gt_packed_allele(sv.genotypes_packed, s, 1);
+                        if (a1 >= 0 && a2 >= 0) {
+                            ac[s] = (a1 > 0 ? 1 : 0) + (a2 > 0 ? 1 : 0);
                         }
                     }
                     for (int i = 0; i < num_samples; i++) {
@@ -2940,12 +3985,26 @@ int main(int argc, char *argv[]) {
         // Recompute atac_num slots if needed (use same Brent exponent as RNA)
         unordered_map<bitset<NBITS>, long> atac_clade_slots;
         
-        // Scale slot allocation proportionally to atac_num vs num
+        // B4: Hamilton apportionment matching RNA path
         double atac_scale = (double)atac_num / (double)num;
+        vector<pair<double, bitset<NBITS>>> atac_remainders;
+        long atac_sum_floor = 0;
         for (auto& kv : clade_slot_allocation) {
-            long slots = (long)round(kv.second * atac_scale);
+            double slots_float = kv.second * atac_scale;
+            long slots = (long)floor(slots_float);
             if (slots < 1) slots = 1;
             atac_clade_slots[kv.first] = slots;
+            atac_sum_floor += slots;
+            atac_remainders.push_back({slots_float - floor(slots_float), kv.first});
+        }
+        long atac_leftover = (long)atac_num - atac_sum_floor;
+        if (atac_leftover > 0) {
+            sort(atac_remainders.begin(), atac_remainders.end(),
+                [](const pair<double, bitset<NBITS>>& a,
+                   const pair<double, bitset<NBITS>>& b) { return a.first > b.first; });
+            for (long k = 0; k < atac_leftover && k < (long)atac_remainders.size(); k++) {
+                atac_clade_slots[atac_remainders[k].second] += 1;
+            }
         }
         
         // Group variants by clade with ATAC coverage scoring
@@ -2959,12 +4018,12 @@ int main(int argc, char *argv[]) {
             
             string chrom = chroms[sv.chrom_idx];
             float atac_cov = get_coverage_score_fast(chrom, sv.pos, atac_coverage_map);
-            if (atac_cov < min_cov) continue;
+            if (atac_cov < atac_min_cov) continue;
             
-            int ac = sv.alt.count();
-            int afc = sv.alt_flip.count();
+            int atac_ta = sv.total_alt;
+            int atac_ta_flip = sv.total_alt_flip;
             bitset<NBITS> clade_key;
-            if (ac < afc || (ac == afc && sv.alt < sv.alt_flip)) {
+            if (atac_ta < atac_ta_flip || (atac_ta == atac_ta_flip && sv.alt < sv.alt_flip)) {
                 clade_key = sv.alt;
             } else {
                 clade_key = sv.alt_flip;
@@ -3014,54 +4073,32 @@ int main(int argc, char *argv[]) {
         #pragma omp parallel for schedule(dynamic, 1000)
         for (size_t i = 0; i < selected_het_indices.size(); ++i) {
             HetCandidate& hc = all_het_candidates[selected_het_indices[i]];
+            const StoredVariant& sv_ref = all_variants[hc.variant_idx];
             
-            // Reconstruct alt/alt_flip/present bitsets from stored genotypes
-            bitset<NBITS> alt, alt_flip, present;
-            int ploidy = hc.genotypes.size() / hc.n_samples;
-            
-            for (int s = 0; s < hc.n_samples; ++s) {
-                int32_t* gt_ptr = hc.genotypes.data() + s * ploidy;
-                
-                if (bcf_gt_is_missing(gt_ptr[0]) || (ploidy > 1 && bcf_gt_is_missing(gt_ptr[1]))) {
-                    continue;  // Missing - not present
-                }
-                
-                present.set(s);
-                
-                int a1 = bcf_gt_allele(gt_ptr[0]);
-                int a2 = (ploidy > 1) ? bcf_gt_allele(gt_ptr[1]) : a1;
-                
-                if (a1 > 0 || a2 > 0) {
-                    alt.set(s);
-                }
-                if (a1 == 0 || a2 == 0) {
-                    alt_flip.set(s);
-                }
-            }
-            
+            // Use precomputed dosage-aware bitsets from StoredVariant
             // Look up downsample probability
             double samp_prob = 1.0;
-            int ac = alt.count();
-            int afc = alt_flip.count();
+            int ta = sv_ref.total_alt;
+            int ta_flip = sv_ref.total_alt_flip;
             
-            if (present.count() == (size_t)hc.n_samples) {
+            if (sv_ref.present.count() == (size_t)hc.n_samples) {
                 // No missing data
-                if (ac < afc || (ac == afc && alt < alt_flip)) {
-                    if (downsample_prob.count(alt) > 0) {
-                        samp_prob = downsample_prob.at(alt);
+                if (ta < ta_flip || (ta == ta_flip && sv_ref.alt < sv_ref.alt_flip)) {
+                    if (downsample_prob.count(sv_ref.alt) > 0) {
+                        samp_prob = downsample_prob.at(sv_ref.alt);
                     }
                 } else {
-                    if (downsample_prob.count(alt_flip) > 0) {
-                        samp_prob = downsample_prob.at(alt_flip);
+                    if (downsample_prob.count(sv_ref.alt_flip) > 0) {
+                        samp_prob = downsample_prob.at(sv_ref.alt_flip);
                     }
                 }
             } else {
                 // Has missing data
                 pair<bitset<NBITS>, bitset<NBITS>> key;
-                if (ac < afc || (ac == afc && alt < alt_flip)) {
-                    key = make_pair(present, alt);
+                if (ta < ta_flip || (ta == ta_flip && sv_ref.alt < sv_ref.alt_flip)) {
+                    key = make_pair(sv_ref.present, sv_ref.alt);
                 } else {
-                    key = make_pair(present, alt_flip);
+                    key = make_pair(sv_ref.present, sv_ref.alt_flip);
                 }
                 if (downsample_miss_prob.count(key) > 0) {
                     samp_prob = downsample_miss_prob.at(key);
@@ -3086,9 +4123,8 @@ int main(int argc, char *argv[]) {
         bcf_hdr_append(het_header, "##INFO=<ID=ANNOT_SCORE,Number=1,Type=Float,Description=\"Annotation weight (1.0=genic, 0.1=intergenic)\">");
         bcf_hdr_append(het_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"RNA coverage score\">");
         bcf_hdr_append(het_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index for evenness tracking\">");
-        if (enable_pool_scoring) {
-            bcf_hdr_append(het_header, "##INFO=<ID=HET_SEL_SCORE,Number=1,Type=Float,Description=\"Selection ranking score: final_het_score * (log2(cov+1) + 0.1*annot_boost)\">");
-        }
+        bcf_hdr_append(het_header, "##INFO=<ID=HET_SEL_SCORE,Number=1,Type=Float,Description=\"Selection ranking score: final_het_score * call_rate * (log2(cov+1) + 0.1*annot_boost)\">");
+        bcf_hdr_append(het_header, "##INFO=<ID=HET_RAW_SCORE,Number=1,Type=Float,Description=\"Same as HET_SCORE; explicit name.\">");
         if (bcf_hdr_sync(het_header) < 0) {
             fprintf(stderr, "ERROR: Failed to sync het header\n");
             exit(1);
@@ -3121,14 +4157,16 @@ int main(int argc, char *argv[]) {
             // Set chromosome and position
             het_rec->rid = bcf_hdr_name2id(het_header, hc->chrom.c_str());
             het_rec->pos = hc->pos;
-            het_rec->qual = 0;
+            het_rec->qual = all_variants[hc->variant_idx].qual;
             
             // Set alleles
             string alleles = hc->ref_allele + "," + hc->alt_allele;
             bcf_update_alleles_str(het_header, het_rec, alleles.c_str());
             
-            // Set genotypes
-            bcf_update_genotypes(het_header, het_rec, hc->genotypes.data(), hc->genotypes.size());
+            // Set genotypes (unpack from packed storage)
+            vector<int32_t> het_gt;
+            unpack_genotypes(all_variants[hc->variant_idx].genotypes_packed, hc->n_samples, het_gt);
+            bcf_update_genotypes(het_header, het_rec, het_gt.data(), het_gt.size());
             
             // Set INFO fields - ALL scores
             float demux_score = hc->demux_score;
@@ -3152,6 +4190,13 @@ int main(int argc, char *argv[]) {
             if (enable_pool_scoring) {
                 float sel_score = hc->het_sel_score;
                 bcf_update_info_float(het_header, het_rec, "HET_SEL_SCORE", &sel_score, 1);
+            } else {
+                float sel_score = hc->het_sel_score;
+                bcf_update_info_float(het_header, het_rec, "HET_SEL_SCORE", &sel_score, 1);
+            }
+            {
+                float raw_score = hc->het_freq * (1.0f - hc->missing_freq * 0.5f);
+                bcf_update_info_float(het_header, het_rec, "HET_RAW_SCORE", &raw_score, 1);
             }
             
             if (bcf_write(het_out, het_header, het_rec) < 0) {
@@ -3201,6 +4246,8 @@ int main(int argc, char *argv[]) {
         bcf_hdr_append(atac_het_header, "##INFO=<ID=MISSING_FREQ,Number=1,Type=Float,Description=\"Fraction of individuals with missing genotype\">");
         bcf_hdr_append(atac_het_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"ATAC coverage score\">");
         bcf_hdr_append(atac_het_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index\">");
+        bcf_hdr_append(atac_het_header, "##INFO=<ID=HET_SEL_SCORE,Number=1,Type=Float,Description=\"Selection ranking score\">");
+        bcf_hdr_append(atac_het_header, "##INFO=<ID=HET_RAW_SCORE,Number=1,Type=Float,Description=\"Same as HET_SCORE; explicit name.\">");
         if (bcf_hdr_sync(atac_het_header) < 0) {
             fprintf(stderr, "ERROR: Failed to sync ATAC-het header\n");
             exit(1);
@@ -3229,11 +4276,14 @@ int main(int argc, char *argv[]) {
             bcf_clear(ah_rec);
             ah_rec->rid = bcf_hdr_name2id(atac_het_header, hc->chrom.c_str());
             ah_rec->pos = hc->pos;
-            ah_rec->qual = 0;
+            ah_rec->qual = all_variants[hc->variant_idx].qual;
             
             string alleles_str = hc->ref_allele + "," + hc->alt_allele;
             bcf_update_alleles_str(atac_het_header, ah_rec, alleles_str.c_str());
-            bcf_update_genotypes(atac_het_header, ah_rec, hc->genotypes.data(), hc->genotypes.size());
+            const vector<uint8_t>& ah_gt_packed = all_variants[hc->variant_idx].genotypes_packed;
+            vector<int32_t> ah_gt;
+            unpack_genotypes(ah_gt_packed, num_samples, ah_gt);
+            bcf_update_genotypes(atac_het_header, ah_rec, ah_gt.data(), ah_gt.size());
             
             float hs_info = hc->het_freq * (1.0f - hc->missing_freq * 0.5f);
             float hf = hc->het_freq;
@@ -3246,6 +4296,12 @@ int main(int argc, char *argv[]) {
             
             string bin_id = make_bin_id(hc->chrom, hc->bin_idx);
             bcf_update_info_string(atac_het_header, ah_rec, "BIN_ID", bin_id.c_str());
+            
+            // Fix 5: HET_SEL_SCORE and HET_RAW_SCORE parity with RNA-het output
+            float ah_sel_score = hc->het_sel_score;
+            bcf_update_info_float(atac_het_header, ah_rec, "HET_SEL_SCORE", &ah_sel_score, 1);
+            float ah_raw_score = hc->het_freq * (1.0f - hc->missing_freq * 0.5f);
+            bcf_update_info_float(atac_het_header, ah_rec, "HET_RAW_SCORE", &ah_raw_score, 1);
             
             if (bcf_write(atac_het_out, atac_het_header, ah_rec) < 0) {
                 fprintf(stderr, "ERROR: Failed to write ATAC-het record\n");
@@ -3286,8 +4342,14 @@ int main(int argc, char *argv[]) {
         bcf_hdr_append(sp_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"Coverage score used for selection\">");
         bcf_hdr_append(sp_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index\">");
         bcf_hdr_append(sp_header, "##INFO=<ID=PAIR_ASSIGNED,Number=1,Type=String,Description=\"Species pair this site was assigned to during selection\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=PAIR_CREDITED,Number=1,Type=String,Description=\"Comma-separated species pairs this site discriminates above species_min_pair_discrim\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=SP_MAX_PAIR_SCORE,Number=1,Type=Float,Description=\"Maximum species pair score across all pairs\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=SP_SELECTION_SCORE,Number=1,Type=Float,Description=\"Legacy aggregate score (max_pair_score * capped_coverage); recorded only, NOT used for ranking. Primary ranking uses pair_discrim.\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=SP_MAX_PAIR_DISCRIM,Number=1,Type=Float,Description=\"Maximum pair_discrim across all pairs (primary ranking score)\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=ASSIGNED_PAIR_DISCRIM,Number=1,Type=Float,Description=\"pair_discrim for the pair that pulled this site\">");
+        bcf_hdr_append(sp_header, "##INFO=<ID=ASSIGNED_PAIR_SCORE,Number=1,Type=Float,Description=\"Legacy multiplicative pair_score for the assigned pair\">");
         
-        // Add per-pair PAIR_DISCRIM fields
+        // Per-pair PAIR_DISCRIM fields
         for (int pi = 0; pi < panel_metadata.n_pairs; pi++) {
             string field_name = "PAIR_DISCRIM_" + panel_metadata.species_pairs[pi].first + 
                                 "_" + panel_metadata.species_pairs[pi].second;
@@ -3296,6 +4358,29 @@ int main(int argc, char *argv[]) {
                 panel_metadata.species_pairs[pi].first + "," + 
                 panel_metadata.species_pairs[pi].second + ")\">";
             bcf_hdr_append(sp_header, hdr_line.c_str());
+        }
+
+        // Per-pair PAIR_SCORE (legacy companion to PAIR_DISCRIM)
+        for (int pi = 0; pi < panel_metadata.n_pairs; pi++) {
+            string field_name = "PAIR_SCORE_" + panel_metadata.species_pairs[pi].first +
+                                "_" + panel_metadata.species_pairs[pi].second;
+            string hdr_line = "##INFO=<ID=" + field_name +
+                ",Number=1,Type=Float,Description=\"Legacy multiplicative pair_score (" +
+                panel_metadata.species_pairs[pi].first + "," +
+                panel_metadata.species_pairs[pi].second + ")\">";
+            bcf_hdr_append(sp_header, hdr_line.c_str());
+        }
+
+        // Per-species stats
+        for (const string& sp : panel_metadata.species_list) {
+            string mf = "##INFO=<ID=SP_MEAN_ALT_" + sp + ",Number=1,Type=Float,Description=\"Weighted mean alt dosage in species " + sp + "\">";
+            string cf = "##INFO=<ID=SP_CALL_RATE_" + sp + ",Number=1,Type=Float,Description=\"Weighted call rate in species " + sp + "\">";
+            string df = "##INFO=<ID=SP_MAJOR_DOSAGE_FRAC_" + sp + ",Number=1,Type=Float,Description=\"Weighted major dosage fraction in species " + sp + "\">";
+            string nf = "##INFO=<ID=SP_N_CALLED_" + sp + ",Number=1,Type=Integer,Description=\"Unweighted count of called individuals in species " + sp + "\">";
+            bcf_hdr_append(sp_header, mf.c_str());
+            bcf_hdr_append(sp_header, cf.c_str());
+            bcf_hdr_append(sp_header, df.c_str());
+            bcf_hdr_append(sp_header, nf.c_str());
         }
         
         if (bcf_hdr_sync(sp_header) < 0) {
@@ -3329,26 +4414,19 @@ int main(int argc, char *argv[]) {
             
             sp_rec->rid = bcf_hdr_name2id(sp_header, sc->chrom.c_str());
             sp_rec->pos = sc->pos;
-            sp_rec->qual = 0;
+            sp_rec->qual = all_variants[sc->variant_idx].qual;
             
             string alleles_str = sc->ref_allele + "," + sc->alt_allele;
             bcf_update_alleles_str(sp_header, sp_rec, alleles_str.c_str());
-            bcf_update_genotypes(sp_header, sp_rec, sc->genotypes.data(), sc->genotypes.size());
+            const vector<uint8_t>& sp_gt_packed = all_variants[sc->variant_idx].genotypes_packed;
+            vector<int32_t> sp_gt;
+            unpack_genotypes(sp_gt_packed, num_samples, sp_gt);
+            bcf_update_genotypes(sp_header, sp_rec, sp_gt.data(), sp_gt.size());
             
             // Compute het_freq and missing_freq for the record
-            int ploidy = 2;
-            int n_het = 0, n_called = 0, n_missing = 0;
-            for (int s = 0; s < sc->n_samples; s++) {
-                const int32_t* gt = sc->genotypes.data() + s * ploidy;
-                if (bcf_gt_is_missing(gt[0]) || bcf_gt_is_missing(gt[1])) {
-                    n_missing++;
-                } else {
-                    n_called++;
-                    if (bcf_gt_allele(gt[0]) != bcf_gt_allele(gt[1])) n_het++;
-                }
-            }
-            float hf = (n_called > 0) ? (float)n_het / n_called : 0.0f;
-            float mf = (float)n_missing / sc->n_samples;
+            HetStats sp_hs = compute_het_stats_packed(sp_gt_packed, sc->n_samples);
+            float hf = sp_hs.het_freq;
+            float mf = sp_hs.missing_freq;
             float cv = sc->cov_score;
             
             bcf_update_info_float(sp_header, sp_rec, "HET_FREQ", &hf, 1);
@@ -3365,12 +4443,72 @@ int main(int argc, char *argv[]) {
                 bcf_update_info_string(sp_header, sp_rec, "PAIR_ASSIGNED", pair_str.c_str());
             }
             
-            // Per-pair PAIR_DISCRIM fields
+            // PAIR_CREDITED: comma-separated list of all pairs this site discriminates
+            // above species_min_pair_discrim. Used by the audit summary so multi-pair
+            // contribution is not lost when only PAIR_ASSIGNED is inspected.
+            {
+                string credited_list;
+                for (int pi = 0; pi < panel_metadata.n_pairs; pi++) {
+                    if (sc->pair_discrim[pi] >= species_min_pair_discrim) {
+                        if (!credited_list.empty()) credited_list += ",";
+                        credited_list += panel_metadata.species_pairs[pi].first +
+                                         "-" + panel_metadata.species_pairs[pi].second;
+                    }
+                }
+                if (!credited_list.empty()) {
+                    bcf_update_info_string(sp_header, sp_rec, "PAIR_CREDITED",
+                        credited_list.c_str());
+                }
+            }
+            
+            // Per-pair PAIR_DISCRIM fields (legacy) and new PAIR_SCORE fields
             for (int pi = 0; pi < panel_metadata.n_pairs; pi++) {
                 string field_name = "PAIR_DISCRIM_" + panel_metadata.species_pairs[pi].first +
                                     "_" + panel_metadata.species_pairs[pi].second;
                 float pd = sc->pair_discrim[pi];
                 bcf_update_info_float(sp_header, sp_rec, field_name.c_str(), &pd, 1);
+            }
+            
+            // New aggregate score fields
+            float mps = sc->max_pair_score;
+            float ss = sc->selection_score;
+            bcf_update_info_float(sp_header, sp_rec, "SP_MAX_PAIR_SCORE", &mps, 1);
+            bcf_update_info_float(sp_header, sp_rec, "SP_SELECTION_SCORE", &ss, 1);
+            
+            // New audit fields
+            float mpd = sc->max_pair_discrim;
+            bcf_update_info_float(sp_header, sp_rec, "SP_MAX_PAIR_DISCRIM", &mpd, 1);
+
+            if (sc->assigned_pair >= 0) {
+                float apd = sc->pair_discrim[sc->assigned_pair];
+                float aps = sc->pair_score[sc->assigned_pair];
+                bcf_update_info_float(sp_header, sp_rec, "ASSIGNED_PAIR_DISCRIM", &apd, 1);
+                bcf_update_info_float(sp_header, sp_rec, "ASSIGNED_PAIR_SCORE", &aps, 1);
+            }
+
+            // Per-pair legacy pair_score (companion to existing PAIR_DISCRIM_<A>_<B>)
+            for (int pi = 0; pi < panel_metadata.n_pairs; pi++) {
+                string fld = "PAIR_SCORE_" + panel_metadata.species_pairs[pi].first +
+                             "_" + panel_metadata.species_pairs[pi].second;
+                float v = sc->pair_score[pi];
+                bcf_update_info_float(sp_header, sp_rec, fld.c_str(), &v, 1);
+            }
+
+            // Per-species stats
+            for (int si = 0; si < (int)panel_metadata.species_list.size(); si++) {
+                const string& sp = panel_metadata.species_list[si];
+                float ma = sc->sp_mean_alt[si];
+                float cr = sc->sp_call_rate[si];
+                float md = sc->sp_major_dosage_frac[si];
+                int   nc = sc->sp_n_called[si];
+                string fm = "SP_MEAN_ALT_" + sp;
+                string fc = "SP_CALL_RATE_" + sp;
+                string fd = "SP_MAJOR_DOSAGE_FRAC_" + sp;
+                string fn = "SP_N_CALLED_" + sp;
+                bcf_update_info_float(sp_header, sp_rec, fm.c_str(), &ma, 1);
+                bcf_update_info_float(sp_header, sp_rec, fc.c_str(), &cr, 1);
+                bcf_update_info_float(sp_header, sp_rec, fd.c_str(), &md, 1);
+                bcf_update_info_int32(sp_header, sp_rec, fn.c_str(), &nc, 1);
             }
             
             if (bcf_write(sp_out, sp_header, sp_rec) < 0) {
@@ -3457,8 +4595,8 @@ int main(int argc, char *argv[]) {
     // Vector to track which chromosomes have output (for concatenation order)
     vector<string> chrom_files(chroms.size());
     vector<string> annot_chrom_files(chroms.size());  // For annotate_all
-    vector<bool> chrom_has_data(chroms.size(), false);
-    vector<bool> annot_chrom_has_data(chroms.size(), false);
+    vector<uint8_t> chrom_has_data(chroms.size(), 0);
+    vector<uint8_t> annot_chrom_has_data(chroms.size(), 0);
     
     #pragma omp parallel num_threads(n_threads)
     {
@@ -3515,11 +4653,11 @@ int main(int argc, char *argv[]) {
                 
                 if (sv.passes_qc) {
                     // Use precomputed bitsets (same as what proc_bcf_record would return)
-                    int ac = sv.alt.count();
-                    int afc = sv.alt_flip.count();
+                    int p2_ta = sv.total_alt;
+                    int p2_ta_flip = sv.total_alt_flip;
                     
                     if (sv.present.count() == (size_t)num_samples) {
-                        if (ac < afc || (ac == afc && sv.alt < sv.alt_flip)) {
+                        if (p2_ta < p2_ta_flip || (p2_ta == p2_ta_flip && sv.alt < sv.alt_flip)) {
                             if (downsample_prob.count(sv.alt) > 0) {
                                 samp_prob = downsample_prob[sv.alt];
                             }
@@ -3530,7 +4668,7 @@ int main(int argc, char *argv[]) {
                         }
                     } else {
                         pair<bitset<NBITS>, bitset<NBITS>> key;
-                        if (ac < afc || (ac == afc && sv.alt < sv.alt_flip)) {
+                        if (p2_ta < p2_ta_flip || (p2_ta == p2_ta_flip && sv.alt < sv.alt_flip)) {
                             key = make_pair(sv.present, sv.alt);
                         } else {
                             key = make_pair(sv.present, sv.alt_flip);
@@ -3550,7 +4688,7 @@ int main(int argc, char *argv[]) {
                 // Get annotation and coverage scores FRESH (consistent with het and stratified selection)
                 float annot_score = 0.1f;
                 if (!annotations.empty()) {
-                    annot_score = get_annot_score(chrom, sv.pos, annotations);
+                    annot_score = get_annot_score(chrom, sv.pos + 1, annotations);
                 }
                 float cov_score = 0.0f;
                 if (!coverage_map.empty()) {
@@ -3559,39 +4697,15 @@ int main(int argc, char *argv[]) {
                 int bin_idx = get_bin_idx(sv.pos, bin_size);
                 string bin_id = make_bin_id(chrom, bin_idx);
                 
-                // Compute HET scores from genotypes (EXACT same logic as original)
+                // Compute HET scores from packed genotypes using helper (C1)
                 float het_freq = 0.0f;
                 float missing_freq = 0.0f;
                 float het_score = 0.0f;
                 
-                if (!sv.genotypes.empty()) {
-                    int ploidy = sv.genotypes.size() / num_samples;  // Same as: ret / num_samples
-                    int n_het = 0;
-                    int n_called = 0;
-                    int n_missing = 0;
-                    
-                    for (int s = 0; s < num_samples; s++) {
-                        const int32_t* gt_ptr = sv.genotypes.data() + s * ploidy;
-                        
-                        if (bcf_gt_is_missing(gt_ptr[0]) || 
-                            (ploidy > 1 && bcf_gt_is_missing(gt_ptr[1]))) {
-                            n_missing++;
-                            continue;
-                        }
-                        
-                        n_called++;
-                        
-                        if (ploidy >= 2) {
-                            int a1 = bcf_gt_allele(gt_ptr[0]);
-                            int a2 = bcf_gt_allele(gt_ptr[1]);
-                            if (a1 != a2) {
-                                n_het++;
-                            }
-                        }
-                    }
-                    
-                    het_freq = (n_called > 0) ? (float)n_het / n_called : 0.0f;
-                    missing_freq = (float)n_missing / num_samples;
+                if (!sv.genotypes_packed.empty()) {
+                    HetStats hs_p2 = compute_het_stats_packed(sv.genotypes_packed, num_samples);
+                    het_freq = hs_p2.het_freq;
+                    missing_freq = hs_p2.missing_freq;
                     float missing_penalty = 1.0f - (missing_freq * 0.5f);
                     het_score = het_freq * missing_penalty;
                 }
@@ -3600,16 +4714,22 @@ int main(int argc, char *argv[]) {
                 bcf_clear(out_rec);
                 out_rec->rid = sv.chrom_idx;
                 out_rec->pos = sv.pos;
-                out_rec->qual = 0;
+                out_rec->qual = sv.qual;
                 
                 // Set alleles
                 if (!sv.alleles.empty()) {
                     bcf_update_alleles_str(thread_out_header, out_rec, sv.alleles.c_str());
                 }
                 
-                // Set genotypes
-                if (!sv.genotypes.empty()) {
-                    bcf_update_genotypes(thread_out_header, out_rec, sv.genotypes.data(), sv.genotypes.size());
+                // Set genotypes: use raw for non-biallelic (lossless), packed for biallelic
+                if (!sv.genotypes_raw.empty()) {
+                    // Non-biallelic: use preserved raw genotypes (avoids multi-allelic collapse)
+                    bcf_update_genotypes(thread_out_header, out_rec,
+                        sv.genotypes_raw.data(), sv.genotypes_raw.size());
+                } else if (!sv.genotypes_packed.empty()) {
+                    vector<int32_t> unpacked_gt;
+                    unpack_genotypes(sv.genotypes_packed, num_samples, unpacked_gt);
+                    bcf_update_genotypes(thread_out_header, out_rec, unpacked_gt.data(), unpacked_gt.size());
                 }
                 
                 // Add ALL INFO fields
@@ -3642,14 +4762,14 @@ int main(int argc, char *argv[]) {
             }
             
             if (local_kept > 0) {
-                chrom_has_data[c] = true;
+                chrom_has_data[c] = 1;
             } else {
                 // Remove empty file
                 remove(temp_file.c_str());
             }
             
             if (local_annotated > 0) {
-                annot_chrom_has_data[c] = true;
+                annot_chrom_has_data[c] = 1;
             } else if (annot_out) {
                 remove(annot_chrom_files[c].c_str());
             }
@@ -3660,9 +4780,12 @@ int main(int argc, char *argv[]) {
             int done = ++chroms_written;
             
             if (local_kept > 0 || done % 100 == 0) {
+                #pragma omp critical(stderr_log)
+                {
                 fprintf(stderr, "  Chromosome %s: kept %ld [%d/%zu]\n", 
                     chrom.c_str(), local_kept, done, chroms.size());
                 fflush(stderr);
+                }
             }
         }
         
@@ -3670,7 +4793,7 @@ int main(int argc, char *argv[]) {
         bcf_hdr_destroy(thread_out_header);
     }
     
-    hts_idx_destroy(vcf_idx);
+    // vcf_idx already freed after Pass 1 (C4)
     
     end_time = chrono::high_resolution_clock::now();
     duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
@@ -3822,13 +4945,15 @@ int main(int argc, char *argv[]) {
                 bcf_clear(atac_rec);
                 atac_rec->rid = sv.chrom_idx;
                 atac_rec->pos = sv.pos;
-                atac_rec->qual = 0;
+                atac_rec->qual = sv.qual;
                 
                 if (!sv.alleles.empty()) {
                     bcf_update_alleles_str(atac_out_header, atac_rec, sv.alleles.c_str());
                 }
-                if (!sv.genotypes.empty()) {
-                    bcf_update_genotypes(atac_out_header, atac_rec, sv.genotypes.data(), sv.genotypes.size());
+                if (!sv.genotypes_packed.empty()) {
+                    vector<int32_t> atac_unpacked_gt;
+                    unpack_genotypes(sv.genotypes_packed, num_samples, atac_unpacked_gt);
+                    bcf_update_genotypes(atac_out_header, atac_rec, atac_unpacked_gt.data(), atac_unpacked_gt.size());
                 }
                 
                 float atac_cov = get_coverage_score_fast(chroms[c], sv.pos, atac_coverage_map);
