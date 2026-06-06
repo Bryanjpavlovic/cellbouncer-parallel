@@ -1487,7 +1487,7 @@ void contamFinder3::est_contam_cells(){
             // Add Beta prior on c (param index 1) if available
             if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
                 pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
-                solver.add_beta_prior(bm.first, bm.second, 1);
+                solver.add_beta_prior(1, bm.first, bm.second);
             }
 
             try {
@@ -1546,7 +1546,7 @@ void contamFinder3::est_contam_cells(){
                 }
                 if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
                     pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
-                    solver_alt.add_beta_prior(bm.first, bm.second, 1);
+                    solver_alt.add_beta_prior(1, bm.first, bm.second);
                 }
                 try {
                     bool success = solver_alt.solve();
