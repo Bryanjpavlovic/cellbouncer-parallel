@@ -212,7 +212,7 @@ bool llr_table::del(int n_keep){
         for (vector<pair<short, short> >::iterator x = it->second.begin();
             x != it->second.end();){
             if (!included[x->first] || !included[x->second]){
-                it->second.erase(x);
+                x = it->second.erase(x);
             }
             else if (del_all){
                 if (included[x->first]){
@@ -221,7 +221,7 @@ bool llr_table::del(int n_keep){
                     minllr[x->first] = 0.0;
                     maxllr[x->first] = 0.0;
                 }
-                it->second.erase(x);
+                x = it->second.erase(x);
             }
             else{
                 double mllr = maxllr[x->first];
@@ -259,7 +259,7 @@ bool llr_table::del(int n_keep){
                         minllr[x->first] = 0.0;
                         n_indvs--;
                     }
-                    it->second.erase(x);
+                    x = it->second.erase(x);
                 }
                 else{
                     ++x;
@@ -275,7 +275,7 @@ bool llr_table::del(int n_keep){
                     maxllr[x->first] = 0.0;
                     minllr[x->first] = 0.0;
                 }
-                it->second.erase(x);
+                x = it->second.erase(x);
             }
             lookup_llr.erase(it++);
         }
@@ -303,6 +303,23 @@ double llr_table::get_min_margin(int identity) const {
         return 0.0;
     }
     return minllr[identity];
+}
+
+// Selection-audit: winner under the maxllr criterion. Nathan's del(2)
+// elimination removes identities with the lowest maxllr until two survive,
+// then returns the higher; that survivor is argmax(maxllr) over included
+// identities, which this computes directly without mutating the table.
+void llr_table::get_max_by_maxllr(int& best_idx, double& best_maxllr) const {
+    best_idx = -1;
+    best_maxllr = 0.0;
+    for (size_t i = 0; i < included.size(); ++i){
+        if (included[i]){
+            if (best_idx == -1 || maxllr[i] > best_maxllr){
+                best_idx = (int)i;
+                best_maxllr = maxllr[i];
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1227,6 +1244,20 @@ void get_diagnostics_from_llrs(
         
         runners.push_back(RunnerUp(runner_id, llr_vs_winner, runner_margin));
     }
+
+    // Winner-vs-runner-up LLR (best vs second-best), mirroring the original
+    // demux_vcf elimination semantics. runners[0] is the rank-1 runner-up
+    // (highest min_margin among non-winners). Its llr_vs_winner is the direct
+    // pairwise LLR from the runner-up's perspective (negative because it lost),
+    // so the winner's margin over it is the magnitude. This is reported in the
+    // distinct `llr` output column; it does NOT affect winner selection.
+    if (!runners.empty()){
+        diag.llr_vs_runnerup = -runners[0].llr_vs_winner;
+    } else {
+        // No competitor (single included identity): fall back to the winner's
+        // own min_margin so the column is never empty.
+        diag.llr_vs_runnerup = diag.min_margin;
+    }
 }
 
 /**
@@ -1363,6 +1394,7 @@ double compute_total_depth(const CellCounts& counts, int n_samples){
 
 void compute_posterior_entropy(
     const map<int, map<int, double> >& llrs,
+    const llr_table& tab,
     int winner,
     int n_samples,
     CellDiagnostics& diag) {
@@ -1373,59 +1405,49 @@ void compute_posterior_entropy(
         return;
     }
     
-    // Step 1: Collect all identity indices from llrs
-    set<int> all_identities;
-    for (const auto& outer : llrs) {
-        all_identities.insert(outer.first);
-        for (const auto& inner : outer.second) {
-            all_identities.insert(inner.first);
+    // Use the tab's minllr vector for posterior computation.
+    // minllr[i] = identity i's worst pairwise LLR (the "min margin").
+    // The winner has the highest minllr. All others have lower values.
+    // Relative LL: identity_ll[i] = minllr[i] - minllr[winner], always <= 0.
+    //
+    // Previous implementation reconstructed per-identity LLs from the raw
+    // pairwise llrs map, but this produced positive values for non-winners
+    // when a singlet beat the winning combo in their direct pairwise comparison
+    // despite losing overall. This caused exp(large_positive) = inf,
+    // sum_exp = inf, posterior = 0.
+    
+    const vector<double>& minllr = tab.get_minllr();
+    const vector<bool>& included = tab.included;
+    
+    double winner_ll = minllr[winner];
+    
+    // Collect all included identities and their relative LLs
+    map<int, double> identity_ll;
+    identity_ll[winner] = 0.0;
+    
+    int n_included = 0;
+    for (int i = 0; i < (int)included.size(); i++) {
+        if (!included[i]) continue;
+        if (i == winner) {
+            n_included++;
+            continue;
         }
+        identity_ll[i] = minllr[i] - winner_ll;  // always <= 0
+        n_included++;
     }
     
-    if (all_identities.size() <= 1) {
+    if (n_included <= 1) {
         diag.posterior = 1.0;
         diag.entropy = 0.0;
         return;
     }
     
-    // Step 2: Compute LL(identity) relative to winner
-    // LL(winner) = 0 by definition
-    map<int, double> identity_ll;
-    identity_ll[winner] = 0.0;
-    
-    for (int id : all_identities) {
-        if (id == winner) continue;
-        
-        // Try direct lookup: llrs[winner][id] = LL(winner) - LL(id)
-        // So LL(id) = -llrs[winner][id]
-        auto winner_it = llrs.find(winner);
-        if (winner_it != llrs.end()) {
-            auto id_it = winner_it->second.find(id);
-            if (id_it != winner_it->second.end()) {
-                identity_ll[id] = -(id_it->second);
-                continue;
-            }
-        }
-        
-        // Try reverse: llrs[id][winner] = LL(id) - LL(winner), so LL(id) = llrs[id][winner]
-        auto id_outer = llrs.find(id);
-        if (id_outer != llrs.end()) {
-            auto winner_inner = id_outer->second.find(winner);
-            if (winner_inner != id_outer->second.end()) {
-                identity_ll[id] = winner_inner->second;
-                continue;
-            }
-        }
-        
-        // No direct comparison available; assign large negative
-        identity_ll[id] = -1000.0;
-    }
-    
-    // Step 3: Softmax with log-sum-exp for numerical stability
-    // All values are relative to winner (which is 0), so max is 0
+    // Softmax: posterior = exp(0) / sum(exp(identity_ll[i]))
+    // Since winner's LL is 0 and all others are <= 0, exp(0) = 1.0
+    // and sum_exp >= 1.0. No overflow possible.
     double sum_exp = 0.0;
     for (const auto& kv : identity_ll) {
-        sum_exp += exp(kv.second);  // kv.second <= 0 for all non-winners
+        sum_exp += exp(kv.second);
     }
     
     if (sum_exp <= 0.0) {
@@ -1436,7 +1458,7 @@ void compute_posterior_entropy(
     
     diag.posterior = 1.0 / sum_exp;
     
-    // Step 4: Compute Shannon entropy (bits)
+    // Shannon entropy (bits)
     double entropy = 0.0;
     for (const auto& kv : identity_ll) {
         double p = exp(kv.second) / sum_exp;
@@ -1719,7 +1741,13 @@ void assign_ids_parallel_with_diagnostics(
     robin_hood::unordered_map<unsigned long, CellCounts>* het_counts,
     // Diagnostic outputs
     robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
-    robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups){
+    robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups,
+    // Extended evidence (2A/2B/2C) - accepted for call-site compatibility
+    robin_hood::unordered_map<unsigned long, CellCounts>* atac_cell_counts,
+    const map<int, double>* identity_prior,
+    double z_doublet,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_rna,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac){
     
     assignments.clear();
     assignments_llr.clear();
@@ -1790,8 +1818,12 @@ void assign_ids_parallel_with_diagnostics(
                         n_runner_ups, close_threshold, diag, runners);
                     
                     // Compute posterior probability and entropy from llrs
-                    compute_posterior_entropy(llrs, assn, n_samples, diag);
-                    
+                    compute_posterior_entropy(llrs, tab, assn, n_samples, diag);
+
+                    // Selection audit: record the maxllr-criterion winner so an
+                    // offline script can compare against the maximin assignment.
+                    tab.get_max_by_maxllr(diag.maxllr_winner, diag.maxllr_winner_score);
+
                     // Compute total depth from main counts
                     diag.total_depth = compute_total_depth(counts, n_samples);
                     
@@ -1857,7 +1889,13 @@ void assign_ids_parallel_with_diagnostics_extended(
     int min_het_sites,
     double min_het_depth,
     robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
-    robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups) {
+    robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups,
+    // Extended evidence (2A/2B/2C)
+    robin_hood::unordered_map<unsigned long, CellCounts>* atac_cell_counts,
+    const map<int, double>* identity_prior,
+    double z_doublet,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_rna,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac) {
     
     int n_samples = samples.size();
     const char* method_name = (het_method == HetBalanceMethod::PERSITE) ? "per-site" : "Welford";
@@ -1923,8 +1961,11 @@ void assign_ids_parallel_with_diagnostics_extended(
                     n_samples, n_runner_ups, close_threshold, diag, runners);
                 
                 // Compute posterior probability and entropy from llrs
-                compute_posterior_entropy(llrs, best_idx, n_samples, diag);
-                
+                compute_posterior_entropy(llrs, tab, best_idx, n_samples, diag);
+
+                // Selection audit: record the maxllr-criterion winner.
+                tab.get_max_by_maxllr(diag.maxllr_winner, diag.maxllr_winner_score);
+
                 diag.total_depth = compute_total_depth(counts, n_samples);
                 
                 // Compute het balance using selected method

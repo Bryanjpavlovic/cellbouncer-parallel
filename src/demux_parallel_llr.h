@@ -34,6 +34,11 @@ extern bool g_debug;
 struct CellDiagnostics {
     // Margin diagnostics (always computed)
     double min_margin;          // Winner's worst pairwise LLR
+    double llr_vs_runnerup;     // Winner's LLR against the rank-1 runner-up
+                                // (best vs second-best). Distinct from min_margin:
+                                // min_margin is the worst pairwise margin over ALL
+                                // competitors; this is the margin over the single
+                                // second-most-likely identity.
     int worst_competitor;       // Identity that gave min_margin
     int n_close;               // Count of identities within close_threshold of winner
     double total_depth;        // Total allele counts from main demux VCF
@@ -49,12 +54,21 @@ struct CellDiagnostics {
     // Posterior probability and entropy (v3)
     double posterior;           // P(winner | data) via softmax over all identities
     double entropy;             // Shannon entropy of posterior distribution (bits)
+
+    // Selection audit (only populated under --dump_selection_audit).
+    // maxllr_winner is the identity that the maxllr criterion (Nathan's del(2)
+    // elimination survivor) would select; the normal assignment uses the
+    // maximin (highest min_margin) winner. These let an offline script count
+    // how often the two criteria disagree. -1 / 0 when not computed.
+    int maxllr_winner;          // argmax(maxllr) identity index
+    double maxllr_winner_score; // that identity's maxllr
     
     CellDiagnostics() 
-        : min_margin(0.0), worst_competitor(-1), n_close(0), total_depth(0.0),
+        : min_margin(0.0), llr_vs_runnerup(0.0), worst_competitor(-1), n_close(0), total_depth(0.0),
           het_balance_var(-1.0), n_het_sites(0), het_total_depth(0.0),
           het_method(HetBalanceMethod::WELFORD),
-          posterior(-1.0), entropy(-1.0) {}
+          posterior(-1.0), entropy(-1.0),
+          maxllr_winner(-1), maxllr_winner_score(0.0) {}
 };
 
 /**
@@ -101,6 +115,14 @@ class llr_table{
         void recalculate_minmax();
         bool del(int n_keep);
         void get_max(int& best_idx, double& best_llr);
+
+        // Selection-audit helper: winner under the maxllr criterion (the
+        // identity with the highest best-pairwise margin). This is the exact
+        // survivor of Nathan's del(2) elimination, which removes identities by
+        // lowest maxllr until two remain; reported here without the destructive
+        // lookup_llr mutation so the table stays intact. Used only by
+        // --dump_selection_audit; does not affect normal assignment.
+        void get_max_by_maxllr(int& best_idx, double& best_maxllr) const;
         
         // NEW: Get min_margin for a specific identity
         double get_min_margin(int identity) const;
@@ -215,7 +237,13 @@ void assign_ids_parallel_with_diagnostics(
     robin_hood::unordered_map<unsigned long, CellCounts>* het_counts,
     // Diagnostic outputs
     robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
-    robin_hood::unordered_map<unsigned long, std::vector<RunnerUp> >& runner_ups);
+    robin_hood::unordered_map<unsigned long, std::vector<RunnerUp> >& runner_ups,
+    // Extended evidence (2A/2B/2C) - unused in this variant, accepted for call-site compatibility
+    robin_hood::unordered_map<unsigned long, CellCounts>* atac_cell_counts = nullptr,
+    const std::map<int, double>* identity_prior = nullptr,
+    double z_doublet = 0.0,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_rna = nullptr,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac = nullptr);
 
 /**
  * Batch process with Welford or per-site het balance method
@@ -246,7 +274,13 @@ void assign_ids_parallel_with_diagnostics_extended(
     double min_het_depth,
     // Outputs
     robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
-    robin_hood::unordered_map<unsigned long, std::vector<RunnerUp> >& runner_ups);
+    robin_hood::unordered_map<unsigned long, std::vector<RunnerUp> >& runner_ups,
+    // Extended evidence (2A/2B/2C)
+    robin_hood::unordered_map<unsigned long, CellCounts>* atac_cell_counts = nullptr,
+    const std::map<int, double>* identity_prior = nullptr,
+    double z_doublet = 0.0,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_rna = nullptr,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac = nullptr);
 
 // ============================================================================
 // DIAGNOSTIC EXTRACTION FUNCTIONS (NEW)
@@ -328,6 +362,7 @@ double compute_total_depth(const CellCounts& counts, int n_samples);
  */
 void compute_posterior_entropy(
     const std::map<int, std::map<int, double> >& llrs,
+    const llr_table& tab,
     int winner,
     int n_samples,
     CellDiagnostics& diag);
