@@ -76,4 +76,36 @@ void fit_dirichlet(std::vector<double>& mle_fracs,
     std::vector<double>& conc_param_results,
     int nthreads=1);
 
+// ============================================================================
+// PANEL METADATA (species-to-individual mapping)
+// ============================================================================
+
+struct PanelMetadata {
+    std::map<std::string, std::string> indiv_to_species;
+    std::vector<std::string> species_list;                    // sorted, unique
+    std::map<std::string, std::vector<int>> species_to_sample_indices;
+    // species_to_sample_indices populated using the VCF sample list passed
+    // to the loader; values are indices into that sample list.
+
+    // Per-(species, sample_index) weight. Default 1.0 for normal individuals.
+    // Hybrid individuals folded into parent species get 0.5 in each parent.
+    // Key: (species_label, sample_index). Missing entries imply weight 1.0.
+    std::map<std::pair<std::string, int>, double> species_sample_weight;
+
+    std::vector<std::pair<std::string, std::string>> species_pairs;  // unordered pairs
+    std::map<std::pair<std::string, std::string>, int> pair_to_index;
+    int n_pairs;
+
+    // Convenience: get weight for a (species, sample_index) pair
+    double get_weight(const std::string& sp, int idx) const {
+        auto key = std::make_pair(sp, idx);
+        auto it = species_sample_weight.find(key);
+        return (it != species_sample_weight.end()) ? it->second : 1.0;
+    }
+};
+
+PanelMetadata load_panel_metadata(const std::string& filename,
+                                  const std::vector<std::string>& vcf_samples,
+                                  bool fold_hybrid = true);
+
 #endif

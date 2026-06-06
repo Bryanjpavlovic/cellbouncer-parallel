@@ -104,4 +104,18 @@ void dump_contam_rates(FILE* outf,
 void dump_amb_fracs(FILE* outf, 
     std::map<std::pair<int, int>, std::map<std::pair<int, int>, double> >& amb_mu);
 
+void load_contam_prof(const std::string& filename,
+                      std::map<int, double>& contam_prof,
+                      std::map<int, double>& contam_prof_conc,
+                      const std::vector<std::string>& samples,
+                      bool error_on_vcf_sample_missing_from_file = true);
+
+void load_species_prior(const std::string& filename,
+    std::map<std::string, double>& species_prof,
+    std::map<std::string, double>& species_prof_conc);
+
+void dump_species_prof(FILE* outf,
+    const std::map<std::string, double>& species_prof,
+    const std::map<std::string, double>& species_prof_conc);
+
 #endif

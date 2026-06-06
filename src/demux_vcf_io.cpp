@@ -760,3 +760,90 @@ void dump_amb_fracs(FILE* outf,
     } 
 }
 
+
+// ============================================================================
+// LOAD CONTAMINATION PROFILE (Appendix C)
+// ============================================================================
+
+void load_contam_prof(const string& filename,
+                      map<int, double>& contam_prof,
+                      map<int, double>& contam_prof_conc,
+                      const vector<string>& samples,
+                      bool error_on_vcf_sample_missing_from_file){
+
+    // Build sample name -> index map
+    map<string, int> sample2idx;
+    for (int i = 0; i < (int)samples.size(); ++i){
+        sample2idx[samples[i]] = i;
+    }
+
+    ifstream inf(filename.c_str());
+    if (!inf.good()){
+        fprintf(stderr, "ERROR: could not open contam_prof file: %s\n", filename.c_str());
+        exit(1);
+    }
+
+    set<int> found_indices;
+    string line;
+    while (getline(inf, line)){
+        if (line.empty()) continue;
+        istringstream ss(line);
+        string indiv_name;
+        double proportion = 0.0;
+        double dirichlet_alpha = -1.0;
+
+        ss >> indiv_name >> proportion;
+        if (ss.fail()){
+            fprintf(stderr, "WARNING: skipping malformed line in %s: %s\n",
+                filename.c_str(), line.c_str());
+            continue;
+        }
+        // Optional third column
+        if (ss >> dirichlet_alpha){
+            // alpha parsed successfully
+        }
+        else{
+            dirichlet_alpha = -1.0;
+        }
+
+        if (indiv_name == "other_species"){
+            contam_prof[-1] = proportion;
+            if (dirichlet_alpha >= 0.0){
+                contam_prof_conc[-1] = dirichlet_alpha;
+            }
+            found_indices.insert(-1);
+            continue;
+        }
+
+        if (sample2idx.count(indiv_name) > 0){
+            int idx = sample2idx[indiv_name];
+            contam_prof[idx] = proportion;
+            if (dirichlet_alpha >= 0.0){
+                contam_prof_conc[idx] = dirichlet_alpha;
+            }
+            found_indices.insert(idx);
+        }
+        else{
+            fprintf(stderr, "WARNING: sample %s in contam_prof file %s not found in VCF samples\n",
+                indiv_name.c_str(), filename.c_str());
+        }
+    }
+
+    // Check for VCF samples missing from the file
+    for (int i = 0; i < (int)samples.size(); ++i){
+        if (found_indices.count(i) == 0){
+            if (error_on_vcf_sample_missing_from_file){
+                fprintf(stderr, "ERROR: VCF sample %s not found in contam_prof file %s\n",
+                    samples[i].c_str(), filename.c_str());
+                exit(1);
+            }
+            else{
+                fprintf(stderr, "WARNING: VCF sample %s not found in contam_prof file %s "
+                    "(effective prior = 0)\n", samples[i].c_str(), filename.c_str());
+            }
+        }
+    }
+
+    fprintf(stderr, "Loaded contam_prof from %s: %lu entries\n", filename.c_str(),
+        contam_prof.size());
+}

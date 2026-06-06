@@ -1,3 +1,4 @@
+#include "common.h"
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -682,8 +683,123 @@ void fit_dirichlet(vector<double>& mle_fracs,
         dirsolver.add_data(bufstr, dirprops[j]);
     }
     
-    dirsolver.solve();
-    for (int j = 0; j < n_samples; ++j){
-        dirichlet_mle.push_back(dirsolver.results[j]);
+    try {
+        dirsolver.solve();
+        for (int j = 0; j < n_samples; ++j){
+            dirichlet_mle.push_back(dirsolver.results[j]);
+        }
+    } catch (...) {
+        fprintf(stderr, "WARNING: Dirichlet solver failed; using MLE fracs as concentration parameters\n");
+        for (int j = 0; j < n_samples; ++j){
+            dirichlet_mle.push_back(mle_fracs[j]);
+        }
     }
+}
+
+// ============================================================================
+// PANEL METADATA (species-to-individual mapping) - Appendix D
+// ============================================================================
+
+PanelMetadata load_panel_metadata(const string& filename,
+                                  const vector<string>& vcf_samples,
+                                  bool fold_hybrid){
+    PanelMetadata pm;
+    pm.n_pairs = 0;
+
+    ifstream inf(filename.c_str());
+    if (!inf.good()){
+        fprintf(stderr, "ERROR: could not open panel metadata file: %s\n", filename.c_str());
+        exit(1);
+    }
+
+    // Build sample name -> index map
+    map<string, int> sample2idx;
+    for (int i = 0; i < (int)vcf_samples.size(); ++i){
+        sample2idx[vcf_samples[i]] = i;
+    }
+
+    // Skip header line
+    string header_line;
+    getline(inf, header_line);
+
+    set<string> species_set;
+    string line;
+    // Temporary storage for hybrid individuals to fold after initial parse
+    vector<pair<string, int>> hybrid_entries;  // (indiv_id's original species, sample_idx)
+
+    while (getline(inf, line)){
+        if (line.empty()) continue;
+        istringstream ss(line);
+        string indiv_id, species;
+        if (!(ss >> indiv_id >> species)) continue;
+
+        pm.indiv_to_species[indiv_id] = species;
+
+        if (sample2idx.count(indiv_id) == 0){
+            fprintf(stderr, "WARNING: individual %s in panel metadata but not in VCF samples\n",
+                indiv_id.c_str());
+            continue;
+        }
+        int idx = sample2idx[indiv_id];
+
+        if (fold_hybrid && species == "Hy"){
+            // Fold chimp-bonobo F1 hybrid into half-C half-B.
+            // The hybrid carries one chimp and one bonobo chromosome at every
+            // locus, making its allele frequencies collinear with a 50/50 C+B
+            // mixture. Including Hy as a separate species creates an
+            // identifiability problem in the ambient mixture solver.
+            hybrid_entries.push_back(make_pair(species, idx));
+        } else {
+            species_set.insert(species);
+            pm.species_to_sample_indices[species].push_back(idx);
+        }
+    }
+
+    // Fold hybrid individuals into C and B with weight 0.5
+    if (!hybrid_entries.empty()){
+        // Ensure C and B exist in species set (they should from non-hybrid entries)
+        species_set.insert("C");
+        species_set.insert("B");
+        for (const auto& he : hybrid_entries){
+            int idx = he.second;
+            pm.species_to_sample_indices["C"].push_back(idx);
+            pm.species_to_sample_indices["B"].push_back(idx);
+            pm.species_sample_weight[make_pair("C", idx)] = 0.5;
+            pm.species_sample_weight[make_pair("B", idx)] = 0.5;
+            fprintf(stderr, "  Hybrid fold: %s (Hy) -> 0.5 C + 0.5 B\n",
+                vcf_samples[idx].c_str());
+        }
+        // Hy is NOT added to species_set/species_list
+    }
+
+    // Convert species set to sorted list
+    pm.species_list.assign(species_set.begin(), species_set.end());
+    sort(pm.species_list.begin(), pm.species_list.end());
+
+    // Enumerate all unordered species pairs
+    for (int i = 0; i < (int)pm.species_list.size(); ++i){
+        for (int j = i + 1; j < (int)pm.species_list.size(); ++j){
+            auto p = make_pair(pm.species_list[i], pm.species_list[j]);
+            pm.pair_to_index[p] = pm.n_pairs;
+            pm.species_pairs.push_back(p);
+            pm.n_pairs++;
+        }
+    }
+
+    // Warn about VCF samples missing from metadata
+    for (int i = 0; i < (int)vcf_samples.size(); ++i){
+        if (pm.indiv_to_species.count(vcf_samples[i]) == 0){
+            fprintf(stderr, "WARNING: VCF sample %s not found in panel metadata file %s\n",
+                vcf_samples[i].c_str(), filename.c_str());
+        }
+    }
+
+    fprintf(stderr, "Panel metadata: %lu individuals, %lu species, %d species pairs",
+        pm.indiv_to_species.size(), pm.species_list.size(), pm.n_pairs);
+    if (!hybrid_entries.empty()){
+        fprintf(stderr, " (%lu Hy individuals folded into C+B)", hybrid_entries.size());
+    }
+    fprintf(stderr, "\n");
+
+    return pm;
 }
