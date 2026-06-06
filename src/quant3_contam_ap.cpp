@@ -46,8 +46,8 @@ using std::endl;
 using namespace std;
 
 // Version tracking
-const string QC_VERSION = "2.1-ap";
-const string QC_VERSION_MSG = "Three-component model with r-feedback and adaptive prior";
+const string QC_VERSION = "2.2-ap-species";
+const string QC_VERSION_MSG = "Three-component model with r-feedback, adaptive prior, species mode";
 
 // ===== Program to profile ambient RNA contamination in cells, =====
 //       given output of a demux_vcf run.
@@ -99,9 +99,6 @@ void help(int code){
     fprintf(stderr, "       Names of individuals must match those in the VCF, and combinations\n");
     fprintf(stderr, "       of two individuals can be specified by giving both individual names\n");
     fprintf(stderr, "       separated by \"+\", with names in either order.\n");
-    fprintf(stderr, "    --dump_freqs -d After inferring the ambient RNA profile, write a file containing\n");
-    fprintf(stderr, "        alt allele frequencies at each type of site in ambient RNA. This file will\n");
-    fprintf(stderr, "        be called [output_prefix].contam.dat\n");
     fprintf(stderr, "    --llr -l Log likelihood ratio cutoff to filter assignments from demux_vcf.\n");
     fprintf(stderr, "        This is the fourth column in the .assignments file. Default = 0 (no filter)\n");
     fprintf(stderr, "    --other_species -s If profiling the ambient RNA is enabled (no -p option),\n");
@@ -165,6 +162,34 @@ void help(int code){
     fprintf(stderr, "    --adaptive_thresh FLOAT  Boundary fraction threshold to trigger\n");
     fprintf(stderr, "        adaptive prior (default 0.20). Distribution is pathological if\n");
     fprintf(stderr, "        frac(c<0.02) + frac(c>0.90) exceeds this value.\n");
+    fprintf(stderr, "===== FIXED AMBIENT PROFILE =====\n");
+    fprintf(stderr, "    --fixed_ambient_prof -A FILE  Load a pre-computed ambient profile\n");
+    fprintf(stderr, "        (.contam_prof_empty from quant3_contam_empty_drops). Skips\n");
+    fprintf(stderr, "        iterative ambient profile estimation; per-cell c is estimated\n");
+    fprintf(stderr, "        against the fixed profile.\n");
+    fprintf(stderr, "===== SPECIES MODE =====\n");
+    fprintf(stderr, "    --species_mode MODE  Species-level ambient profile parameterization.\n");
+    fprintf(stderr, "        none     (default) Per-individual pi, no species awareness.\n");
+    fprintf(stderr, "        estimate Estimate one pi per species. Requires --panel_metadata.\n");
+    fprintf(stderr, "        fixed    Load species-level pi from file. Requires --panel_metadata\n");
+    fprintf(stderr, "                 and --species_prior.\n");
+    fprintf(stderr, "    --panel_metadata -P FILE  TSV mapping individual to species.\n");
+    fprintf(stderr, "        Format: indiv_id<TAB>species (header required).\n");
+    fprintf(stderr, "    --species_prior FILE  Species-level .species_prof_empty file\n");
+    fprintf(stderr, "        (from quant3_contam_empty_drops --aggregate_to_species).\n");
+    fprintf(stderr, "        Required only with --species_mode fixed.\n");
+    fprintf(stderr, "    --species_init FILE  Warm-start for --species_mode estimate.\n");
+    fprintf(stderr, "        Same format as .species_prof. Proportions are used as the initial\n");
+    fprintf(stderr, "        starting point for the species-level solver (not locked).\n");
+    fprintf(stderr, "    --indiv_init FILE  Warm-start for the individual-level ambient solver.\n");
+    fprintf(stderr, "        Same format as .contam_prof. Column 1 (fractions) used as initial\n");
+    fprintf(stderr, "        contam_prof; column 2 (concentration) is ignored. Can be used with\n");
+    fprintf(stderr, "        or without --species_mode.\n");
+    fprintf(stderr, "    --species_counts FILE  Species-diagnostic allele counts file.\n");
+    fprintf(stderr, "        Same format as .counts, produced by demux_parallel at species-\n");
+    fprintf(stderr, "        diagnostic SNP sites. Used by the species-level solver for cleaner\n");
+    fprintf(stderr, "        signal. Requires a companion .species_condf file alongside.\n");
+    fprintf(stderr, "        Only used with --species_mode estimate.\n");
     fprintf(stderr, "===== OPTIONAL; FOR INFERRING GENE EXPRESSION =====\n");
     fprintf(stderr, "    --barcodes -B (Optionally gzipped) barcodes file, from MEX-format single cell gene\n");
     fprintf(stderr, "        expression data\n");
@@ -260,7 +285,18 @@ void infer_from_genotypes(string& output_prefix,
     bool adaptive_prior,
     double adaptive_mean,
     double adaptive_init_var,
-    double adaptive_thresh){
+    double adaptive_thresh,
+    // Fixed ambient profile (Step 0a)
+    const string& fixed_ambient_prof_file,
+    // Species mode
+    const string& species_mode_str,
+    const string& panel_metadata_file,
+    const string& species_prior_file,
+    // Warm-start init profiles
+    const string& species_init_file,
+    const string& indiv_init_file,
+    // Species-diagnostic counts
+    const string& species_counts_file){
     
     // Load conditional matching probabilities
     map<pair<int, int>, map<int, float> > exp_match_fracs;
@@ -320,6 +356,8 @@ all possible individuals\n", idfile_doublet.c_str());
     robin_hood::unordered_map<unsigned long, double> contam_rate_se;
     robin_hood::unordered_map<unsigned long, double> allele_ratio;
     robin_hood::unordered_map<unsigned long, double> allele_ratio_se;
+    map<string, double> species_contam_prof_out;
+    map<string, double> species_contam_prof_conc_out;
     
     int nits = 0;
     while (delta > delta_thresh){
@@ -433,6 +471,123 @@ all possible individuals\n", idfile_doublet.c_str());
         if (weight){
             cf.use_weights();
         }
+
+        // Fixed ambient profile (Step 0a)
+        if (!fixed_ambient_prof_file.empty()){
+            if (nits == 0){
+                map<int, double> loaded_prof;
+                map<int, double> loaded_conc;
+                load_contam_prof(fixed_ambient_prof_file, loaded_prof, loaded_conc,
+                    samples, true);
+                cf.set_init_contam_prof(loaded_prof);
+                cf.set_fixed_amb_prof(true);
+                fprintf(stderr, "Fixed ambient profile loaded from: %s\n",
+                    fixed_ambient_prof_file.c_str());
+            } else {
+                cf.set_fixed_amb_prof(true);
+            }
+        }
+
+        // Species mode
+        if (species_mode_str != "none"){
+            PanelMetadata pm = load_panel_metadata(panel_metadata_file, samples);
+            cf.set_species_mode(pm);
+            fprintf(stderr, "Species mode: %s (%lu species: ",
+                species_mode_str.c_str(), pm.species_list.size());
+            for (int si = 0; si < (int)pm.species_list.size(); si++){
+                if (si > 0) fprintf(stderr, ", ");
+                fprintf(stderr, "%s", pm.species_list[si].c_str());
+            }
+            fprintf(stderr, ")\n");
+
+            if (species_mode_str == "fixed"){
+                map<string, double> sp_prof, sp_conc;
+                load_species_prior(species_prior_file, sp_prof, sp_conc);
+                cf.set_species_prior(sp_prof, sp_conc);
+                cf.set_fixed_amb_prof(true);
+                fprintf(stderr, "Species prior loaded from: %s\n",
+                    species_prior_file.c_str());
+
+                // Validate species labels
+                for (const auto& sp : sp_prof){
+                    bool found = false;
+                    for (const auto& psp : pm.species_list){
+                        if (sp.first == psp){ found = true; break; }
+                    }
+                    if (!found){
+                        fprintf(stderr, "ERROR: species label '%s' in species_prior file "
+                            "not found in panel_metadata\n", sp.first.c_str());
+                        exit(1);
+                    }
+                }
+                for (const auto& psp : pm.species_list){
+                    if (sp_prof.count(psp) == 0){
+                        fprintf(stderr, "WARNING: species '%s' in panel_metadata not found "
+                            "in species_prior (treated as proportion zero)\n", psp.c_str());
+                    }
+                }
+            }
+        }
+
+        // Warm-start: species-level init for species_mode estimate
+        if (!species_init_file.empty()){
+            map<string, double> sp_init, sp_init_conc;
+            load_species_prior(species_init_file, sp_init, sp_init_conc);
+            cf.set_species_init(sp_init);
+            fprintf(stderr, "Species warm start loaded from: %s\n",
+                species_init_file.c_str());
+        }
+
+        // Warm-start: individual-level init
+        if (!indiv_init_file.empty()){
+            map<int, double> indiv_prof;
+            map<int, double> indiv_conc;
+            load_contam_prof(indiv_init_file, indiv_prof, indiv_conc,
+                samples, false);
+            cf.set_indiv_init(indiv_prof);
+            fprintf(stderr, "Individual warm start loaded from: %s (%lu entries)\n",
+                indiv_init_file.c_str(), indiv_prof.size());
+        }
+
+        // Species-diagnostic counts for species-level solver
+        if (!species_counts_file.empty()){
+            robin_hood::unordered_map<unsigned long, map<pair<int, int>,
+                map<pair<int, int>, pair<float, float> > > > sp_counts;
+            string sp_counts_name = species_counts_file;
+            if (file_exists(sp_counts_name)){
+                fprintf(stderr, "Loading species-diagnostic counts from %s...\n",
+                    sp_counts_name.c_str());
+                load_counts_from_file(sp_counts, samples, sp_counts_name, allowed_ids);
+                fprintf(stderr, "  Loaded species counts for %lu cells\n", sp_counts.size());
+            } else {
+                fprintf(stderr, "ERROR: species counts file not found: %s\n",
+                    sp_counts_name.c_str());
+                exit(1);
+            }
+
+            // Load companion .species_condf
+            string sp_condf_name = species_counts_file;
+            // Replace .species_counts with .species_condf
+            size_t pos = sp_condf_name.rfind(".species_counts");
+            if (pos != string::npos){
+                sp_condf_name = sp_condf_name.substr(0, pos) + ".species_condf";
+            } else {
+                sp_condf_name = sp_condf_name + ".species_condf";
+            }
+            map<pair<int, int>, map<int, float> > sp_expfracs;
+            if (file_exists(sp_condf_name)){
+                load_exp_fracs(sp_condf_name, sp_expfracs);
+                fprintf(stderr, "  Loaded species condf from %s\n", sp_condf_name.c_str());
+            } else {
+                fprintf(stderr, "ERROR: species condf file not found: %s\n",
+                    sp_condf_name.c_str());
+                fprintf(stderr, "  (expected alongside %s)\n", species_counts_file.c_str());
+                exit(1);
+            }
+
+            cf.set_species_counts(sp_counts, sp_expfracs);
+        }
+
         cf.fit(); 
         
         for (int i = 0; i < (int)samples.size(); ++i){
@@ -452,6 +607,8 @@ all possible individuals\n", idfile_doublet.c_str());
             contam_rate_se = cf.contam_rate_se;
             allele_ratio = cf.allele_ratio;
             allele_ratio_se = cf.allele_ratio_se;
+            species_contam_prof_out = cf.species_contam_prof;
+            species_contam_prof_conc_out = cf.species_contam_prof_conc;
             
             delta = 0;
         }
@@ -463,6 +620,9 @@ all possible individuals\n", idfile_doublet.c_str());
                 contam_rate = cf.contam_rate;
                 contam_rate_se = cf.contam_rate_se;
                 allele_ratio = cf.allele_ratio;
+                allele_ratio_se = cf.allele_ratio_se;
+                species_contam_prof_out = cf.species_contam_prof;
+                species_contam_prof_conc_out = cf.species_contam_prof_conc;
                 allele_ratio_se = cf.allele_ratio_se;
             }
             fprintf(stderr, " -- Log likelihood: %f", ll);
@@ -529,6 +689,14 @@ on mixture proportions...\n");
         dump_contam_prof(outf, contam_prof, contam_prof_conc, samples);
         fclose(outf);
     }
+    // Write species-level profile if species mode was active
+    if (species_mode_str != "none" && !species_contam_prof_out.empty()){
+        string fname = output_prefix + ".species_prof";
+        FILE* outf = fopen(fname.c_str(), "w");
+        fprintf(stderr, "Writing species-level profile to disk...\n");
+        dump_species_prof(outf, species_contam_prof_out, species_contam_prof_conc_out);
+        fclose(outf);
+    }
     // Write contamination rate (and standard error) per cell to disk
     {
         string fname = output_prefix + ".contam_rate";
@@ -577,29 +745,14 @@ on mixture proportions...\n");
         }
         fclose(outf);
     }
-    /*
-    if (dump_freqs){
-        // Write alt allele matching frequencies to a file
-        string fname = output_prefix + ".contam.dat";
-        FILE* outf = fopen(fname.c_str(), "w");
-        dump_amb_fracs(outf, cf.amb_mu);
-        fclose(outf);
-    }
-    */
+
     // Write refined assignments to disk
-    // If run_once is set, assume the user is happy with the preliminary, un-refined
-    // assignments.
-    if (true){
-    //if (!run_once){
+    {
         string fname = output_prefix + ".decontam.assignments";
         FILE* outf = fopen(fname.c_str(), "w");
         dump_assignments(outf, assn, assn_llr, samples, libname, 
             cellranger, seurat, underscore);
         fclose(outf); 
-    }
-    else if (file_exists(output_prefix + ".decontam.assignments")){
-        string fn = output_prefix + ".decontam.assignments";
-        unlink(fn.c_str());
     }
 }
 
@@ -823,7 +976,6 @@ int main(int argc, char *argv[]) {
        {"llr", required_argument, 0, 'l'},
        {"n_mixprop_trials", required_argument, 0, 'N'},
        {"no_weights", no_argument, 0, 'w'},
-       {"dump_freqs", no_argument, 0, 'd'},
        {"ids", required_argument, 0, 'i'},
        {"ids_doublet", required_argument, 0, 'I'},
        {"libname", required_argument, 0, 'n'},
@@ -848,10 +1000,17 @@ int main(int argc, char *argv[]) {
        {"prior_mean", required_argument, 0, 1004},
        {"prior_var", required_argument, 0, 1005},
        {"r_feedback", no_argument, 0, 1006},
-       {"adaptive_prior", no_argument, 0, 'A'},
+       {"adaptive_prior", no_argument, 0, 1010},
        {"adaptive_mean", required_argument, 0, 1007},
        {"adaptive_init_var", required_argument, 0, 1008},
        {"adaptive_thresh", required_argument, 0, 1009},
+       {"fixed_ambient_prof", required_argument, 0, 'A'},
+       {"species_mode", required_argument, 0, 1011},
+       {"panel_metadata", required_argument, 0, 'P'},
+       {"species_prior", required_argument, 0, 1012},
+       {"species_init", required_argument, 0, 1013},
+       {"indiv_init", required_argument, 0, 1014},
+       {"species_counts", required_argument, 0, 1015},
        {0, 0, 0, 0} 
        
     };
@@ -864,7 +1023,6 @@ int main(int argc, char *argv[]) {
     double llr = 0.0;
     int n_mixprop_trials = 10;
     bool weight = true;
-    bool dump_freqs = false;
     string idfile;
     bool idfile_given = false;
     string idfile_doublet;
@@ -905,13 +1063,24 @@ int main(int argc, char *argv[]) {
     double adaptive_init_var = 0.04;
     double adaptive_thresh = 0.20;
 
+    // Fixed ambient profile (Step 0a)
+    string fixed_ambient_prof_file = "";
+
+    // Species mode
+    string species_mode_str = "none";
+    string panel_metadata_file = "";
+    string species_prior_file = "";
+    string species_init_file = "";
+    string indiv_init_file = "";
+    string species_counts_file = "";
+
     int option_index = 0;
     int ch;
     
     if (argc == 1){
         help(0);
     }
-    while((ch = getopt_long(argc, argv, "o:e:g:G:E:l:N:i:I:n:b:D:B:F:M:t:c:T:X:ARrsCSUdwh", long_options, &option_index )) != -1){
+    while((ch = getopt_long(argc, argv, "o:e:g:G:E:l:N:i:I:n:b:D:B:F:M:t:c:T:X:A:P:RrsCSUwh", long_options, &option_index )) != -1){
         switch(ch){
             case 0:
                 // This option set a flag. No need to do anything here.
@@ -944,7 +1113,28 @@ int main(int argc, char *argv[]) {
                 r_feedback = true;
                 break;
             case 'A':
+                fixed_ambient_prof_file = optarg;
+                break;
+            case 1010:
                 adaptive_prior = true;
+                break;
+            case 1011:
+                species_mode_str = optarg;
+                break;
+            case 'P':
+                panel_metadata_file = optarg;
+                break;
+            case 1012:
+                species_prior_file = optarg;
+                break;
+            case 1013:
+                species_init_file = optarg;
+                break;
+            case 1014:
+                indiv_init_file = optarg;
+                break;
+            case 1015:
+                species_counts_file = optarg;
                 break;
             case 1007:
                 adaptive_mean = atof(optarg);
@@ -989,9 +1179,6 @@ int main(int argc, char *argv[]) {
                 break;
             case 'w':
                 weight = false;
-                break;
-            case 'd':
-                dump_freqs = true;
                 break;
             case 'n':
                 libname = optarg;
@@ -1076,6 +1263,36 @@ be less accurate if there is much cell type heterogeneity).\n");
     }
     if (clustfile != "" && barcodesfile == ""){
         fprintf(stderr, "ERROR: --clusters/-c only applicable when loading gene expression data\n");
+        exit(1);
+    }
+
+    // Validate species mode flags
+    if (species_mode_str != "none" && species_mode_str != "estimate" && species_mode_str != "fixed"){
+        fprintf(stderr, "ERROR: --species_mode must be none, estimate, or fixed\n");
+        exit(1);
+    }
+    if (species_mode_str != "none" && panel_metadata_file.empty()){
+        fprintf(stderr, "ERROR: --species_mode %s requires --panel_metadata\n", species_mode_str.c_str());
+        exit(1);
+    }
+    if (species_mode_str == "fixed" && species_prior_file.empty()){
+        fprintf(stderr, "ERROR: --species_mode fixed requires --species_prior\n");
+        exit(1);
+    }
+    if (!species_prior_file.empty() && species_mode_str != "fixed"){
+        fprintf(stderr, "ERROR: --species_prior requires --species_mode fixed\n");
+        exit(1);
+    }
+    if (species_mode_str == "fixed" && !fixed_ambient_prof_file.empty()){
+        fprintf(stderr, "ERROR: --species_mode fixed and --fixed_ambient_prof are mutually exclusive\n");
+        exit(1);
+    }
+    if (!species_init_file.empty() && species_mode_str != "estimate"){
+        fprintf(stderr, "ERROR: --species_init requires --species_mode estimate\n");
+        exit(1);
+    }
+    if (!species_counts_file.empty() && species_mode_str != "estimate"){
+        fprintf(stderr, "ERROR: --species_counts requires --species_mode estimate\n");
         exit(1);
     }
 
@@ -1272,7 +1489,14 @@ provided. Nothing to do.\n");
             adaptive_prior,
             adaptive_mean,
             adaptive_init_var,
-            adaptive_thresh);
+            adaptive_thresh,
+            fixed_ambient_prof_file,
+            species_mode_str,
+            panel_metadata_file,
+            species_prior_file,
+            species_init_file,
+            indiv_init_file,
+            species_counts_file);
     }
     
     if (load_gex){
