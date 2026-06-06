@@ -19,6 +19,9 @@
 #include <optimML/brent.h>
 #include <optimML/multivar_ml.h>
 #include <htswrapper/robin_hood/robin_hood.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "common.h"
 #include "demux_vcf_llr.h"
 #include "ambient_rna_three_ap.h"
@@ -468,14 +471,22 @@ contamFinder3::contamFinder3(robin_hood::unordered_map<unsigned long,
 
     llrtot = 0.0;
 
+    bool caller_restricted_ids = (allowed_ids.size() > 0);
+
     for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin(); a != 
         assn.end(); ++a){
-        this->allowed_ids.insert(a->second);
-        // Make sure we also allow sub-IDs of combinations
-        if (a->second >= n_samples){
-            pair<int, int> combo = idx_to_hap_comb(a->second, n_samples);
-            this->allowed_ids.insert(combo.first);
-            this->allowed_ids.insert(combo.second);
+        // If the caller provided an allowed set (from -i/-I or --expected_lines),
+        // treat it as authoritative. Do not re-add out-of-pool assignments from
+        // the original demux call, because a few bad assignments can otherwise
+        // make absent species legal ambient sources.
+        if (!caller_restricted_ids){
+            this->allowed_ids.insert(a->second);
+            // Make sure we also allow sub-IDs of combinations
+            if (a->second >= n_samples){
+                pair<int, int> combo = idx_to_hap_comb(a->second, n_samples);
+                this->allowed_ids.insert(combo.first);
+                this->allowed_ids.insert(combo.second);
+            }
         }
         if (id_llrsum.count(a->second) == 0){
             id_llrsum.insert(make_pair(a->second, 0.0));
@@ -507,14 +518,14 @@ contamFinder3::contamFinder3(robin_hood::unordered_map<unsigned long,
     // individual genotypes that were allowed in this run (if no filter was given,
     // allow all single individuals from the VCF).
 
-    if (allowed_ids.size() == 0){
+    if (this->allowed_ids.size() == 0){
         // Default to all possible individuals
         for (int i = 0; i < n_samples; ++i){
             idx2samp.push_back(i);
         }
     }
     else{
-        for (set<int>::iterator a = allowed_ids.begin(); a != allowed_ids.end(); ++a){
+        for (set<int>::iterator a = this->allowed_ids.begin(); a != this->allowed_ids.end(); ++a){
             if (*a < n_samples){
                 idx2samp.push_back(*a);
             }
@@ -536,6 +547,8 @@ contamFinder3::contamFinder3(robin_hood::unordered_map<unsigned long,
     this->weighted = false;
     
     this->num_threads = 1;
+    this->thorough_multistart = false;
+    this->adaptive_multistart = true;
 
     // Tetraploid-aware defaults (v1.4)
     this->tetraploid_aware = false;
@@ -567,12 +580,69 @@ contamFinder3::contamFinder3(robin_hood::unordered_map<unsigned long,
     this->adaptive_prior_boundary_high = 0.90;
     this->adaptive_prior_max_shrink_steps = 8;
 
+    // Fixed ambient profile default (disabled)
+    this->fixed_amb_prof = false;
+
+    // Species mode default (disabled)
+    this->species_mode = false;
+    this->species_init_used = false;
+    this->has_species_counts = false;
+    this->primary_species_counts_enabled = false;
+
+    // Bulk mode default (disabled)
+    this->bulk_mode = false;
+
     // Compile data in the format needed by other functions
     this->compile_data(assn, indv_allelecounts);
 }
 
 void contamFinder3::set_init_contam_prof(map<int, double>& cp){
-    this->contam_prof = cp;
+    // Filter to only include individuals present in idx2samp (active individuals).
+    // Warm-start files may contain entries for all VCF individuals (e.g. 28), but
+    // idx2samp only has the subset present in cell assignments. Without filtering,
+    // update_amb_prof_mixture builds startprops from contam_prof (28 entries) but
+    // mixfracs columns from idx2samp (fewer entries), causing an optimML dimension
+    // mismatch error. The -1 key (other_species) is preserved if present.
+    // Missing active individuals are filled with epsilon to prevent contam_prof
+    // from being shorter than idx2samp.
+    std::set<int> active(idx2samp.begin(), idx2samp.end());
+    this->contam_prof.clear();
+    double kept_sum = 0.0;
+    int n_dropped = 0;
+    for (auto& kv : cp){
+        if (kv.first == -1){
+            // Always keep the other_species entry
+            this->contam_prof[-1] = kv.second;
+            kept_sum += kv.second;
+        } else if (active.count(kv.first) > 0){
+            this->contam_prof[kv.first] = kv.second;
+            kept_sum += kv.second;
+        } else {
+            n_dropped++;
+        }
+    }
+    // Fill any active idx2samp individuals missing from the input profile
+    int n_filled = 0;
+    double eps = 1e-4;
+    for (int i = 0; i < (int)idx2samp.size(); i++){
+        int samp = idx2samp[i];
+        if (this->contam_prof.count(samp) == 0){
+            this->contam_prof[samp] = eps;
+            kept_sum += eps;
+            n_filled++;
+        }
+    }
+    // Re-normalize so proportions sum to 1.0
+    if (kept_sum > 0.0){
+        for (auto& kv : this->contam_prof){
+            kv.second /= kept_sum;
+        }
+    }
+    if (n_dropped > 0 || n_filled > 0){
+        fprintf(stderr, "  set_init_contam_prof: filtered %d inactive, filled %d missing "
+            "(%lu final, %lu active individuals)\n",
+            n_dropped, n_filled, this->contam_prof.size(), idx2samp.size());
+    }
     contam_prof_initialized = true;
 }
 
@@ -590,6 +660,11 @@ void contamFinder3::set_doublet_rate(double d){
 }
 
 void contamFinder3::model_other_species(){
+    if (this->species_mode){
+        fprintf(stderr, "ERROR: --other_species cannot be used with --species_mode. "
+            "Species mode already captures all cross-species contributions explicitly.\n");
+        exit(1);
+    }
     this->inter_species = true;
 }
 
@@ -627,6 +702,14 @@ void contamFinder3::set_init_c(double c){
 
 void contamFinder3::set_num_threads(int nt){
     num_threads = nt;
+}
+
+void contamFinder3::set_thorough_multistart(bool enabled){
+    thorough_multistart = enabled;
+}
+
+void contamFinder3::set_adaptive_multistart(bool enabled){
+    adaptive_multistart = enabled;
 }
 
 void contamFinder3::set_locked_identities(const set<int>& locked){
@@ -680,6 +763,657 @@ void contamFinder3::set_adaptive_prior(bool enabled,
     this->adaptive_prior_init_var = init_var;
     this->adaptive_prior_min_var = min_var;
     this->adaptive_prior_boundary_thresh = boundary_thresh;
+}
+
+// =============================================================================
+// Fixed ambient profile (Step 0a)
+// =============================================================================
+
+void contamFinder3::set_fixed_amb_prof(bool enabled){
+    this->fixed_amb_prof = enabled;
+}
+
+void contamFinder3::rebuild_amb_mu_from_contam_prof(){
+    // Extracted from the "Update stored ambient RNA profile" block at the end of
+    // update_amb_prof_mixture. Rebuilds amb_mu from contam_prof and expfracs.
+    for (int x = 0; x < (int)idx2samp.size(); ++x){
+        int i = idx2samp[x];
+        for (int nalt = 0; nalt <= 2; ++nalt){
+            pair<int, int> key = make_pair(i, nalt);
+            if (amb_mu.count(key) == 0){
+                map<pair<int, int>, double> m;
+                amb_mu.insert(make_pair(key, m));
+            }
+            pair<int, int> nullkey = make_pair(-1,-1);
+            if (amb_mu[key].count(nullkey) == 0){
+                amb_mu[key].insert(make_pair(nullkey, 0));
+            }
+            double val = 0.0;
+            for (map<int, double>::iterator cp = contam_prof.begin();
+                cp != contam_prof.end(); ++cp){
+                if (cp->first == -1){
+                    val += cp->second * 0.0;
+                }
+                else if (ef_all_avg && cp->first == key.first){
+                    val += cp->second * ((double)key.second/2.0);
+                }
+                else{
+                    double ef_val = (double)key.second / 2.0;
+                    if (expfracs.count(key) > 0 &&
+                        expfracs[key].count(cp->first) > 0){
+                        ef_val = expfracs[key][cp->first];
+                    }
+                    val += cp->second * ef_val;
+                }
+            }
+            amb_mu[key][nullkey] = val;
+            for (int y = x + 1; y < (int)idx2samp.size(); ++y){
+                int j = idx2samp[y];
+                for (int nalt2 = 0; nalt2 <= 2; ++nalt2){
+                    pair<int, int> key2 = make_pair(j, nalt2);
+                    if (amb_mu[key].count(key2) == 0){
+                        amb_mu[key].insert(make_pair(key2, 0));
+                    }
+                    double val = 0.0;
+                    for (map<int, double>::iterator cp = contam_prof.begin();
+                        cp != contam_prof.end(); ++cp){
+                        if (cp->first == -1){
+                            val += cp->second * adjust_p_err(0.0, e_r, e_a);
+                        }
+                        else{
+                            if (ef_all_avg && cp->first == key.first){
+                                val += cp->second * adjust_p_err(
+                                    (double)key.second / 2.0, e_r, e_a);
+                            }
+                            else if (ef_all_avg && cp->first == key2.first){
+                                val += cp->second * adjust_p_err(
+                                    (double)key2.second / 2.0, e_r, e_a);
+                            }
+                            else{
+                                double ef1 = (double)key.second / 2.0;
+                                double ef2 = (double)key2.second / 2.0;
+                                if (expfracs.count(key) > 0 &&
+                                    expfracs[key].count(cp->first) > 0){
+                                    ef1 = expfracs[key][cp->first];
+                                }
+                                if (expfracs.count(key2) > 0 &&
+                                    expfracs[key2].count(cp->first) > 0){
+                                    ef2 = expfracs[key2][cp->first];
+                                }
+                                val += cp->second * (0.5*ef1 + 0.5*ef2);
+                            }
+                        }
+                    }
+                    amb_mu[key][key2] = val;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Species mode
+// =============================================================================
+
+void contamFinder3::set_species_mode(const PanelMetadata& panel){
+    this->species_mode = true;
+    this->panel_meta = panel;
+    // Two-way protection: species mode forces inter_species off
+    if (this->inter_species){
+        fprintf(stderr, "WARNING: --species_mode disables --other_species "
+            "(species-level pi already captures cross-species contributions)\n");
+    }
+    this->inter_species = false;
+}
+
+void contamFinder3::set_species_prior(const map<string, double>& species_prof,
+                                       const map<string, double>& species_prof_conc){
+    this->species_prior_prof = species_prof;
+    this->species_prior_conc = species_prof_conc;
+}
+
+void contamFinder3::set_species_init(const map<string, double>& init_prof){
+    this->species_init_prof = init_prof;
+    this->species_init_used = false;
+}
+
+void contamFinder3::set_indiv_init(const map<int, double>& init_prof){
+    // Warm-start the individual-level ambient profile from an external file.
+    // Filter to idx2samp, fill missing, normalize.
+    set<int> active(idx2samp.begin(), idx2samp.end());
+    contam_prof.clear();
+    double sum = 0.0;
+    for (int i = 0; i < (int)idx2samp.size(); i++){
+        int samp = idx2samp[i];
+        double val = 1e-6;
+        if (init_prof.count(samp) > 0){
+            val = init_prof.at(samp);
+            if (val < 1e-6) val = 1e-6;
+        }
+        contam_prof[samp] = val;
+        sum += val;
+    }
+    if (inter_species){
+        double os_val = 1e-6;
+        if (init_prof.count(-1) > 0){
+            os_val = init_prof.at(-1);
+            if (os_val < 1e-6) os_val = 1e-6;
+        }
+        contam_prof[-1] = os_val;
+        sum += os_val;
+    }
+    // Normalize
+    for (auto& cp : contam_prof){
+        cp.second /= sum;
+    }
+    contam_prof_initialized = true;
+}
+
+void contamFinder3::compute_loading_weights(){
+    indiv_loading_weights.clear();
+
+    // Count cells assigned to each singlet individual.
+    // Doublets contribute 0.5 to each constituent.
+    for (auto& a : assn){
+        int idx = a.second;
+        if (idx < n_samples){
+            indiv_loading_weights[idx] += 1.0;
+        } else {
+            std::pair<short, short> combo = idx_to_hap_comb(idx, n_samples);
+            indiv_loading_weights[combo.first] += 0.5;
+            indiv_loading_weights[combo.second] += 0.5;
+        }
+    }
+
+    // If no assignments exist but contam_prof is initialized (warm start),
+    // use the contam_prof values as proxy weights.
+    if (indiv_loading_weights.empty() && contam_prof_initialized){
+        for (auto& cp : contam_prof){
+            if (cp.first >= 0){
+                indiv_loading_weights[cp.first] = cp.second;
+            }
+        }
+    }
+
+    // Normalize within each species so weights sum to 1.0 per species.
+    for (const auto& sp : panel_meta.species_list){
+        double sp_sum = 0.0;
+        if (panel_meta.species_to_sample_indices.count(sp) > 0){
+            for (int idx : panel_meta.species_to_sample_indices.at(sp)){
+                if (indiv_loading_weights.count(idx) > 0){
+                    sp_sum += indiv_loading_weights[idx];
+                }
+            }
+        }
+        if (sp_sum > 0.0){
+            if (panel_meta.species_to_sample_indices.count(sp) > 0){
+                for (int idx : panel_meta.species_to_sample_indices.at(sp)){
+                    if (indiv_loading_weights.count(idx) > 0){
+                        indiv_loading_weights[idx] /= sp_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void contamFinder3::set_primary_species_counts_enabled(bool enabled){
+    this->primary_species_counts_enabled = enabled;
+}
+
+void contamFinder3::set_species_counts(
+    robin_hood::unordered_map<unsigned long,
+        map<pair<int, int>,
+            map<pair<int, int>,
+                pair<float, float> > > >& counts,
+    map<pair<int, int>, map<int, float> >& condf){
+    this->species_allelecounts = counts;
+    this->species_expfracs = condf;
+    this->has_species_counts = true;
+    fprintf(stderr, "  Species-diagnostic counts: %lu cells\n", counts.size());
+}
+
+void contamFinder3::expand_species_prior_to_indiv(){
+    // Expand species-level pi to individual-level via weighted split.
+    // Each individual's contribution to a species is weighted by
+    // panel_meta.get_weight(species, idx) -- normally 1.0, but 0.5 for
+    // hybrid individuals folded into two parent species.
+    // An individual appearing in multiple species (e.g. Hy folded into C+B)
+    // accumulates contributions from each species.
+    // Only populate contam_prof for individuals in idx2samp. When a species
+    // has zero active weight, redistribute its mass proportionally.
+    contam_prof.clear();
+    species_contam_prof.clear();
+    species_contam_prof_conc.clear();
+
+    set<int> active_samples(idx2samp.begin(), idx2samp.end());
+
+    // First pass: compute weighted active count per species, accumulate orphan mass
+    double orphan_mass = 0.0;
+    double active_mass = 0.0;
+    map<string, double> sp_w_active;  // sum of weights for active individuals
+    for (const auto& sp : panel_meta.species_list){
+        double pi_s = 0.0;
+        if (species_prior_prof.count(sp) > 0){
+            pi_s = species_prior_prof[sp];
+        }
+        species_contam_prof[sp] = pi_s;
+        if (species_prior_conc.count(sp) > 0){
+            species_contam_prof_conc[sp] = species_prior_conc[sp];
+        }
+
+        double w_sum = 0.0;
+        const auto& indices = panel_meta.species_to_sample_indices;
+        if (indices.count(sp) > 0){
+            for (int idx : indices.at(sp)){
+                if (active_samples.count(idx) > 0){
+                    w_sum += panel_meta.get_weight(sp, idx);
+                }
+            }
+        }
+        sp_w_active[sp] = w_sum;
+        if (w_sum <= 0.0){
+            orphan_mass += pi_s;
+        } else {
+            active_mass += pi_s;
+        }
+    }
+
+    // Second pass: assign individual-level proportions with redistributed mass.
+    //
+    // Loading weight semantics: when indiv_loading_weights is non-empty, a
+    // missing entry means zero assigned cells, so effective weight is 0.0 (not
+    // implicit 1.0). If all individuals in a species have zero loading weight,
+    // fall back to base panel weights for that species to avoid dropping its
+    // entire mass.
+    double scale = (active_mass > 0) ? (active_mass + orphan_mass) / active_mass : 1.0;
+    for (const auto& sp : panel_meta.species_list){
+        if (sp_w_active[sp] <= 0.0) continue;
+        double pi_s = species_contam_prof[sp] * scale;
+        const auto& indices = panel_meta.species_to_sample_indices;
+
+        // Compute effective weight sum for this species.
+        // Try loading-weighted first; fall back to base if the species has
+        // zero total effective loading weight.
+        double eff_w_sum = 0.0;
+        bool use_loading = !indiv_loading_weights.empty();
+        if (use_loading){
+            for (int idx : indices.at(sp)){
+                if (active_samples.count(idx) > 0){
+                    auto it = indiv_loading_weights.find(idx);
+                    if (it != indiv_loading_weights.end()){
+                        eff_w_sum += panel_meta.get_weight(sp, idx) * it->second;
+                    }
+                    // missing entry => 0.0, contributes nothing
+                }
+            }
+            if (eff_w_sum <= 0.0){
+                // Entire species has zero loading weight (no cells assigned to
+                // any individual in this species). Fall back to base panel
+                // weights so the species mass is not silently dropped.
+                use_loading = false;
+            }
+        }
+        if (!use_loading){
+            eff_w_sum = 0.0;
+            for (int idx : indices.at(sp)){
+                if (active_samples.count(idx) > 0){
+                    eff_w_sum += panel_meta.get_weight(sp, idx);
+                }
+            }
+        }
+        if (eff_w_sum <= 0.0) continue;
+
+        for (int idx : indices.at(sp)){
+            if (active_samples.count(idx) > 0){
+                double w;
+                if (use_loading){
+                    auto it = indiv_loading_weights.find(idx);
+                    w = (it != indiv_loading_weights.end())
+                      ? panel_meta.get_weight(sp, idx) * it->second
+                      : 0.0;
+                } else {
+                    w = panel_meta.get_weight(sp, idx);
+                }
+                if (w > 0.0){
+                    contam_prof[idx] += (w / eff_w_sum) * pi_s;
+                }
+            }
+        }
+    }
+}
+
+double contamFinder3::solve_species_level_pi(){
+    // Build species-aggregated mixture components for the solver.
+    // Each species gets one component whose mixfracs vector is the
+    // average of its constituent individuals' expfracs entries.
+
+    // Ensure loading weights are populated before any species-to-individual
+    // expansion. On the first call (from init_params), loading weights may not
+    // yet exist. Without them, expand_species_prior_to_indiv uses only base
+    // panel weights, which is less accurate when individuals within a species
+    // have unequal cell counts.
+    // Skip in bulk mode: the synthetic placeholder assignment would produce
+    // meaningless loading weights (one cell assigned to index 0).
+    if (!bulk_mode && indiv_loading_weights.empty()){
+        compute_loading_weights();
+    }
+
+    vector<vector<double> > mixfracs;
+    vector<double> weights;
+    vector<double> n;
+    vector<double> k;
+    vector<double> p_e;
+    vector<double> c;
+
+    // Choose how to get per-observation c values:
+    // If per-cell contam_rate has been estimated, use per-cell c (use_global_c=false).
+    // If contam_rate is empty (first call from init_params), use the global prior
+    // or a default. Using per-cell=0 would zero out all mixture signal.
+    bool use_global = contam_rate.empty();
+    if (use_global && contam_cell_prior <= 0){
+        // No global prior set yet either. Use a conservative default.
+        contam_cell_prior = 0.05;
+    }
+
+    // When species-diagnostic counts are available, swap them in for
+    // compile_amb_prof_dat. The species-diagnostic SNPs have near-fixed
+    // allele frequencies within each species, giving the mixture solver
+    // much cleaner signal than the individual-diagnostic SNPs.
+    if (has_species_counts){
+        std::swap(indv_allelecounts, species_allelecounts);
+        std::swap(expfracs, species_expfracs);
+    }
+
+    if (bulk_mode){
+        compile_bulk_amb_prof_dat(mixfracs, weights, n, k, p_e, c);
+    } else {
+        compile_amb_prof_dat(false, use_global, mixfracs, weights, n, k, p_e, c);
+    }
+
+    // Swap back so individual-level estimation uses the original data
+    if (has_species_counts){
+        std::swap(indv_allelecounts, species_allelecounts);
+        std::swap(expfracs, species_expfracs);
+    }
+
+    if (mixfracs.empty()){
+        fprintf(stderr, "WARNING: no data for species-level pi estimation\n");
+        return 0.0;
+    }
+
+    // Remap per-individual mixture columns to per-species using weights.
+    // An individual may contribute to multiple species (e.g. Hy folded into C+B),
+    // so we use species_to_sample_indices + get_weight rather than a 1:1 map.
+    int n_obs = (int)mixfracs.size();
+    int n_species = (int)panel_meta.species_list.size();
+
+    // Build idx2samp position lookup: sample_index -> position in idx2samp
+    map<int, int> samp_to_pos;
+    for (int i = 0; i < (int)idx2samp.size(); i++){
+        samp_to_pos[idx2samp[i]] = i;
+    }
+
+    // Build samp_to_species_idx for the samp_to_species_idx lookups elsewhere
+    // (used later for startprops). A sample can map to multiple species now,
+    // but this map only stores the last one seen; that's OK because we don't
+    // use it for the aggregation anymore.
+    map<int, int> samp_to_species_idx;
+    for (int s = 0; s < n_species; s++){
+        const string& sp = panel_meta.species_list[s];
+        if (panel_meta.species_to_sample_indices.count(sp) > 0){
+            for (int idx : panel_meta.species_to_sample_indices.at(sp)){
+                samp_to_species_idx[idx] = s;
+            }
+        }
+    }
+
+    // Compute weighted active count per species
+    vector<double> species_weight_sum(n_species, 0.0);
+    set<int> active_samples_set(idx2samp.begin(), idx2samp.end());
+    for (int s = 0; s < n_species; s++){
+        const string& sp = panel_meta.species_list[s];
+        if (panel_meta.species_to_sample_indices.count(sp) > 0){
+            for (int idx : panel_meta.species_to_sample_indices.at(sp)){
+                if (active_samples_set.count(idx) > 0){
+                    species_weight_sum[s] += panel_meta.get_weight(sp, idx);
+                }
+            }
+        }
+    }
+
+    // Identify active species (those with at least one individual in idx2samp).
+    // Species with zero active weight produce all-zero mixture columns, making
+    // them invisible to the likelihood. The solver can assign arbitrary mass to
+    // such columns without penalty, causing spurious nonzero estimates for
+    // species not present in the pool. Exclude them from the solver entirely.
+    vector<int> active_sp_idx;      // full-species-index for each active slot
+    map<int, int> full_to_active;   // full species index -> active slot
+    for (int s = 0; s < n_species; s++){
+        if (species_weight_sum[s] > 0.0){
+            full_to_active[s] = (int)active_sp_idx.size();
+            active_sp_idx.push_back(s);
+        }
+    }
+    int n_active_species = (int)active_sp_idx.size();
+
+    if (n_active_species == 0){
+        fprintf(stderr, "WARNING: no active species for species-level pi estimation\n");
+        return 0.0;
+    }
+
+    // Log which species are active vs excluded
+    {
+        vector<string> active_names, excluded_names;
+        for (int s = 0; s < n_species; s++){
+            if (full_to_active.count(s) > 0){
+                active_names.push_back(panel_meta.species_list[s]);
+            } else {
+                excluded_names.push_back(panel_meta.species_list[s]);
+            }
+        }
+        fprintf(stderr, "  Species solver: %d active", n_active_species);
+        for (const auto& nm : active_names) fprintf(stderr, " %s", nm.c_str());
+        if (!excluded_names.empty()){
+            fprintf(stderr, " | excluded (no individuals in pool):");
+            for (const auto& nm : excluded_names) fprintf(stderr, " %s", nm.c_str());
+        }
+        fprintf(stderr, "\n");
+    }
+
+    // Aggregate: for each observation, build species-level mixfrac as
+    // weighted average of individual mixfracs within each species.
+    // Only active species get columns in the solver matrix.
+    vector<vector<double> > species_mixfracs(n_obs, vector<double>(n_active_species, 0.0));
+
+    for (int obs = 0; obs < n_obs; obs++){
+        for (int a = 0; a < n_active_species; a++){
+            int s = active_sp_idx[a];
+            const string& sp = panel_meta.species_list[s];
+            double wsum = 0.0;
+            if (panel_meta.species_to_sample_indices.count(sp) > 0){
+                for (int idx : panel_meta.species_to_sample_indices.at(sp)){
+                    if (samp_to_pos.count(idx) > 0){
+                        double w = panel_meta.get_weight(sp, idx);
+                        wsum += w * mixfracs[obs][samp_to_pos[idx]];
+                    }
+                }
+            }
+            species_mixfracs[obs][a] = wsum / species_weight_sum[s];
+        }
+    }
+
+    // Build starting proportions (active species only).
+    // On the first call, use species_init_prof if provided (warm start).
+    // On subsequent calls, use the previous solution stored in species_contam_prof.
+    vector<double> startprops(n_active_species, 0.0);
+    bool have_init = false;
+
+    if (!species_init_used && !species_init_prof.empty()){
+        // First call with warm-start from --species_init
+        // Collect only active species values; mass from inactive species
+        // is redistributed proportionally among active ones.
+        double sp_sum = 0.0;
+        double orphan = 0.0;
+        for (int s = 0; s < n_species; s++){
+            const string& sp = panel_meta.species_list[s];
+            double val = 0.0;
+            if (species_init_prof.count(sp) > 0){
+                val = species_init_prof[sp];
+            }
+            if (full_to_active.count(s) > 0){
+                startprops[full_to_active[s]] = val;
+                sp_sum += val;
+            } else {
+                orphan += val;
+            }
+        }
+        // Redistribute orphan mass proportionally
+        if (orphan > 0.0 && sp_sum > 0.0){
+            double scale = (sp_sum + orphan) / sp_sum;
+            for (int a = 0; a < n_active_species; a++){
+                startprops[a] *= scale;
+            }
+            sp_sum += orphan;
+        }
+        // Normalize
+        if (sp_sum > 0.0){
+            for (int a = 0; a < n_active_species; a++){
+                startprops[a] /= sp_sum;
+            }
+            have_init = true;
+        }
+        species_init_used = true;
+        fprintf(stderr, "  Species warm start from --species_init:");
+        for (int a = 0; a < n_active_species; a++){
+            fprintf(stderr, " %s=%.4f",
+                panel_meta.species_list[active_sp_idx[a]].c_str(), startprops[a]);
+        }
+        fprintf(stderr, "\n");
+    } else if (!species_contam_prof.empty()){
+        // Subsequent calls: use previous solution (active species only)
+        double sp_sum = 0.0;
+        for (int a = 0; a < n_active_species; a++){
+            const string& sp = panel_meta.species_list[active_sp_idx[a]];
+            if (species_contam_prof.count(sp) > 0){
+                startprops[a] = species_contam_prof[sp];
+            }
+            sp_sum += startprops[a];
+        }
+        if (sp_sum > 0.0){
+            for (int a = 0; a < n_active_species; a++) startprops[a] /= sp_sum;
+            have_init = true;
+        }
+    }
+
+    if (!have_init){
+        // Fall back to uniform across active species only
+        for (int a = 0; a < n_active_species; a++){
+            startprops[a] = 1.0 / (double)n_active_species;
+        }
+    }
+
+    // Solve with active species only
+    vector<double> params;
+    optimML::multivar_ml_solver solver(params, ll_amb_prof_mixture, dll_amb_prof_mixture);
+    if (num_threads > 1){
+        solver.set_bfgs_threads(num_threads);
+    }
+    solver.add_mixcomp(species_mixfracs);
+    solver.add_mixcomp_fracs(startprops);
+    solver.add_data("n", n);
+    solver.add_data("k", k);
+    solver.add_data("p_e", p_e);
+    solver.add_data("c", c);
+    solver.add_weights(weights);
+
+    bool solve_ok = false;
+    double maxll = -1e30;
+    vector<double> best_mixcomp;
+
+    try {
+        solver.solve();
+        if (std::isfinite(solver.log_likelihood)){
+            solve_ok = true;
+            maxll = solver.log_likelihood;
+            best_mixcomp = solver.results_mixcomp;
+        }
+    } catch (...) {
+        fprintf(stderr, "WARNING: species-level mixture solve failed on initial attempt\n");
+    }
+
+    // Try randomized starting conditions
+    if (!solve_ok || n_mixprop_trials > 0){
+        int ntrials = n_active_species * n_mixprop_trials;
+        for (int trial = 0; trial < ntrials; trial++){
+            try {
+                solver.randomize_mixcomps();
+                solver.solve();
+                if (std::isfinite(solver.log_likelihood) && solver.log_likelihood > maxll){
+                    maxll = solver.log_likelihood;
+                    best_mixcomp = solver.results_mixcomp;
+                    solve_ok = true;
+                }
+            } catch (...) {
+                // ignore, try next
+            }
+        }
+    }
+
+    if (!solve_ok){
+        fprintf(stderr, "WARNING: all species-level mixture solves failed; "
+            "falling back to uniform proportions across active species\n");
+        // CRITICAL: contam_prof may contain stale entries from est_min_c()
+        // with wrong dimensions (all VCF individuals vs idx2samp subset).
+        // Initialize to uniform across ACTIVE species only to prevent
+        // downstream dimension mismatch and spurious inactive species mass.
+        species_contam_prof.clear();
+        species_prior_prof.clear();
+        for (int s = 0; s < n_species; s++){
+            if (full_to_active.count(s) > 0){
+                double unif = 1.0 / (double)n_active_species;
+                species_contam_prof[panel_meta.species_list[s]] = unif;
+                species_prior_prof[panel_meta.species_list[s]] = unif;
+            } else {
+                species_contam_prof[panel_meta.species_list[s]] = 0.0;
+                species_prior_prof[panel_meta.species_list[s]] = 0.0;
+            }
+        }
+        expand_species_prior_to_indiv();
+        rebuild_amb_mu_from_contam_prof();
+        return 0.0;
+    }
+
+    // Map active-species solver results back to full species list.
+    // Inactive species get 0.0.
+    species_contam_prof.clear();
+    for (int s = 0; s < n_species; s++){
+        if (full_to_active.count(s) > 0){
+            species_contam_prof[panel_meta.species_list[s]] = best_mixcomp[full_to_active[s]];
+        } else {
+            species_contam_prof[panel_meta.species_list[s]] = 0.0;
+        }
+    }
+
+    // Expand to individual-level via uniform-within-species split
+    species_prior_prof = species_contam_prof;
+    expand_species_prior_to_indiv();
+
+    // Rebuild amb_mu from individual-level contam_prof
+    rebuild_amb_mu_from_contam_prof();
+
+    return maxll;
+}
+
+// =============================================================================
+// Bulk mode (for quant3_contam_empty_drops)
+// =============================================================================
+
+void contamFinder3::set_bulk_mode(bool enabled){
+    this->bulk_mode = enabled;
+    if (enabled){
+        this->skip_reassign = true;
+    }
 }
 
 void contamFinder3::report_r_feedback_stats(){
@@ -797,6 +1531,100 @@ static double compute_fi_weight(double p_e, double p_c){
     return gap * gap;
 }
 
+
+bool contamFinder3::has_composition_override(unsigned long barcode) const{
+    auto it = cell_composition_overrides.find(barcode);
+    return it != cell_composition_overrides.end() && !it->second.empty();
+}
+
+double contamFinder3::composition_expected_from_row(
+    const map<int, double>& comp,
+    const pair<int, int>& key1,
+    const pair<int, int>& key2) const{
+
+    double out = 0.0;
+    double wsum = 0.0;
+    for (auto it = comp.begin(); it != comp.end(); ++it){
+        int idx = it->first;
+        double w = it->second;
+        if (w <= 0.0) continue;
+
+        double val = 0.5;
+        bool have = false;
+
+        if (key1.first == idx){
+            val = (double)key1.second / 2.0;
+            have = true;
+        } else if (key2.first == idx){
+            val = (double)key2.second / 2.0;
+            have = true;
+        } else {
+            // For weighted identities with >2 native species components, the
+            // counts file is still pairwise.  Estimate missing component dosage
+            // from the conditional matching fractions for the observed row.  If
+            // both pair axes can inform the missing species, average them.
+            double acc = 0.0;
+            int nhave = 0;
+            auto e1 = expfracs.find(key1);
+            if (e1 != expfracs.end()){
+                auto v = e1->second.find(idx);
+                if (v != e1->second.end()){
+                    acc += v->second;
+                    nhave++;
+                }
+            }
+            if (key2.first != -1){
+                auto e2 = expfracs.find(key2);
+                if (e2 != expfracs.end()){
+                    auto v = e2->second.find(idx);
+                    if (v != e2->second.end()){
+                        acc += v->second;
+                        nhave++;
+                    }
+                }
+            }
+            if (nhave > 0){
+                val = acc / (double)nhave;
+                have = true;
+            }
+        }
+
+        // If no conditional information is available, keep neutral 0.5 rather
+        // than inventing a species-specific dosage.
+        (void)have;
+        out += w * val;
+        wsum += w;
+    }
+
+    if (wsum > 0.0) out /= wsum;
+    return out;
+}
+
+bool contamFinder3::composition_row_is_relevant(
+    const map<int, double>& comp,
+    const pair<int, int>& key1,
+    const pair<int, int>& key2) const{
+
+    if (comp.empty()) return false;
+    if (comp.size() == 1){
+        int only = comp.begin()->first;
+        return key1.first == only && key2.first == -1;
+    }
+
+    // Pairwise counts are the native artifact currently available.  For a
+    // weighted composition with k>1 species, use pair rows where both axes are
+    // non-null and both species are among the nonzero composition components.
+    if (key2.first < 0) return false;
+    return comp.count(key1.first) > 0 && comp.count(key2.first) > 0;
+}
+
+void contamFinder3::set_cell_composition_overrides(
+    const map<unsigned long, map<int, double> >& overrides){
+    cell_composition_overrides = overrides;
+    clear_data();
+    compile_data(this->assn, this->indv_allelecounts);
+}
+
 /**
  * Populates internal data structures with data and expected values.
  */
@@ -815,7 +1643,7 @@ void contamFinder3::compile_data(robin_hood::unordered_map<unsigned long, int>& 
         vector<pair<int, int> > type1;
         vector<pair<int, int> > type2; 
 
-        this->get_reads_expectations(a->second, indv_allelecounts[a->first],
+        this->get_reads_expectations(a->first, a->second, indv_allelecounts[a->first],
             n, k, p_e, p_A, p_B, type1, type2);
         
         for (int i = 0; i < n.size(); ++i){
@@ -891,7 +1719,8 @@ void contamFinder3::clear_data(){
  * each different type of allelic state and organize data in a way that is amenable
  * to solving for the parameters.
  */
-void contamFinder3::get_reads_expectations(int ident,
+void contamFinder3::get_reads_expectations(unsigned long barcode,
+    int ident,
     map<pair<int, int>, map<pair<int, int>, pair<float, float> > >& allelecounts,
     vector<double>& n,
     vector<double>& k,
@@ -902,6 +1731,33 @@ void contamFinder3::get_reads_expectations(int ident,
     vector<pair<int, int> >& type2){
     
     static pair<int, int> nullkey = make_pair(-1, -1);
+
+    if (has_composition_override(barcode)){
+        const map<int, double>& comp = cell_composition_overrides[barcode];
+        for (auto ac = allelecounts.begin(); ac != allelecounts.end(); ++ac){
+            for (auto ac2 = ac->second.begin(); ac2 != ac->second.end(); ++ac2){
+                if (!composition_row_is_relevant(comp, ac->first, ac2->first)){
+                    continue;
+                }
+                double ref = ac2->second.first;
+                double alt = ac2->second.second;
+                if (ref + alt <= 0) continue;
+
+                double expected_raw = composition_expected_from_row(comp, ac->first, ac2->first);
+                // Weighted species-composition identities do not currently have
+                // a generalized multi-r expression model.  Use the biologically
+                // specified dosage composition as p_e and estimate only c.
+                n.push_back(ref + alt);
+                k.push_back(alt);
+                p_e.push_back(expected_raw);
+                p_A.push_back(-1.0);
+                p_B.push_back(-1.0);
+                type1.push_back(ac->first);
+                type2.push_back(ac2->first);
+            }
+        }
+        return;
+    }
 
     bool is_combo = false;
     pair<int, int> combo;
@@ -1162,17 +2018,23 @@ double contamFinder3::est_min_c(){
     contam_prof.clear();
     double minval = 0.01;
     double denom = 0.0;
+
+    // Build set of active individuals for filtering
+    set<int> active_set(idx2samp.begin(), idx2samp.end());
+
     // Guard: if c_est is zero or negative, all fracs become degenerate.
     // Fall back to equal proportions.
     if (c_est <= 0.0 || isnan(c_est) || isinf(c_est)){
         for (map<int, double>::iterator mi = minc_by_id.begin(); mi != minc_by_id.end(); ++mi){
-            double frac = 1.0 / (double)minc_by_id.size();
+            if (active_set.count(mi->first) == 0) continue;
+            double frac = 1.0 / (double)idx2samp.size();
             denom += frac;
             contam_prof.insert(make_pair(mi->first, frac));
         }
     }
     else{
         for (map<int, double>::iterator mi = minc_by_id.begin(); mi != minc_by_id.end(); ++mi){
+            if (active_set.count(mi->first) == 0) continue;
             double val = mi->second/minc_by_id_count[mi->first];
             double frac = 1.0 - val/c_est;
             if (frac < minval){
@@ -1182,8 +2044,16 @@ double contamFinder3::est_min_c(){
             contam_prof.insert(make_pair(mi->first, frac));
         }
     }
+    // Fill any idx2samp individuals not in minc_by_id with minimum fraction
+    for (int i = 0; i < (int)idx2samp.size(); i++){
+        int samp = idx2samp[i];
+        if (contam_prof.count(samp) == 0){
+            contam_prof.insert(make_pair(samp, minval));
+            denom += minval;
+        }
+    }
     if (inter_species){
-        contam_prof.insert(make_pair(-1, 1.0/((double)minc_by_id.size() + 1.0)));
+        contam_prof.insert(make_pair(-1, 1.0/((double)idx2samp.size() + 1.0)));
         denom += contam_prof[-1];
     }
     for (map<int, double>::iterator cp = contam_prof.begin(); cp != contam_prof.end(); ++cp){
@@ -1384,7 +2254,7 @@ void contamFinder3::compute_loo_profiles(){
                     }
                 }
                 // If we got a valid value, use it; otherwise fall back to global
-                if (val > 1e-15 || val < 1.0 - 1e-15){
+                if (val > 1e-15 && val < 1.0 - 1e-15){
                     loo_prof[t1->first][t2->first] = val;
                 } else {
                     loo_prof[t1->first][t2->first] = t2->second;
@@ -1407,246 +2277,218 @@ void contamFinder3::compute_loo_profiles(){
  * estimate.
  *
  */
-void contamFinder3::est_contam_cells(){
-    
-    contam_rate.clear();
-    contam_rate_se.clear();
-    contam_rate_ll.clear();
-    allele_ratio.clear();
-    allele_ratio_se.clear();
 
-    // Store all successful estimates of contamination rate for computing the
-    // mean and variance across the data set 
-    vector<double> cell_c_maps;
-    // Store cell weights (log likelihood ratio of most likely ID assignment)
-    // to use in calculating this mean & variance
-    vector<double> cell_c_llr;
+contamFinder3::CellContamFitResult contamFinder3::fit_one_contam_cell(
+    unsigned long barcode,
+    const vector<int>& obs_idx){
 
-    // Separate tracking for two-component (singlet/homotypic) c values only,
-    // used for the Empirical Bayes prior. Heterotypic BFGS estimates on the
-    // r/c likelihood ridge have inflated variance that would weaken the prior.
-    vector<double> twocomp_c_maps;
-    vector<double> twocomp_c_llr;
+    CellContamFitResult out;
+    out.barcode = barcode;
+    out.c = 1.0;
+    out.c_se = 0.0;
+    out.ll = -INFINITY;
+    out.r = 0.5;
+    out.r_se = 0.0;
+    out.is_heterotypic = false;
+    out.bfgs_fallback = false;
+    out.has_allele_ratio = false;
 
-    // Track three-component stats for reporting
-    int n_three_comp = 0;
-    int n_two_comp = 0;
-    int n_bfgs_fallback = 0;
-    vector<double> cell_r_maps;
+    // Determine this cell's identity for LOO lookup.
+    int cell_ident = -1;
+    if (use_loo && assn.count(barcode) > 0){
+        cell_ident = assn[barcode];
+        // For doublets, LOO is not applied (no single identity to exclude).
+        if (cell_ident >= n_samples){
+            cell_ident = -1;
+        }
+    }
+    bool have_loo = (cell_ident >= 0 && amb_mu_loo.count(cell_ident) > 0);
 
-    for (map<unsigned long, vector<int> >::iterator ci = cell_to_idx.begin(); 
-        ci != cell_to_idx.end(); ++ci){
-        
-        // Determine this cell's identity for LOO lookup
-        int cell_ident = -1;
-        if (use_loo && assn.count(ci->first) > 0){
-            cell_ident = assn[ci->first];
-            // For doublets, LOO is not applied (no single identity to exclude)
-            if (cell_ident >= n_samples){
-                cell_ident = -1;
+    // Determine if this cell is a heterotypic combo eligible for the
+    // three-component model.
+    bool is_heterotypic = false;
+    if (assn.count(barcode) > 0 && assn[barcode] >= n_samples){
+        pair<int, int> combo = idx_to_hap_comb(assn[barcode], n_samples);
+        if (combo.first != combo.second){
+            is_heterotypic = true;
+        }
+    }
+    out.is_heterotypic = is_heterotypic;
+
+    vector<double> n;
+    vector<double> k;
+    vector<double> p_e;
+    vector<double> p_c;
+    vector<double> cell_p_A;
+    vector<double> cell_p_B;
+    vector<double> fi_weights;
+
+    auto get_pc = [&](int obs_index) -> double {
+        const pair<int,int>& t1 = type1_all[obs_index];
+        const pair<int,int>& t2 = type2_all[obs_index];
+        if (have_loo){
+            auto loo_id = amb_mu_loo.find(cell_ident);
+            if (loo_id != amb_mu_loo.end()){
+                auto a1 = loo_id->second.find(t1);
+                if (a1 != loo_id->second.end()){
+                    auto a2 = a1->second.find(t2);
+                    if (a2 != a1->second.end()){
+                        return a2->second;
+                    }
+                }
             }
         }
-
-        // Reference to the ambient profile for this cell (global or LOO)
-        bool have_loo = (cell_ident >= 0 && amb_mu_loo.count(cell_ident) > 0);
-
-        // Determine if this cell is a heterotypic combo (eligible for three-component)
-        // A heterotypic combo has p_A_all >= 0 for its observations AND p_A != p_B
-        // for at least some categories (i.e., the two genomes are distinguishable)
-        bool is_heterotypic = false;
-        bool has_any_data = false;
-        if (assn.count(ci->first) > 0 && assn[ci->first] >= n_samples){
-            // It's a combo assignment. Check if heterotypic (A != B)
-            pair<int, int> combo = idx_to_hap_comb(assn[ci->first], n_samples);
-            if (combo.first != combo.second){
-                is_heterotypic = true;
+        auto a1 = amb_mu.find(t1);
+        if (a1 != amb_mu.end()){
+            auto a2 = a1->second.find(t2);
+            if (a2 != a1->second.end()){
+                return a2->second;
             }
         }
+        return 0.5;
+    };
 
-        // Compile data for this cell
-        vector<double> n;
-        vector<double> k;
-        vector<double> p_e;
-        vector<double> p_c;
-        vector<double> cell_p_A;
-        vector<double> cell_p_B;
-        vector<double> fi_weights;
+    // Compile data for this cell.
+    for (vector<int>::const_iterator i = obs_idx.begin(); i != obs_idx.end(); ++i){
+        double this_p_e = adjust_p_err(p_e_all[*i], e_r, e_a);
+        double this_p_c = get_pc(*i);
 
-        for (vector<int>::iterator i = ci->second.begin(); i != ci->second.end(); ++i){
+        double this_p_A = -1.0;
+        double this_p_B = -1.0;
+        if (is_heterotypic && p_A_all[*i] >= 0){
+            this_p_A = adjust_p_err(p_A_all[*i], e_r, e_a);
+            this_p_B = adjust_p_err(p_B_all[*i], e_r, e_a);
+        }
+
+        if (use_fi_weight){
+            double w = compute_fi_weight(this_p_e, this_p_c);
+            if (w < 1e-12) continue;
+            n.push_back(n_all[*i]);
+            k.push_back(k_all[*i]);
+            p_e.push_back(this_p_e);
+            p_c.push_back(this_p_c);
+            cell_p_A.push_back(this_p_A);
+            cell_p_B.push_back(this_p_B);
+            fi_weights.push_back(w);
+        } else {
+            if (!is_heterotypic && tetraploid_aware){
+                bool is_combo_cat = (type2_all[*i].first != -1);
+                if (is_combo_cat){
+                    if (amb_mu_available){
+                        if (!category_passes_adaptive_filter(this_p_e, this_p_c, min_signal_gap)){
+                            continue;
+                        }
+                    } else {
+                        if (!category_passes_hard_filter(true, type1_all[*i].second, type2_all[*i].second)){
+                            continue;
+                        }
+                    }
+                }
+            }
+            n.push_back(n_all[*i]);
+            k.push_back(k_all[*i]);
+            p_e.push_back(this_p_e);
+            p_c.push_back(this_p_c);
+            cell_p_A.push_back(this_p_A);
+            cell_p_B.push_back(this_p_B);
+        }
+    }
+
+    // If filtering removed all data for this cell, fall back to unfiltered.
+    if (n.empty() && (tetraploid_aware || use_fi_weight)){
+        fi_weights.clear();
+        cell_p_A.clear();
+        cell_p_B.clear();
+        for (vector<int>::const_iterator i = obs_idx.begin(); i != obs_idx.end(); ++i){
             double this_p_e = adjust_p_err(p_e_all[*i], e_r, e_a);
-            
-            // LOO: use per-identity ambient profile if available
-            double this_p_c;
-            if (have_loo &&
-                amb_mu_loo[cell_ident].count(type1_all[*i]) > 0 &&
-                amb_mu_loo[cell_ident][type1_all[*i]].count(type2_all[*i]) > 0){
-                this_p_c = amb_mu_loo[cell_ident][type1_all[*i]][type2_all[*i]];
-            } else {
-                this_p_c = amb_mu[type1_all[*i]][type2_all[*i]];
-            }
-            
-            // For three-component model: get per-genome expectations
+            double this_p_c = get_pc(*i);
+            n.push_back(n_all[*i]);
+            k.push_back(k_all[*i]);
+            p_e.push_back(this_p_e);
+            p_c.push_back(this_p_c);
             double this_p_A = -1.0;
             double this_p_B = -1.0;
             if (is_heterotypic && p_A_all[*i] >= 0){
                 this_p_A = adjust_p_err(p_A_all[*i], e_r, e_a);
                 this_p_B = adjust_p_err(p_B_all[*i], e_r, e_a);
             }
-
-            // FI-weight mode: compute continuous weight
+            cell_p_A.push_back(this_p_A);
+            cell_p_B.push_back(this_p_B);
             if (use_fi_weight){
-                double w = compute_fi_weight(this_p_e, this_p_c);
-                if (w < 1e-12) continue;
-                n.push_back(n_all[*i]);
-                k.push_back(k_all[*i]);
-                p_e.push_back(this_p_e);
-                p_c.push_back(this_p_c);
-                cell_p_A.push_back(this_p_A);
-                cell_p_B.push_back(this_p_B);
-                fi_weights.push_back(w);
-            } else {
-                // Tetraploid-aware filtering (for two-component path)
-                // Note: for three-component cells, we keep ALL categories since
-                // the model can handle p_e near p_c by decomposing into p_A and p_B
-                if (!is_heterotypic && tetraploid_aware){
-                    bool is_combo_cat = (type2_all[*i].first != -1);
-                    // Only filter combo-structured categories (homotypic tetraploids).
-                    // Singlet cells have is_combo_cat == false for all categories,
-                    // and their p_e = nalt/2 carries valid signal even when close to p_c.
-                    if (is_combo_cat){
-                        if (amb_mu_available){
-                            if (!category_passes_adaptive_filter(this_p_e, this_p_c, min_signal_gap)){
-                                continue;
-                            }
-                        } else {
-                            if (!category_passes_hard_filter(true, type1_all[*i].second, type2_all[*i].second)){
-                                continue;
-                            }
-                        }
-                    }
-                }
-                
-                n.push_back(n_all[*i]);
-                k.push_back(k_all[*i]);
-                p_e.push_back(this_p_e);
-                p_c.push_back(this_p_c);
-                cell_p_A.push_back(this_p_A);
-                cell_p_B.push_back(this_p_B);
+                fi_weights.push_back(compute_fi_weight(this_p_e, this_p_c));
             }
         }
-        
-        // If filtering removed all data for this cell, fall back to unfiltered
-        if (n.empty() && (tetraploid_aware || use_fi_weight)){
-            fi_weights.clear();
-            cell_p_A.clear();
-            cell_p_B.clear();
-            for (vector<int>::iterator i = ci->second.begin(); i != ci->second.end(); ++i){
-                double this_p_e = adjust_p_err(p_e_all[*i], e_r, e_a);
-                double this_p_c;
-                if (have_loo &&
-                    amb_mu_loo[cell_ident].count(type1_all[*i]) > 0 &&
-                    amb_mu_loo[cell_ident][type1_all[*i]].count(type2_all[*i]) > 0){
-                    this_p_c = amb_mu_loo[cell_ident][type1_all[*i]][type2_all[*i]];
-                } else {
-                    this_p_c = amb_mu[type1_all[*i]][type2_all[*i]];
-                }
-                n.push_back(n_all[*i]);
-                k.push_back(k_all[*i]);
-                p_e.push_back(this_p_e);
-                p_c.push_back(this_p_c);
-                double this_p_A = -1.0, this_p_B = -1.0;
-                if (is_heterotypic && p_A_all[*i] >= 0){
-                    this_p_A = adjust_p_err(p_A_all[*i], e_r, e_a);
-                    this_p_B = adjust_p_err(p_B_all[*i], e_r, e_a);
-                }
-                cell_p_A.push_back(this_p_A);
-                cell_p_B.push_back(this_p_B);
-                if (use_fi_weight){
-                    fi_weights.push_back(compute_fi_weight(this_p_e, this_p_c));
-                }
-            }
+    }
+
+    double c_cell_map = 1.0;
+    double se = 0.0;
+    double ll = -INFINITY;
+    double r_cell_map = 0.5;
+    double r_se = 0.0;
+
+    if (is_heterotypic && !cell_p_A.empty() && cell_p_A[0] >= 0){
+        double c_init_cell = (contam_cell_prior > 0) ? contam_cell_prior : 0.15;
+
+        vector<double> params_init = {0.5, c_init_cell};
+        optimML::multivar_ml_solver solver(params_init, ll_three, dll_three);
+        solver.add_data("n", n);
+        solver.add_data("k", k);
+        solver.add_data("p_A", cell_p_A);
+        solver.add_data("p_B", cell_p_B);
+        solver.add_data("p_c", p_c);
+        solver.constrain_01(0);
+        solver.constrain_01(1);
+        if (use_fi_weight && !fi_weights.empty()){
+            solver.add_weights(fi_weights);
+        }
+        if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
+            pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
+            solver.add_beta_prior(1, bm.first, bm.second);
         }
 
-        double c_cell_map = 1.0;
-        double se = 0.0;
-        double ll = -INFINITY;
-        double r_cell_map = 0.5;
-        double r_se = 0.0;
-
-        // ================================================================
-        // THREE-COMPONENT PATH: heterotypic combo cells
-        // Jointly estimate (r, c) via BFGS
-        // ================================================================
-        if (is_heterotypic && !cell_p_A.empty() && cell_p_A[0] >= 0){
-            // Initial guesses: r=0.5, c=global prior or 0.15
-            double r_init = 0.5;
-            double c_init_cell = (contam_cell_prior > 0) ? contam_cell_prior : 0.15;
-            
-            vector<double> params_init = {r_init, c_init_cell};
-            optimML::multivar_ml_solver solver(params_init, ll_three, dll_three);
-            
-            solver.add_data("n", n);
-            solver.add_data("k", k);
-            solver.add_data("p_A", cell_p_A);
-            solver.add_data("p_B", cell_p_B);
-            solver.add_data("p_c", p_c);
-            
-            // Constrain both r and c to [0, 1]
-            solver.constrain_01(0);  // r
-            solver.constrain_01(1);  // c
-            
-            // FI-weight: add per-observation weights
-            if (use_fi_weight && !fi_weights.empty()){
-                solver.add_weights(fi_weights);
+        try {
+            bool success = solver.solve();
+            if (success){
+                r_cell_map = solver.results[0];
+                c_cell_map = solver.results[1];
+                ll = solver.log_likelihood;
+                se = 0.0;
+                r_se = 0.0;
             }
-
-            // Add Beta prior on c (param index 1) if available
+        } catch (...){
+            out.bfgs_fallback = true;
+            r_cell_map = 0.5;
+            optimML::brent_solver c_fallback(ll_c, dll_dc, d2ll_dc2);
+            c_fallback.add_data("n", n);
+            c_fallback.add_data("k", k);
+            c_fallback.add_data("p_e", p_e);
+            c_fallback.add_data("p_c", p_c);
+            c_fallback.constrain_01();
             if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
                 pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
-                solver.add_beta_prior(bm.first, bm.second, 1);
+                c_fallback.add_beta_prior(bm.first, bm.second);
             }
-
+            c_fallback.set_maxiter(-1);
             try {
-                bool success = solver.solve();
-                if (success){
-                    r_cell_map = solver.results[0];
-                    c_cell_map = solver.results[1];
-                    ll = solver.log_likelihood;
-                    // SE from BFGS: use diagonal of inverse Hessian if available
-                    // The multivar solver stores se per parameter when available
-                    // For now, set SE = 0 (BFGS does not always provide clean SEs)
-                    se = 0.0;
-                    r_se = 0.0;
+                c_cell_map = c_fallback.solve(0, 1);
+                if (c_fallback.root_found){
+                    ll = c_fallback.log_likelihood;
+                    if (c_fallback.se_found) se = c_fallback.se;
                 }
+            } catch (...) {
+                c_cell_map = 1.0;
             }
-            catch (...){
-                // BFGS failed. Fall back to two-component estimate for this cell
-                n_bfgs_fallback++;
-                r_cell_map = 0.5;
-                optimML::brent_solver c_fallback(ll_c, dll_dc, d2ll_dc2);
-                c_fallback.add_data("n", n);
-                c_fallback.add_data("k", k);
-                c_fallback.add_data("p_e", p_e);
-                c_fallback.add_data("p_c", p_c);
-                c_fallback.constrain_01();
-                if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
-                    pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
-                    c_fallback.add_beta_prior(bm.first, bm.second);
-                }
-                c_fallback.set_maxiter(-1);
-                try {
-                    c_cell_map = c_fallback.solve(0, 1);
-                    if (c_fallback.root_found){
-                        ll = c_fallback.log_likelihood;
-                        if (c_fallback.se_found) se = c_fallback.se;
-                    }
-                } catch (...) {
-                    c_cell_map = 1.0;
-                }
-            }
+        }
 
-            // Also try a few alternative starting conditions to avoid local optima
-            // Try r=0.2 and r=0.8 in addition to r=0.5
+        bool try_extra_starts = thorough_multistart;
+        if (adaptive_multistart && !try_extra_starts){
+            bool failed_or_bad = !std::isfinite(ll);
+            bool boundary_r = (r_cell_map < 0.05 || r_cell_map > 0.95);
+            bool boundary_c = (c_cell_map < 0.01 || c_cell_map > 0.95);
+            try_extra_starts = failed_or_bad || boundary_r || boundary_c;
+        }
+
+        if (try_extra_starts){
             for (double r_alt : {0.2, 0.8}){
                 vector<double> alt_init = {r_alt, c_init_cell};
                 optimML::multivar_ml_solver solver_alt(alt_init, ll_three, dll_three);
@@ -1662,7 +2504,7 @@ void contamFinder3::est_contam_cells(){
                 }
                 if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
                     pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
-                    solver_alt.add_beta_prior(bm.first, bm.second, 1);
+                    solver_alt.add_beta_prior(1, bm.first, bm.second);
                 }
                 try {
                     bool success = solver_alt.solve();
@@ -1672,72 +2514,137 @@ void contamFinder3::est_contam_cells(){
                         ll = solver_alt.log_likelihood;
                     }
                 } catch (...) {
-                    // ignore
+                    // ignore this alternate start
                 }
             }
-
-            n_three_comp++;
-            cell_r_maps.push_back(r_cell_map);
-            allele_ratio.emplace(ci->first, r_cell_map);
-            allele_ratio_se.emplace(ci->first, r_se);
         }
-        // ================================================================
-        // TWO-COMPONENT PATH: diploid singlets and homotypic tetraploids
-        // Estimate c via Brent's method (standard path)
-        // ================================================================
-        else {
-            optimML::brent_solver c_cell(ll_c, dll_dc, d2ll_dc2);
 
-            c_cell.add_data("n", n);
-            c_cell.add_data("k", k);
-            c_cell.add_data("p_e", p_e);
-            c_cell.add_data("p_c", p_c);
-            c_cell.constrain_01();
-
-            if (use_fi_weight && !fi_weights.empty()){
-                c_cell.add_weights(fi_weights);
+        out.has_allele_ratio = true;
+        out.r = r_cell_map;
+        out.r_se = r_se;
+    } else {
+        optimML::brent_solver c_cell(ll_c, dll_dc, d2ll_dc2);
+        c_cell.add_data("n", n);
+        c_cell.add_data("k", k);
+        c_cell.add_data("p_e", p_e);
+        c_cell.add_data("p_c", p_c);
+        c_cell.constrain_01();
+        if (use_fi_weight && !fi_weights.empty()){
+            c_cell.add_weights(fi_weights);
+        }
+        if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
+            pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
+            c_cell.add_beta_prior(bm.first, bm.second);
+        }
+        c_cell.set_maxiter(-1);
+        try{
+            c_cell_map = c_cell.solve(0,1);
+            if (c_cell.root_found){
+                ll = c_cell.log_likelihood;
+                if (c_cell.se_found){
+                    se = c_cell.se;
+                }
             }
+        } catch (...){
+            // keep default c=1.0 and ll=-inf
+        }
+    }
 
-            if (contam_cell_prior > 0 && contam_cell_prior_var > 0){
-                pair<double, double> bm = beta_moments(contam_cell_prior, contam_cell_prior_var);
-                c_cell.add_beta_prior(bm.first, bm.second);
-            }
-            c_cell.set_maxiter(-1);
-            
-            try{
-                c_cell_map = c_cell.solve(0,1);
-                if (c_cell.root_found){
-                    ll = c_cell.log_likelihood;
-                    if (c_cell.se_found){
-                        se = c_cell.se;
+    out.c = c_cell_map;
+    out.c_se = se;
+    out.ll = ll;
+    return out;
+}
+
+/**
+ * Once an ambient RNA profile exists (we have estimates of p_c parameters for
+ * every category of SNP), re-estimate the likeliest contamination rate per cell.
+ * The expensive per-cell optimizer work is embarrassingly parallel, so worker
+ * threads write CellContamFitResult records and the class-owned maps are merged
+ * serially after the OpenMP loop.
+ */
+void contamFinder3::est_contam_cells(){
+
+    contam_rate.clear();
+    contam_rate_se.clear();
+    contam_rate_ll.clear();
+    allele_ratio.clear();
+    allele_ratio_se.clear();
+
+    vector<pair<unsigned long, vector<int> > > cells;
+    cells.reserve(cell_to_idx.size());
+    for (map<unsigned long, vector<int> >::iterator ci = cell_to_idx.begin();
+        ci != cell_to_idx.end(); ++ci){
+        cells.push_back(*ci);
+    }
+
+    vector<CellContamFitResult> results(cells.size());
+    int nt = (num_threads > 1) ? num_threads : 1;
+
+    #pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
+    for (int i = 0; i < (int)cells.size(); ++i){
+        results[i] = fit_one_contam_cell(cells[i].first, cells[i].second);
+    }
+
+    vector<double> cell_c_maps;
+    vector<double> cell_c_llr;
+    vector<double> twocomp_c_maps;
+    vector<double> twocomp_c_llr;
+    vector<double> cell_r_maps;
+    cell_c_maps.reserve(results.size());
+    twocomp_c_maps.reserve(results.size());
+
+    int n_three_comp = 0;
+    int n_two_comp = 0;
+    int n_bfgs_fallback = 0;
+
+    for (vector<CellContamFitResult>::const_iterator it = results.begin();
+        it != results.end(); ++it){
+        contam_rate.emplace(it->barcode, it->c);
+        contam_rate_se.emplace(it->barcode, it->c_se);
+        contam_rate_ll.emplace(it->barcode, it->ll);
+
+        if (it->has_allele_ratio){
+            allele_ratio.emplace(it->barcode, it->r);
+            allele_ratio_se.emplace(it->barcode, it->r_se);
+            cell_r_maps.push_back(it->r);
+        }
+        if (it->is_heterotypic){
+            n_three_comp++;
+        } else {
+            n_two_comp++;
+        }
+        if (it->bfgs_fallback){
+            n_bfgs_fallback++;
+        }
+
+        // Keep cell_c_maps and cell_c_llr (and their twocomp counterparts)
+        // in lockstep: in weighted mode, only push when a valid weight exists;
+        // in unweighted mode, push unconditionally.
+        if (weighted){
+            if (assn.count(it->barcode) > 0){
+                int aid = assn[it->barcode];
+                if (id_llrsum.count(aid) > 0 && id_llrsum[aid] != 0.0){
+                    double weight = assn_llr[it->barcode] / id_llrsum[aid];
+                    cell_c_maps.push_back(it->c);
+                    cell_c_llr.push_back(weight);
+                    if (!it->is_heterotypic){
+                        twocomp_c_maps.push_back(it->c);
+                        twocomp_c_llr.push_back(weight);
                     }
                 }
             }
-            catch (...){
-                // pass
-            }
-            n_two_comp++;
-        }
-
-        contam_rate.emplace(ci->first, c_cell_map);
-        cell_c_maps.push_back(c_cell_map);
-        if (!is_heterotypic){
-            twocomp_c_maps.push_back(c_cell_map);
-        }
-        if (weighted){
-            double weight = assn_llr[ci->first] / id_llrsum[assn[ci->first]];
-            cell_c_llr.push_back(weight);
-            if (!is_heterotypic){
-                twocomp_c_llr.push_back(weight);
+        } else {
+            cell_c_maps.push_back(it->c);
+            if (!it->is_heterotypic){
+                twocomp_c_maps.push_back(it->c);
             }
         }
-        contam_rate_se.emplace(ci->first, se);
-        contam_rate_ll.emplace(ci->first, ll);
     }
-    
-    // Re-compute data set-wide distribution (all cells, for reporting)
+
+    // Re-compute data set-wide distribution (all cells, for reporting).
     pair<double, double> mu_var;
-    if (weighted){
+    if (weighted && !cell_c_llr.empty()){
         mu_var = welford_weights(cell_c_maps, cell_c_llr, false);
     }
     else{
@@ -1746,7 +2653,6 @@ void contamFinder3::est_contam_cells(){
 
     // Compute prior from two-component cells only (singlets + homotypic),
     // to avoid heterotypic ridge-variance inflating the prior.
-    // Fall back to all-cell stats if there are too few two-component cells.
     pair<double, double> prior_mu_var;
     bool use_twocomp_prior = (twocomp_c_maps.size() >= 20);
     if (use_twocomp_prior){
@@ -1777,7 +2683,7 @@ void contamFinder3::est_contam_cells(){
             n_three_comp, n_two_comp);
         if (n_bfgs_fallback > 0){
             fprintf(stderr, "  BFGS fallbacks to Brent: %d / %d heterotypic cells\n",
-                n_bfgs_fallback, n_three_comp + n_bfgs_fallback);
+                n_bfgs_fallback, n_three_comp);
         }
         if (!cell_r_maps.empty()){
             pair<double, double> r_stats = welford(cell_r_maps);
@@ -1799,6 +2705,7 @@ void contamFinder3::est_contam_cells(){
     map<int, double> idccount;
     for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin();
         a != assn.end(); ++a){
+        if (contam_rate.count(a->first) == 0) continue;
         if (a->second >= n_samples){
             pair<int, int> comb = idx_to_hap_comb(a->second, n_samples);
             if (idcsum.count(comb.first) == 0){
@@ -1822,9 +2729,6 @@ void contamFinder3::est_contam_cells(){
             idcsum[a->second] += contam_rate[a->first];
             idccount[a->second] += 1.0;
         }
-    }
-    for (map<int, double>::iterator c = idcsum.begin(); c != idcsum.end(); ++c){
-        //fprintf(stderr, "contam mean %d) %f\n", c->first, c->second/idccount[c->first]);
     }
 }
 
@@ -1975,6 +2879,95 @@ void contamFinder3::compile_amb_prof_dat(bool solve_for_c,
                 this_c = contam_rate[a->first];
             }
         }
+
+        if (has_composition_override(a->first)){
+            const map<int, double>& comp = cell_composition_overrides[a->first];
+            for (auto ac1 = indv_allelecounts[a->first].begin();
+                ac1 != indv_allelecounts[a->first].end(); ++ac1){
+
+                for (auto ac2 = ac1->second.begin(); ac2 != ac1->second.end(); ++ac2){
+                    if (!composition_row_is_relevant(comp, ac1->first, ac2->first)){
+                        continue;
+                    }
+
+                    double ref = ac2->second.first;
+                    double alt = ac2->second.second;
+                    if (ref + alt <= 0) continue;
+
+                    double expected = adjust_p_err(
+                        composition_expected_from_row(comp, ac1->first, ac2->first),
+                        e_r, e_a);
+
+                    if (tetraploid_aware && comp.size() > 1){
+                        if (amb_mu_available){
+                            double this_p_c = 0.0;
+                            if (amb_mu.count(ac1->first) > 0 &&
+                                amb_mu[ac1->first].count(ac2->first) > 0){
+                                this_p_c = amb_mu[ac1->first][ac2->first];
+                            }
+                            if (!category_passes_adaptive_filter(expected, this_p_c, min_signal_gap)){
+                                continue;
+                            }
+                        } else {
+                            // Use the original hard filter on pairwise rows.  For
+                            // weighted multi-species identities these rows are an
+                            // approximation until native triple-count artifacts exist.
+                            if (!category_passes_hard_filter(true, ac1->first.second, ac2->first.second)){
+                                continue;
+                            }
+                        }
+                    }
+
+                    n.push_back(ref + alt);
+                    k.push_back(alt);
+                    weights.push_back(weight);
+                    if (!solve_for_c){
+                        c.push_back(this_c);
+                    }
+                    p_e.push_back(expected);
+
+                    vector<double> mixfrac_row;
+                    for (int i = 0; i < idx2samp.size(); ++i){
+                        int samp = idx2samp[i];
+                        if (ac2->first.first == -1){
+                            double ef_val = 0.5;
+                            if (expfracs.count(ac1->first) > 0 &&
+                                expfracs[ac1->first].count(samp) > 0){
+                                ef_val = expfracs[ac1->first][samp];
+                            }
+                            mixfrac_row.push_back(ef_val);
+                        } else {
+                            if (ef_all_avg && ac1->first.first == samp){
+                                mixfrac_row.push_back(adjust_p_err(
+                                    ac1->first.second / 2.0, e_r, e_a));
+                            }
+                            else if (ef_all_avg && ac2->first.first == samp){
+                                mixfrac_row.push_back(adjust_p_err(
+                                    ac2->first.second / 2.0, e_r, e_a));
+                            }
+                            else{
+                                double ef1 = 0.5, ef2 = 0.5;
+                                if (expfracs.count(ac1->first) > 0 &&
+                                    expfracs[ac1->first].count(samp) > 0){
+                                    ef1 = expfracs[ac1->first][samp];
+                                }
+                                if (expfracs.count(ac2->first) > 0 &&
+                                    expfracs[ac2->first].count(samp) > 0){
+                                    ef2 = expfracs[ac2->first][samp];
+                                }
+                                mixfrac_row.push_back(0.5 * ef1 + 0.5 * ef2);
+                            }
+                        }
+                    }
+                    if (inter_species){
+                        mixfrac_row.push_back(adjust_p_err(0.0, e_r, e_a));
+                    }
+                    mixfracs.push_back(mixfrac_row);
+                }
+            }
+            continue;
+        }
+
         for (map<pair<int, int>, map<pair<int, int>, pair<float, float> > >::iterator ac1 = 
             indv_allelecounts[a->first].begin(); ac1 != indv_allelecounts[a->first].end(); 
             ++ac1){
@@ -1987,14 +2980,30 @@ void contamFinder3::compile_amb_prof_dat(bool solve_for_c,
                     if ((!is_comb && ac2->first.first == -1) || 
                         (is_comb && ac2->first.first == comb.second)){
                         
+                        // For heterotypic combo rows, current r-feedback should
+                        // use the same parent-specific mixing ratio for the
+                        // endogenous expected fraction p_e and for the ambient
+                        // candidate mixfrac columns.  When r-feedback is off or
+                        // no allele_ratio has been estimated yet, cell_r remains
+                        // 0.5, preserving the historical fixed-50/50 behavior.
+                        double cell_r = 0.5;
+                        if (r_feedback_enabled && is_comb && comb.first != comb.second &&
+                            allele_ratio.count(a->first) > 0){
+                            cell_r = allele_ratio[a->first];
+                            if (cell_r < 0.01) cell_r = 0.01;
+                            if (cell_r > 0.99) cell_r = 0.99;
+                        }
+
                         double expected;
                         if (!is_comb){
                             expected = adjust_p_err((double)ac1->first.second / 2.0, 
                                 e_r, e_a);
                         }
                         else{
-                            expected = adjust_p_err((double)(ac1->first.second + 
-                                ac2->first.second)/4.0, e_r, e_a);
+                            double p1 = (double)ac1->first.second / 2.0;
+                            double p2 = (double)ac2->first.second / 2.0;
+                            expected = adjust_p_err(cell_r * p1 + (1.0 - cell_r) * p2,
+                                e_r, e_a);
                         }
                         
                         // Tetraploid-aware filtering
@@ -2059,18 +3068,7 @@ void contamFinder3::compile_amb_prof_dat(bool solve_for_c,
                                         expfracs[ac2->first].count(samp) > 0){
                                         ef2 = expfracs[ac2->first][samp];
                                     }
-                                    // R-feedback: use per-cell allele ratio if available
-                                    // Falls back to 0.5 when disabled or not yet estimated
-                                    double cell_r = 0.5;
-                                    if (r_feedback_enabled && is_comb){
-                                        pair<int, int> comb_pair = idx_to_hap_comb(a->second, n_samples);
-                                        if (comb_pair.first != comb_pair.second &&
-                                            allele_ratio.count(a->first) > 0){
-                                            cell_r = allele_ratio[a->first];
-                                            if (cell_r < 0.01) cell_r = 0.01;
-                                            if (cell_r > 0.99) cell_r = 0.99;
-                                        }
-                                    }
+                                    // R-feedback: use the same cell_r used above for p_e.
                                     mixfrac_row.push_back(cell_r * ef1 + (1.0 - cell_r) * ef2);
                                 }
                             }
@@ -2082,6 +3080,80 @@ void contamFinder3::compile_amb_prof_dat(bool solve_for_c,
                         mixfracs.push_back(mixfrac_row);
                     }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Bulk-mode data compiler for ambient profile estimation from empty droplets.
+ *
+ * Unlike compile_amb_prof_dat, this does not filter count rows by cell identity.
+ * Every count row with ref+alt > 0 is included, because c=1.0 means the entire
+ * signal is ambient. The mixture column for each row uses the condf-derived
+ * expected alt fraction per individual (same as the singlet branch of
+ * compile_amb_prof_dat), giving the solver full signal across all SNP categories.
+ */
+void contamFinder3::compile_bulk_amb_prof_dat(
+    vector<vector<double> >& mixfracs,
+    vector<double>& weights,
+    vector<double>& n,
+    vector<double>& k,
+    vector<double>& p_e,
+    vector<double>& c){
+
+    for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin();
+        a != assn.end(); ++a){
+
+        for (auto ac1 = indv_allelecounts[a->first].begin();
+            ac1 != indv_allelecounts[a->first].end(); ++ac1){
+
+            for (auto ac2 = ac1->second.begin(); ac2 != ac1->second.end(); ++ac2){
+
+                double ref = ac2->second.first;
+                double alt = ac2->second.second;
+                if (ref + alt <= 0) continue;
+
+                // For bulk mode, p_e is not used in the mixture model because
+                // c=1.0 eliminates the endogenous term entirely.
+                // Set to 0.5 as a harmless default.
+                double expected = 0.5;
+
+                n.push_back(ref + alt);
+                k.push_back(alt);
+                weights.push_back(1.0);
+                c.push_back(1.0);
+                p_e.push_back(expected);
+
+                // Build mixfrac row: condf-derived expected alt frac per individual.
+                // Mirror the non-bulk logic for paired categories: when
+                // ac2->first.first != -1, the count row represents a paired
+                // genotype category and needs a 50/50 blend of both sides.
+                bool is_paired = (ac2->first.first != -1);
+                vector<double> mixfrac_row;
+                for (int i = 0; i < (int)idx2samp.size(); ++i){
+                    int samp = idx2samp[i];
+                    double ef1 = 0.5;
+                    if (expfracs.count(ac1->first) > 0 &&
+                        expfracs[ac1->first].count(samp) > 0){
+                        ef1 = expfracs[ac1->first][samp];
+                    }
+
+                    if (!is_paired){
+                        mixfrac_row.push_back(ef1);
+                    } else {
+                        double ef2 = 0.5;
+                        if (expfracs.count(ac2->first) > 0 &&
+                            expfracs[ac2->first].count(samp) > 0){
+                            ef2 = expfracs[ac2->first][samp];
+                        }
+                        mixfrac_row.push_back(0.5 * ef1 + 0.5 * ef2);
+                    }
+                }
+                if (inter_species){
+                    mixfrac_row.push_back(adjust_p_err(0.0, e_r, e_a));
+                }
+                mixfracs.push_back(mixfrac_row);
             }
         }
     }
@@ -2100,6 +3172,25 @@ void contamFinder3::compile_amb_prof_dat(bool solve_for_c,
  */
 double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, bool use_global_c){
     
+    // Species mode bypass (section 4.5)
+    if (this->species_mode){
+        if (this->fixed_amb_prof){
+            // Species-level pi was loaded; expand to individual-level via split rule
+            expand_species_prior_to_indiv();
+            rebuild_amb_mu_from_contam_prof();
+            return 0.0;
+        } else {
+            // Estimate species-level pi via species-aggregated mixture components
+            return solve_species_level_pi();
+        }
+    }
+
+    // Fixed ambient profile bypass (Step 0a)
+    if (this->fixed_amb_prof){
+        rebuild_amb_mu_from_contam_prof();
+        return 0.0;
+    }
+
     vector<double> params;
     if (solve_for_c){
         params.push_back(init_c);
@@ -2119,19 +3210,40 @@ double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, 
     vector<double> c;
     
     // Get data
-    compile_amb_prof_dat(solve_for_c, use_global_c, mixfracs, weights,
-        n, k, p_e, c); 
+    if (bulk_mode){
+        compile_bulk_amb_prof_dat(mixfracs, weights, n, k, p_e, c);
+    } else {
+        compile_amb_prof_dat(solve_for_c, use_global_c, mixfracs, weights,
+            n, k, p_e, c);
+    }
     
-    // Starting proportions should be those previously set
+    // Starting proportions: build in idx2samp order to match mixfracs columns
+    // produced by compile_amb_prof_dat (which iterates idx2samp).
     vector<double> startprops;
-    for (map<int, double>::iterator cp = contam_prof.begin(); 
-        cp != contam_prof.end(); ++cp){
-        if (cp->first != -1){
-            startprops.push_back(cp->second);
+    for (int i = 0; i < (int)idx2samp.size(); i++){
+        int samp = idx2samp[i];
+        if (contam_prof.count(samp) > 0){
+            startprops.push_back(contam_prof[samp]);
+        } else {
+            startprops.push_back(1.0 / (double)idx2samp.size());
         }
     }
-    if (contam_prof.count(-1) > 0){
+    if (inter_species && contam_prof.count(-1) > 0){
         startprops.push_back(contam_prof[-1]);
+    } else if (inter_species){
+        startprops.push_back(1.0 / (double)(idx2samp.size() + 1));
+    }
+
+    // Safety check: if sizes still don't match, fall back to uniform
+    if (!mixfracs.empty() && startprops.size() != mixfracs[0].size()){
+        fprintf(stderr, "WARNING: startprops size (%lu) != mixfracs columns (%lu); "
+            "falling back to uniform\n",
+            startprops.size(), mixfracs[0].size());
+        startprops.clear();
+        size_t n_cols = mixfracs[0].size();
+        for (size_t i = 0; i < n_cols; i++){
+            startprops.push_back(1.0 / (double)n_cols);
+        }
     }
     
     // Set up ML solver 
@@ -2367,8 +3479,12 @@ double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, 
  */
 void contamFinder3::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_params){
     // Assumes we have already solved everything and that this is at the end.
+    if (n_boots <= 0){
+        fprintf(stderr, "Bootstrap disabled (n_boots <= 0); skipping concentration fit\n");
+        return;
+    }
 
-    // Compile everything we need
+    // Compile individual-level data (used by both species and non-species paths)
     vector<vector<double> > mixfracs;
     vector<double> weights;
     vector<double> n;
@@ -2376,49 +3492,314 @@ void contamFinder3::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_
     vector<double> p_e;
     vector<double> c;
     
-    compile_amb_prof_dat(false, false, mixfracs, weights, n, k, p_e, c);
-   
-    // Store MLEs from bootstrap samples, which will serve as samples from
-    // a Dirichlet distribution 
-    vector<vector<double> > dirprops;
-    
-    // Store MLE solution from contam_prof
-    vector<double> mle_fracs;
-
-    // Starting proportions should be those previously set
-    vector<double> startprops;
-    for (map<int, double>::iterator cp = contam_prof.begin(); cp != contam_prof.end(); ++cp){
-        if (cp->first != -1){
-            startprops.push_back(cp->second);
-            vector<double> v;
-            dirprops.push_back(v);
-            mle_fracs.push_back(cp->second);
-        }
+    if (bulk_mode){
+        compile_bulk_amb_prof_dat(mixfracs, weights, n, k, p_e, c);
+    } else {
+        compile_amb_prof_dat(false, false, mixfracs, weights, n, k, p_e, c);
     }
-    if (contam_prof.count(-1) > 0){
+
+    if (mixfracs.empty() || n.empty()){
+        fprintf(stderr, "WARNING: no data for bootstrap; skipping\n");
+        return;
+    }
+
+    // ---- Species-mode bootstrap: aggregate to species level ----
+    if (species_mode){
+        // Keep bootstrap alpha expansion consistent with solve_species_level_pi()
+        // and expand_species_prior_to_indiv(). Skip in bulk mode because the
+        // synthetic placeholder assignment would create meaningless loading weights.
+        if (!bulk_mode && indiv_loading_weights.empty()){
+            compute_loading_weights();
+        }
+
+        int n_obs = (int)mixfracs.size();
+        int n_sp = (int)panel_meta.species_list.size();
+
+        // Build sample position lookup
+        map<int, int> samp_to_pos;
+        for (int i = 0; i < (int)idx2samp.size(); i++){
+            samp_to_pos[idx2samp[i]] = i;
+        }
+
+        // Compute weighted active count per species
+        set<int> active_set(idx2samp.begin(), idx2samp.end());
+        vector<double> sp_weight_sum(n_sp, 0.0);
+        for (int s = 0; s < n_sp; s++){
+            const string& sp = panel_meta.species_list[s];
+            if (panel_meta.species_to_sample_indices.count(sp) > 0){
+                for (int idx : panel_meta.species_to_sample_indices.at(sp)){
+                    if (active_set.count(idx) > 0){
+                        sp_weight_sum[s] += panel_meta.get_weight(sp, idx);
+                    }
+                }
+            }
+        }
+
+        // Identify active species (exclude zero-weight species from solver
+        // to prevent degenerate mass assignment to absent species)
+        vector<int> active_sp_idx;
+        map<int, int> full_to_active;
+        for (int s = 0; s < n_sp; s++){
+            if (sp_weight_sum[s] > 0.0){
+                full_to_active[s] = (int)active_sp_idx.size();
+                active_sp_idx.push_back(s);
+            }
+        }
+        int n_active_sp = (int)active_sp_idx.size();
+
+        if (n_active_sp == 0){
+            fprintf(stderr, "WARNING: no active species for bootstrap; skipping\n");
+            return;
+        }
+
+        // Remap mixfracs to active-species level using weighted average
+        vector<vector<double> > sp_mixfracs(n_obs, vector<double>(n_active_sp, 0.0));
+        for (int obs = 0; obs < n_obs; obs++){
+            for (int a = 0; a < n_active_sp; a++){
+                int s = active_sp_idx[a];
+                const string& sp = panel_meta.species_list[s];
+                double wsum = 0.0;
+                if (panel_meta.species_to_sample_indices.count(sp) > 0){
+                    for (int idx : panel_meta.species_to_sample_indices.at(sp)){
+                        if (samp_to_pos.count(idx) > 0){
+                            double w = panel_meta.get_weight(sp, idx);
+                            wsum += w * mixfracs[obs][samp_to_pos[idx]];
+                        }
+                    }
+                }
+                sp_mixfracs[obs][a] = wsum / sp_weight_sum[active_sp_idx[a]];
+            }
+        }
+
+        // Active-species startprops and MLE fracs from species_contam_prof
+        vector<double> startprops(n_active_sp, 1.0 / (double)n_active_sp);
+        vector<double> mle_fracs(n_active_sp, 0.0);
+        vector<vector<double> > dirprops(n_active_sp);
+        for (int a = 0; a < n_active_sp; a++){
+            const string& sp = panel_meta.species_list[active_sp_idx[a]];
+            if (species_contam_prof.count(sp) > 0){
+                startprops[a] = species_contam_prof[sp];
+                mle_fracs[a] = species_contam_prof[sp];
+            }
+        }
+        // Normalize startprops to sum to 1 (inactive species mass excluded)
+        {
+            double sp_sum = 0.0;
+            for (int a = 0; a < n_active_sp; a++) sp_sum += startprops[a];
+            if (sp_sum > 0.0){
+                for (int a = 0; a < n_active_sp; a++) startprops[a] /= sp_sum;
+            }
+        }
+
+        // Bootstrap at species level. Parallelize over independent replicates.
+        // Each worker stores one result vector; dirprops is populated serially
+        // after the OpenMP region to avoid concurrent vector push_back.
+        vector<vector<double> > boot_results(n_boots);
+        int nt_boot = (num_threads > 1) ? std::min(num_threads, n_boots) : 1;
+
+        #pragma omp parallel for num_threads(nt_boot) schedule(dynamic, 1)
+        for (int b = 0; b < n_boots; ++b){
+            mt19937 rand_gen(1337 + b);
+            uniform_int_distribution<int> uni_dist(0, n_obs - 1);
+
+            vector<vector<double> > mf_boot;
+            vector<double> w_boot, n_boot, k_boot, pe_boot, c_boot;
+            mf_boot.reserve(n_obs);
+            w_boot.reserve(n_obs);
+            n_boot.reserve(n_obs);
+            k_boot.reserve(n_obs);
+            pe_boot.reserve(n_obs);
+            c_boot.reserve(n_obs);
+
+            for (int x = 0; x < n_obs; ++x){
+                int r = uni_dist(rand_gen);
+                mf_boot.push_back(sp_mixfracs[r]);
+                w_boot.push_back(weights[r]);
+                n_boot.push_back(n[r]);
+                k_boot.push_back(k[r]);
+                pe_boot.push_back(p_e[r]);
+                c_boot.push_back(c[r]);
+            }
+
+            vector<double> params;
+            optimML::multivar_ml_solver solver(params, ll_amb_prof_mixture,
+                dll_amb_prof_mixture);
+            solver.add_mixcomp(mf_boot);
+            solver.add_mixcomp_fracs(startprops);
+            solver.add_data("n", n_boot);
+            solver.add_data("k", k_boot);
+            solver.add_data("p_e", pe_boot);
+            solver.add_data("c", c_boot);
+
+            try {
+                solver.solve();
+                if (std::isfinite(solver.log_likelihood)){
+                    for (int x = 0; x < (int)solver.results_mixcomp.size() &&
+                         x < n_active_sp; ++x){
+                        boot_results[b].push_back(solver.results_mixcomp[x]);
+                    }
+                }
+            } catch (...) {
+                // Skip failed bootstrap sample
+            }
+        }
+
+        for (int b = 0; b < n_boots; ++b){
+            if ((int)boot_results[b].size() != n_active_sp) continue;
+            for (int x = 0; x < n_active_sp; ++x){
+                dirprops[x].push_back(boot_results[b][x]);
+            }
+        }
+        fprintf(stderr, "Bootstrap samples complete: %d requested\n", n_boots);
+
+        // Fit Dirichlet at active-species level
+        vector<double> dirichlet_soln;
+        fit_dirichlet(mle_fracs, dirprops, dirichlet_soln);
+
+        // Expand active-species Dirichlet params to individual level using the
+        // same effective split as expand_species_prior_to_indiv().
+        //
+        // Semantics:
+        //   - base panel weight comes from panel_meta.get_weight(sp, idx)
+        //   - if indiv_loading_weights is non-empty, missing idx means zero
+        //   - if an entire species has zero loading-weighted mass, fall back to
+        //     base panel weights for that species only
+        dirichlet_params.clear();
+
+        for (int a = 0; a < n_active_sp && a < (int)dirichlet_soln.size(); a++){
+            int s = active_sp_idx[a];
+            const string& sp = panel_meta.species_list[s];
+
+            if (panel_meta.species_to_sample_indices.count(sp) == 0) continue;
+
+            const auto& sp_indices = panel_meta.species_to_sample_indices.at(sp);
+
+            double eff_w_sum = 0.0;
+            bool use_loading = !indiv_loading_weights.empty();
+
+            if (use_loading){
+                for (int idx : sp_indices){
+                    if (active_set.count(idx) > 0){
+                        auto it = indiv_loading_weights.find(idx);
+                        if (it != indiv_loading_weights.end()){
+                            eff_w_sum += panel_meta.get_weight(sp, idx) * it->second;
+                        }
+                    }
+                }
+                if (eff_w_sum <= 0.0){
+                    use_loading = false;
+                }
+            }
+
+            if (!use_loading){
+                eff_w_sum = 0.0;
+                for (int idx : sp_indices){
+                    if (active_set.count(idx) > 0){
+                        eff_w_sum += panel_meta.get_weight(sp, idx);
+                    }
+                }
+            }
+
+            if (eff_w_sum <= 0.0) continue;
+
+            for (int idx : sp_indices){
+                if (active_set.count(idx) > 0){
+                    double w = 0.0;
+                    if (use_loading){
+                        auto it = indiv_loading_weights.find(idx);
+                        w = (it != indiv_loading_weights.end())
+                          ? panel_meta.get_weight(sp, idx) * it->second
+                          : 0.0;
+                    } else {
+                        w = panel_meta.get_weight(sp, idx);
+                    }
+                    if (w > 0.0){
+                        dirichlet_params[idx] += (w / eff_w_sum) * dirichlet_soln[a];
+                    }
+                }
+            }
+        }
+        // Store species-level Dirichlet concentrations for output.
+        // Active species get fitted values; inactive species get 0.0.
+        species_contam_prof_conc.clear();
+        for (int s = 0; s < n_sp; s++){
+            if (full_to_active.count(s) > 0 &&
+                full_to_active[s] < (int)dirichlet_soln.size()){
+                species_contam_prof_conc[panel_meta.species_list[s]] =
+                    dirichlet_soln[full_to_active[s]];
+            } else {
+                species_contam_prof_conc[panel_meta.species_list[s]] = 0.0;
+            }
+        }
+
+        return;
+    }
+
+    // ---- Individual-level bootstrap (non-species mode) ----
+
+    // Build startprops/mle_fracs/dirprops in idx2samp order to match
+    // mixfracs columns from compile_amb_prof_dat.
+    vector<vector<double> > dirprops;
+    vector<double> mle_fracs;
+    vector<double> startprops;
+    for (int i = 0; i < (int)idx2samp.size(); i++){
+        int samp = idx2samp[i];
+        double val = 1.0 / (double)idx2samp.size();
+        if (contam_prof.count(samp) > 0){
+            val = contam_prof[samp];
+        }
+        startprops.push_back(val);
+        dirprops.push_back(vector<double>());
+        mle_fracs.push_back(val);
+    }
+    if (inter_species && contam_prof.count(-1) > 0){
         startprops.push_back(contam_prof[-1]);
-        vector<double> v;
-        dirprops.push_back(v);
+        dirprops.push_back(vector<double>());
         mle_fracs.push_back(contam_prof[-1]);
     }
+
+    // Safety check: if sizes still don't match, fall back to uniform
+    if (!mixfracs.empty() && startprops.size() != mixfracs[0].size()){
+        fprintf(stderr, "WARNING: bootstrap startprops size (%lu) != mixfracs columns (%lu); "
+            "falling back to uniform\n", startprops.size(), mixfracs[0].size());
+        size_t n_cols = mixfracs[0].size();
+        startprops.clear();
+        dirprops.clear();
+        mle_fracs.clear();
+        for (size_t i = 0; i < n_cols; i++){
+            startprops.push_back(1.0 / (double)n_cols);
+            dirprops.push_back(vector<double>());
+            mle_fracs.push_back(1.0 / (double)n_cols);
+        }
+    }
     
-    // Initialize random stuff
-    static random_device dev;
-    static mt19937 rand_gen = mt19937(dev());
-    static uniform_int_distribution<int> uni_dist(0, n.size()-1);
-    
+    // Parallel bootstrap over independent replicates.  Each replicate gets a
+    // deterministic seed and writes to boot_results[b]; dirprops is filled
+    // serially afterward.
+    int n_obs = (int)n.size();
+    int n_props = (int)startprops.size();
+    vector<vector<double> > boot_results(n_boots);
+    int nt_boot = (num_threads > 1) ? std::min(num_threads, n_boots) : 1;
+
+    #pragma omp parallel for num_threads(nt_boot) schedule(dynamic, 1)
     for (int b = 0; b < n_boots; ++b){
-        fprintf(stderr, "Bootstrap sample %d...\r", b+1);
-        
-        // Re-sample
+        mt19937 rand_gen(7331 + b);
+        uniform_int_distribution<int> uni_dist(0, n_obs - 1);
+
         vector<vector<double> > mixfracs_boot;
         vector<double> weights_boot;
         vector<double> n_boot;
         vector<double> k_boot;
         vector<double> p_e_boot;
         vector<double> c_boot;
-        
-        for (int x = 0; x < n.size(); ++x){
+        mixfracs_boot.reserve(n_obs);
+        weights_boot.reserve(n_obs);
+        n_boot.reserve(n_obs);
+        k_boot.reserve(n_obs);
+        p_e_boot.reserve(n_obs);
+        c_boot.reserve(n_obs);
+
+        for (int x = 0; x < n_obs; ++x){
             int r = uni_dist(rand_gen);
             mixfracs_boot.push_back(mixfracs[r]);
             weights_boot.push_back(weights[r]);
@@ -2426,44 +3807,43 @@ void contamFinder3::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_
             k_boot.push_back(k[r]);
             p_e_boot.push_back(p_e[r]);
             c_boot.push_back(c[r]);
-        }    
-        
-        // Solve
-        vector<double> params;
-        optimML::multivar_ml_solver solver(params, ll_amb_prof_mixture, dll_amb_prof_mixture);
-        if (num_threads > 1){
-            // Avoid multithreading for evaluation for mixture proportion problems
-            //solver.set_threads(num_threads);
-            solver.set_bfgs_threads(num_threads);
         }
+
+        vector<double> params;
+        optimML::multivar_ml_solver solver(params, ll_amb_prof_mixture,
+            dll_amb_prof_mixture);
         solver.add_mixcomp(mixfracs_boot);
         solver.add_mixcomp_fracs(startprops);
         solver.add_data("n", n_boot);
         solver.add_data("k", k_boot);
         solver.add_data("p_e", p_e_boot);
         solver.add_data("c", c_boot);
-        
+
         try {
             solver.solve();
             if (std::isfinite(solver.log_likelihood)){
-                for (int x = 0; x < (int)solver.results_mixcomp.size(); ++x){
-                    dirprops[x].push_back(solver.results_mixcomp[x]);
+                for (int x = 0; x < (int)solver.results_mixcomp.size() && x < n_props; ++x){
+                    boot_results[b].push_back(solver.results_mixcomp[x]);
                 }
             }
-            // else: skip this bootstrap sample (non-finite LL)
         } catch (...) {
-            // Skip this bootstrap sample - solver failed on resampled data
+            // Skip failed bootstrap sample
         }
-        
     }
-    fprintf(stderr, "\n");
+
+    for (int b = 0; b < n_boots; ++b){
+        if ((int)boot_results[b].size() != n_props) continue;
+        for (int x = 0; x < n_props; ++x){
+            dirprops[x].push_back(boot_results[b][x]);
+        }
+    }
+    fprintf(stderr, "Bootstrap samples complete: %d requested\n", n_boots);
     
-    // Now fit Dirichlet MLE
     vector<double> dirichlet_soln;
     fit_dirichlet(mle_fracs, dirprops, dirichlet_soln);
     
     dirichlet_params.clear();
-    for (int i = 0; i < idx2samp.size(); ++i){
+    for (int i = 0; i < (int)dirichlet_soln.size() && i < (int)idx2samp.size(); ++i){
         int samp = idx2samp[i];
         dirichlet_params.insert(make_pair(samp, dirichlet_soln[i]));
     }
@@ -3004,6 +4384,9 @@ bool contamFinder3::reclassify_cells(){
         allele_ratio.erase(*rm);
         allele_ratio_se.erase(*rm);
     }
+    if (species_mode){
+        compute_loading_weights();
+    }
     return changed;
 }
 
@@ -3127,6 +4510,48 @@ double contamFinder3::compute_ll(){
 void contamFinder3::fit(){
     // Report active mechanisms
     fprintf(stderr, "Three-component model active for heterotypic tetraploid cells\n");
+
+    // Bulk mode: simplified flow for empty-droplet profiling
+    if (bulk_mode){
+        fprintf(stderr, "Bulk mode: solving for ambient profile only (c fixed at 1.0)\n");
+
+        // Skip init_params() entirely in bulk mode. init_params() runs the mixture
+        // solver at a freely-optimized c, producing starting proportions estimated
+        // at the wrong contamination rate. It also runs 250 BFGS restarts that are
+        // completely wasted since we immediately overwrite all c values to 1.0.
+        //
+        // Instead, set uniform starting proportions directly. If set_init_contam_prof()
+        // was called before fit() (warm-start case), those proportions are already in
+        // contam_prof and contam_prof_initialized is true, so we skip this block.
+        if (!contam_prof_initialized){
+            for (int i = 0; i < (int)idx2samp.size(); ++i){
+                int samp = idx2samp[i];
+                if (inter_species){
+                    contam_prof[samp] = 1.0 / (double)(idx2samp.size() + 1);
+                } else {
+                    contam_prof[samp] = 1.0 / (double)idx2samp.size();
+                }
+            }
+            if (inter_species){
+                contam_prof[-1] = 1.0 / (double)(idx2samp.size() + 1);
+            }
+            contam_prof_initialized = true;
+        }
+
+        // Set all barcodes with assignments to c=1.0 (everything is ambient).
+        // Use assn (public member) to get the full barcode set.
+        for (auto& a : assn){
+            contam_rate[a.first] = 1.0;
+        }
+
+        // Solve for pi (mixture proportions) with c fixed at 1.0
+        double dummy = -1.0;
+        double loglik = this->update_amb_prof_mixture(false, dummy, false);
+        fprintf(stderr, "Bulk mode log likelihood: %f\n", loglik);
+        this->amb_mu_available = true;
+        return;
+    }
+
     if (use_fi_weight){
         fprintf(stderr, "FI-weight mode: continuous Fisher Information weighting active\n");
     }
@@ -3145,6 +4570,14 @@ void contamFinder3::fit(){
         fprintf(stderr, "Adaptive prior: will check distribution and apply fixed prior "
             "fallback if pathological (thresh=%.2f, mean=%.4f)\n",
             adaptive_prior_boundary_thresh, adaptive_prior_mean);
+    }
+
+    if (species_mode && !has_species_counts && !primary_species_counts_enabled && !fixed_amb_prof){
+        fprintf(stderr, "WARNING: species-level estimation has no species-diagnostic data source.\n"
+            "  Native --interspecies runs should call set_primary_species_counts_enabled(true)\n"
+            "  after loading .species_counts/.species_condf as the primary inputs.\n");
+    } else if (species_mode && primary_species_counts_enabled && !has_species_counts){
+        fprintf(stderr, "Species-level estimation uses native .species_counts/.species_condf primary inputs.\n");
     }
 
     // -- Phase 1: Initialization (unchanged) --
@@ -3170,6 +4603,10 @@ void contamFinder3::fit(){
     // Second call: applies empirical Bayes shrinkage (or fixed prior if user_prior_set)
     this->est_contam_cells();
 
+    if (species_mode){
+        compute_loading_weights();
+    }
+
     // -- Phase 3: Adaptive prior (if enabled) --
     // Checks the post-EB distribution. If pathological, overrides with a
     // fixed prior at adaptive_prior_mean and iteratively halves variance
@@ -3181,25 +4618,83 @@ void contamFinder3::fit(){
     // -- Phase 4: R-feedback (if enabled) --
     // Uses per-cell allele ratios from est_contam_cells to re-weight
     // heterotypic cell contributions in the ambient profile mixture.
+    //
+    // V1_R12 / R3: make this update acceptance-gated. The species free
+    // estimator can otherwise move into a coupled bad basin where a proposed
+    // profile and the newly re-fit per-cell c/r reinforce each other. Save the
+    // currently accepted state, propose the r-informed profile, re-fit c/r
+    // against that profile, and keep it only if the comparable full objective
+    // improves and remains finite.
     if (r_feedback_enabled && !allele_ratio.empty()){
         this->report_r_feedback_stats();
 
+        map<int, double> old_contam_prof = this->contam_prof;
+        map<string, double> old_species_contam_prof = this->species_contam_prof;
+        map<string, double> old_species_contam_prof_conc = this->species_contam_prof_conc;
+        map<string, double> old_species_prior_prof = this->species_prior_prof;
+        map<string, double> old_species_prior_conc = this->species_prior_conc;
+        map<pair<int, int>, map<pair<int, int>, double> > old_amb_mu = this->amb_mu;
+        map<int, map<pair<int,int>, map<pair<int,int>, double> > > old_amb_mu_loo = this->amb_mu_loo;
+        robin_hood::unordered_map<unsigned long, double> old_contam_rate = this->contam_rate;
+        robin_hood::unordered_map<unsigned long, double> old_contam_rate_se = this->contam_rate_se;
+        robin_hood::unordered_map<unsigned long, double> old_contam_rate_ll = this->contam_rate_ll;
+        robin_hood::unordered_map<unsigned long, double> old_allele_ratio = this->allele_ratio;
+        robin_hood::unordered_map<unsigned long, double> old_allele_ratio_se = this->allele_ratio_se;
+        double old_contam_cell_prior = this->contam_cell_prior;
+        double old_contam_cell_prior_var = this->contam_cell_prior_var;
+
+        double old_obj = this->compute_ll();
+        fprintf(stderr, "R-feedback acceptance gate: current objective before update = %f\n",
+            old_obj);
+
         fprintf(stderr, "Re-estimating ambient profile with r-feedback...\n");
         double dummy2 = -1.0;
-        this->update_amb_prof_mixture(false, dummy2, false);
-
-        if (use_loo){
-            fprintf(stderr, "Recomputing LOO profiles against r-informed ambient...\n");
-            this->compute_loo_profiles();
-        }
+        double proposed_profile_ll = this->update_amb_prof_mixture(false, dummy2, false);
 
         fprintf(stderr, "Re-estimating per-cell contamination against r-informed profile...\n");
         this->est_contam_cells();
 
-        // If adaptive prior triggered earlier, re-check after r-feedback
+        // If adaptive prior triggered earlier, re-check after r-feedback. This
+        // is part of the proposed state and will also be rolled back if the
+        // objective gate rejects the proposal.
         if (adaptive_prior_enabled){
             fprintf(stderr, "Post-r-feedback adaptive prior re-check...\n");
             this->run_adaptive_prior();
+        }
+
+        double new_obj = this->compute_ll();
+        double min_improvement = 1e-6;
+        bool accept_r_feedback = std::isfinite(old_obj) && std::isfinite(new_obj) &&
+            (new_obj > old_obj + min_improvement);
+
+        if (accept_r_feedback){
+            fprintf(stderr, "R-feedback acceptance gate: accepted update "
+                "(old=%f, new=%f, delta=%f; profile_solver_ll=%f)\n",
+                old_obj, new_obj, new_obj - old_obj, proposed_profile_ll);
+            if (use_loo){
+                fprintf(stderr, "Recomputing LOO profiles against accepted r-informed ambient...\n");
+                this->compute_loo_profiles();
+            }
+        } else {
+            fprintf(stderr, "R-feedback acceptance gate: rejected update "
+                "(old=%f, new=%f, delta=%f; profile_solver_ll=%f). Restoring previous state.\n",
+                old_obj, new_obj, new_obj - old_obj, proposed_profile_ll);
+
+            this->contam_prof = old_contam_prof;
+            this->species_contam_prof = old_species_contam_prof;
+            this->species_contam_prof_conc = old_species_contam_prof_conc;
+            this->species_prior_prof = old_species_prior_prof;
+            this->species_prior_conc = old_species_prior_conc;
+            this->amb_mu = old_amb_mu;
+            this->amb_mu_loo = old_amb_mu_loo;
+            this->contam_rate = old_contam_rate;
+            this->contam_rate_se = old_contam_rate_se;
+            this->contam_rate_ll = old_contam_rate_ll;
+            this->allele_ratio = old_allele_ratio;
+            this->allele_ratio_se = old_allele_ratio_se;
+            this->contam_cell_prior = old_contam_cell_prior;
+            this->contam_cell_prior_var = old_contam_cell_prior_var;
+            this->amb_mu_available = true;
         }
     }
 
@@ -3230,4 +4725,106 @@ void contamFinder3::fit(){
 //        Phase 4 r-feedback + ambient re-estimation, Phase 5 reclassification.
 //        Both features off by default; controlled via set_r_feedback() and
 //        set_adaptive_prior().
+// V1_R2: Added fixed_amb_prof support (set_fixed_amb_prof, rebuild_amb_mu_from_contam_prof).
+//        Added species mode (set_species_mode, set_species_prior,
+//        expand_species_prior_to_indiv, solve_species_level_pi). Added bulk mode
+//        (set_bulk_mode). Two-way protection between species_mode and inter_species.
+//        update_amb_prof_mixture bypass for fixed_amb_prof and species mode paths.
+// V1_R3: Fixed dimension mismatch crash in --species_mode estimate.
+//        (1) expand_species_prior_to_indiv now filters to idx2samp-active
+//            individuals only, preventing contam_prof from containing entries
+//            for individuals not in the model. This fixes the bootstrap and
+//            update_amb_prof_mixture dimension mismatch (contam_prof.size() vs
+//            idx2samp.size() / mixfracs column count).
+//        (2) solve_species_level_pi now detects empty contam_rate (first call
+//            from init_params before any per-cell estimation) and falls back to
+//            global c via use_global_c=true in compile_amb_prof_dat, preventing
+//            degenerate c=0 data that eliminates mixture signal.
+// V1_R4: Fixed remaining dimension mismatch in --species_mode estimate.
+//        Root cause: est_min_c() populates contam_prof from minc_by_id which
+//        contains ALL individuals observed in allele counts (up to 28), not
+//        just the idx2samp subset (13 for lib13). When solve_species_level_pi
+//        fails (all solver attempts throw), expand_species_prior_to_indiv is
+//        never called, leaving contam_prof with 28 entries. bootstrap_amb_prof
+//        then builds startprops (28) vs mixfracs (13 cols) -> mismatch crash.
+//        Fixes: (a) est_min_c now filters contam_prof to idx2samp-active
+//        individuals and fills missing ones with minimum fraction. (b)
+//        solve_species_level_pi failure path now calls expand_species_prior_to
+//        _indiv with uniform species proportions instead of leaving contam_prof
+//        stale. (c) bootstrap_amb_prof dirichlet_soln indexing is bounds-checked.
+// V1_R5: Species-level bootstrap in bootstrap_amb_prof. When species_mode is
+//        true, the bootstrap now aggregates mixfracs to species level (same
+//        remapping as solve_species_level_pi), runs the mixture solver with
+//        n_species components, fits the Dirichlet at species level, then
+//        expands the concentration parameters back to individual level via
+//        the uniform-within-species split. Also stores species-level
+//        concentrations in species_contam_prof_conc for output. Fixes the
+//        dimension mismatch where individual-level bootstrap (28 components)
+//        produced a degenerate Dirichlet that collapsed to 5 effective params,
+//        then the indexing loop over idx2samp (28) overran the 5-element result.
+//        Non-species path is unchanged.
+// V1_R6: Fixed orphan mass bug in expand_species_prior_to_indiv. When a species
+//        has nonzero estimated proportion but zero active individuals in idx2samp
+//        (e.g. Hy at 22% with no Hy in expected_lines for lib13), the old code
+//        silently dropped that mass via `continue`, causing contam_prof to sum to
+//        ~78% instead of 100%. Now redistributes orphan mass proportionally across
+//        species that have active individuals. species_contam_prof still records
+//        the original solver-estimated proportions (including zero-active species).
+// V1_R7: Hybrid fold support. PanelMetadata now carries per-(species, individual)
+//        weights (default 1.0). load_panel_metadata folds Hy individuals into C
+//        and B with weight 0.5 each, eliminating the collinear 5th species.
+//        solve_species_level_pi, bootstrap_amb_prof, and expand_species_prior_to
+//        _indiv all use weighted aggregation/expansion: an individual appearing
+//        in multiple species contributes proportionally to each, and accumulates
+//        proportion from each when expanding back. common.h adds get_weight()
+//        convenience method and species_sample_weight map to PanelMetadata.
+//        load_panel_metadata gains fold_hybrid param (default true).
+// V1_R8: Added --species_init and --indiv_init warm-start features.
+//        species_init_prof (map<string,double>) and species_init_used flag
+//        on contamFinder3. set_species_init() stores the profile; on the first
+//        solve_species_level_pi call, startprops are built from the init file
+//        (with orphan mass redistribution for inactive species). Subsequent
+//        calls use the previous solution. set_indiv_init() filters to idx2samp,
+//        fills missing entries with 1e-6, normalizes, and sets
+//        contam_prof_initialized=true so init_params uses these values.
+//        quant3_contam_ap.cpp: CLI parsing for both flags, validation
+//        (species_init requires species_mode estimate), file loading via
+//        existing load_species_prior / load_contam_prof helpers.
+// V1_R9: Added --species_counts support. New member variables:
+//        has_species_counts, species_allelecounts, species_expfracs.
+//        set_species_counts() stores species-diagnostic allele counts and condf.
+//        solve_species_level_pi() swaps in species counts/condf before calling
+//        compile_amb_prof_dat when available, swaps back after. Individual-level
+//        estimation (per-cell c, bootstrap, est_contam_cells) is unchanged.
+//        quant3_contam_ap.cpp: CLI --species_counts (long opt 1015), loads
+//        .species_counts and companion .species_condf.
+//        quant3_contam_empty_drops.cpp: CLI --species_counts (long opt 1002),
+//        same loading pattern, requires --aggregate_to_species.
+// V1_R10: Fixed degenerate zero-column bug in species-level solver and bootstrap.
+//        When a species has no individuals in the pool (species_weight_sum == 0),
+//        its mixture column is all zeros. The solver can assign arbitrary mass to
+//        zero columns without changing the likelihood, causing spurious nonzero
+//        estimates for absent species (e.g. Bonobo/Orangutan in human+chimp pools).
+//        Fix: both solve_species_level_pi() and bootstrap_amb_prof() now build an
+//        active-species index (active_sp_idx / full_to_active) and exclude inactive
+//        species from the solver matrix, startprops, and MLE fracs. After solving,
+//        results are mapped back to the full species list with 0.0 for inactive
+//        species. The failure path in solve_species_level_pi also uses uniform
+//        across active species only. Diagnostic logging reports which species are
+//        active vs excluded per solver invocation.
+// V1_R11: WP0 shared library changes (three changes):
+//        (1) Bulk mode init fix in fit(): skip init_params() entirely in
+//            bulk_mode. Set uniform starting proportions directly unless
+//            contam_prof was pre-initialized via set_init_contam_prof().
+//            Use assn (not contam_rate) to populate c=1.0 for all barcodes.
+//        (2) Weighted within-species split: new compute_loading_weights()
+//            method counts per-individual cell assignments (doublets
+//            contribute 0.5 each). expand_species_prior_to_indiv() now
+//            multiplies panel weights by loading weights for proportional
+//            within-species distribution. Called after Phase 2 EB estimation
+//            and at the end of reclassify_cells().
+//        (3) Validation warning in fit(): warns when species_mode is active
+//            without species-diagnostic counts and without fixed ambient
+//            profile (interindividual SNPs produce poorly separated species
+//            columns).
 // ============================================================================

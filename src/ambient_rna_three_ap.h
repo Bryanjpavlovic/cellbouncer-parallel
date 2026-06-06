@@ -119,7 +119,41 @@ class contamFinder3{
         int num_threads;
         bool skip_reassign;
 
+        // Per-cell fit result used by the OpenMP-parallel contamination
+        // estimator.  Worker threads fill these POD-like records only; the
+        // owning maps are updated serially after the parallel region.
+        struct CellContamFitResult {
+            unsigned long barcode;
+            double c;
+            double c_se;
+            double ll;
+            double r;
+            double r_se;
+            bool is_heterotypic;
+            bool bfgs_fallback;
+            bool has_allele_ratio;
+        };
+
+        bool thorough_multistart;
+        bool adaptive_multistart;
+
         // ---- Tetraploid-aware mode ----
+
+        // Optional per-cell species composition override.  Native species mode can
+        // derive a biologically weighted endogenous composition from the original
+        // individual assignment (e.g. Chinobo-mCherry+JOS3C1 ->
+        // B:0.25,C:0.25,O:0.5).  Keys are numeric cell barcodes; values are
+        // sample/species-index -> dosage weight maps that sum to 1.0.
+        std::map<unsigned long, std::map<int, double> > cell_composition_overrides;
+        bool has_composition_override(unsigned long barcode) const;
+        double composition_expected_from_row(
+            const std::map<int, double>& comp,
+            const std::pair<int, int>& key1,
+            const std::pair<int, int>& key2) const;
+        bool composition_row_is_relevant(
+            const std::map<int, double>& comp,
+            const std::pair<int, int>& key1,
+            const std::pair<int, int>& key2) const;
 
         std::set<int> locked_identities;
         std::set<int> safe_singlets;
@@ -160,6 +194,44 @@ class contamFinder3{
         double adaptive_prior_boundary_high;
         int adaptive_prior_max_shrink_steps;
 
+        // ---- Fixed ambient profile (Step 0a) ----
+
+        bool fixed_amb_prof;
+        void rebuild_amb_mu_from_contam_prof();
+
+        // ---- Species mode ----
+
+        bool species_mode;
+        PanelMetadata panel_meta;
+        std::map<std::string, double> species_prior_prof;
+        std::map<std::string, double> species_prior_conc;
+        void expand_species_prior_to_indiv();
+        double solve_species_level_pi();
+
+        // ---- Species-diagnostic counts (--species_counts) ----
+
+        bool has_species_counts;
+        bool primary_species_counts_enabled;  // true when native --interspecies uses .species_counts as primary counts
+        robin_hood::unordered_map<unsigned long,
+                std::map<std::pair<int, int>,
+                    std::map<std::pair<int, int>,
+                        std::pair<float, float> > > > species_allelecounts;
+        std::map<std::pair<int, int>, std::map<int, float> > species_expfracs;
+
+        // ---- Loading weights for within-species individual weighting ----
+
+        std::map<int, double> indiv_loading_weights;
+        void compute_loading_weights();
+
+        // ---- Warm-start init profiles ----
+
+        std::map<std::string, double> species_init_prof;  // species-level warm start
+        bool species_init_used;  // becomes true after first solve_species_level_pi call
+
+        // ---- Bulk mode (for empty-drops tool) ----
+
+        bool bulk_mode;
+
         // ---- Internal methods ----
 
         void compile_data(robin_hood::unordered_map<unsigned long, int>& assn,
@@ -170,7 +242,8 @@ class contamFinder3{
 
         void clear_data();
 
-        void get_reads_expectations(int ident,
+        void get_reads_expectations(unsigned long barcode,
+            int ident,
             std::map<std::pair<int, int>,
                 std::map<std::pair<int, int>,
                 std::pair<float, float> > >& allelecounts,
@@ -185,6 +258,8 @@ class contamFinder3{
         // Per-cell estimation
         void est_contam_cells();
         void est_contam_cells_global();
+        CellContamFitResult fit_one_contam_cell(unsigned long barcode,
+            const std::vector<int>& obs_idx);
 
         // Ambient profile
         double update_ambient_profile(bool global_c = false);
@@ -194,6 +269,16 @@ class contamFinder3{
 
         void compile_amb_prof_dat(bool solve_for_c,
             bool use_global_c,
+            std::vector<std::vector<double> >& mixfracs,
+            std::vector<double>& weights,
+            std::vector<double>& n,
+            std::vector<double>& k,
+            std::vector<double>& p_e,
+            std::vector<double>& c);
+
+        // Bulk-mode data compiler: includes all count rows regardless of
+        // identity assignment. Used by tet_ambient_profile (empty drops).
+        void compile_bulk_amb_prof_dat(
             std::vector<std::vector<double> >& mixfracs,
             std::vector<double>& weights,
             std::vector<double>& n,
@@ -262,6 +347,8 @@ class contamFinder3{
         void use_weights();
         void no_weights();
         void set_num_threads(int nt);
+        void set_thorough_multistart(bool enabled);
+        void set_adaptive_multistart(bool enabled);
         void no_reassign();
 
         // Tetraploid-aware mode
@@ -270,6 +357,8 @@ class contamFinder3{
         void set_tetraploid_aware(bool enabled);
         void set_min_signal_gap(double gap);
         void set_ids_restricted(bool restricted);
+        void set_cell_composition_overrides(
+            const std::map<unsigned long, std::map<int, double> >& overrides);
 
         // LOO
         void set_use_loo(bool enabled);
@@ -300,6 +389,34 @@ class contamFinder3{
         BoundaryDiag diagnose_contam_distribution();
         void run_adaptive_prior();
 
+        // Fixed ambient profile (Step 0a)
+        void set_fixed_amb_prof(bool enabled);
+
+        // Species mode
+        void set_species_mode(const PanelMetadata& panel);
+        void set_species_prior(const std::map<std::string, double>& species_prof,
+                               const std::map<std::string, double>& species_prof_conc);
+
+        // Warm-start init profiles
+        void set_species_init(const std::map<std::string, double>& init_prof);
+        void set_indiv_init(const std::map<int, double>& init_prof);
+
+        // Species-diagnostic counts
+        void set_primary_species_counts_enabled(bool enabled);
+        void set_species_counts(
+            robin_hood::unordered_map<unsigned long,
+                std::map<std::pair<int, int>,
+                    std::map<std::pair<int, int>,
+                        std::pair<float, float> > > >& counts,
+            std::map<std::pair<int, int>, std::map<int, float> >& condf);
+
+        // Bulk mode (for quant3_contam_empty_drops)
+        void set_bulk_mode(bool enabled);
+
+        // Species output
+        std::map<std::string, double> species_contam_prof;
+        std::map<std::string, double> species_contam_prof_conc;
+
         // Bootstrap
         void bootstrap_amb_prof(int n_boots,
             std::map<int, double>& contam_prof_cont);
@@ -318,4 +435,22 @@ class contamFinder3{
 // V1_R1: Forked from ambient_rna_three.h V1_R3. Added r-feedback flag and
 //        setter, adaptive prior members (BoundaryDiag struct, set_adaptive_prior,
 //        diagnose_contam_distribution, run_adaptive_prior), report_r_feedback_stats.
+// V1_R2: Added fixed_amb_prof support (set_fixed_amb_prof, rebuild_amb_mu_from_contam_prof).
+//        Added species mode (set_species_mode, set_species_prior,
+//        expand_species_prior_to_indiv, solve_species_level_pi, species output maps).
+//        Added bulk mode (set_bulk_mode) for quant3_contam_empty_drops.
+// V1_R3: No header changes; see ambient_rna_three_ap.cpp V1_R3 for dimension
+//        mismatch fix in expand_species_prior_to_indiv and solve_species_level_pi.
+// V1_R4: No header changes; see ambient_rna_three_ap.cpp V1_R4 for est_min_c
+//        and solve_species_level_pi failure path fixes.
+// V1_R5: No header changes; see ambient_rna_three_ap.cpp V1_R5 for species-level
+//        bootstrap in bootstrap_amb_prof.
+// V1_R6: No header changes; see ambient_rna_three_ap.cpp V1_R6 for orphan mass
+//        redistribution in expand_species_prior_to_indiv.
+// V1_R7: No _ap header changes. common.h gains species_sample_weight map and
+//        get_weight() on PanelMetadata; load_panel_metadata adds fold_hybrid param.
+// V1_R8: Added species_init_prof, species_init_used private members.
+//        Added set_species_init(), set_indiv_init() public methods.
+// V1_R9: Added has_species_counts, species_allelecounts, species_expfracs
+//        private members. Added set_species_counts() public method.
 // ============================================================================
