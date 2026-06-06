@@ -260,17 +260,83 @@ struct var{
 // ============================================================================
 
 /**
+ * Precomputed accumulation target for one individual at one SNP.
+ * Used for total counts: cc.total_ref[total_idx] += ref, etc.
+ */
+struct SNPTotalTarget {
+    int total_idx;    // = indv * GENOTYPE_STATES + nalt
+};
+
+/**
+ * Precomputed accumulation target for one individual pair at one SNP.
+ * Used for pairwise counts: cc.ref_counts[pair_idx] += ref, etc.
+ */
+struct SNPPairTarget {
+    size_t pair_idx;  // = idx1 * state_count + idx2
+};
+
+/**
  * SNPData - combines position and variant data for cache-efficient iteration
  */
 struct SNPData {
     int pos;
     var data;
+    uint8_t panel_id;  // 0 = interindividual, 1 = species
     
-    SNPData() : pos(0) {}
-    SNPData(int p, const var& v) : pos(p), data(v) {}
+    // Precomputed genotype for each individual: 0, 1, 2, or -1 (uncovered).
+    // Populated at VCF load time.  Avoids 3 bitset lookups per individual
+    // per read in the BAM counting inner loop.
+    // Length == n_samples (set by precompute_genotypes).
+    std::vector<int8_t> geno;  // -1 = uncovered, 0/1/2 = nalt
+    
+    // Precomputed accumulation targets.
+    // total_targets: one entry per covered individual (length = n_covered).
+    // pair_targets:  one entry per covered pair (length = n_covered*(n_covered-1)/2).
+    // Populated by precompute_targets().
+    std::vector<SNPTotalTarget> total_targets;
+    std::vector<SNPPairTarget> pair_targets;
+    
+    SNPData() : pos(0), panel_id(0) {}
+    SNPData(int p, const var& v) : pos(p), data(v), panel_id(0) {}
+    SNPData(int p, const var& v, uint8_t pid) : pos(p), data(v), panel_id(pid) {}
     
     bool operator<(const SNPData& other) const {
         return pos < other.pos;
+    }
+    
+    // Call after data is fully populated
+    void precompute_genotypes(int n_samples) {
+        geno.resize(n_samples);
+        for (int i = 0; i < n_samples; ++i) {
+            if (!data.haps_covered.test(i)) {
+                geno[i] = -1;
+            } else {
+                int nalt = 0;
+                if (data.haps1.test(i)) nalt++;
+                if (data.haps2.test(i)) nalt++;
+                geno[i] = (int8_t)nalt;
+            }
+        }
+    }
+    
+    // Call after precompute_genotypes.  state_count = n_samples * GENOTYPE_STATES.
+    void precompute_targets(int n_samples) {
+        int state_count = n_samples * GENOTYPE_STATES;
+        total_targets.clear();
+        pair_targets.clear();
+        
+        for (int i = 0; i < n_samples; ++i) {
+            if (geno[i] < 0) continue;
+            int idx1 = i * GENOTYPE_STATES + geno[i];
+            total_targets.push_back({idx1});
+            
+            for (int j = i + 1; j < n_samples; ++j) {
+                if (geno[j] < 0) continue;
+                int idx2 = j * GENOTYPE_STATES + geno[j];
+                size_t flat = (size_t)idx1 * state_count + idx2;
+                pair_targets.push_back({flat});
+            }
+        }
     }
 };
 
@@ -314,6 +380,58 @@ struct ChromSNPs {
     bool empty() const { return snps.empty(); }
     size_t size() const { return snps.size(); }
 };
+
+/**
+ * Coarse spatial index for fast read skipping.
+ * Bins the chromosome into BIN_SIZE-bp intervals and tracks which bins
+ * contain at least one SNP.  Reads whose [start, end) range lies entirely
+ * within cold bins are skipped without CB extraction or barcode lookup.
+ */
+struct ChromBinIndex {
+    static constexpr int BIN_SIZE = 10000;  // 10 kb
+    
+    std::vector<bool> hot;   // hot[bin_id] = true if any SNP in that bin
+    int n_bins;
+    
+    ChromBinIndex() : n_bins(0) {}
+    
+    void build(const ChromSNPs& snps, int64_t chrom_length) {
+        n_bins = (int)((chrom_length + BIN_SIZE - 1) / BIN_SIZE) + 1;
+        hot.assign(n_bins, false);
+        for (const auto& s : snps.snps) {
+            int bin = s.pos / BIN_SIZE;
+            if (bin < n_bins) hot[bin] = true;
+        }
+    }
+    
+    // Returns true if the read MIGHT overlap a SNP.
+    // Returns false only if the read is entirely within cold bins.
+    inline bool might_overlap(int read_start, int read_end) const {
+        int bin_start = read_start / BIN_SIZE;
+        int bin_end = read_end / BIN_SIZE;
+        // Clamp to valid range
+        if (bin_start >= n_bins) return false;
+        if (bin_end >= n_bins) bin_end = n_bins - 1;
+        // Check all bins the read spans
+        for (int b = bin_start; b <= bin_end; ++b) {
+            if (hot[b]) return true;
+        }
+        return false;
+    }
+};
+
+// Precompute genotype vectors and accumulation targets for all SNPs.
+// Must be called after VCF loading / shared VCF attach, before BAM counting.
+void precompute_all_genotypes(
+    robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    int n_samples);
+
+// Build bin indices for all chromosomes.
+// chrom_lengths: indexed by tid, from BAM header.
+void build_bin_indices(
+    const robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    const std::vector<int64_t>& chrom_lengths,
+    robin_hood::unordered_map<int, ChromBinIndex>& bin_indices);
 
 /**
  * CellCounts - Flat, cache-friendly structure for allele counts per cell
@@ -500,6 +618,16 @@ void get_vcf_chroms(std::string& vcf_file,
 void get_bam_chroms(bam_reader& reader,
     std::set<std::string>& chroms);
 
+/**
+ * Read BAM header chromosome names and seq->tid mapping directly through HTSlib.
+ * This avoids depending on htswrapper::bam_reader state for early header-only
+ * operations before any reads are consumed. Exits with an explicit error on
+ * unreadable BAM/header instead of allowing a null header dereference.
+ */
+void get_bam_header_chroms_and_seq2tid(const std::string& bamfile,
+    std::set<std::string>& chroms,
+    std::map<std::string, int>& seq2tid);
+
 long int count_vcf_snps(std::string& vcf_file,
     std::set<std::string>& chroms_to_include,
     int min_vq);
@@ -563,6 +691,18 @@ void conditional_match_fracs_normalize(std::map<std::pair<int, int>, std::map<in
     std::map<std::pair<int, int>, std::map<int, float> >& conditional_match_tots,
     int n_samples);
 
+/**
+ * Parallel conditional match fraction computation.
+ * Replaces the sequential loop-over-chromosomes + normalize pattern.
+ * Uses flat arrays instead of nested maps and OpenMP across chromosomes.
+ * Output format matches dump_exp_fracs expectations.
+ */
+void compute_conditional_match_fracs_parallel(
+    robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    std::map<std::pair<int, int>, std::map<int, float> >& conditional_match_fracs,
+    int n_samples,
+    int n_threads);
+
 // ============================================================================
 // BAM PROCESSING FUNCTIONS (original interface)
 // ============================================================================
@@ -621,6 +761,23 @@ void count_alleles_parallel(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>& cell_counts,
+    const std::set<unsigned long>& valid_barcodes,
+    int n_samples,
+    int n_threads,
+    int htslib_threads,
+    bool dump_pileup = false,
+    const std::string& pileup_prefix = "");
+
+/**
+ * Dual-output parallel counting: routes allele counts to panel0 or panel1
+ * based on SNPData::panel_id. Eliminates second BAM pass when both
+ * interindividual and species SNPs are needed.
+ */
+void count_alleles_parallel_dual(
+    const std::string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel1,
     const std::set<unsigned long>& valid_barcodes,
     int n_samples,
     int n_threads,

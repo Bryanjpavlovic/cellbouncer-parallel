@@ -259,6 +259,42 @@ void get_bam_chroms(bam_reader& reader, set<string>& chroms){
     }
 }
 
+void get_bam_header_chroms_and_seq2tid(const string& bamfile,
+    set<string>& chroms,
+    map<string, int>& seq2tid){
+
+    chroms.clear();
+    seq2tid.clear();
+
+    htsFile* fp = hts_open(bamfile.c_str(), "r");
+    if (!fp){
+        fprintf(stderr, "ERROR: Could not open BAM file for header read: %s\n",
+            bamfile.c_str());
+        exit(1);
+    }
+
+    bam_hdr_t* hdr = sam_hdr_read(fp);
+    if (!hdr){
+        fprintf(stderr, "ERROR: Could not read BAM header from: %s\n",
+            bamfile.c_str());
+        hts_close(fp);
+        exit(1);
+    }
+
+    for (int tid = 0; tid < hdr->n_targets; ++tid){
+        const char* name = hdr->target_name[tid];
+        if (!name){
+            continue;
+        }
+        string chrom(name);
+        chroms.insert(chrom);
+        seq2tid[chrom] = tid;
+    }
+
+    bam_hdr_destroy(hdr);
+    hts_close(fp);
+}
+
 long int count_vcf_snps(string& vcf_file, set<string>& chroms_to_include, int min_vq){
     htsFile* bcf_reader = bcf_open(vcf_file.c_str(), "r");
     if (bcf_reader == NULL){
@@ -517,6 +553,45 @@ void convert_snpdat_to_optimized(
     }
 }
 
+void precompute_all_genotypes(
+    robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    int n_samples){
+    
+    long count = 0;
+    for (auto& kv : snpdat_all){
+        for (auto& snp : kv.second.snps){
+            snp.precompute_genotypes(n_samples);
+            snp.precompute_targets(n_samples);
+            count++;
+        }
+    }
+    fprintf(stderr, "Precomputed genotypes and targets for %ld SNPs (%d samples)\n",
+        count, n_samples);
+}
+
+void build_bin_indices(
+    const robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    const vector<int64_t>& chrom_lengths,
+    robin_hood::unordered_map<int, ChromBinIndex>& bin_indices){
+    
+    bin_indices.clear();
+    long hot_bins = 0, total_bins = 0;
+    for (const auto& kv : snpdat_all){
+        int tid = kv.first;
+        int64_t len = (tid < (int)chrom_lengths.size()) ? chrom_lengths[tid] : 0;
+        if (len == 0) continue;
+        
+        ChromBinIndex& idx = bin_indices[tid];
+        idx.build(kv.second, len);
+        for (int b = 0; b < idx.n_bins; ++b){
+            if (idx.hot[b]) hot_bins++;
+            total_bins++;
+        }
+    }
+    fprintf(stderr, "Bin index: %ld/%ld bins hot (%.1f%% coverage)\n",
+        hot_bins, total_bins, 100.0 * hot_bins / (total_bins > 0 ? total_bins : 1));
+}
+
 // ============================================================================
 // CONDITIONAL MATCH FRACTION FUNCTIONS
 // ============================================================================
@@ -606,6 +681,135 @@ void conditional_match_fracs_normalize(map<pair<int, int>, map<int, float> >& co
             }
         }
     }
+}
+
+// ============================================================================
+// PARALLEL CONDITIONAL MATCH FRACTION COMPUTATION
+// ============================================================================
+//
+// The key space for conditional match fractions is:
+//   row = (individual i, genotype nalt_i)  where i in [0, n_samples), nalt in {0,1,2}
+//   col = individual j                     where j in [0, n_samples)
+//
+// So the flat index is: row = i * 3 + nalt_i, col = j
+// Total array size: (n_samples * 3) * n_samples
+//
+// Each thread accumulates into its own flat array, then we sum across threads.
+
+void compute_conditional_match_fracs_parallel(
+    robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    map<pair<int, int>, map<int, float> >& conditional_match_fracs,
+    int n_samples,
+    int n_threads){
+    
+    int n_rows = n_samples * 3;
+    int n_cols = n_samples;
+    size_t arr_size = (size_t)n_rows * n_cols;
+    
+    // Flatten the chromosome map into a vector for OpenMP indexing
+    vector<ChromSNPs*> chrom_ptrs;
+    chrom_ptrs.reserve(snpdat_all.size());
+    for (auto& kv : snpdat_all){
+        chrom_ptrs.push_back(&kv.second);
+    }
+    int n_chroms = (int)chrom_ptrs.size();
+    
+    fprintf(stderr, "Parallel condf: %d chromosomes, %d samples, %d threads\n",
+        n_chroms, n_samples, n_threads);
+
+    // CONDF only needs SNPData::geno. Some callers (notably the dual-panel
+    // species path) have already precomputed targets on a copied/combined SNP
+    // set, but not on the original species_snpdat that is later used here for
+    // .species_condf. Indexing an empty geno vector segfaults. Do a cheap,
+    // genotype-only preflight here so this function is safe for every caller
+    // without allocating the very large per-SNP pair_targets arrays.
+    long geno_precomputed = 0;
+    for (auto& kv : snpdat_all){
+        for (auto& snp : kv.second.snps){
+            if ((int)snp.geno.size() != n_samples){
+                snp.precompute_genotypes(n_samples);
+                ++geno_precomputed;
+            }
+        }
+    }
+    if (geno_precomputed > 0){
+        fprintf(stderr, "Parallel condf: genotype-only precompute for %ld SNPs\n",
+            geno_precomputed);
+    }
+    
+    // Global accumulators (sum of all threads)
+    vector<double> global_fracs(arr_size, 0.0);
+    vector<double> global_tots(arr_size, 0.0);
+    
+    omp_set_num_threads(n_threads);
+    
+    #pragma omp parallel
+    {
+        // Thread-local accumulators
+        vector<double> local_fracs(arr_size, 0.0);
+        vector<double> local_tots(arr_size, 0.0);
+        
+        #pragma omp for schedule(dynamic, 1)
+        for (int c = 0; c < n_chroms; c++){
+            ChromSNPs& chrom = *chrom_ptrs[c];
+            
+            for (const auto& s : chrom.snps){
+                const int8_t* geno = s.geno.data();
+                for (int i = 0; i < n_samples; ++i){
+                    int8_t nalt_i = geno[i];
+                    if (nalt_i < 0 || nalt_i >= 3) continue;
+                    int row = i * 3 + nalt_i;
+                    
+                    for (int j = 0; j < n_samples; ++j){
+                        int8_t nalt_j = geno[j];
+                        if (nalt_j < 0 || nalt_j >= 3) continue;
+                        
+                        size_t idx = (size_t)row * n_cols + j;
+                        local_fracs[idx] += (double)nalt_j / 2.0;
+                        local_tots[idx] += 1.0;
+                    }
+                }
+            }
+        }
+        
+        // Merge thread-local into global (critical section)
+        #pragma omp critical
+        {
+            for (size_t k = 0; k < arr_size; k++){
+                global_fracs[k] += local_fracs[k];
+                global_tots[k] += local_tots[k];
+            }
+        }
+    }
+    
+    // Normalize and convert to map format
+    conditional_match_fracs.clear();
+    for (int i = 0; i < n_samples; ++i){
+        for (int nalt = 0; nalt < 3; ++nalt){
+            int row = i * 3 + nalt;
+            pair<int, int> key_i = make_pair(i, nalt);
+            
+            bool has_any = false;
+            for (int j = 0; j < n_samples; ++j){
+                size_t idx = (size_t)row * n_cols + j;
+                if (global_tots[idx] > 0){
+                    has_any = true;
+                    break;
+                }
+            }
+            if (!has_any) continue;
+            
+            map<int, float>& frac_map = conditional_match_fracs[key_i];
+            for (int j = 0; j < n_samples; ++j){
+                size_t idx = (size_t)row * n_cols + j;
+                if (global_tots[idx] > 0){
+                    frac_map[j] = (float)(global_fracs[idx] / global_tots[idx]);
+                }
+            }
+        }
+    }
+    
+    fprintf(stderr, "Parallel condf complete: %lu entries\n", conditional_match_fracs.size());
 }
 
 // ============================================================================
@@ -842,7 +1046,9 @@ void count_alleles_parallel(
     const set<unsigned long>& valid_barcodes,
     int n_samples,
     int n_threads,
-    int htslib_threads){
+    int htslib_threads,
+    bool dump_pileup,
+    const string& pileup_prefix){
     
     bool has_bc_list = !valid_barcodes.empty();
     
@@ -866,7 +1072,40 @@ void count_alleles_parallel(
     bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
     hts_idx_t* idx_tmp = sam_index_load(bam_tmp, bamfile.c_str());
     int n_chroms = hdr_tmp->n_targets;
-    
+
+    // --dump_pileup: emit the per-SNP genotype sidecar for the variant-consistency
+    // metric (interindividual panel only).  geno[] is already populated by
+    // precompute_all_genotypes(), and hdr_tmp is still valid here (destroyed below).
+    // Columns: tid  chrom  pos  ref  alt  geno_0 .. geno_{n_samples-1}  (0/1/2/-1).
+    // The (tid,pos) pair is the producer's SNP join key; ref/alt are the allele
+    // bases (informational; the metric is allele-orientation based).
+    if (dump_pileup){
+        string sites_path = pileup_prefix + ".pileup_sites.tsv.gz";
+        gzFile sf = gzopen(sites_path.c_str(), "w");
+        if (!sf){
+            fprintf(stderr, "ERROR: could not open %s for writing\n", sites_path.c_str());
+        } else {
+            long n_sites_written = 0;
+            for (auto& kv : snpdat_all){
+                int tid_s = kv.first;
+                const char* cname = (tid_s >= 0 && tid_s < n_chroms) ?
+                    hdr_tmp->target_name[tid_s] : ".";
+                for (auto& snp : kv.second.snps){
+                    if (snp.panel_id != 0) continue;
+                    gzprintf(sf, "%d\t%s\t%d\t%c\t%c", tid_s, cname, snp.pos,
+                        snp.data.ref, snp.data.alt);
+                    for (int s = 0; s < n_samples; s++){
+                        gzprintf(sf, "\t%d", (int)snp.geno[s]);
+                    }
+                    gzprintf(sf, "\n");
+                    n_sites_written++;
+                }
+            }
+            gzclose(sf);
+            fprintf(stderr, "Wrote %ld pileup sites to %s\n", n_sites_written, sites_path.c_str());
+        }
+    }
+
     // Get read counts per chromosome from index
     vector<uint64_t> chrom_read_counts(n_chroms, 0);
     vector<int64_t> chrom_lengths(n_chroms);
@@ -887,6 +1126,10 @@ void count_alleles_parallel(
     }
     bam_hdr_destroy(hdr_tmp);
     hts_close(bam_tmp);
+    
+    // Build bin index for read skipping (Change 3)
+    robin_hood::unordered_map<int, ChromBinIndex> bin_indices;
+    build_bin_indices(snpdat_all, chrom_lengths, bin_indices);
     
     // Work unit: represents a region to process (whole chromosome or chunk)
     struct WorkUnit {
@@ -1021,6 +1264,12 @@ void count_alleles_parallel(
     // With fixed-point int64 arithmetic, merge order doesn't matter (integer addition is associative)
     omp_set_num_threads(n_threads);
     vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts(n_threads);
+
+    // --dump_pileup: per-thread per-(cell,SNP) allele evidence (interindividual
+    // only).  Inner key packs (tid<<32 | pos); value is (ref_scaled, alt_scaled).
+    // Empty and untouched unless dump_pileup is set.
+    vector<robin_hood::unordered_map<unsigned long,
+        robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
     
     #pragma omp parallel
     {
@@ -1115,6 +1364,15 @@ void count_alleles_parallel(
                             ++local_snps;
                         }
                         
+                        // Bin-skip: if no SNP bin overlaps this read, skip CB extraction
+                        {
+                            auto bin_it = bin_indices.find(tid);
+                            if (bin_it != bin_indices.end() &&
+                                !bin_it->second.might_overlap(read_start, read_end)){
+                                continue;
+                            }
+                        }
+                        
                         // Extract cell barcode
                         uint8_t* cb_tag = bam_aux_get(record, "CB");
                         if (!cb_tag) continue;
@@ -1166,27 +1424,28 @@ void count_alleles_parallel(
                                 }
                                 CellCounts& cc = it->second;
                                 
-                                // Update for all individuals (fixed-point arithmetic)
-                                for (int indv = 0; indv < n_samples; ++indv){
-                                    if (!snp_check->data.haps_covered.test(indv)) continue;
-                                    
-                                    int nalt = 0;
-                                    if (snp_check->data.haps1.test(indv)) nalt++;
-                                    if (snp_check->data.haps2.test(indv)) nalt++;
-                                    
-                                    // Store total for this individual
-                                    cc.add_total(indv, nalt, ref_add, alt_add);
-                                    
-                                    // Pairwise counts
-                                    for (int indv2 = indv + 1; indv2 < n_samples; ++indv2){
-                                        if (!snp_check->data.haps_covered.test(indv2)) continue;
-                                        
-                                        int nalt2 = 0;
-                                        if (snp_check->data.haps1.test(indv2)) nalt2++;
-                                        if (snp_check->data.haps2.test(indv2)) nalt2++;
-                                        
-                                        cc.add(indv, nalt, indv2, nalt2, ref_add, alt_add);
-                                    }
+                                // Precomputed targets: linear traversal, no branches
+                                const auto& ttargets = snp_check->total_targets;
+                                const auto& ptargets = snp_check->pair_targets;
+                                
+                                for (const auto& t : ttargets){
+                                    cc.total_ref[t.total_idx] += ref_add;
+                                    cc.total_alt[t.total_idx] += alt_add;
+                                }
+                                for (const auto& p : ptargets){
+                                    cc.ref_counts[p.pair_idx] += ref_add;
+                                    cc.alt_counts[p.pair_idx] += alt_add;
+                                }
+
+                                // --dump_pileup: record per-(cell,SNP) evidence for
+                                // interindividual SNPs.  Summed within a thread; the
+                                // producer sums any cross-thread duplicates.
+                                if (dump_pileup && snp_check->panel_id == 0){
+                                    int64_t pkey = ((int64_t)tid << 32) |
+                                        (int64_t)(uint32_t)snp_check->pos;
+                                    auto& slot = thread_pileup[thread_id][bc_key][pkey];
+                                    slot.first += ref_add;
+                                    slot.second += alt_add;
                                 }
                             }
                         }
@@ -1248,6 +1507,38 @@ void count_alleles_parallel(
     // Final cleanup
     thread_counts.clear();
     thread_counts.shrink_to_fit();
+
+    // --dump_pileup: flush per-thread per-(cell,SNP) observations.  Per-thread
+    // rows are pre-summed; the same (bc,tid,pos) may still appear across threads
+    // and is summed downstream by the producer.  Columns: bc_hash tid pos ref alt
+    // (ref/alt are prob-scaled float evidence, matching the .counts units).
+    if (dump_pileup){
+        string obs_path = pileup_prefix + ".pileup_obs.tsv.gz";
+        gzFile pf = gzopen(obs_path.c_str(), "w");
+        if (!pf){
+            fprintf(stderr, "ERROR: could not open %s for writing\n", obs_path.c_str());
+        } else {
+            long n_obs_written = 0;
+            for (int t = 0; t < n_threads; t++){
+                for (auto& cell : thread_pileup[t]){
+                    unsigned long bc = cell.first;
+                    for (auto& kv : cell.second){
+                        int tid_o = (int)(kv.first >> 32);
+                        int pos_o = (int)(kv.first & 0xFFFFFFFF);
+                        gzprintf(pf, "%lu\t%d\t%d\t%f\t%f\n", bc, tid_o, pos_o,
+                            (double)kv.second.first / FIXED_POINT_SCALE,
+                            (double)kv.second.second / FIXED_POINT_SCALE);
+                        n_obs_written++;
+                    }
+                }
+                thread_pileup[t].clear();
+            }
+            gzclose(pf);
+            fprintf(stderr, "Wrote %ld pileup observations to %s\n", n_obs_written, obs_path.c_str());
+        }
+    }
+    thread_pileup.clear();
+    thread_pileup.shrink_to_fit();
     
     fprintf(stderr, "Completed: %d chromosomes (%lu work units), %ld SNPs, %ld reads, %lu cells\n",
         n_chroms, work_units.size(), snps_processed.load(), reads_processed.load(), 
@@ -1262,6 +1553,406 @@ void count_alleles_parallel(
     fprintf(stderr, "  dash:    %ld\n", g_base_dash.load());
     fprintf(stderr, "  other:   %ld\n", g_base_other.load());
     fprintf(stderr, "  queries per read: %.2f\n", (double)g_base_queries.load() / reads_processed.load());
+}
+
+// ============================================================================
+// DUAL-OUTPUT PARALLEL COUNTING (WP3: single BAM pass for two panels)
+// ============================================================================
+
+void count_alleles_parallel_dual(
+    const string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel1,
+    const set<unsigned long>& valid_barcodes,
+    int n_samples,
+    int n_threads,
+    int htslib_threads){
+    
+    bool has_bc_list = !valid_barcodes.empty();
+    
+    // Pre-allocate count structures for known barcodes
+    if (has_bc_list){
+        fprintf(stderr, "Pre-allocating dual counts for %lu cells...\n", valid_barcodes.size());
+        for (unsigned long bc : valid_barcodes){
+            counts_panel0.emplace(std::piecewise_construct,
+                std::forward_as_tuple(bc),
+                std::forward_as_tuple(n_samples));
+            counts_panel1.emplace(std::piecewise_construct,
+                std::forward_as_tuple(bc),
+                std::forward_as_tuple(n_samples));
+        }
+    }
+    
+    // Get chromosome info from BAM header
+    htsFile* bam_tmp = hts_open(bamfile.c_str(), "r");
+    if (!bam_tmp){
+        fprintf(stderr, "ERROR: Could not open BAM file to get header\n");
+        return;
+    }
+    bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
+    hts_idx_t* idx_tmp = sam_index_load(bam_tmp, bamfile.c_str());
+    int n_chroms = hdr_tmp->n_targets;
+    
+    vector<uint64_t> chrom_read_counts(n_chroms, 0);
+    vector<int64_t> chrom_lengths(n_chroms);
+    
+    if (idx_tmp){
+        for (int i = 0; i < n_chroms; i++){
+            uint64_t mapped, unmapped;
+            hts_idx_get_stat(idx_tmp, i, &mapped, &unmapped);
+            chrom_read_counts[i] = mapped;
+            chrom_lengths[i] = hdr_tmp->target_len[i];
+        }
+        hts_idx_destroy(idx_tmp);
+    } else {
+        fprintf(stderr, "WARNING: Could not load BAM index for read count estimation\n");
+        for (int i = 0; i < n_chroms; i++){
+            chrom_lengths[i] = hdr_tmp->target_len[i];
+        }
+    }
+    bam_hdr_destroy(hdr_tmp);
+    hts_close(bam_tmp);
+    
+    // Build bin index for read skipping (Change 3)
+    robin_hood::unordered_map<int, ChromBinIndex> bin_indices;
+    build_bin_indices(combined_snpdat, chrom_lengths, bin_indices);
+    
+    // Work unit structure (same as count_alleles_parallel)
+    struct WorkUnit {
+        int tid;
+        int start_pos;
+        int end_pos;
+        size_t snp_start;
+        size_t snp_end;
+        bool has_snps;
+        uint64_t est_reads;
+    };
+    
+    // Build work units (identical logic to count_alleles_parallel)
+    vector<WorkUnit> work_units;
+    long total_snps = 0;
+    int chroms_with_snps = 0;
+    int chroms_chunked_by_snp = 0;
+    int chroms_chunked_by_reads = 0;
+    
+    const size_t CHUNK_SNP_THRESHOLD = 100000;
+    const uint64_t CHUNK_READ_THRESHOLD = 10000000;
+    
+    for (int tid = 0; tid < n_chroms; tid++){
+        auto it = combined_snpdat.find(tid);
+        int64_t chrom_len = chrom_lengths[tid];
+        uint64_t chrom_reads = chrom_read_counts[tid];
+        
+        if (it == combined_snpdat.end() || it->second.empty()){
+            if (chrom_reads > CHUNK_READ_THRESHOLD){
+                size_t n_chunks = (chrom_reads + CHUNK_READ_THRESHOLD - 1) / CHUNK_READ_THRESHOLD;
+                n_chunks = std::min(n_chunks, (size_t)20);
+                int64_t chunk_size = (chrom_len + n_chunks - 1) / n_chunks;
+                uint64_t reads_per_chunk = chrom_reads / n_chunks;
+                
+                for (size_t c = 0; c < n_chunks; c++){
+                    int start_pos = c * chunk_size;
+                    int end_pos = (c == n_chunks - 1) ? INT_MAX : (int)((c + 1) * chunk_size);
+                    work_units.push_back({tid, start_pos, end_pos, 0, 0, false, reads_per_chunk});
+                }
+                chroms_chunked_by_reads++;
+            }
+            else{
+                work_units.push_back({tid, 0, INT_MAX, 0, 0, false, chrom_reads});
+            }
+        }
+        else{
+            ChromSNPs& chrom_snps = it->second;
+            size_t n_snps = chrom_snps.snps.size();
+            total_snps += n_snps;
+            chroms_with_snps++;
+            
+            size_t chunks_by_snp = (n_snps > CHUNK_SNP_THRESHOLD) ? 
+                (n_snps + CHUNK_SNP_THRESHOLD - 1) / CHUNK_SNP_THRESHOLD : 1;
+            size_t chunks_by_reads = (chrom_reads > CHUNK_READ_THRESHOLD) ?
+                (chrom_reads + CHUNK_READ_THRESHOLD - 1) / CHUNK_READ_THRESHOLD : 1;
+            
+            chunks_by_reads = std::min(chunks_by_reads, (size_t)20);
+            
+            if (chunks_by_snp >= chunks_by_reads && chunks_by_snp > 1){
+                size_t snps_per_chunk = (n_snps + chunks_by_snp - 1) / chunks_by_snp;
+                uint64_t reads_per_chunk = chrom_reads / chunks_by_snp;
+                
+                for (size_t c = 0; c < chunks_by_snp; c++){
+                    size_t snp_start = c * snps_per_chunk;
+                    size_t snp_end = std::min(snp_start + snps_per_chunk, n_snps);
+                    
+                    int start_pos = (snp_start == 0) ? 0 : chrom_snps.snps[snp_start].pos;
+                    int end_pos = (snp_end >= n_snps) ? INT_MAX : chrom_snps.snps[snp_end - 1].pos + 1000;
+                    
+                    work_units.push_back({tid, start_pos, end_pos, snp_start, snp_end, true, reads_per_chunk});
+                }
+                chroms_chunked_by_snp++;
+            }
+            else if (chunks_by_reads > 1){
+                int64_t chunk_size = (chrom_len + chunks_by_reads - 1) / chunks_by_reads;
+                uint64_t reads_per_chunk = chrom_reads / chunks_by_reads;
+                
+                size_t snp_idx = 0;
+                for (size_t c = 0; c < chunks_by_reads; c++){
+                    int start_pos = c * chunk_size;
+                    int end_pos = (c == chunks_by_reads - 1) ? INT_MAX : (int)((c + 1) * chunk_size);
+                    
+                    size_t snp_start = snp_idx;
+                    while (snp_idx < n_snps && chrom_snps.snps[snp_idx].pos < (c + 1) * chunk_size){
+                        snp_idx++;
+                    }
+                    size_t snp_end = snp_idx;
+                    
+                    work_units.push_back({tid, start_pos, end_pos, snp_start, snp_end, true, reads_per_chunk});
+                }
+                chroms_chunked_by_reads++;
+            }
+            else{
+                work_units.push_back({tid, 0, INT_MAX, 0, n_snps, true, chrom_reads});
+            }
+        }
+    }
+    
+    // Sort work units by estimated reads (highest first)
+    std::sort(work_units.begin(), work_units.end(),
+              [](const WorkUnit& a, const WorkUnit& b){
+                  return a.est_reads > b.est_reads;
+              });
+    
+    fprintf(stderr, "DUAL-PANEL: Processing %d chromosomes (%d with SNPs, %ld total combined SNPs) using %d threads...\n",
+        n_chroms, chroms_with_snps, total_snps, n_threads);
+    fprintf(stderr, "  Split into %lu work units (%d by SNP density, %d by read density)\n", 
+        work_units.size(), chroms_chunked_by_snp, chroms_chunked_by_reads);
+    
+    // Progress tracking
+    atomic<long> snps_processed(0);
+    atomic<int> units_done(0);
+    atomic<long> reads_processed(0);
+    
+    // Per-thread cell counts: separate maps for panel 0 and panel 1
+    omp_set_num_threads(n_threads);
+    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts_p0(n_threads);
+    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts_p1(n_threads);
+    
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        auto& local_p0 = thread_counts_p0[thread_id];
+        auto& local_p1 = thread_counts_p1[thread_id];
+        
+        htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
+        if (!bam_fp){
+            fprintf(stderr, "ERROR: Thread %d could not open BAM file\n", omp_get_thread_num());
+        }
+        else{
+            hts_set_threads(bam_fp, htslib_threads);
+            
+            bam_hdr_t* header = sam_hdr_read(bam_fp);
+            hts_idx_t* idx = sam_index_load(bam_fp, bamfile.c_str());
+            bam1_t* record = bam_init1();
+            
+            if (!idx){
+                fprintf(stderr, "ERROR: Could not load BAM index\n");
+            }
+            else{
+                #pragma omp for schedule(dynamic, 1)
+                for (size_t i = 0; i < work_units.size(); i++){
+                    WorkUnit& wu = work_units[i];
+                    int tid = wu.tid;
+                    
+                    hts_itr_t* iter = sam_itr_queryi(idx, tid, wu.start_pos, wu.end_pos);
+                    if (!iter) continue;
+                    
+                    long local_snps = 0;
+                    long local_reads = 0;
+                    long local_all_reads = 0;
+                    
+                    if (!wu.has_snps){
+                        while (sam_itr_next(bam_fp, iter, record) >= 0){
+                            if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
+                                continue;
+                            }
+                            local_all_reads++;
+                        }
+                        hts_itr_destroy(iter);
+                        reads_processed += local_all_reads;
+                        
+                        int done = ++units_done;
+                        if (done % 100 == 0 || done == (int)work_units.size()){
+                            fprintf(stderr, "\rDUAL progress: %d/%lu units, %ld/%ld SNPs, %ld reads",
+                                done, work_units.size(), snps_processed.load(), total_snps,
+                                reads_processed.load());
+                        }
+                        continue;
+                    }
+                    
+                    auto snp_it = combined_snpdat.find(tid);
+                    ChromSNPs& chrom_snps = snp_it->second;
+                    
+                    auto snp_iter = chrom_snps.snps.begin() + wu.snp_start;
+                    auto snp_chunk_end = chrom_snps.snps.begin() + wu.snp_end;
+                    
+                    while (sam_itr_next(bam_fp, iter, record) >= 0){
+                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
+                            continue;
+                        }
+                        
+                        local_all_reads++;
+                        
+                        int read_start = record->core.pos;
+                        int read_end = bam_endpos(record);
+                        
+                        while (snp_iter != snp_chunk_end && snp_iter->pos < read_start){
+                            ++snp_iter;
+                            ++local_snps;
+                        }
+                        
+                        // Bin-skip: if no SNP bin overlaps this read, skip CB extraction
+                        {
+                            auto bin_it = bin_indices.find(tid);
+                            if (bin_it != bin_indices.end() &&
+                                !bin_it->second.might_overlap(read_start, read_end)){
+                                continue;
+                            }
+                        }
+                        
+                        uint8_t* cb_tag = bam_aux_get(record, "CB");
+                        if (!cb_tag) continue;
+                        
+                        const char* cb_str = bam_aux2Z(cb_tag);
+                        bc cb_bits;
+                        str2bc(cb_str, cb_bits);
+                        unsigned long bc_key = cb_bits.to_ulong();
+                        
+                        if (has_bc_list && valid_barcodes.find(bc_key) == valid_barcodes.end()){
+                            continue;
+                        }
+                        
+                        local_reads++;
+                        
+                        float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
+                        int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
+                        
+                        for (auto snp_check = snp_iter; 
+                             snp_check != snp_chunk_end && snp_check->pos <= read_end; 
+                             ++snp_check){
+                            
+                            char allele = get_base_at_pos(record, snp_check->pos);
+                            if (allele == 'N' || allele == '-') continue;
+                            
+                            int64_t ref_add = 0, alt_add = 0;
+                            
+                            if (allele == snp_check->data.ref){
+                                ref_add = prob_scaled;
+                                g_base_valid++;
+                            }
+                            else if (allele == snp_check->data.alt){
+                                alt_add = prob_scaled;
+                                g_base_valid++;
+                            }
+                            else {
+                                g_base_other++;
+                            }
+                            
+                            if (ref_add > 0 || alt_add > 0){
+                                // Route to panel-specific thread-local map based on panel_id
+                                auto& target_counts = (snp_check->panel_id == 0) ? local_p0 : local_p1;
+                                
+                                auto it = target_counts.find(bc_key);
+                                if (it == target_counts.end()){
+                                    target_counts.emplace(bc_key, CellCounts(n_samples));
+                                    it = target_counts.find(bc_key);
+                                }
+                                CellCounts& cc = it->second;
+                                
+                                // Precomputed targets: linear traversal, no branches
+                                const auto& ttargets = snp_check->total_targets;
+                                const auto& ptargets = snp_check->pair_targets;
+                                
+                                for (const auto& t : ttargets){
+                                    cc.total_ref[t.total_idx] += ref_add;
+                                    cc.total_alt[t.total_idx] += alt_add;
+                                }
+                                for (const auto& p : ptargets){
+                                    cc.ref_counts[p.pair_idx] += ref_add;
+                                    cc.alt_counts[p.pair_idx] += alt_add;
+                                }
+                            }
+                        }
+                    }
+                    
+                    while (snp_iter != snp_chunk_end){
+                        ++snp_iter;
+                        ++local_snps;
+                    }
+                    
+                    snps_processed += local_snps;
+                    reads_processed += local_all_reads;
+                    int done = ++units_done;
+                    
+                    if (done % 10 == 0 || done == (int)work_units.size()){
+                        fprintf(stderr, "\rDUAL progress: %d/%lu units, %ld/%ld SNPs, %ld reads          ",
+                            done, work_units.size(), snps_processed.load(), total_snps,
+                            reads_processed.load());
+                    }
+                    
+                    hts_itr_destroy(iter);
+                }
+                
+                hts_idx_destroy(idx);
+            }
+            
+            bam_destroy1(record);
+            bam_hdr_destroy(header);
+            hts_close(bam_fp);
+        }
+    }
+    
+    // Merge per-thread counts for panel 0
+    fprintf(stderr, "\nMerging per-thread counts (panel 0)...\n");
+    for (int t = 0; t < n_threads; t++){
+        for (auto& kv : thread_counts_p0[t]){
+            unsigned long bc_key = kv.first;
+            auto it = counts_panel0.find(bc_key);
+            if (it == counts_panel0.end()){
+                counts_panel0.emplace(std::piecewise_construct,
+                    std::forward_as_tuple(bc_key),
+                    std::forward_as_tuple(n_samples));
+                it = counts_panel0.find(bc_key);
+            }
+            it->second.counts.merge(kv.second);
+        }
+        thread_counts_p0[t].clear();
+    }
+    
+    // Merge per-thread counts for panel 1
+    fprintf(stderr, "Merging per-thread counts (panel 1)...\n");
+    for (int t = 0; t < n_threads; t++){
+        for (auto& kv : thread_counts_p1[t]){
+            unsigned long bc_key = kv.first;
+            auto it = counts_panel1.find(bc_key);
+            if (it == counts_panel1.end()){
+                counts_panel1.emplace(std::piecewise_construct,
+                    std::forward_as_tuple(bc_key),
+                    std::forward_as_tuple(n_samples));
+                it = counts_panel1.find(bc_key);
+            }
+            it->second.counts.merge(kv.second);
+        }
+        thread_counts_p1[t].clear();
+    }
+    
+    thread_counts_p0.clear();
+    thread_counts_p0.shrink_to_fit();
+    thread_counts_p1.clear();
+    thread_counts_p1.shrink_to_fit();
+    
+    fprintf(stderr, "DUAL completed: %d chromosomes (%lu work units), %ld SNPs, %ld reads\n",
+        n_chroms, work_units.size(), snps_processed.load(), reads_processed.load());
+    fprintf(stderr, "  Panel 0 (interindiv): %lu cells\n", counts_panel0.size());
+    fprintf(stderr, "  Panel 1 (species):    %lu cells\n", counts_panel1.size());
 }
 
 void count_alleles_single_threaded(
@@ -1372,25 +2063,18 @@ void count_alleles_single_threaded(
                     it = cell_counts.find(bc_key);
                 }
                 
-                // Update counts (fixed-point arithmetic)
-                for (int indv = 0; indv < n_samples; ++indv){
-                    if (!snp_check->data.haps_covered.test(indv)) continue;
-                    
-                    int nalt = 0;
-                    if (snp_check->data.haps1.test(indv)) nalt++;
-                    if (snp_check->data.haps2.test(indv)) nalt++;
-                    
-                    it->second.add_total(indv, nalt, ref_add, alt_add);
-                    
-                    for (int indv2 = indv + 1; indv2 < n_samples; ++indv2){
-                        if (!snp_check->data.haps_covered.test(indv2)) continue;
-                        
-                        int nalt2 = 0;
-                        if (snp_check->data.haps1.test(indv2)) nalt2++;
-                        if (snp_check->data.haps2.test(indv2)) nalt2++;
-                        
-                        it->second.add(indv, nalt, indv2, nalt2, ref_add, alt_add);
-                    }
+                // Precomputed targets: linear traversal, no branches
+                CellCounts& cc = it->second;
+                const auto& ttargets = snp_check->total_targets;
+                const auto& ptargets = snp_check->pair_targets;
+                
+                for (const auto& t : ttargets){
+                    cc.total_ref[t.total_idx] += ref_add;
+                    cc.total_alt[t.total_idx] += alt_add;
+                }
+                for (const auto& p : ptargets){
+                    cc.ref_counts[p.pair_idx] += ref_add;
+                    cc.alt_counts[p.pair_idx] += alt_add;
                 }
             }
         }
@@ -1498,9 +2182,30 @@ bool create_shared_vcf(
         header->chrom_snp_counts[chrom_idx] = kv.second.snps.size();
         header->chrom_tids[chrom_idx] = kv.first;
         
-        // Copy SNP data
+        // Serialize SNP data field-by-field into shared memory.
+        // SNPData contains var::gqs (a std::vector<float>) which is
+        // non-trivially-copyable. A raw memcpy would write the vector's
+        // internal heap pointer into shared memory, causing UB when the
+        // reader process later interprets those bytes. Instead, we zero
+        // each slot first (clearing the gqs region to a null/zero state),
+        // then copy only the POD fields.
+        for (size_t s = 0; s < kv.second.snps.size(); s++){
+            SNPData* dest = (SNPData*)(data_ptr + s * sizeof(SNPData));
+            // Zero the entire slot so the gqs vector bytes are null
+            memset(dest, 0, sizeof(SNPData));
+            // Copy POD fields only
+            const SNPData& src = kv.second.snps[s];
+            dest->pos = src.pos;
+            dest->panel_id = src.panel_id;
+            dest->data.ref = src.data.ref;
+            dest->data.alt = src.data.alt;
+            dest->data.haps1 = src.data.haps1;
+            dest->data.haps2 = src.data.haps2;
+            dest->data.haps_covered = src.data.haps_covered;
+            dest->data.vq = src.data.vq;
+            // data.gqs left as zeroed bytes (empty vector representation)
+        }
         size_t copy_size = kv.second.snps.size() * sizeof(SNPData);
-        memcpy(data_ptr, kv.second.snps.data(), copy_size);
         data_ptr += copy_size;
         offset += copy_size;
         chrom_idx++;
@@ -1567,7 +2272,23 @@ bool attach_shared_vcf(
         cs.snps.reserve(n_snps);
         
         for (size_t j = 0; j < n_snps; j++){
-            cs.snps.push_back(snp_ptr[j]);
+            // Cannot use push_back(snp_ptr[j]) because the SNPData in shared
+            // memory was written via memcpy, and the var struct contains a
+            // std::vector<float> gqs whose internal heap pointer is from the
+            // daemon's address space. Copying it would segfault.
+            // Instead, construct each SNPData from the safe POD fields only.
+            SNPData sd;
+            sd.pos = snp_ptr[j].pos;
+            sd.panel_id = snp_ptr[j].panel_id;
+            sd.data.ref = snp_ptr[j].data.ref;
+            sd.data.alt = snp_ptr[j].data.alt;
+            sd.data.haps1 = snp_ptr[j].data.haps1;
+            sd.data.haps2 = snp_ptr[j].data.haps2;
+            sd.data.haps_covered = snp_ptr[j].data.haps_covered;
+            sd.data.vq = snp_ptr[j].data.vq;
+            // gqs is left empty (default-constructed); it's not needed
+            // for counting or conditional match fraction computation.
+            cs.snps.push_back(std::move(sd));
         }
     }
     
