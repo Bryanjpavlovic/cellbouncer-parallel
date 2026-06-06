@@ -1,10 +1,13 @@
-// tetra_refine v3.2
+// tetra_refine v3.3
 //
 // Revision history:
 //   V2_R1 - Complete rewrite separating ploidy from droplet contents (chat 543ca616)
 //   V3_R1 - Add DNLLR, margin_ratio, posterior/entropy carry-through,
 //           demote het_var to annotation, add --contam_rate and --external_ploidy inputs,
 //           backward-compatible 11-col and 13-col diagnostics parsing
+//   V3_R3 - Add --scoring_only pass-through mode: emit scoring metrics only,
+//           no ploidy reclassification, no droplet flagging, no threshold computation.
+//           --external_ploidy is ignored in this mode (with warning).
 
 #include <getopt.h>
 #include <string>
@@ -151,6 +154,7 @@ struct SummaryStats {
     int total_cells;
     int original_singlets;
     int original_doublets;
+    int passthrough_count;   // v3.3: scoring-only mode count
     int ploidy_diploid;
     int ploidy_tetraploid;
     int ploidy_unknown;
@@ -491,8 +495,15 @@ double compute_margin_ratio(double winner_min_margin, const vector<RunnerUp>* ru
     if (runner_ups == NULL || runner_ups->empty()) return 1e6;
     // rank 1 runner-up (first entry, should be sorted by rank)
     double ru_margin = (*runner_ups)[0].min_margin;
-    if (ru_margin <= 0) return 1e6;  // runner-up has no support
-    return winner_min_margin / ru_margin;
+    // Both margins can be negative (LLR-based). Use absolute values.
+    // Winner min_margin is typically positive (winner beats everyone);
+    // runner-up min_margin is typically negative (runner-up loses its
+    // worst comparison). A ratio of absolute values captures relative
+    // dominance regardless of sign.
+    double abs_winner = fabs(winner_min_margin);
+    double abs_runner = fabs(ru_margin);
+    if (abs_runner < 1e-10) return 1e6;  // runner-up has no separation at all
+    return abs_winner / abs_runner;
 }
 
 // ============================================================================
@@ -631,6 +642,7 @@ void classify_cell(const Assignment& assn,
                    const ExpectedLines& expected,
                    const Thresholds& thresholds,
                    double median_depth,
+                   double external_ploidy_min_prob,
                    bool has_het_data,
                    RefinedCell& cell) {
     
@@ -736,13 +748,19 @@ void classify_cell(const Assignment& assn,
         } else if (ext_ploidy->probability > 0) {
             cell.ploidy_confidence = "LOW";
         } else {
-            // probability not provided, default MEDIUM
-            cell.ploidy_confidence = "MEDIUM";
+            // probability not provided; annotate but do not relabel by default.
+            cell.ploidy_confidence = "LOW";
         }
         
-        if (cell.ploidy == "tetraploid" && has_homotypic_in_pool) {
+        bool external_confident_enough = (ext_ploidy->probability >= external_ploidy_min_prob);
+        if (cell.ploidy == "tetraploid" && has_homotypic_in_pool && external_confident_enough) {
             cell.refined_assignment = make_homotypic(indv);
             cell.changed = true;
+        } else if (cell.ploidy == "tetraploid" && has_homotypic_in_pool && !external_confident_enough) {
+            // Preserve the external ploidy annotation, but avoid biological relabeling
+            // from a borderline NN call.  The audit can report this as optional
+            // evidence without changing assignment.
+            cell.ploidy_method = "external_low_confidence";
         }
         
         cell.cells_in_droplet = 1;
@@ -758,6 +776,70 @@ void classify_cell(const Assignment& assn,
     cell.ploidy_confidence = "LOW";
     cell.cells_in_droplet = 1;
     cell.overall_confidence = "LOW";
+}
+
+// ============================================================================
+// Scoring-only pass-through (v3.3)
+// ============================================================================
+
+void score_only_cell(const Assignment& assn,
+                     const Diagnostics* diag,
+                     const vector<RunnerUp>* runner_ups,
+                     const ExpectedLines& expected,
+                     const Thresholds& thresholds,
+                     bool has_het_data,
+                     RefinedCell& cell) {
+
+    (void)expected;  // unused; signature parallels classify_cell()
+
+    cell.barcode = assn.barcode;
+    cell.original_assignment = assn.identity;
+    cell.original_type = assn.type;
+    cell.llr = assn.llr;
+
+    // Pass-through: no reclassification
+    cell.refined_assignment = assn.identity;
+    cell.changed = false;
+
+    // Fixed tokens for the ploidy/droplet columns
+    cell.ploidy = "passthrough";
+    cell.ploidy_method = "scoring_only";
+    cell.ploidy_confidence = "N/A";
+    cell.cells_in_droplet = 1;
+    cell.droplet_flag = "NONE";
+    cell.droplet_candidates = ".";
+
+    // Het diagnostics annotation only
+    cell.het_var_signal = "no_data";
+    cell.het_balance_var = -1.0;
+    if (diag != NULL && diag->het_balance_var >= 0 && diag->singlet_doublet == 'S') {
+        cell.het_balance_var = diag->het_balance_var;
+        cell.het_var_signal = compute_het_var_signal(diag->het_balance_var,
+                                                     thresholds, has_het_data);
+    }
+
+    // Quad pattern score is informative; still compute it but don't act on it
+    cell.quad_pattern_score = -1.0;
+    if (assn.type == 'D' && diag != NULL && runner_ups != NULL) {
+        string id1, id2;
+        parse_doublet_identity(assn.identity, id1, id2);
+        if (id1 != id2) {
+            string dummy_candidates;
+            // detect_droplet_doublet writes the pattern score as a side effect;
+            // we throw away the returned label
+            (void)detect_droplet_doublet(*diag, *runner_ups, thresholds,
+                                         dummy_candidates, cell.quad_pattern_score);
+        }
+    }
+
+    // overall_confidence from posterior alone
+    if (diag != NULL && diag->posterior >= 0) {
+        if (diag->posterior >= 0.9) cell.overall_confidence = "HIGH";
+        else if (diag->posterior >= 0.7) cell.overall_confidence = "MEDIUM";
+        else cell.overall_confidence = "LOW";
+    } else {
+        cell.overall_confidence = "UNKNOWN";
+    }
 }
 
 // ============================================================================
@@ -856,13 +938,13 @@ void write_simple_assignments(const string& filename, const vector<RefinedCell>&
         exit(1);
     }
     
-    outf << "barcode\tassignment\tploidy\tcells_in_droplet\tllr" << endl;
-    
+    // Demux-compatible assignment-like output: no header, four columns.
+    // Rich biological annotations remain in *.refined_assignments.
     for (const auto& cell : cells) {
+        char sd = (cell.refined_assignment.find('+') != string::npos) ? 'D' : 'S';
         outf << cell.barcode << "\t"
              << cell.refined_assignment << "\t"
-             << cell.ploidy << "\t"
-             << cell.cells_in_droplet << "\t"
+             << sd << "\t"
              << cell.llr << endl;
     }
 }
@@ -880,7 +962,8 @@ void write_summary(const string& filename,
                    bool has_het_data,
                    bool has_posterior_data,
                    double median_depth,
-                   const SummaryStats& stats) {
+                   const SummaryStats& stats,
+                   bool scoring_only) {
     
     ofstream outf(filename);
     if (!outf.is_open()) {
@@ -888,8 +971,11 @@ void write_summary(const string& filename,
         exit(1);
     }
     
-    outf << "tetra_refine v3.2 summary" << endl;
+    outf << "tetra_refine v3.3 summary" << endl;
     outf << "=======================" << endl;
+    if (scoring_only) {
+        outf << "Mode: scoring-only (pass-through, no reclassification)" << endl;
+    }
     outf << endl;
     
     outf << "Input files:" << endl;
@@ -935,14 +1021,19 @@ void write_summary(const string& filename,
     outf << "  Original doublets (D): " << stats.original_doublets << endl;
     outf << endl;
     
-    outf << "Ploidy classification:" << endl;
-    outf << "  Diploid: " << stats.ploidy_diploid << endl;
-    outf << "  Tetraploid: " << stats.ploidy_tetraploid << endl;
-    outf << "    - Heterotypic: " << stats.tetraploid_heterotypic << endl;
-    outf << "    - Homotypic (from expected_lines): " << stats.tetraploid_from_expected << endl;
-    outf << "    - Homotypic (from external ploidy): " << stats.tetraploid_from_external << endl;
-    outf << "  Unknown: " << stats.ploidy_unknown << endl;
-    outf << endl;
+    if (!scoring_only) {
+        outf << "Ploidy classification:" << endl;
+        outf << "  Diploid: " << stats.ploidy_diploid << endl;
+        outf << "  Tetraploid: " << stats.ploidy_tetraploid << endl;
+        outf << "    - Heterotypic: " << stats.tetraploid_heterotypic << endl;
+        outf << "    - Homotypic (from expected_lines): " << stats.tetraploid_from_expected << endl;
+        outf << "    - Homotypic (from external ploidy): " << stats.tetraploid_from_external << endl;
+        outf << "  Unknown: " << stats.ploidy_unknown << endl;
+        outf << endl;
+    } else {
+        outf << "Pass-through cells: " << stats.passthrough_count << endl;
+        outf << endl;
+    }
     
     outf << "Droplet classification:" << endl;
     outf << "  Singlet (1 cell): " << stats.droplet_singlet << endl;
@@ -962,7 +1053,7 @@ void write_summary(const string& filename,
 // ============================================================================
 
 void help(int code) {
-    fprintf(stderr, "tetra_refine v3.2 [OPTIONS]\n");
+    fprintf(stderr, "tetra_refine v3.3 [OPTIONS]\n");
     fprintf(stderr, "Refines demux_parallel assignments for tetraploid pools.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "This tool:\n");
@@ -982,6 +1073,7 @@ void help(int code) {
     fprintf(stderr, "    --contam_rate FILE       .contam_rate file from quant_contam\n");
     fprintf(stderr, "    --external_ploidy FILE   External ploidy calls (barcode\\tploidy[\\tprob])\n");
     fprintf(stderr, "    --external_ploidy_library STR  Filter external ploidy to this library number\n");
+    fprintf(stderr, "    --external_ploidy_min_prob F  Min confidence to relabel A -> A+A from external ploidy [0.90]\n");
     fprintf(stderr, "\n===== OPTIONAL - Threshold overrides =====\n");
     fprintf(stderr, "    --het_var_diploid F      Het variance annotation threshold for diploid\n");
     fprintf(stderr, "    --het_var_tetraploid F   Het variance annotation threshold for tetraploid\n");
@@ -989,6 +1081,14 @@ void help(int code) {
     fprintf(stderr, "\n===== OPTIONAL - Output =====\n");
     fprintf(stderr, "    --write_changed_only     Also write separate file with only changed cells\n");
     fprintf(stderr, "    --write_simple           Also write simple .assignments format file\n");
+    fprintf(stderr, "\n===== OPTIONAL - Scoring-only mode =====\n");
+    fprintf(stderr, "    --scoring_only           Pass through assignments unchanged; emit only scoring\n");
+    fprintf(stderr, "                             columns (DNLLR, margin_ratio, posterior, entropy,\n");
+    fprintf(stderr, "                             contam_rate, het_balance_var, quad_pattern_score).\n");
+    fprintf(stderr, "                             No ploidy reclassification, no doublet flagging.\n");
+    fprintf(stderr, "                             --external_ploidy is ignored in this mode.\n");
+    fprintf(stderr, "                             --expected is still required (used for pool-membership\n");
+    fprintf(stderr, "                             annotations only).\n");
     fprintf(stderr, "    --verbose -V             Detailed progress messages\n");
     fprintf(stderr, "    --help -h                Display this message and exit\n");
     exit(code);
@@ -1009,11 +1109,13 @@ int main(int argc, char* argv[]) {
         {"contam_rate", required_argument, 0, 1006},
         {"external_ploidy", required_argument, 0, 1007},
         {"external_ploidy_library", required_argument, 0, 1008},
+        {"external_ploidy_min_prob", required_argument, 0, 1011},
         {"het_var_diploid", required_argument, 0, 1001},
         {"het_var_tetraploid", required_argument, 0, 1002},
         {"min_margin", required_argument, 0, 1003},
         {"write_changed_only", no_argument, 0, 1004},
         {"write_simple", no_argument, 0, 1005},
+        {"scoring_only", no_argument, 0, 1010},
         {"verbose", no_argument, 0, 'V'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -1027,6 +1129,7 @@ int main(int argc, char* argv[]) {
     string contam_rate_file = "";
     string external_ploidy_file = "";
     string external_ploidy_library = "";
+    double external_ploidy_min_prob = 0.90;
     
     double het_var_diploid_override = -1.0;
     double het_var_tetraploid_override = -1.0;
@@ -1035,6 +1138,7 @@ int main(int argc, char* argv[]) {
     bool write_changed_only = false;
     bool write_simple = false;
     bool verbose = false;
+    bool scoring_only = false;
     
     int option_index = 0;
     int ch;
@@ -1058,6 +1162,8 @@ int main(int argc, char* argv[]) {
             case 1006: contam_rate_file = optarg; break;
             case 1007: external_ploidy_file = optarg; break;
             case 1008: external_ploidy_library = optarg; break;
+            case 1011: external_ploidy_min_prob = atof(optarg); break;
+            case 1010: scoring_only = true; break;
             case 'V': verbose = true; break;
             case 'h': help(0); break;
             default: help(1);
@@ -1070,9 +1176,22 @@ int main(int argc, char* argv[]) {
     if (runner_ups_file.empty()) { fprintf(stderr, "ERROR: --runner_ups/-r is required\n"); exit(1); }
     if (expected_lines_file.empty()) { fprintf(stderr, "ERROR: --expected/-e is required\n"); exit(1); }
     if (output_prefix.empty()) { fprintf(stderr, "ERROR: --output/-o is required\n"); exit(1); }
-    
-    fprintf(stderr, "tetra_refine v3.2\n");
+    if (external_ploidy_min_prob < 0.0 || external_ploidy_min_prob > 1.0) {
+        fprintf(stderr, "ERROR: --external_ploidy_min_prob must be between 0 and 1\n");
+        exit(1);
+    }
+
+    // Scoring-only mode: --external_ploidy is ignored (warn and clear)
+    if (scoring_only && !external_ploidy_file.empty()) {
+        fprintf(stderr, "WARNING: --external_ploidy ignored in --scoring_only mode\n");
+        external_ploidy_file = "";
+    }
+
+    fprintf(stderr, "tetra_refine v3.3\n");
     fprintf(stderr, "===============\n");
+    if (verbose && scoring_only) {
+        fprintf(stderr, "Mode: scoring-only (no reclassification)\n");
+    }
     
     // ========================================================================
     // Load data
@@ -1147,41 +1266,51 @@ int main(int argc, char* argv[]) {
     
     Thresholds thresholds;
     thresholds.source = "";
-    
-    // Min margin thresholds for quad detection (D-type only)
-    if (min_margin_override > 0) {
-        thresholds.min_margin_threshold = min_margin_override;
-        thresholds.min_margin_possible = min_margin_override * 2.5;
-        thresholds.source += "min_margin: user (strict), user*2.5 (lenient); ";
-    } else if (!min_margins_d.empty()) {
-        thresholds.min_margin_threshold = compute_percentile(min_margins_d, 10.0);
-        thresholds.min_margin_possible = compute_percentile(min_margins_d, 25.0);
-        thresholds.source += "min_margin: D-type p10 (strict), p25 (lenient); ";
-    } else {
-        thresholds.min_margin_threshold = 50.0;
-        thresholds.min_margin_possible = 125.0;
-        thresholds.source += "min_margin: default; ";
-    }
-    
-    // Het variance thresholds (annotation only in v3)
-    if (het_var_diploid_override > 0 && het_var_tetraploid_override > 0) {
-        thresholds.het_var_diploid = het_var_diploid_override;
-        thresholds.het_var_tetraploid = het_var_tetraploid_override;
-        thresholds.source += "het_var: user (annotation)";
-    } else if (has_het_data && !het_vars_singlet.empty()) {
-        double p25 = compute_percentile(het_vars_singlet, 25.0);
-        double p75 = compute_percentile(het_vars_singlet, 75.0);
-        thresholds.het_var_tetraploid = p25;
-        thresholds.het_var_diploid = p75;
-        thresholds.source += "het_var: 25th/75th percentile (annotation)";
-    } else {
+
+    if (scoring_only) {
+        thresholds.min_margin_threshold = 0.0;
+        thresholds.min_margin_possible = 0.0;
         thresholds.het_var_diploid = 0.0;
         thresholds.het_var_tetraploid = 0.0;
-        thresholds.source += "het_var: N/A";
+        thresholds.close_count_threshold = 1;
+        thresholds.depth_ratio_threshold = 1.5;
+        thresholds.source = "scoring_only";
+    } else {
+        // Min margin thresholds for quad detection (D-type only)
+        if (min_margin_override > 0) {
+            thresholds.min_margin_threshold = min_margin_override;
+            thresholds.min_margin_possible = min_margin_override * 2.5;
+            thresholds.source += "min_margin: user (strict), user*2.5 (lenient); ";
+        } else if (!min_margins_d.empty()) {
+            thresholds.min_margin_threshold = compute_percentile(min_margins_d, 10.0);
+            thresholds.min_margin_possible = compute_percentile(min_margins_d, 25.0);
+            thresholds.source += "min_margin: D-type p10 (strict), p25 (lenient); ";
+        } else {
+            thresholds.min_margin_threshold = 50.0;
+            thresholds.min_margin_possible = 125.0;
+            thresholds.source += "min_margin: default; ";
+        }
+
+        // Het variance thresholds (annotation only in v3)
+        if (het_var_diploid_override > 0 && het_var_tetraploid_override > 0) {
+            thresholds.het_var_diploid = het_var_diploid_override;
+            thresholds.het_var_tetraploid = het_var_tetraploid_override;
+            thresholds.source += "het_var: user (annotation)";
+        } else if (has_het_data && !het_vars_singlet.empty()) {
+            double p25 = compute_percentile(het_vars_singlet, 25.0);
+            double p75 = compute_percentile(het_vars_singlet, 75.0);
+            thresholds.het_var_tetraploid = p25;
+            thresholds.het_var_diploid = p75;
+            thresholds.source += "het_var: 25th/75th percentile (annotation)";
+        } else {
+            thresholds.het_var_diploid = 0.0;
+            thresholds.het_var_tetraploid = 0.0;
+            thresholds.source += "het_var: N/A";
+        }
+
+        thresholds.close_count_threshold = 1;
+        thresholds.depth_ratio_threshold = 1.5;
     }
-    
-    thresholds.close_count_threshold = 1;
-    thresholds.depth_ratio_threshold = 1.5;
     
     if (verbose) {
         fprintf(stderr, "\nThresholds:\n");
@@ -1224,8 +1353,13 @@ int main(int argc, char* argv[]) {
         }
         
         RefinedCell cell;
-        classify_cell(assn, diag_ptr, runner_ptr, ext_ptr, expected, thresholds,
-                      median_depth, has_het_data, cell);
+        if (scoring_only) {
+            score_only_cell(assn, diag_ptr, runner_ptr, expected, thresholds,
+                            has_het_data, cell);
+        } else {
+            classify_cell(assn, diag_ptr, runner_ptr, ext_ptr, expected, thresholds,
+                          median_depth, external_ploidy_min_prob, has_het_data, cell);
+        }
         
         // Compute confidence metrics
         if (diag_ptr != NULL) {
@@ -1253,7 +1387,8 @@ int main(int argc, char* argv[]) {
         if (assn.type == 'S') stats.original_singlets++;
         else stats.original_doublets++;
         
-        if (cell.ploidy == "diploid") stats.ploidy_diploid++;
+        if (cell.ploidy == "passthrough") stats.passthrough_count++;
+        else if (cell.ploidy == "diploid") stats.ploidy_diploid++;
         else if (cell.ploidy == "tetraploid") stats.ploidy_tetraploid++;
         else stats.ploidy_unknown++;
         
@@ -1300,26 +1435,31 @@ int main(int argc, char* argv[]) {
     write_summary(summary_file, assignments_file, diagnostics_file, runner_ups_file,
                   expected_lines_file, contam_rate_file, external_ploidy_file,
                   external_ploidy_library,
-                  expected, thresholds, has_het_data, has_posterior_data, median_depth, stats);
+                  expected, thresholds, has_het_data, has_posterior_data, median_depth, stats,
+                  scoring_only);
     
     // Print summary to stderr
-    fprintf(stderr, "\ntetra_refine v3.2 complete\n");
+    fprintf(stderr, "\ntetra_refine v3.3 complete\n");
     fprintf(stderr, "========================\n");
     fprintf(stderr, "Total cells: %d\n", stats.total_cells);
-    fprintf(stderr, "\nPloidy classification:\n");
-    fprintf(stderr, "  Diploid: %d\n", stats.ploidy_diploid);
-    fprintf(stderr, "  Tetraploid: %d\n", stats.ploidy_tetraploid);
-    fprintf(stderr, "    - Heterotypic (A+B): %d\n", stats.tetraploid_heterotypic);
-    fprintf(stderr, "    - Homotypic from expected_lines: %d\n", stats.tetraploid_from_expected);
-    fprintf(stderr, "    - From external ploidy: %d\n", stats.tetraploid_from_external);
-    fprintf(stderr, "  Unknown: %d\n", stats.ploidy_unknown);
-    fprintf(stderr, "\nDroplet status:\n");
-    fprintf(stderr, "  Singlets (1 cell): %d\n", stats.droplet_singlet);
-    fprintf(stderr, "  Possible doublets: %d\n", stats.droplet_possible);
-    fprintf(stderr, "  Likely doublets: %d\n", stats.droplet_likely);
-    fprintf(stderr, "\nAssignments changed: %d (%.1f%%)\n",
-            stats.assignment_changed,
-            stats.total_cells > 0 ? 100.0 * stats.assignment_changed / stats.total_cells : 0.0);
+    if (!scoring_only) {
+        fprintf(stderr, "\nPloidy classification:\n");
+        fprintf(stderr, "  Diploid: %d\n", stats.ploidy_diploid);
+        fprintf(stderr, "  Tetraploid: %d\n", stats.ploidy_tetraploid);
+        fprintf(stderr, "    - Heterotypic (A+B): %d\n", stats.tetraploid_heterotypic);
+        fprintf(stderr, "    - Homotypic from expected_lines: %d\n", stats.tetraploid_from_expected);
+        fprintf(stderr, "    - From external ploidy: %d\n", stats.tetraploid_from_external);
+        fprintf(stderr, "  Unknown: %d\n", stats.ploidy_unknown);
+        fprintf(stderr, "\nDroplet status:\n");
+        fprintf(stderr, "  Singlets (1 cell): %d\n", stats.droplet_singlet);
+        fprintf(stderr, "  Possible doublets: %d\n", stats.droplet_possible);
+        fprintf(stderr, "  Likely doublets: %d\n", stats.droplet_likely);
+        fprintf(stderr, "\nAssignments changed: %d (%.1f%%)\n",
+                stats.assignment_changed,
+                stats.total_cells > 0 ? 100.0 * stats.assignment_changed / stats.total_cells : 0.0);
+    } else {
+        fprintf(stderr, "\nPass-through cells: %d\n", stats.passthrough_count);
+    }
     fprintf(stderr, "\nData sources:\n");
     fprintf(stderr, "  Posterior/entropy: %s\n", has_posterior_data ? "available" : "not in diagnostics");
     fprintf(stderr, "  Contamination rate: %s\n", !contam_rate_file.empty() ? "loaded" : "not provided");
