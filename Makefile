@@ -3,21 +3,43 @@ COMP = g++
 CCOMP = gcc
 PREFIX ?= /usr/local
 
+# -----------------------------------------------------------------------------
+# Cluster-portable CPU target
+# -----------------------------------------------------------------------------
+# This tree is compiled once on ash and synced to pika/char/squirtle.
+# ash/pika/char are Zen4-class EPYC systems, but squirtle is Zen3-class EPYC.
+# Therefore the shared binaries must NOT use -march=native when compiled on ash.
+# Default to Zen3 so the same binaries run safely on every node.
+#
+# Override only if intentionally building a node-specific binary, e.g.:
+#   make CPU_ARCH=znver4 CPU_TUNE=znver4 ...
+CPU_ARCH ?= znver3
+CPU_TUNE ?= znver3
+ARCHFLAGS ?= -march=$(CPU_ARCH) -mtune=$(CPU_TUNE)
+
 # Standard flags for original CellBouncer tools
 CXXFLAGS_STD = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2)
 
 # Optimized flags for parallel tools:
 # -O3 for high optimization without enabling fast-math semantics
-# -march=native for CPU-specific instructions
+# $(ARCHFLAGS) for a cluster-portable CPU target; default is znver3.
 # -fopenmp for parallelism
 CXXFLAGS_PARALLEL = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -DNBITS=$(NBITS) \
-                    -O3 -march=native -fopenmp
+                    -O3 $(ARCHFLAGS) -fopenmp
 
-CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 -march=native
+CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 $(ARCHFLAGS)
 CXXIFLAGS = -I$(PREFIX)/include -Iinclude
 CIFLAGS = -I$(PREFIX)/include -Iinclude
 LFLAGS = -L$(PREFIX)/lib -Llib
 LFLAGS_PARALLEL = -L$(PREFIX)/lib -Llib -fopenmp -flto=auto
+
+# Optimized flags for tet contamination tools.  These deliberately use a
+# separate ambient_rna_three_ap_tet.o object so legacy quant3_contam_ap remains
+# buildable with the original standard flags, while the production tet tools get
+# optimization and OpenMP linkage.
+CXXFLAGS_TET = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) \
+               -O3 $(ARCHFLAGS) -fopenmp
+LFLAGS_TET = -L$(PREFIX)/lib -Llib -fopenmp
 NBITS ?= 2048
 
 ifeq ($(findstring cellbouncer, ${CONDA_PREFIX}), cellbouncer)
@@ -25,6 +47,7 @@ ifeq ($(findstring cellbouncer, ${CONDA_PREFIX}), cellbouncer)
     CIFLAGS += -I${CONDA_PREFIX}/include
     LFLAGS += -L${CONDA_PREFIX}/lib
     LFLAGS_PARALLEL += -L${CONDA_PREFIX}/lib
+    LFLAGS_TET += -L${CONDA_PREFIX}/lib
 endif
 
 MAX_SITES ?= 2000
@@ -40,15 +63,27 @@ DEPS2_PARALLEL = -lz -lhts -lpthread -lrt
 # MAIN TARGETS
 # ============================================================================
 
-all: dependencies original_tools parallel_tools
+all: dependencies original_tools parallel_tools tet_tools qc_tools
 
 original_tools: demux_vcf demux_mt demux_tags demux_species quant_contam doublet_dragon bulkprops utils
 
 parallel_tools: demux_parallel vcf_loader_daemon utils/downsample_vcf_parallel tetra_refine
 
+tet_tools: tet_ambient_profile tet_contam_estimate
+
+qc_tools: tetra_score_calls
+
 utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts utils/downsample_vcf
 
 dependencies: lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a
+
+print_flags:
+	@echo "CPU_ARCH=$(CPU_ARCH)"
+	@echo "CPU_TUNE=$(CPU_TUNE)"
+	@echo "ARCHFLAGS=$(ARCHFLAGS)"
+	@echo "CXXFLAGS_PARALLEL=$(CXXFLAGS_PARALLEL)"
+	@echo "CXXFLAGS_TET=$(CXXFLAGS_TET)"
+	@echo "CFLAGS=$(CFLAGS)"
 
 # ============================================================================
 # ORIGINAL CELLBOUNCER TOOLS
@@ -76,7 +111,7 @@ bulkprops: src/bulkprops.cpp src/common.h build/common.o src/demux_vcf_hts.h bui
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o build/demux_vcf_io.o build/demux_vcf_hts.o src/bulkprops.cpp $(LFLAGS) $(DEPS) -o bulkprops $(DEPS2)
 
 # ============================================================================
-# PARALLEL TOOLS (NEW)
+# PARALLEL TOOLS
 # ============================================================================
 
 demux_parallel: src/demux_parallel.cpp build/common_parallel.o build/demux_vcf_io_parallel.o build/demux_parallel_hts.o build/demux_parallel_llr.o $(DEPS)
@@ -85,14 +120,14 @@ demux_parallel: src/demux_parallel.cpp build/common_parallel.o build/demux_vcf_i
 vcf_loader_daemon: src/vcf_loader_daemon.cpp build/common_parallel.o build/demux_parallel_hts.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o build/demux_parallel_hts.o src/vcf_loader_daemon.cpp -o vcf_loader_daemon $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
-utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp src/downsample_vcf.h build/common_parallel.o $(DEPS)
+utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp src/downsample_vcf_parallel.h build/common_parallel.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o src/downsample_vcf_parallel.cpp -o utils/downsample_vcf_parallel $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
 tetra_refine: src/tetra_refine.cpp lib/libhtswrapper.a
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 src/tetra_refine.cpp -o tetra_refine $(LFLAGS) lib/libhtswrapper.a -lz
 
 # ============================================================================
-# THREE-COMPONENT MODEL (quant3_contam)
+# THREE-COMPONENT MODEL (quant3_contam) - legacy
 # ============================================================================
 
 build/ambient_rna_three.o: src/ambient_rna_three.cpp src/ambient_rna_three.h src/common.h $(DEPS)
@@ -102,15 +137,49 @@ quant3_contam: src/quant3_contam.cpp src/ambient_rna_three.h src/common.h build/
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three.o build/ambient_rna_gex.o src/quant3_contam.cpp -o quant3_contam $(LFLAGS) $(DEPS) $(DEPS2)
 
 # ============================================================================
-# THREE-COMPONENT MODEL + AMBIENT PROFILE REFINEMENTS (quant3_contam_ap)
-# r-feedback and adaptive prior extensions
+# THREE-COMPONENT MODEL + AP REFINEMENTS (quant3_contam_ap) - legacy
+# These remain buildable for comparison but are superseded by tet_tools.
 # ============================================================================
 
 build/ambient_rna_three_ap.o: src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/common.h $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap.o
 
-quant3_contam_ap: src/quant3_contam_ap.cpp src/ambient_rna_three_ap.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o src/quant3_contam_ap.cpp -o quant3_contam_ap $(LFLAGS) $(DEPS) $(DEPS2)
+build/demux_vcf_io_species.o: src/demux_vcf_io_species.cpp src/demux_vcf_io.h src/common.h
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g src/demux_vcf_io_species.cpp -c -o build/demux_vcf_io_species.o
+
+quant3_contam_ap: src/quant3_contam_ap.cpp src/ambient_rna_three_ap.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o src/quant3_contam_ap.cpp $(LFLAGS) $(DEPS) -o quant3_contam_ap $(DEPS2)
+
+quant3_contam_empty_drops: src/quant3_contam_empty_drops.cpp src/ambient_rna_three_ap.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o src/quant3_contam_empty_drops.cpp $(LFLAGS) $(DEPS) -o quant3_contam_empty_drops $(DEPS2)
+
+# ============================================================================
+# TET TOOLS (new pipeline, replaces quant3_contam_ap / quant3_contam_empty_drops)
+# Same shared library (ambient_rna_three_ap) with WP0 fixes applied.
+# ============================================================================
+
+build/ambient_rna_three_ap_tet.o: src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/common.h $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap_tet.o
+
+tet_ambient_profile: src/tet_ambient_profile.cpp src/ambient_rna_three_ap.h src/common.h \
+    build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o \
+    build/ambient_rna_three_ap_tet.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g build/common.o build/demux_vcf_io.o \
+	    build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap_tet.o \
+	    src/tet_ambient_profile.cpp $(LFLAGS_TET) $(DEPS) -o tet_ambient_profile $(DEPS2)
+
+tet_contam_estimate: src/tet_contam_estimate.cpp src/ambient_rna_three_ap.h src/common.h \
+    build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o \
+    build/ambient_rna_three_ap_tet.o build/ambient_rna_gex.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g build/common.o build/demux_vcf_io.o \
+	    build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap_tet.o \
+	    build/ambient_rna_gex.o src/tet_contam_estimate.cpp $(LFLAGS_TET) $(DEPS) \
+	    -o tet_contam_estimate $(DEPS2)
+
+# Per-cell post-hoc QC scorer used by the swap-audit layer.
+tetra_score_calls: src/tetra_score_calls.cpp lib/libhtswrapper.a
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g src/tetra_score_calls.cpp \
+	    -o tetra_score_calls $(LFLAGS_TET) lib/libhtswrapper.a -lz
 
 # ============================================================================
 # UTILITY TOOLS
@@ -213,6 +282,7 @@ lib/libmixturedist.a:
 
 lib/liboptimml.a:
 	cd dependencies/optimML && sed -i 's/assert(-dot(g, p)<0);/if (-dot(g, p) >= 0) throw 1;/' src/stlbfgs/stlbfgs.cpp
+	cd dependencies/optimML && sed -i 's/assert(std::isfinite(alpha));/if (!std::isfinite(alpha)) throw 2;/' src/stlbfgs/stlbfgs.cpp
 	cd dependencies/optimML && $(MAKE) PREFIX=../..
 	cd dependencies/optimML && $(MAKE) install PREFIX=../..
 
@@ -228,7 +298,8 @@ clean_build:
 clean_binaries:
 	rm -f demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops
 	rm -f demux_parallel vcf_loader_daemon tetra_refine
-	rm -f quant3_contam quant3_contam_ap
+	rm -f quant3_contam quant3_contam_ap quant3_contam_empty_drops
+	rm -f tet_ambient_profile tet_contam_estimate tetra_score_calls
 	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers
 	rm -f utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts
 	rm -f utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel
@@ -245,13 +316,20 @@ clean_all: clean clean_deps
 # INSTALL
 # ============================================================================
 
-install: all quant3_contam quant3_contam_ap
+install: all quant3_contam quant3_contam_ap quant3_contam_empty_drops install_scripts
 	mkdir -p $(PREFIX)/bin
 	cp demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops $(PREFIX)/bin/
 	cp demux_parallel vcf_loader_daemon tetra_refine $(PREFIX)/bin/
-	cp quant3_contam quant3_contam_ap $(PREFIX)/bin/
+	cp quant3_contam quant3_contam_ap quant3_contam_empty_drops $(PREFIX)/bin/
+	cp tet_ambient_profile tet_contam_estimate tetra_score_calls $(PREFIX)/bin/
 	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers $(PREFIX)/bin/
 	cp utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts $(PREFIX)/bin/
 	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
 
-.PHONY: all original_tools parallel_tools utils dependencies clean clean_build clean_binaries clean_deps clean_all install
+
+install_scripts:
+	mkdir -p $(PREFIX)/bin
+	cp scripts/*.py $(PREFIX)/bin/
+	chmod +x $(PREFIX)/bin/*.py
+
+.PHONY: all original_tools parallel_tools tet_tools utils dependencies print_flags clean clean_build clean_binaries clean_deps clean_all install install_scripts
