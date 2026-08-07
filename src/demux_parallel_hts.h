@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <utility>
+#include <tuple>
 #include <zlib.h>
 #include <mutex>
 #include <atomic>
@@ -295,7 +296,7 @@ struct SNPData {
     // Populated by precompute_targets().
     std::vector<SNPTotalTarget> total_targets;
     std::vector<SNPPairTarget> pair_targets;
-    
+
     SNPData() : pos(0), panel_id(0) {}
     SNPData(int p, const var& v) : pos(p), data(v), panel_id(0) {}
     SNPData(int p, const var& v, uint8_t pid) : pos(p), data(v), panel_id(pid) {}
@@ -703,6 +704,53 @@ void compute_conditional_match_fracs_parallel(
     int n_samples,
     int n_threads);
 
+// Accepted observation weight at one VCF site, keyed by (tid,pos). Values are
+// fixed-point mapping-quality weights accumulated from the same accepted BAM
+// observations that feed .counts. This is library-derived and contains no
+// synthetic provenance or truth labels.
+using AcceptedSiteWeightMap = robin_hood::unordered_map<int64_t, int64_t>;
+
+inline int64_t accepted_site_weight_key(int tid, int pos) {
+    return (int64_t)(((uint64_t)(uint32_t)tid << 32) | (uint64_t)(uint32_t)pos);
+}
+
+// Per-SNP native-species weights are kept outside SNPData so the shared-VCF
+// memory layout remains unchanged.  Each qualifying SNP owns one compact,
+// fixed-width weight block:
+//   n_species * 3 singlet genotype bins, followed by
+//   n_species*(n_species-1)/2 * 9 heterotypic-pair genotype bins.
+// site_offsets is aligned one-to-one with ChromSNPs::snps; UINT64_MAX means
+// that no native-species target block is present for that SNP.
+struct NativeSpeciesChromTargets {
+    int n_species = 0;
+    int n_pairs = 0;
+    uint32_t weights_per_site = 0;
+    std::vector<uint64_t> site_offsets;
+    std::vector<int32_t> weights;
+};
+
+using NativeSpeciesTargetTable =
+    robin_hood::unordered_map<int, NativeSpeciesChromTargets>;
+
+struct ConditionalWeightStats {
+    uint64_t observed_sites = 0;
+    double accepted_weight = 0.0;
+};
+
+/**
+ * Compute conditional donor allele fractions on the exact accepted-observation
+ * site weighting from a BAM recount. Sites without accepted observations are
+ * excluded. This avoids substituting a global site-average for the observation
+ * process actually consumed by the estimator.
+ */
+ConditionalWeightStats compute_conditional_match_fracs_weighted(
+    robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    const AcceptedSiteWeightMap& accepted_site_weights,
+    std::map<std::pair<int, int>, std::map<int, float> >& conditional_match_fracs,
+    int n_samples,
+    int n_threads);
+
+
 // ============================================================================
 // BAM PROCESSING FUNCTIONS (original interface)
 // ============================================================================
@@ -766,13 +814,20 @@ void count_alleles_parallel(
     int n_threads,
     int htslib_threads,
     bool dump_pileup = false,
-    const std::string& pileup_prefix = "");
+    const std::string& pileup_prefix = "",
+    AcceptedSiteWeightMap* accepted_site_weights = nullptr,
+    const NativeSpeciesTargetTable* species_native_targets = nullptr,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts = nullptr,
+    int species_native_n_samples = 0);
 
 /**
  * Dual-output parallel counting: routes allele counts to panel0 or panel1
  * based on SNPData::panel_id. Eliminates second BAM pass when both
  * interindividual and species SNPs are needed.
  */
+// Backward-compatible overload for callers compiled against the historical
+// interface. Source-provenance output is disabled because no sample-name
+// mapping was supplied.
 void count_alleles_parallel_dual(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
@@ -782,6 +837,31 @@ void count_alleles_parallel_dual(
     int n_samples,
     int n_threads,
     int htslib_threads);
+
+void count_alleles_parallel_dual(
+    const std::string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel1,
+    const std::set<unsigned long>& valid_barcodes,
+    int n_samples,
+    const std::vector<std::string>& sample_names,
+    int n_threads,
+    int htslib_threads,
+    bool dump_source_observations = false,
+    const std::string& source_observations_prefix = "",
+    const std::string& source_provenance_tag = "YI",
+    const std::string& synthetic_id_tag = "YS",
+    const std::string& expected_synthetic_id = "",
+    const std::string& source_receiver_map_path = "",
+    bool source_reconciliation_mode = false,
+    bool source_donor_site_audit = false,
+    int source_donor_site_sample_mod = 256,
+    AcceptedSiteWeightMap* accepted_site_weights_panel0 = nullptr,
+    AcceptedSiteWeightMap* accepted_site_weights_panel1 = nullptr,
+    const NativeSpeciesTargetTable* species_native_targets = nullptr,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts = nullptr,
+    int species_native_n_samples = 0);
 
 /**
  * Single-threaded counting using optimized data structures
@@ -795,7 +875,10 @@ void count_alleles_single_threaded(
     int n_samples,
     std::map<std::pair<int, int>, std::map<int, float> >& conditional_match_fracs,
     std::map<std::pair<int, int>, std::map<int, float> >& conditional_match_tots,
-    bool compute_conditional);
+    bool compute_conditional,
+    const NativeSpeciesTargetTable* species_native_targets = nullptr,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_native_counts = nullptr,
+    int species_native_n_samples = 0);
 
 /**
  * Convert parallel cell counts to non-mutex version for LLR computation

@@ -1,4 +1,5 @@
 #include <string>
+#include <climits>
 #include <algorithm>
 #include <vector>
 #include <iterator>
@@ -812,6 +813,100 @@ void compute_conditional_match_fracs_parallel(
     fprintf(stderr, "Parallel condf complete: %lu entries\n", conditional_match_fracs.size());
 }
 
+ConditionalWeightStats compute_conditional_match_fracs_weighted(
+    robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
+    const AcceptedSiteWeightMap& accepted_site_weights,
+    map<pair<int, int>, map<int, float> >& conditional_match_fracs,
+    int n_samples,
+    int n_threads){
+
+    ConditionalWeightStats stats;
+    const int n_rows = n_samples * 3;
+    const int n_cols = n_samples;
+    const size_t arr_size = (size_t)n_rows * n_cols;
+
+    vector<pair<int, ChromSNPs*> > chrom_ptrs;
+    chrom_ptrs.reserve(snpdat_all.size());
+    for (auto& kv : snpdat_all){
+        chrom_ptrs.push_back(make_pair(kv.first, &kv.second));
+        for (auto& snp : kv.second.snps){
+            if ((int)snp.geno.size() != n_samples) snp.precompute_genotypes(n_samples);
+        }
+    }
+
+    vector<double> global_fracs(arr_size, 0.0);
+    vector<double> global_tots(arr_size, 0.0);
+    uint64_t global_sites = 0;
+    long double global_weight = 0.0L;
+
+    omp_set_num_threads(n_threads);
+    #pragma omp parallel
+    {
+        vector<double> local_fracs(arr_size, 0.0);
+        vector<double> local_tots(arr_size, 0.0);
+        uint64_t local_sites = 0;
+        long double local_weight = 0.0L;
+
+        #pragma omp for schedule(dynamic, 1)
+        for (int c = 0; c < (int)chrom_ptrs.size(); ++c){
+            const int tid = chrom_ptrs[c].first;
+            ChromSNPs& chrom = *chrom_ptrs[c].second;
+            for (const auto& snp : chrom.snps){
+                auto wit = accepted_site_weights.find(accepted_site_weight_key(tid, snp.pos));
+                if (wit == accepted_site_weights.end() || wit->second <= 0) continue;
+                const double weight = (double)wit->second;
+                ++local_sites;
+                local_weight += (long double)weight;
+                const int8_t* geno = snp.geno.data();
+                for (int i = 0; i < n_samples; ++i){
+                    const int8_t nalt_i = geno[i];
+                    if (nalt_i < 0 || nalt_i >= 3) continue;
+                    const int row = i * 3 + nalt_i;
+                    for (int j = 0; j < n_samples; ++j){
+                        const int8_t nalt_j = geno[j];
+                        if (nalt_j < 0 || nalt_j >= 3) continue;
+                        const size_t idx = (size_t)row * n_cols + j;
+                        local_fracs[idx] += weight * ((double)nalt_j / 2.0);
+                        local_tots[idx] += weight;
+                    }
+                }
+            }
+        }
+        #pragma omp critical
+        {
+            for (size_t k = 0; k < arr_size; ++k){
+                global_fracs[k] += local_fracs[k];
+                global_tots[k] += local_tots[k];
+            }
+            global_sites += local_sites;
+            global_weight += local_weight;
+        }
+    }
+
+    conditional_match_fracs.clear();
+    for (int i = 0; i < n_samples; ++i){
+        for (int nalt = 0; nalt < 3; ++nalt){
+            const int row = i * 3 + nalt;
+            const pair<int, int> key_i = make_pair(i, nalt);
+            for (int j = 0; j < n_samples; ++j){
+                const size_t idx = (size_t)row * n_cols + j;
+                if (global_tots[idx] > 0.0){
+                    conditional_match_fracs[key_i][j] =
+                        (float)(global_fracs[idx] / global_tots[idx]);
+                }
+            }
+        }
+    }
+
+    stats.observed_sites = global_sites;
+    stats.accepted_weight = (double)(global_weight / (long double)FIXED_POINT_SCALE);
+    fprintf(stderr,
+        "Accepted-observation-weighted condf complete: %llu sites, %.6f accepted weight, %lu row entries\n",
+        (unsigned long long)stats.observed_sites, stats.accepted_weight,
+        conditional_match_fracs.size());
+    return stats;
+}
+
 // ============================================================================
 // ORIGINAL BAM PROCESSING FUNCTIONS
 // ============================================================================
@@ -1039,6 +1134,66 @@ char get_base_at_pos(bam1_t* record, int pos){
 }
 
 
+static inline int64_t apply_species_target_weight(
+    int64_t value,
+    int32_t weight_scaled){
+
+    if (value == 0 || weight_scaled == 0) return 0;
+    const int64_t half = FIXED_POINT_SCALE / 2;
+    return (value * (int64_t)weight_scaled + half) / FIXED_POINT_SCALE;
+}
+
+static inline bool accumulate_species_native_targets(
+    CellCounts& counts,
+    const NativeSpeciesChromTargets& chrom_targets,
+    size_t snp_index,
+    int64_t ref_add,
+    int64_t alt_add){
+
+    if (snp_index >= chrom_targets.site_offsets.size()) return false;
+    const uint64_t offset = chrom_targets.site_offsets[snp_index];
+    if (offset == UINT64_MAX) return false;
+    if ((uint64_t)offset + chrom_targets.weights_per_site >
+        (uint64_t)chrom_targets.weights.size()) return false;
+
+    const int n_species = chrom_targets.n_species;
+    const int state_count = n_species * GENOTYPE_STATES;
+    const int32_t* weights = chrom_targets.weights.data() + offset;
+    size_t cursor = 0;
+
+    for (int sp = 0; sp < n_species; ++sp){
+        for (int g = 0; g < GENOTYPE_STATES; ++g, ++cursor){
+            const int32_t weight = weights[cursor];
+            if (weight == 0) continue;
+            const int total_idx = sp * GENOTYPE_STATES + g;
+            counts.total_ref[total_idx] +=
+                apply_species_target_weight(ref_add, weight);
+            counts.total_alt[total_idx] +=
+                apply_species_target_weight(alt_add, weight);
+        }
+    }
+
+    for (int a = 0; a < n_species; ++a){
+        for (int b = a + 1; b < n_species; ++b){
+            for (int ga = 0; ga < GENOTYPE_STATES; ++ga){
+                const int idx_a = a * GENOTYPE_STATES + ga;
+                for (int gb = 0; gb < GENOTYPE_STATES; ++gb, ++cursor){
+                    const int32_t weight = weights[cursor];
+                    if (weight == 0) continue;
+                    const int idx_b = b * GENOTYPE_STATES + gb;
+                    const size_t pair_idx =
+                        (size_t)idx_a * (size_t)state_count + (size_t)idx_b;
+                    counts.ref_counts[pair_idx] +=
+                        apply_species_target_weight(ref_add, weight);
+                    counts.alt_counts[pair_idx] +=
+                        apply_species_target_weight(alt_add, weight);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void count_alleles_parallel(
     const string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
@@ -1048,9 +1203,16 @@ void count_alleles_parallel(
     int n_threads,
     int htslib_threads,
     bool dump_pileup,
-    const string& pileup_prefix){
+    const string& pileup_prefix,
+    AcceptedSiteWeightMap* accepted_site_weights,
+    const NativeSpeciesTargetTable* species_native_targets,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts,
+    int species_native_n_samples){
     
     bool has_bc_list = !valid_barcodes.empty();
+    const bool collect_species_native =
+        species_native_targets != nullptr && species_native_counts != nullptr &&
+        species_native_n_samples > 0;
     
     // Pre-allocate count structure for known barcodes
     if (has_bc_list){
@@ -1059,6 +1221,11 @@ void count_alleles_parallel(
             cell_counts.emplace(std::piecewise_construct,
                 std::forward_as_tuple(bc),
                 std::forward_as_tuple(n_samples));
+            if (collect_species_native){
+                species_native_counts->emplace(std::piecewise_construct,
+                    std::forward_as_tuple(bc),
+                    std::forward_as_tuple(species_native_n_samples));
+            }
         }
     }
     
@@ -1109,6 +1276,10 @@ void count_alleles_parallel(
     // Get read counts per chromosome from index
     vector<uint64_t> chrom_read_counts(n_chroms, 0);
     vector<int64_t> chrom_lengths(n_chroms);
+    vector<string> chrom_names(n_chroms);
+    for (int i = 0; i < n_chroms; ++i){
+        chrom_names[i] = hdr_tmp->target_name[i] ? hdr_tmp->target_name[i] : std::to_string(i);
+    }
     
     if (idx_tmp){
         for (int i = 0; i < n_chroms; i++){
@@ -1264,17 +1435,23 @@ void count_alleles_parallel(
     // With fixed-point int64 arithmetic, merge order doesn't matter (integer addition is associative)
     omp_set_num_threads(n_threads);
     vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts(n_threads);
+    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_species_native_counts(
+        collect_species_native ? n_threads : 0);
 
     // --dump_pileup: per-thread per-(cell,SNP) allele evidence (interindividual
     // only).  Inner key packs (tid<<32 | pos); value is (ref_scaled, alt_scaled).
     // Empty and untouched unless dump_pileup is set.
     vector<robin_hood::unordered_map<unsigned long,
         robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
+    vector<AcceptedSiteWeightMap> thread_site_weights(n_threads);
     
     #pragma omp parallel
     {
         int thread_id = omp_get_thread_num();
         auto& local_counts = thread_counts[thread_id];
+        robin_hood::unordered_map<unsigned long, CellCounts>* local_species_native =
+            collect_species_native ? &thread_species_native_counts[thread_id] : nullptr;
+        auto& local_site_weights = thread_site_weights[thread_id];
         
         // Each thread gets its own BAM reader
         htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
@@ -1329,6 +1506,13 @@ void count_alleles_parallel(
                     // Has SNPs - do full processing for this chunk
                     auto snp_it = snpdat_all.find(tid);
                     ChromSNPs& chrom_snps = snp_it->second;
+                    const NativeSpeciesChromTargets* native_chrom_targets = nullptr;
+                    if (collect_species_native){
+                        auto native_it = species_native_targets->find(tid);
+                        if (native_it != species_native_targets->end()){
+                            native_chrom_targets = &native_it->second;
+                        }
+                    }
                     
                     // Get iterators for just our chunk of SNPs
                     auto snp_iter = chrom_snps.snps.begin() + wu.snp_start;
@@ -1416,6 +1600,10 @@ void count_alleles_parallel(
                             }
                             
                             if (ref_add > 0 || alt_add > 0){
+                                if (accepted_site_weights != nullptr){
+                                    local_site_weights[accepted_site_weight_key(tid, snp_check->pos)] +=
+                                        ref_add + alt_add;
+                                }
                                 // Accumulate to per-thread storage (no locks needed)
                                 auto it = local_counts.find(bc_key);
                                 if (it == local_counts.end()){
@@ -1435,6 +1623,24 @@ void count_alleles_parallel(
                                 for (const auto& p : ptargets){
                                     cc.ref_counts[p.pair_idx] += ref_add;
                                     cc.alt_counts[p.pair_idx] += alt_add;
+                                }
+
+                                if (local_species_native != nullptr &&
+                                    native_chrom_targets != nullptr){
+                                    const size_t snp_index = (size_t)(
+                                        snp_check - chrom_snps.snps.begin());
+                                    if (snp_index < native_chrom_targets->site_offsets.size() &&
+                                        native_chrom_targets->site_offsets[snp_index] != UINT64_MAX){
+                                        auto native_it = local_species_native->find(bc_key);
+                                        if (native_it == local_species_native->end()){
+                                            local_species_native->emplace(
+                                                bc_key, CellCounts(species_native_n_samples));
+                                            native_it = local_species_native->find(bc_key);
+                                        }
+                                        accumulate_species_native_targets(
+                                            native_it->second, *native_chrom_targets, snp_index,
+                                            ref_add, alt_add);
+                                    }
                                 }
 
                                 // --dump_pileup: record per-(cell,SNP) evidence for
@@ -1504,6 +1710,42 @@ void count_alleles_parallel(
         }
     }
     
+    if (collect_species_native){
+        fprintf(stderr, "Merging per-thread native species counts...\n");
+        for (int t = 0; t < n_threads; ++t){
+            for (auto& kv : thread_species_native_counts[t]){
+                const unsigned long bc_key = kv.first;
+                auto it = species_native_counts->find(bc_key);
+                if (it == species_native_counts->end()){
+                    species_native_counts->emplace(std::piecewise_construct,
+                        std::forward_as_tuple(bc_key),
+                        std::forward_as_tuple(species_native_n_samples));
+                    it = species_native_counts->find(bc_key);
+                }
+                it->second.counts.merge(kv.second);
+            }
+            thread_species_native_counts[t].clear();
+        }
+        thread_species_native_counts.clear();
+        thread_species_native_counts.shrink_to_fit();
+        fprintf(stderr, "Native species counts: %lu cells, %d species\n",
+            species_native_counts->size(), species_native_n_samples);
+    }
+
+    if (accepted_site_weights != nullptr){
+        accepted_site_weights->clear();
+        for (int t = 0; t < n_threads; ++t){
+            for (const auto& kv : thread_site_weights[t]){
+                (*accepted_site_weights)[kv.first] += kv.second;
+            }
+            thread_site_weights[t].clear();
+        }
+        fprintf(stderr, "Accepted-site weight map: %lu observed sites\n",
+            accepted_site_weights->size());
+    }
+    thread_site_weights.clear();
+    thread_site_weights.shrink_to_fit();
+
     // Final cleanup
     thread_counts.clear();
     thread_counts.shrink_to_fit();
@@ -1556,6 +1798,596 @@ void count_alleles_parallel(
 }
 
 // ============================================================================
+// SYNTHETIC SOURCE-PROVENANCE OBSERVATION SUMMARY
+// ============================================================================
+
+struct SourceObservationStats {
+    uint64_t n_reads = 0;
+    uint64_t n_observations = 0;
+    double ref_weight = 0.0;
+    double alt_weight = 0.0;
+
+    void merge(const SourceObservationStats& other){
+        n_reads += other.n_reads;
+        n_observations += other.n_observations;
+        ref_weight += other.ref_weight;
+        alt_weight += other.alt_weight;
+    }
+};
+
+struct SourceReceiverInfo {
+    std::string identity;
+    std::string name_a;
+    std::string name_b;
+    int idx_a = -1;
+    int idx_b = -1;
+};
+
+using SourceReceiverMap = std::unordered_map<unsigned long, SourceReceiverInfo>;
+
+static std::string trim_copy(const std::string& value){
+    const size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+static std::string barcode_core_copy(const std::string& value){
+    std::string out = trim_copy(value);
+    const size_t dash = out.find('-');
+    if (dash != std::string::npos) out.resize(dash);
+    return out;
+}
+
+static SourceReceiverMap load_source_receiver_map(
+    const std::string& path,
+    const std::map<std::string, int>& sample_to_idx){
+    SourceReceiverMap result;
+    if (path.empty()) return result;
+    std::ifstream in(path.c_str());
+    if (!in){
+        fprintf(stderr, "ERROR: could not open source receiver map: %s\n", path.c_str());
+        exit(1);
+    }
+    std::string line;
+    size_t line_no = 0;
+    while (std::getline(in, line)){
+        line_no++;
+        line = trim_copy(line);
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string barcode, identity;
+        if (!(ss >> barcode >> identity)){
+            fprintf(stderr, "ERROR: %s:%lu: expected barcode and receiver_identity\n",
+                path.c_str(), (unsigned long)line_no);
+            exit(1);
+        }
+        if (barcode == "barcode" && (identity == "receiver_identity" || identity == "identity")){
+            continue;
+        }
+        const size_t plus = identity.find('+');
+        if (plus == std::string::npos || identity.find('+', plus + 1) != std::string::npos){
+            fprintf(stderr, "ERROR: %s:%lu: receiver_identity must be exactly A+B, observed '%s'\n",
+                path.c_str(), (unsigned long)line_no, identity.c_str());
+            exit(1);
+        }
+        const std::string name_a = identity.substr(0, plus);
+        const std::string name_b = identity.substr(plus + 1);
+        auto ita = sample_to_idx.find(name_a);
+        auto itb = sample_to_idx.find(name_b);
+        if (ita == sample_to_idx.end() || itb == sample_to_idx.end()){
+            fprintf(stderr, "ERROR: %s:%lu: receiver '%s' contains a name absent from the individual VCF sample set\n",
+                path.c_str(), (unsigned long)line_no, identity.c_str());
+            exit(1);
+        }
+        const std::string core = barcode_core_copy(barcode);
+        if (core.empty()){
+            fprintf(stderr, "ERROR: %s:%lu: empty barcode\n", path.c_str(), (unsigned long)line_no);
+            exit(1);
+        }
+        bc bits;
+        str2bc(core.c_str(), bits);
+        const unsigned long key = bits.to_ulong();
+        SourceReceiverInfo info;
+        info.identity = identity;
+        info.name_a = name_a;
+        info.name_b = name_b;
+        info.idx_a = ita->second;
+        info.idx_b = itb->second;
+        auto existing = result.find(key);
+        if (existing != result.end() && existing->second.identity != identity){
+            fprintf(stderr, "ERROR: %s:%lu: barcode '%s' maps to conflicting identities '%s' and '%s'\n",
+                path.c_str(), (unsigned long)line_no, core.c_str(),
+                existing->second.identity.c_str(), identity.c_str());
+            exit(1);
+        }
+        result[key] = info;
+    }
+    if (result.empty()){
+        fprintf(stderr, "ERROR: source receiver map is empty after parsing: %s\n", path.c_str());
+        exit(1);
+    }
+    fprintf(stderr, "Loaded %lu barcode-to-receiver mappings from %s\n",
+        (unsigned long)result.size(), path.c_str());
+    return result;
+}
+
+// barcode, receiver identity/A/B/category, explicit origin bucket,
+// resolved source, raw YI source, typing status, panel. The receiver category
+// is populated for the individual panel when --source_receiver_map is supplied;
+// species rows use -1/-1.
+using SourceObservationKey = std::tuple<
+    unsigned long,
+    std::string, std::string, std::string, int, int,
+    std::string, std::string, std::string, std::string, int>;
+using SourceObservationMap = std::map<SourceObservationKey, SourceObservationStats>;
+
+using SourceCategoryKey = std::tuple<
+    unsigned long,
+    std::string, std::string, std::string, int, int, int>;
+using SourceCategoryMap = std::map<SourceCategoryKey, SourceObservationStats>;
+
+// Complete audit aggregate.  Every accepted injected individual-panel
+// observation is accounted, but rows are compactly aggregated by receiver,
+// source label, exact source genotypes, and typing state rather than emitted
+// read-by-read.
+struct DonorAuditStats {
+    uint64_t n_observations = 0;
+    double ref_weight = 0.0;
+    double alt_weight = 0.0;
+    double direct_supported_weight = 0.0;
+    double direct_unsupported_weight = 0.0;
+    double flipped_supported_weight = 0.0;
+    double unique_component_a_weight = 0.0;
+    double unique_component_b_weight = 0.0;
+    double ambiguous_component_weight = 0.0;
+    double no_component_weight = 0.0;
+    double raw_equalmix_expected_alt_num = 0.0;
+    double raw_equalmix_expected_weight = 0.0;
+    double resolved_expected_alt_num = 0.0;
+    double resolved_expected_weight = 0.0;
+
+    void merge(const DonorAuditStats& other){
+        n_observations += other.n_observations;
+        ref_weight += other.ref_weight;
+        alt_weight += other.alt_weight;
+        direct_supported_weight += other.direct_supported_weight;
+        direct_unsupported_weight += other.direct_unsupported_weight;
+        flipped_supported_weight += other.flipped_supported_weight;
+        unique_component_a_weight += other.unique_component_a_weight;
+        unique_component_b_weight += other.unique_component_b_weight;
+        ambiguous_component_weight += other.ambiguous_component_weight;
+        no_component_weight += other.no_component_weight;
+        raw_equalmix_expected_alt_num += other.raw_equalmix_expected_alt_num;
+        raw_equalmix_expected_weight += other.raw_equalmix_expected_weight;
+        resolved_expected_alt_num += other.resolved_expected_alt_num;
+        resolved_expected_weight += other.resolved_expected_weight;
+    }
+};
+
+// receiver identity/A/B/category, raw YI, resolved source/typing state,
+// raw-source component names and exact site genotypes, resolved genotype.
+using DonorAuditKey = std::tuple<
+    std::string, std::string, std::string, int, int,
+    std::string, std::string, std::string,
+    std::string, std::string, int, int, int>;
+using DonorAuditMap = std::map<DonorAuditKey, DonorAuditStats>;
+
+// Deterministic exact-site evidence sample.  The complete aggregate above uses
+// every accepted observation; this sampled table provides inspectable loci
+// without generating a multi-gigabyte read/site dump.
+using DonorSiteAuditKey = std::tuple<
+    int, int, char, char,
+    std::string, std::string, std::string, int, int,
+    std::string, std::string, std::string,
+    std::string, std::string, int, int, int>;
+using DonorSiteAuditMap = std::map<DonorSiteAuditKey, DonorAuditStats>;
+
+static bool genotype_supports_observed_allele(int genotype, bool is_ref){
+    if (genotype < 0 || genotype > 2) return false;
+    if (genotype == 1) return true;
+    return is_ref ? genotype == 0 : genotype == 2;
+}
+
+static bool donor_site_is_sampled(int tid, int pos, int modulus){
+    if (modulus <= 1) return true;
+    uint64_t x = ((uint64_t)(uint32_t)tid << 32) ^ (uint64_t)(uint32_t)pos;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (x % (uint64_t)modulus) == 0;
+}
+
+static void describe_source_genotypes(
+    const std::string& raw_source,
+    const std::string& resolved_source,
+    const SNPData& snp,
+    const std::map<std::string, int>& sample_to_idx,
+    std::string& source_a,
+    std::string& source_b,
+    int& source_nalt_a,
+    int& source_nalt_b,
+    int& resolved_nalt){
+    source_a.clear();
+    source_b.clear();
+    source_nalt_a = -1;
+    source_nalt_b = -1;
+    resolved_nalt = -1;
+
+    auto genotype_for = [&](const std::string& name) -> int {
+        auto hit = sample_to_idx.find(name);
+        if (hit == sample_to_idx.end()) return -1;
+        const int idx = hit->second;
+        if (idx < 0 || idx >= (int)snp.geno.size()) return -1;
+        return (int)snp.geno[idx];
+    };
+
+    const size_t plus = raw_source.find('+');
+    if (plus == std::string::npos){
+        source_a = raw_source;
+        source_nalt_a = genotype_for(source_a);
+    }
+    else if (raw_source.find('+', plus + 1) == std::string::npos){
+        source_a = raw_source.substr(0, plus);
+        source_b = raw_source.substr(plus + 1);
+        source_nalt_a = genotype_for(source_a);
+        source_nalt_b = genotype_for(source_b);
+        if (source_a == source_b){
+            source_b.clear();
+            source_nalt_b = -1;
+        }
+    }
+    resolved_nalt = genotype_for(resolved_source);
+}
+
+static void update_donor_audit_stats(
+    DonorAuditStats& stats,
+    bool is_ref,
+    double weight,
+    int source_nalt_a,
+    int source_nalt_b,
+    int resolved_nalt){
+    stats.n_observations += 1;
+    if (is_ref) stats.ref_weight += weight;
+    else stats.alt_weight += weight;
+
+    const bool a_supports = genotype_supports_observed_allele(source_nalt_a, is_ref);
+    const bool b_present = source_nalt_b >= 0 && source_nalt_b <= 2;
+    const bool b_supports = b_present && genotype_supports_observed_allele(source_nalt_b, is_ref);
+    const bool any_supports = a_supports || b_supports;
+    if (any_supports) stats.direct_supported_weight += weight;
+    else stats.direct_unsupported_weight += weight;
+
+    const bool flipped_a = genotype_supports_observed_allele(source_nalt_a, !is_ref);
+    const bool flipped_b = b_present && genotype_supports_observed_allele(source_nalt_b, !is_ref);
+    if (flipped_a || flipped_b) stats.flipped_supported_weight += weight;
+
+    if (a_supports && !b_supports) stats.unique_component_a_weight += weight;
+    else if (b_supports && !a_supports) stats.unique_component_b_weight += weight;
+    else if (a_supports && b_supports) stats.ambiguous_component_weight += weight;
+    else stats.no_component_weight += weight;
+
+    if (source_nalt_a >= 0 && source_nalt_a <= 2){
+        double p = (double)source_nalt_a / 2.0;
+        if (b_present) p = ((double)source_nalt_a + (double)source_nalt_b) / 4.0;
+        stats.raw_equalmix_expected_alt_num += weight * p;
+        stats.raw_equalmix_expected_weight += weight;
+    }
+    if (resolved_nalt >= 0 && resolved_nalt <= 2){
+        stats.resolved_expected_alt_num += weight * ((double)resolved_nalt / 2.0);
+        stats.resolved_expected_weight += weight;
+    }
+}
+
+static bool split_pair_source_label(
+    const std::string& raw,
+    const std::map<std::string, int>& sample_to_idx,
+    int& idx_a,
+    int& idx_b,
+    std::string& name_a,
+    std::string& name_b){
+    const size_t plus = raw.find('+');
+    if (plus == std::string::npos || raw.find('+', plus + 1) != std::string::npos) return false;
+    name_a = raw.substr(0, plus);
+    name_b = raw.substr(plus + 1);
+    auto a = sample_to_idx.find(name_a);
+    auto b = sample_to_idx.find(name_b);
+    if (name_a.empty() || name_b.empty() || a == sample_to_idx.end() || b == sample_to_idx.end()) return false;
+    idx_a = a->second;
+    idx_b = b->second;
+    return true;
+}
+
+static bool source_label_is_known(
+    const std::string& raw,
+    const std::map<std::string, int>& sample_to_idx){
+    if (raw.empty()) return false;
+    if (raw.find('+') == std::string::npos){
+        return sample_to_idx.find(raw) != sample_to_idx.end();
+    }
+    int idx_a = -1, idx_b = -1;
+    std::string name_a, name_b;
+    return split_pair_source_label(raw, sample_to_idx, idx_a, idx_b, name_a, name_b);
+}
+
+static void resolve_source_observation(
+    const std::string& raw_source,
+    const SNPData& snp,
+    bool is_ref,
+    const std::map<std::string, int>& sample_to_idx,
+    std::string& resolved_source,
+    std::string& typing_status){
+    int idx_a = -1, idx_b = -1;
+    std::string name_a, name_b;
+    if (raw_source.find('+') == std::string::npos){
+        resolved_source = raw_source;
+        typing_status = "singleton";
+        return;
+    }
+    if (!split_pair_source_label(raw_source, sample_to_idx, idx_a, idx_b, name_a, name_b)){
+        resolved_source = raw_source;
+        typing_status = "composite_unmapped";
+        return;
+    }
+    if (idx_a < 0 || idx_b < 0 || idx_a >= (int)snp.geno.size() || idx_b >= (int)snp.geno.size()){
+        resolved_source = raw_source;
+        typing_status = "composite_unmapped";
+        return;
+    }
+    // A+A is a homotypic cell label, not an ambiguous source mixture: every
+    // emitted read originates from the same biological individual A.
+    if (name_a == name_b){
+        resolved_source = name_a;
+        typing_status = "homotypic_composite";
+        return;
+    }
+    const int ga = (int)snp.geno[idx_a];
+    const int gb = (int)snp.geno[idx_b];
+    // B35 exact primitive: only homozygous-opposite constituent sites type the
+    // source observation. Heterozygous/agreement sites remain explicitly
+    // ambiguous and are never forced to a 50:50 split.
+    if (ga == 0 && gb == 2){
+        resolved_source = is_ref ? name_a : name_b;
+        typing_status = "typed_composite";
+    }
+    else if (ga == 2 && gb == 0){
+        resolved_source = is_ref ? name_b : name_a;
+        typing_status = "typed_composite";
+    }
+    else{
+        resolved_source = raw_source;
+        typing_status = "composite_ambiguous";
+    }
+}
+
+static void write_source_observation_summary(
+    const std::string& prefix,
+    const SourceObservationMap& observations){
+    if (prefix.empty()) return;
+    const std::string out_path = prefix + ".source_observations.tsv.gz";
+    gzFile out = gzopen(out_path.c_str(), "wb");
+    if (!out){
+        fprintf(stderr, "ERROR: could not open %s for source-observation output\n", out_path.c_str());
+        exit(1);
+    }
+    gzprintf(out, "barcode\treceiver_identity\treceiver_A\treceiver_B\tnalt_A\tnalt_B\torigin\tsource\traw_source\ttyped_status\tpanel\tn_reads\tn_observations\tref_weight\talt_weight\tweighted_observations\n");
+    for (const auto& kv : observations){
+        const unsigned long bc_key = std::get<0>(kv.first);
+        const std::string& receiver_identity = std::get<1>(kv.first);
+        const std::string& receiver_a = std::get<2>(kv.first);
+        const std::string& receiver_b = std::get<3>(kv.first);
+        const int nalt_a = std::get<4>(kv.first);
+        const int nalt_b = std::get<5>(kv.first);
+        const std::string& origin = std::get<6>(kv.first);
+        const std::string& source = std::get<7>(kv.first);
+        const std::string& raw_source = std::get<8>(kv.first);
+        const std::string& typed_status = std::get<9>(kv.first);
+        const int panel_id = std::get<10>(kv.first);
+        const auto& st = kv.second;
+        const std::string barcode = bc2str(bc_key);
+        const char* panel = panel_id == 0 ? "individual" : "species";
+        gzprintf(out, "%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%llu\t%llu\t%.10g\t%.10g\t%.10g\n",
+            barcode.c_str(), receiver_identity.c_str(), receiver_a.c_str(), receiver_b.c_str(),
+            nalt_a, nalt_b, origin.c_str(), source.c_str(), raw_source.c_str(), typed_status.c_str(), panel,
+            (unsigned long long)st.n_reads,
+            (unsigned long long)st.n_observations,
+            st.ref_weight, st.alt_weight, st.ref_weight + st.alt_weight);
+    }
+    gzclose(out);
+    fprintf(stderr, "Wrote %lu source-provenance rows to %s\n", observations.size(), out_path.c_str());
+}
+
+static void write_donor_genotype_audit(
+    const std::string& prefix,
+    const DonorAuditMap& audit){
+    if (prefix.empty()) return;
+    const std::string out_path = prefix + ".donor_genotype_audit.tsv.gz";
+    gzFile out = gzopen(out_path.c_str(), "wb");
+    if (!out){
+        fprintf(stderr, "ERROR: could not open %s for donor-genotype audit output\n", out_path.c_str());
+        exit(1);
+    }
+    gzprintf(out,
+        "receiver_identity\treceiver_A\treceiver_B\tnalt_A\tnalt_B"
+        "\traw_source\tresolved_source\ttyped_status\tsource_A\tsource_B"
+        "\tsource_nalt_A\tsource_nalt_B\tresolved_nalt\tn_observations"
+        "\tref_weight\talt_weight\tweighted_observations\tempirical_alt_fraction"
+        "\tdirect_supported_weight\tdirect_unsupported_weight\tdirect_unsupported_fraction"
+        "\tflipped_supported_weight\tunique_component_A_weight\tunique_component_B_weight"
+        "\tambiguous_component_weight\tno_component_weight"
+        "\traw_equalmix_expected_alt_fraction\tresolved_expected_alt_fraction\n");
+    for (const auto& kv : audit){
+        const auto& key = kv.first;
+        const auto& st = kv.second;
+        const double total = st.ref_weight + st.alt_weight;
+        const double empirical = total > 0 ? st.alt_weight / total : NAN;
+        const double unsupported = total > 0 ? st.direct_unsupported_weight / total : NAN;
+        const double raw_expected = st.raw_equalmix_expected_weight > 0
+            ? st.raw_equalmix_expected_alt_num / st.raw_equalmix_expected_weight : NAN;
+        const double resolved_expected = st.resolved_expected_weight > 0
+            ? st.resolved_expected_alt_num / st.resolved_expected_weight : NAN;
+        gzprintf(out,
+            "%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d"
+            "\t%llu\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g"
+            "\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n",
+            std::get<0>(key).c_str(), std::get<1>(key).c_str(), std::get<2>(key).c_str(),
+            std::get<3>(key), std::get<4>(key), std::get<5>(key).c_str(),
+            std::get<6>(key).c_str(), std::get<7>(key).c_str(), std::get<8>(key).c_str(),
+            std::get<9>(key).c_str(), std::get<10>(key), std::get<11>(key), std::get<12>(key),
+            (unsigned long long)st.n_observations,
+            st.ref_weight, st.alt_weight, total, empirical,
+            st.direct_supported_weight, st.direct_unsupported_weight, unsupported,
+            st.flipped_supported_weight, st.unique_component_a_weight,
+            st.unique_component_b_weight, st.ambiguous_component_weight,
+            st.no_component_weight, raw_expected, resolved_expected);
+    }
+    gzclose(out);
+    fprintf(stderr, "Wrote %lu donor-genotype audit rows to %s\n",
+        (unsigned long)audit.size(), out_path.c_str());
+}
+
+static void write_donor_site_sample(
+    const std::string& prefix,
+    const DonorSiteAuditMap& audit,
+    const std::vector<std::string>& chrom_names,
+    int sample_mod){
+    if (prefix.empty()) return;
+    const std::string out_path = prefix + ".donor_site_sample.tsv.gz";
+    gzFile out = gzopen(out_path.c_str(), "wb");
+    if (!out){
+        fprintf(stderr, "ERROR: could not open %s for donor-site sample output\n", out_path.c_str());
+        exit(1);
+    }
+    gzprintf(out,
+        "chrom\ttid\tpos0\tpos1\tref\talt\treceiver_identity\treceiver_A\treceiver_B"
+        "\tnalt_A\tnalt_B\traw_source\tresolved_source\ttyped_status\tsource_A\tsource_B"
+        "\tsource_nalt_A\tsource_nalt_B\tresolved_nalt\tn_observations\tref_weight\talt_weight"
+        "\tweighted_observations\tempirical_alt_fraction\tdirect_unsupported_fraction"
+        "\traw_equalmix_expected_alt_fraction\tresolved_expected_alt_fraction\tsample_mod\n");
+    for (const auto& kv : audit){
+        const auto& key = kv.first;
+        const auto& st = kv.second;
+        const int tid = std::get<0>(key);
+        const int pos = std::get<1>(key);
+        const std::string chrom = tid >= 0 && tid < (int)chrom_names.size()
+            ? chrom_names[tid] : std::to_string(tid);
+        const double total = st.ref_weight + st.alt_weight;
+        const double empirical = total > 0 ? st.alt_weight / total : NAN;
+        const double unsupported = total > 0 ? st.direct_unsupported_weight / total : NAN;
+        const double raw_expected = st.raw_equalmix_expected_weight > 0
+            ? st.raw_equalmix_expected_alt_num / st.raw_equalmix_expected_weight : NAN;
+        const double resolved_expected = st.resolved_expected_weight > 0
+            ? st.resolved_expected_alt_num / st.resolved_expected_weight : NAN;
+        gzprintf(out,
+            "%s\t%d\t%d\t%d\t%c\t%c\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s"
+            "\t%d\t%d\t%d\t%llu\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%d\n",
+            chrom.c_str(), tid, pos, pos + 1, std::get<2>(key), std::get<3>(key),
+            std::get<4>(key).c_str(), std::get<5>(key).c_str(), std::get<6>(key).c_str(),
+            std::get<7>(key), std::get<8>(key), std::get<9>(key).c_str(),
+            std::get<10>(key).c_str(), std::get<11>(key).c_str(), std::get<12>(key).c_str(),
+            std::get<13>(key).c_str(), std::get<14>(key), std::get<15>(key), std::get<16>(key),
+            (unsigned long long)st.n_observations, st.ref_weight, st.alt_weight, total,
+            empirical, unsupported, raw_expected, resolved_expected, sample_mod);
+    }
+    gzclose(out);
+    fprintf(stderr, "Wrote %lu deterministic donor-site sample rows (mod=%d) to %s\n",
+        (unsigned long)audit.size(), sample_mod, out_path.c_str());
+}
+
+static SourceCategoryKey observation_category_key(const SourceObservationKey& key){
+    return SourceCategoryKey(
+        std::get<0>(key), std::get<1>(key), std::get<2>(key), std::get<3>(key),
+        std::get<4>(key), std::get<5>(key), std::get<10>(key));
+}
+
+static void write_source_reconciliation_summary(
+    const std::string& prefix,
+    const SourceObservationMap& observations,
+    const SourceCategoryMap& raw_categories){
+    if (prefix.empty()) return;
+    const std::string out_path = prefix + ".source_reconciliation.tsv.gz";
+    gzFile out = gzopen(out_path.c_str(), "wb");
+    if (!out){
+        fprintf(stderr, "ERROR: could not open %s for source-reconciliation output\n", out_path.c_str());
+        exit(1);
+    }
+
+    using OriginMap = std::map<std::string, SourceObservationStats>;
+    std::map<SourceCategoryKey, OriginMap> by_origin;
+    for (const auto& kv : observations){
+        if (std::get<10>(kv.first) != 0) continue;
+        by_origin[observation_category_key(kv.first)][std::get<6>(kv.first)].merge(kv.second);
+    }
+
+    std::set<SourceCategoryKey> keys;
+    for (const auto& kv : raw_categories){
+        if (std::get<6>(kv.first) == 0) keys.insert(kv.first);
+    }
+    for (const auto& kv : by_origin) keys.insert(kv.first);
+
+    const std::vector<std::string> origins = {
+        "native", "native_untagged", "injected_expected_ys",
+        "injected_missing_yi", "injected_missing_ys", "injected_wrong_ys",
+        "missing_yi", "invalid_yi", "unknown_yi"
+    };
+    gzprintf(out,
+        "barcode\treceiver_identity\treceiver_A\treceiver_B\tnalt_A\tnalt_B\tpanel"
+        "\traw_n_observations\traw_ref\traw_alt");
+    for (const auto& origin : origins){
+        gzprintf(out, "\t%s_n_observations\t%s_ref\t%s_alt",
+            origin.c_str(), origin.c_str(), origin.c_str());
+    }
+    gzprintf(out,
+        "\taccounted_ref\taccounted_alt\tref_difference_raw_minus_accounted"
+        "\talt_difference_raw_minus_accounted\treconciliation_pass\n");
+
+    uint64_t failed_rows = 0;
+    double abs_ref_error = 0.0;
+    double abs_alt_error = 0.0;
+    for (const auto& key : keys){
+        const auto raw_it = raw_categories.find(key);
+        const SourceObservationStats empty;
+        const SourceObservationStats& raw = raw_it == raw_categories.end() ? empty : raw_it->second;
+        const auto origin_it = by_origin.find(key);
+        double accounted_ref = 0.0;
+        double accounted_alt = 0.0;
+        const std::string barcode = bc2str(std::get<0>(key));
+        gzprintf(out, "%s\t%s\t%s\t%s\t%d\t%d\tindividual\t%llu\t%.17g\t%.17g",
+            barcode.c_str(), std::get<1>(key).c_str(), std::get<2>(key).c_str(),
+            std::get<3>(key).c_str(), std::get<4>(key), std::get<5>(key),
+            (unsigned long long)raw.n_observations, raw.ref_weight, raw.alt_weight);
+        for (const auto& origin : origins){
+            SourceObservationStats st;
+            if (origin_it != by_origin.end()){
+                auto hit = origin_it->second.find(origin);
+                if (hit != origin_it->second.end()) st = hit->second;
+            }
+            accounted_ref += st.ref_weight;
+            accounted_alt += st.alt_weight;
+            gzprintf(out, "\t%llu\t%.17g\t%.17g",
+                (unsigned long long)st.n_observations, st.ref_weight, st.alt_weight);
+        }
+        const double ref_diff = raw.ref_weight - accounted_ref;
+        const double alt_diff = raw.alt_weight - accounted_alt;
+        const double ref_tol = 1e-7 + 1e-12 * std::max(1.0, std::fabs(raw.ref_weight));
+        const double alt_tol = 1e-7 + 1e-12 * std::max(1.0, std::fabs(raw.alt_weight));
+        const bool pass = std::fabs(ref_diff) <= ref_tol && std::fabs(alt_diff) <= alt_tol;
+        if (!pass) failed_rows++;
+        abs_ref_error += std::fabs(ref_diff);
+        abs_alt_error += std::fabs(alt_diff);
+        gzprintf(out, "\t%.17g\t%.17g\t%.17g\t%.17g\t%s\n",
+            accounted_ref, accounted_alt, ref_diff, alt_diff, pass ? "PASS" : "FAIL");
+    }
+    gzclose(out);
+    fprintf(stderr,
+        "Source reconciliation: rows=%lu failed_rows=%llu absolute_ref_error=%.10g absolute_alt_error=%.10g -> %s\n",
+        (unsigned long)keys.size(), (unsigned long long)failed_rows,
+        abs_ref_error, abs_alt_error, out_path.c_str());
+}
+
+// ============================================================================
 // DUAL-OUTPUT PARALLEL COUNTING (WP3: single BAM pass for two panels)
 // ============================================================================
 
@@ -1568,8 +2400,43 @@ void count_alleles_parallel_dual(
     int n_samples,
     int n_threads,
     int htslib_threads){
+    const vector<string> no_sample_names;
+    count_alleles_parallel_dual(
+        bamfile, combined_snpdat, counts_panel0, counts_panel1, valid_barcodes,
+        n_samples, no_sample_names, n_threads, htslib_threads,
+        false, "", "YI", "YS", "", "", false, false, 256,
+        nullptr, nullptr, nullptr, nullptr, 0);
+}
+
+void count_alleles_parallel_dual(
+    const string& bamfile,
+    robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel1,
+    const set<unsigned long>& valid_barcodes,
+    int n_samples,
+    const vector<string>& sample_names,
+    int n_threads,
+    int htslib_threads,
+    bool dump_source_observations,
+    const string& source_observations_prefix,
+    const string& source_provenance_tag,
+    const string& synthetic_id_tag,
+    const string& expected_synthetic_id,
+    const string& source_receiver_map_path,
+    bool source_reconciliation_mode,
+    bool source_donor_site_audit,
+    int source_donor_site_sample_mod,
+    AcceptedSiteWeightMap* accepted_site_weights_panel0,
+    AcceptedSiteWeightMap* accepted_site_weights_panel1,
+    const NativeSpeciesTargetTable* species_native_targets,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts,
+    int species_native_n_samples){
     
     bool has_bc_list = !valid_barcodes.empty();
+    const bool collect_species_native =
+        species_native_targets != nullptr && species_native_counts != nullptr &&
+        species_native_n_samples > 0;
     
     // Pre-allocate count structures for known barcodes
     if (has_bc_list){
@@ -1581,6 +2448,11 @@ void count_alleles_parallel_dual(
             counts_panel1.emplace(std::piecewise_construct,
                 std::forward_as_tuple(bc),
                 std::forward_as_tuple(n_samples));
+            if (collect_species_native){
+                species_native_counts->emplace(std::piecewise_construct,
+                    std::forward_as_tuple(bc),
+                    std::forward_as_tuple(species_native_n_samples));
+            }
         }
     }
     
@@ -1596,6 +2468,12 @@ void count_alleles_parallel_dual(
     
     vector<uint64_t> chrom_read_counts(n_chroms, 0);
     vector<int64_t> chrom_lengths(n_chroms);
+    vector<string> chrom_names(n_chroms);
+    for (int i = 0; i < n_chroms; ++i){
+        chrom_names[i] = hdr_tmp->target_name[i]
+            ? hdr_tmp->target_name[i]
+            : std::to_string(i);
+    }
     
     if (idx_tmp){
         for (int i = 0; i < n_chroms; i++){
@@ -1735,12 +2613,42 @@ void count_alleles_parallel_dual(
     omp_set_num_threads(n_threads);
     vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts_p0(n_threads);
     vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts_p1(n_threads);
+    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_species_native_counts(
+        collect_species_native ? n_threads : 0);
+    vector<AcceptedSiteWeightMap> thread_site_weights_p0(n_threads);
+    vector<AcceptedSiteWeightMap> thread_site_weights_p1(n_threads);
+    vector<SourceObservationMap> thread_source_observations(n_threads);
+    vector<SourceCategoryMap> thread_source_raw_categories(n_threads);
+    vector<DonorAuditMap> thread_donor_audit(n_threads);
+    vector<DonorSiteAuditMap> thread_donor_site_audit(n_threads);
+    std::atomic<uint64_t> source_reads_native_sentinel{0};
+    std::atomic<uint64_t> source_reads_missing_yi{0};
+    std::atomic<uint64_t> source_reads_invalid_yi{0};
+    std::atomic<uint64_t> source_reads_unknown_yi{0};
+    std::atomic<uint64_t> source_reads_missing_synthetic_id{0};
+    std::atomic<uint64_t> source_reads_mismatched_synthetic_id{0};
+    map<string, int> source_sample_to_idx;
+    for (int i = 0; i < (int)sample_names.size(); ++i){
+        source_sample_to_idx[sample_names[i]] = i;
+    }
+    const SourceReceiverMap source_receiver_map =
+        load_source_receiver_map(source_receiver_map_path, source_sample_to_idx);
+    std::atomic<uint64_t> source_observations_missing_receiver_map{0};
+    std::atomic<uint64_t> source_observations_invalid_receiver_genotype{0};
     
     #pragma omp parallel
     {
         int thread_id = omp_get_thread_num();
         auto& local_p0 = thread_counts_p0[thread_id];
         auto& local_p1 = thread_counts_p1[thread_id];
+        robin_hood::unordered_map<unsigned long, CellCounts>* local_species_native =
+            collect_species_native ? &thread_species_native_counts[thread_id] : nullptr;
+        auto& local_site_weights_p0 = thread_site_weights_p0[thread_id];
+        auto& local_site_weights_p1 = thread_site_weights_p1[thread_id];
+        auto& local_source_observations = thread_source_observations[thread_id];
+        auto& local_source_raw_categories = thread_source_raw_categories[thread_id];
+        auto& local_donor_audit = thread_donor_audit[thread_id];
+        auto& local_donor_site_audit = thread_donor_site_audit[thread_id];
         
         htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
         if (!bam_fp){
@@ -1790,6 +2698,13 @@ void count_alleles_parallel_dual(
                     
                     auto snp_it = combined_snpdat.find(tid);
                     ChromSNPs& chrom_snps = snp_it->second;
+                    const NativeSpeciesChromTargets* native_chrom_targets = nullptr;
+                    if (collect_species_native){
+                        auto native_it = species_native_targets->find(tid);
+                        if (native_it != species_native_targets->end()){
+                            native_chrom_targets = &native_it->second;
+                        }
+                    }
                     
                     auto snp_iter = chrom_snps.snps.begin() + wu.snp_start;
                     auto snp_chunk_end = chrom_snps.snps.begin() + wu.snp_end;
@@ -1831,6 +2746,100 @@ void count_alleles_parallel_dual(
                         }
                         
                         local_reads++;
+
+                        std::string source_label;
+                        std::string source_origin;
+                        bool source_label_resolvable = false;
+                        if (dump_source_observations){
+                            uint8_t* source_tag = bam_aux_get(record, source_provenance_tag.c_str());
+                            if (!source_tag){
+                                source_label = "__MISSING_YI__";
+                                uint8_t* sid_tag = bam_aux_get(record, synthetic_id_tag.c_str());
+                                const char* sid_z = sid_tag ? bam_aux2Z(sid_tag) : NULL;
+                                if (!sid_tag){
+                                    // Native reads do not carry YS. This salvages the existing
+                                    // even BAM without modifying it; the sidecar is never a
+                                    // production estimator input.
+                                    source_origin = "native_untagged";
+                                }
+                                else if (sid_z && sid_z[0] != '\0' && expected_synthetic_id == sid_z){
+                                    // Injected reads always carry YS in the benchmark contract.
+                                    // Their donor identity is unavailable, but their injected
+                                    // origin is still known for evaluator-only rate truth.
+                                    source_origin = "injected_missing_yi";
+                                }
+                                else{
+                                    // Present-but-empty, non-string, or wrong-unit YS is malformed
+                                    // provenance and remains unclassified instead of becoming native.
+                                    source_origin = "missing_yi";
+                                }
+                                source_reads_missing_yi.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            else{
+                                const char* source_z = bam_aux2Z(source_tag);
+                                if (!source_z){
+                                    source_origin = "invalid_yi";
+                                    source_label = "__INVALID_YI__";
+                                    source_reads_invalid_yi.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                else if (source_z[0] == '\0'){
+                                    source_label = "__EMPTY_YI__";
+                                    uint8_t* sid_tag = bam_aux_get(record, synthetic_id_tag.c_str());
+                                    const char* sid_z = sid_tag ? bam_aux2Z(sid_tag) : NULL;
+                                    if (!sid_tag){
+                                        source_origin = "native_untagged";
+                                    }
+                                    else if (sid_z && sid_z[0] != '\0' && expected_synthetic_id == sid_z){
+                                        source_origin = "injected_missing_yi";
+                                    }
+                                    else{
+                                        source_origin = "missing_yi";
+                                    }
+                                    source_reads_missing_yi.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                else if (strcmp(source_z, "__NATIVE__") == 0){
+                                    uint8_t* sid_tag = bam_aux_get(record, synthetic_id_tag.c_str());
+                                    if (sid_tag){
+                                        // Native provenance and a synthetic-unit injection tag are
+                                        // mutually inconsistent. Keep the read explicit but
+                                        // unclassified for evaluator-side truth.
+                                        source_origin = "invalid_yi";
+                                        source_label = "__INVALID_YI__";
+                                        source_reads_invalid_yi.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                    else{
+                                        source_origin = "native";
+                                        source_label.assign(source_z);
+                                        source_label_resolvable = true;
+                                        source_reads_native_sentinel.fetch_add(
+                                            1, std::memory_order_relaxed);
+                                    }
+                                }
+                                else{
+                                    source_label.assign(source_z);
+                                    source_label_resolvable = source_label_is_known(
+                                        source_label, source_sample_to_idx);
+                                    uint8_t* sid_tag = bam_aux_get(record, synthetic_id_tag.c_str());
+                                    const char* sid_z = sid_tag ? bam_aux2Z(sid_tag) : NULL;
+                                    if (!sid_z || sid_z[0] == '\0'){
+                                        source_origin = "injected_missing_ys";
+                                        source_reads_missing_synthetic_id.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                    else if (expected_synthetic_id != sid_z){
+                                        source_origin = "injected_wrong_ys";
+                                        source_reads_mismatched_synthetic_id.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                    else if (!source_label_resolvable){
+                                        source_origin = "unknown_yi";
+                                        source_reads_unknown_yi.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                    else{
+                                        source_origin = "injected_expected_ys";
+                                    }
+                                }
+                            }
+                        }
+                        std::set<SourceObservationKey> source_read_keys;
                         
                         float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
                         int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
@@ -1857,6 +2866,116 @@ void count_alleles_parallel_dual(
                             }
                             
                             if (ref_add > 0 || alt_add > 0){
+                                const int panel_id = snp_check->panel_id == 0 ? 0 : 1;
+                                if (panel_id == 0 && accepted_site_weights_panel0 != nullptr){
+                                    local_site_weights_p0[accepted_site_weight_key(tid, snp_check->pos)] +=
+                                        ref_add + alt_add;
+                                }
+                                else if (panel_id == 1 && accepted_site_weights_panel1 != nullptr){
+                                    local_site_weights_p1[accepted_site_weight_key(tid, snp_check->pos)] +=
+                                        ref_add + alt_add;
+                                }
+                                std::string receiver_identity;
+                                std::string receiver_a;
+                                std::string receiver_b;
+                                int receiver_nalt_a = -1;
+                                int receiver_nalt_b = -1;
+                                bool receiver_category_valid = false;
+                                if (panel_id == 0 && !source_receiver_map.empty()){
+                                    auto receiver_it = source_receiver_map.find(bc_key);
+                                    if (receiver_it == source_receiver_map.end()){
+                                        source_observations_missing_receiver_map.fetch_add(
+                                            1, std::memory_order_relaxed);
+                                    }
+                                    else{
+                                        const SourceReceiverInfo& receiver = receiver_it->second;
+                                        receiver_identity = receiver.identity;
+                                        receiver_a = receiver.name_a;
+                                        receiver_b = receiver.name_b;
+                                        if (receiver.idx_a >= 0 && receiver.idx_b >= 0 &&
+                                            receiver.idx_a < (int)snp_check->geno.size() &&
+                                            receiver.idx_b < (int)snp_check->geno.size()){
+                                            receiver_nalt_a = (int)snp_check->geno[receiver.idx_a];
+                                            receiver_nalt_b = (int)snp_check->geno[receiver.idx_b];
+                                            receiver_category_valid = receiver_nalt_a >= 0 && receiver_nalt_b >= 0;
+                                        }
+                                        else{
+                                            source_observations_invalid_receiver_genotype.fetch_add(
+                                                1, std::memory_order_relaxed);
+                                        }
+                                    }
+                                }
+
+                                if (dump_source_observations && source_reconciliation_mode &&
+                                    panel_id == 0 && receiver_category_valid){
+                                    SourceCategoryKey raw_key(
+                                        bc_key, receiver_identity, receiver_a, receiver_b,
+                                        receiver_nalt_a, receiver_nalt_b, panel_id);
+                                    auto& raw_stats = local_source_raw_categories[raw_key];
+                                    raw_stats.n_observations += 1;
+                                    raw_stats.ref_weight += (double)ref_add / (double)FIXED_POINT_SCALE;
+                                    raw_stats.alt_weight += (double)alt_add / (double)FIXED_POINT_SCALE;
+                                }
+
+                                // Record every accepted observation when a source sidecar is
+                                // requested, including missing/invalid provenance.  The evaluator
+                                // needs those explicit buckets to determine whether rate truth is
+                                // complete; silently dropping them recreates the even native-YI
+                                // failure.  This sidecar is never consumed by production fitting.
+                                const bool record_source = dump_source_observations;
+                                if (record_source){
+                                    std::string resolved_source = source_label;
+                                    std::string typing_status = "unavailable";
+                                    if (source_label_resolvable){
+                                        resolve_source_observation(
+                                            source_label, *snp_check, ref_add > 0, source_sample_to_idx,
+                                            resolved_source, typing_status);
+                                    }
+                                    SourceObservationKey source_key(
+                                        bc_key, receiver_identity, receiver_a, receiver_b,
+                                        receiver_nalt_a, receiver_nalt_b,
+                                        source_origin, resolved_source, source_label, typing_status, panel_id);
+                                    auto& source_stats = local_source_observations[source_key];
+                                    source_stats.n_observations += 1;
+                                    source_stats.ref_weight += (double)ref_add / (double)FIXED_POINT_SCALE;
+                                    source_stats.alt_weight += (double)alt_add / (double)FIXED_POINT_SCALE;
+                                    source_read_keys.insert(source_key);
+
+                                    if (source_donor_site_audit && panel_id == 0 &&
+                                        receiver_category_valid && source_origin == "injected_expected_ys"){
+                                        std::string source_a;
+                                        std::string source_b;
+                                        int source_nalt_a = -1;
+                                        int source_nalt_b = -1;
+                                        int resolved_nalt = -1;
+                                        describe_source_genotypes(
+                                            source_label, resolved_source, *snp_check, source_sample_to_idx,
+                                            source_a, source_b, source_nalt_a, source_nalt_b, resolved_nalt);
+                                        DonorAuditKey donor_key(
+                                            receiver_identity, receiver_a, receiver_b,
+                                            receiver_nalt_a, receiver_nalt_b,
+                                            source_label, resolved_source, typing_status,
+                                            source_a, source_b, source_nalt_a, source_nalt_b, resolved_nalt);
+                                        const bool is_ref = ref_add > 0;
+                                        const double audit_weight = (double)(ref_add + alt_add) /
+                                            (double)FIXED_POINT_SCALE;
+                                        update_donor_audit_stats(
+                                            local_donor_audit[donor_key], is_ref, audit_weight,
+                                            source_nalt_a, source_nalt_b, resolved_nalt);
+                                        if (donor_site_is_sampled(tid, snp_check->pos,
+                                                source_donor_site_sample_mod)){
+                                            DonorSiteAuditKey site_key(
+                                                tid, snp_check->pos, snp_check->data.ref, snp_check->data.alt,
+                                                receiver_identity, receiver_a, receiver_b,
+                                                receiver_nalt_a, receiver_nalt_b,
+                                                source_label, resolved_source, typing_status,
+                                                source_a, source_b, source_nalt_a, source_nalt_b, resolved_nalt);
+                                            update_donor_audit_stats(
+                                                local_donor_site_audit[site_key], is_ref, audit_weight,
+                                                source_nalt_a, source_nalt_b, resolved_nalt);
+                                        }
+                                    }
+                                }
                                 // Route to panel-specific thread-local map based on panel_id
                                 auto& target_counts = (snp_check->panel_id == 0) ? local_p0 : local_p1;
                                 
@@ -1879,6 +2998,29 @@ void count_alleles_parallel_dual(
                                     cc.ref_counts[p.pair_idx] += ref_add;
                                     cc.alt_counts[p.pair_idx] += alt_add;
                                 }
+
+                                if (local_species_native != nullptr && snp_check->panel_id == 1 &&
+                                    native_chrom_targets != nullptr){
+                                    const size_t snp_index = (size_t)(
+                                        snp_check - chrom_snps.snps.begin());
+                                    if (snp_index < native_chrom_targets->site_offsets.size() &&
+                                        native_chrom_targets->site_offsets[snp_index] != UINT64_MAX){
+                                        auto native_it = local_species_native->find(bc_key);
+                                        if (native_it == local_species_native->end()){
+                                            local_species_native->emplace(
+                                                bc_key, CellCounts(species_native_n_samples));
+                                            native_it = local_species_native->find(bc_key);
+                                        }
+                                        accumulate_species_native_targets(
+                                            native_it->second, *native_chrom_targets, snp_index,
+                                            ref_add, alt_add);
+                                    }
+                                }
+                            }
+                        }
+                        if (dump_source_observations){
+                            for (const auto& source_key : source_read_keys){
+                                local_source_observations[source_key].n_reads += 1;
                             }
                         }
                     }
@@ -1944,15 +3086,157 @@ void count_alleles_parallel_dual(
         thread_counts_p1[t].clear();
     }
     
+    if (collect_species_native){
+        fprintf(stderr, "Merging per-thread native species counts (panel 1)...\n");
+        for (int t = 0; t < n_threads; ++t){
+            for (auto& kv : thread_species_native_counts[t]){
+                const unsigned long bc_key = kv.first;
+                auto it = species_native_counts->find(bc_key);
+                if (it == species_native_counts->end()){
+                    species_native_counts->emplace(std::piecewise_construct,
+                        std::forward_as_tuple(bc_key),
+                        std::forward_as_tuple(species_native_n_samples));
+                    it = species_native_counts->find(bc_key);
+                }
+                it->second.counts.merge(kv.second);
+            }
+            thread_species_native_counts[t].clear();
+        }
+        thread_species_native_counts.clear();
+        thread_species_native_counts.shrink_to_fit();
+        fprintf(stderr, "Native species counts (panel 1): %lu cells, %d species\n",
+            species_native_counts->size(), species_native_n_samples);
+    }
+
     thread_counts_p0.clear();
     thread_counts_p0.shrink_to_fit();
     thread_counts_p1.clear();
     thread_counts_p1.shrink_to_fit();
+
+    auto merge_site_weights = [n_threads](
+        vector<AcceptedSiteWeightMap>& per_thread,
+        AcceptedSiteWeightMap* destination,
+        const char* panel_name){
+        if (destination != nullptr){
+            destination->clear();
+            for (int t = 0; t < n_threads; ++t){
+                for (const auto& kv : per_thread[t]){
+                    (*destination)[kv.first] += kv.second;
+                }
+                per_thread[t].clear();
+            }
+            fprintf(stderr, "Accepted-site weight map (%s): %lu observed sites\n",
+                panel_name, destination->size());
+        }
+        per_thread.clear();
+        per_thread.shrink_to_fit();
+    };
+    merge_site_weights(thread_site_weights_p0, accepted_site_weights_panel0, "individual");
+    merge_site_weights(thread_site_weights_p1, accepted_site_weights_panel1, "species");
+
+    if (dump_source_observations){
+        const uint64_t native_sentinel = source_reads_native_sentinel.load();
+        if (native_sentinel > 0){
+            fprintf(stderr,
+                "Source-provenance validation: retained %llu native sentinel reads "
+                "(YI='__NATIVE__') without requiring %s; all non-native YI reads "
+                "must match %s='%s'.\n",
+                (unsigned long long)native_sentinel, synthetic_id_tag.c_str(),
+                synthetic_id_tag.c_str(), expected_synthetic_id.c_str());
+        }
+        const uint64_t missing_yi = source_reads_missing_yi.load();
+        const uint64_t invalid_yi = source_reads_invalid_yi.load();
+        const uint64_t unknown_yi = source_reads_unknown_yi.load();
+        const uint64_t missing_sid = source_reads_missing_synthetic_id.load();
+        const uint64_t mismatched_sid = source_reads_mismatched_synthetic_id.load();
+        const uint64_t missing_receiver = source_observations_missing_receiver_map.load();
+        const uint64_t invalid_receiver_genotype = source_observations_invalid_receiver_genotype.load();
+        if (source_reconciliation_mode){
+            fprintf(stderr,
+                "Source provenance read buckets: native=%llu missing_yi=%llu invalid_yi=%llu "
+                "unknown_yi=%llu injected_missing_ys=%llu injected_wrong_ys=%llu.\n",
+                (unsigned long long)native_sentinel,
+                (unsigned long long)missing_yi,
+                (unsigned long long)invalid_yi,
+                (unsigned long long)unknown_yi,
+                (unsigned long long)missing_sid,
+                (unsigned long long)mismatched_sid);
+        }
+        else if (missing_sid > 0 || mismatched_sid > 0){
+            fprintf(stderr, "ERROR: source-provenance validation failed: %llu YI-tagged reads missing %s and %llu carrying a non-matching %s (expected '%s').\n",
+                (unsigned long long)missing_sid, synthetic_id_tag.c_str(),
+                (unsigned long long)mismatched_sid, synthetic_id_tag.c_str(),
+                expected_synthetic_id.c_str());
+            exit(1);
+        }
+        if (!source_receiver_map_path.empty() &&
+            (missing_receiver > 0 || invalid_receiver_genotype > 0)){
+            fprintf(stderr,
+                "ERROR: category-resolved source provenance failed: %llu accepted individual-panel observations lacked a receiver-map entry and %llu had an invalid receiver genotype index.\n",
+                (unsigned long long)missing_receiver,
+                (unsigned long long)invalid_receiver_genotype);
+            exit(1);
+        }
+        if (!source_receiver_map_path.empty()){
+            fprintf(stderr,
+                "Category-resolved source provenance enabled with %lu receiver mappings; individual-panel rows carry authored receiver (nalt_A,nalt_B).\n",
+                (unsigned long)source_receiver_map.size());
+        }
+        SourceObservationMap merged_source_observations;
+        SourceCategoryMap merged_source_raw_categories;
+        for (int t = 0; t < n_threads; t++){
+            for (const auto& kv : thread_source_observations[t]){
+                merged_source_observations[kv.first].merge(kv.second);
+            }
+            for (const auto& kv : thread_source_raw_categories[t]){
+                merged_source_raw_categories[kv.first].merge(kv.second);
+            }
+            thread_source_observations[t].clear();
+            thread_source_raw_categories[t].clear();
+        }
+        write_source_observation_summary(source_observations_prefix, merged_source_observations);
+        if (source_reconciliation_mode){
+            write_source_reconciliation_summary(
+                source_observations_prefix,
+                merged_source_observations,
+                merged_source_raw_categories);
+        }
+        if (source_donor_site_audit){
+            DonorAuditMap merged_donor_audit;
+            DonorSiteAuditMap merged_donor_site_audit;
+            for (int t = 0; t < n_threads; ++t){
+                for (const auto& kv : thread_donor_audit[t]){
+                    merged_donor_audit[kv.first].merge(kv.second);
+                }
+                for (const auto& kv : thread_donor_site_audit[t]){
+                    merged_donor_site_audit[kv.first].merge(kv.second);
+                }
+                thread_donor_audit[t].clear();
+                thread_donor_site_audit[t].clear();
+            }
+            write_donor_genotype_audit(source_observations_prefix, merged_donor_audit);
+            write_donor_site_sample(
+                source_observations_prefix, merged_donor_site_audit,
+                chrom_names, source_donor_site_sample_mod);
+        }
+    }
+    thread_source_observations.clear();
+    thread_source_observations.shrink_to_fit();
+    thread_source_raw_categories.clear();
+    thread_source_raw_categories.shrink_to_fit();
+    thread_donor_audit.clear();
+    thread_donor_audit.shrink_to_fit();
+    thread_donor_site_audit.clear();
+    thread_donor_site_audit.shrink_to_fit();
     
     fprintf(stderr, "DUAL completed: %d chromosomes (%lu work units), %ld SNPs, %ld reads\n",
         n_chroms, work_units.size(), snps_processed.load(), reads_processed.load());
     fprintf(stderr, "  Panel 0 (interindiv): %lu cells\n", counts_panel0.size());
-    fprintf(stderr, "  Panel 1 (species):    %lu cells\n", counts_panel1.size());
+    fprintf(stderr, "  Panel 1 (individual-shaped species evidence): %lu cells\n", counts_panel1.size());
+    if (collect_species_native){
+        fprintf(stderr, "  Panel 1 (native species evidence):            %lu cells\n",
+            species_native_counts->size());
+    }
 }
 
 void count_alleles_single_threaded(
@@ -1963,9 +3247,15 @@ void count_alleles_single_threaded(
     int n_samples,
     map<pair<int, int>, map<int, float> >& conditional_match_fracs,
     map<pair<int, int>, map<int, float> >& conditional_match_tots,
-    bool compute_conditional){
+    bool compute_conditional,
+    const NativeSpeciesTargetTable* species_native_targets,
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_native_counts,
+    int species_native_n_samples){
     
     bool has_bc_list = !valid_barcodes.empty();
+    const bool collect_species_native =
+        species_native_targets != nullptr && species_native_counts != nullptr &&
+        species_native_n_samples > 0;
     
     string bamfile_copy = bamfile;  // bam_reader needs non-const
     bam_reader reader;
@@ -1983,6 +3273,7 @@ void count_alleles_single_threaded(
     vector<SNPData>::iterator cursnp;
     vector<SNPData>::iterator cursnp_end;
     ChromSNPs* active_chrom = nullptr;
+    const NativeSpeciesChromTargets* active_native_targets = nullptr;
     
     long snps_processed = 0;
     long reads_processed = 0;
@@ -2003,6 +3294,13 @@ void count_alleles_single_threaded(
             auto it = snpdat_all.find(curtid);
             if (it != snpdat_all.end() && !it->second.empty()){
                 active_chrom = &(it->second);
+                active_native_targets = nullptr;
+                if (collect_species_native){
+                    auto native_it = species_native_targets->find(curtid);
+                    if (native_it != species_native_targets->end()){
+                        active_native_targets = &native_it->second;
+                    }
+                }
                 cursnp = active_chrom->snps.begin();
                 cursnp_end = active_chrom->snps.end();
                 
@@ -2013,6 +3311,7 @@ void count_alleles_single_threaded(
             }
             else{
                 active_chrom = nullptr;
+                active_native_targets = nullptr;
             }
         }
         
@@ -2075,6 +3374,23 @@ void count_alleles_single_threaded(
                 for (const auto& p : ptargets){
                     cc.ref_counts[p.pair_idx] += ref_add;
                     cc.alt_counts[p.pair_idx] += alt_add;
+                }
+
+                if (collect_species_native && active_native_targets != nullptr){
+                    const size_t snp_index = (size_t)(
+                        snp_check - active_chrom->snps.begin());
+                    if (snp_index < active_native_targets->site_offsets.size() &&
+                        active_native_targets->site_offsets[snp_index] != UINT64_MAX){
+                        auto native_it = species_native_counts->find(bc_key);
+                        if (native_it == species_native_counts->end()){
+                            species_native_counts->emplace(
+                                bc_key, CellCounts(species_native_n_samples));
+                            native_it = species_native_counts->find(bc_key);
+                        }
+                        accumulate_species_native_targets(
+                            native_it->second, *active_native_targets, snp_index,
+                            ref_add, alt_add);
+                    }
                 }
             }
         }

@@ -1,3 +1,27 @@
+// demux_parallel.cpp
+//
+// Provenance: CellBouncer / Tet2025. Revision history at the bottom of this
+// header block. Stable pipeline source name; version is tracked in-file.
+//
+// Revision history
+//   V1_R1  Repair the -I / --ids_doublet declared-identity contract.
+//          parse_idfile places the singlet halves of every declared combination
+//          into allowed_ids so the doublet likelihood and the llr_table have both
+//          halves available, and deliberately keeps them out of allowed_ids2 so
+//          they are not answers. populate_llr_table_optimized therefore bars them
+//          from round 1 onward, which means their assigned-cell count is zero by
+//          construction. filter_identities was testing that zero against each
+//          parent combination's cell count, the rank arm of the test always
+//          returned "significant" for an empty group, and the decision collapsed
+//          onto ppois(0, parent_cells). Any declared combination holding fewer
+//          than about three cells therefore promoted both of its halves into
+//          allowed_ids2, and the final diagnostic assignment handed cells to
+//          identities the user never declared. filter_identities now requires
+//          positive evidence before promoting a half, ignores empty parent
+//          combinations as evidence, and reports a change only when the answer
+//          set actually widened.
+//          Version bumped to 2.11 so deployed binaries are identifiable in logs.
+
 #include <getopt.h>
 #include <argp.h>
 #include <string>
@@ -19,6 +43,8 @@
 #include <math.h>
 #include <float.h>
 #include <chrono>
+#include <limits>
+#include <stdexcept>
 #include <omp.h>
 #include <htslib/sam.h>
 #include <htslib/vcf.h>
@@ -42,9 +68,9 @@ using std::endl;
 using namespace std;
 
 // Version information
-const string VERSION = "2.01";
-const string VERSION_MESSAGE = "ATAC dual-modality, identity prior, species panel";
-const string VERSION_NEW = "v2.01: diagnostics `llr` column now reports winner-vs-runner-up (distinct from min_margin)";
+const string VERSION = "2.11";
+const string VERSION_MESSAGE = "per-site normalized native species counting with reassignment diagnostics";
+const string VERSION_NEW = "v2.11: -I restricts the answer set to declared identities; singlet halves of declared combinations are promoted only on positive evidence";
 
 // Global verbose flag (defined in demux_parallel_llr.cpp)
 extern bool g_verbose;
@@ -425,15 +451,29 @@ void id_qc(robin_hood::unordered_map<unsigned long, int>& assn,
 
 /**
  * Filter identities based on user-specified doublet ID file.
- * Returns true if any identities were removed.
+ *
+ * -I declares the exact identities the user believes can occur. parse_idfile also
+ * places the singlet halves of every declared combination into allowed_ids, because
+ * the doublet likelihood and the llr_table need both halves to exist, and keeps them
+ * out of allowed_ids2, because they were not declared. populate_llr_table_optimized
+ * disallows every identity that is absent from allowed_ids2, so those halves cannot
+ * win a cell in any preceding round.
+ *
+ * A half may only be promoted into the answer set on positive evidence: it has to
+ * have won cells of its own, and it must not be significantly depleted relative to
+ * each parent combination that itself won cells. A parent combination with no cells
+ * carries no information about whether its half exists alone, so it does not count
+ * as support. When the halves were never selectable they all hold zero cells and
+ * none of them is promoted, which is exactly what -I promises.
+ *
+ * Returns true if the allowed answer set changed, meaning assignments computed
+ * against the previous set are stale and must be recomputed.
  */
 bool filter_identities(robin_hood::unordered_map<unsigned long, int>& assn,
     robin_hood::unordered_map<unsigned long, double>& assn_llr, 
     int n_samples,
     set<int>& allowed_ids, 
     set<int>& allowed_ids2){
-    
-    bool removed_ids = false;
     
     // Get number of cells per ID
     map<int, int> cells_per_id;
@@ -445,48 +485,76 @@ bool filter_identities(robin_hood::unordered_map<unsigned long, int>& assn,
         cells_per_id[a->second]++;
     }
 
-    // Get a list of identities not in the original filtered list, but added because
-    // they're singlet components of allowed doublets
-    set<int> candidate_ids;
+    // Identities that are not in the declared list, but were added because they are
+    // singlet halves of declared combinations. Decide every one of them before
+    // touching allowed_ids2, so the comparison set is fixed for the whole scan.
+    set<int> promote_ids;
     for (set<int>::iterator a = allowed_ids.begin(); a != allowed_ids.end(); ++a){
-        if (allowed_ids2.find(*a) == allowed_ids2.end()){
-            
-            // Check whether this individual has significantly fewer cells than 
-            // all "parent" individuals (doublets including this individual)
-            vector<double> p_ncell;
-            
-            // Check whether cells assigned to this individual have significantly
-            // lower LLRs than cells assigned to "parent" individuals
-            vector<double> p_llr;
-            
-            for (set<int>::iterator a2 = allowed_ids2.begin(); a2 != allowed_ids2.end(); ++a2){
-                if (*a2 >= n_samples){
-                    pair<int, int> combo = idx_to_hap_comb(*a2, n_samples);
-                    if (combo.first == *a || combo.second == *a){
-                        double p1 = ppois((double)cells_per_id[*a], (double)cells_per_id[*a2]);
-                        double p2 = mannwhitney_llr(*a, *a2, assn, assn_llr);
-                        p_ncell.push_back(p1);
-                        p_llr.push_back(p2);
+        if (allowed_ids2.find(*a) != allowed_ids2.end()){
+            continue;
+        }
+
+        int ncell_this = 0;
+        if (cells_per_id.count(*a) > 0){
+            ncell_this = cells_per_id[*a];
+        }
+        if (ncell_this == 0){
+            // No cell preferred this identity. There is nothing to support it.
+            continue;
+        }
+
+        // Check whether this individual has significantly fewer cells than
+        // all "parent" individuals (doublets including this individual)
+        vector<double> p_ncell;
+
+        // Check whether cells assigned to this individual have significantly
+        // lower LLRs than cells assigned to "parent" individuals
+        vector<double> p_llr;
+
+        for (set<int>::iterator a2 = allowed_ids2.begin(); a2 != allowed_ids2.end(); ++a2){
+            if (*a2 >= n_samples){
+                pair<int, int> combo = idx_to_hap_comb(*a2, n_samples);
+                if (combo.first == *a || combo.second == *a){
+                    int ncell_parent = 0;
+                    if (cells_per_id.count(*a2) > 0){
+                        ncell_parent = cells_per_id[*a2];
                     }
+                    if (ncell_parent == 0){
+                        // An empty parent combination is not evidence about its half.
+                        continue;
+                    }
+                    double p1 = ppois((double)ncell_this, (double)ncell_parent);
+                    double p2 = mannwhitney_llr(*a, *a2, assn, assn_llr);
+                    p_ncell.push_back(p1);
+                    p_llr.push_back(p2);
                 }
-            }
-            bool all_p_signif = true;
-            for (int i = 0; i < p_ncell.size(); ++i){
-                if (p_ncell[i] > 0.05 || p_llr[i] > 0.05){
-                    all_p_signif = false;  // At least one comparison not significant
-                }
-            }
-            if (all_p_signif){
-                // Remove a.
-                removed_ids = true;
-            }
-            else{
-                // Safe to keep.
-                allowed_ids2.insert(*a);
             }
         }
+        if (p_ncell.size() == 0){
+            // Cells chose this identity and no parent combination drew any, so the
+            // half stands on its own evidence.
+            promote_ids.insert(*a);
+            continue;
+        }
+        bool all_p_signif = true;
+        for (int i = 0; i < p_ncell.size(); ++i){
+            if (p_ncell[i] > 0.05 || p_llr[i] > 0.05){
+                all_p_signif = false;  // At least one comparison not significant
+            }
+        }
+        if (!all_p_signif){
+            // Safe to keep.
+            promote_ids.insert(*a);
+        }
     }
-    return removed_ids;
+    for (set<int>::iterator p = promote_ids.begin(); p != promote_ids.end(); ++p){
+        allowed_ids2.insert(*p);
+    }
+    if (promote_ids.size() > 0){
+        fprintf(stderr, "Identity restriction: %lu declared-combination half(s) promoted on evidence\n",
+            promote_ids.size());
+    }
+    return promote_ids.size() > 0;
 }
 
 /**
@@ -534,6 +602,16 @@ void dump_cellcounts_optimized(gzFile& out_cell,
     } 
 }
 
+
+static bool text_file_contains(const string& filename, const string& token){
+    std::ifstream in(filename.c_str());
+    if (!in.good()) return false;
+    string line;
+    while (std::getline(in, line)){
+        if (line.find(token) != string::npos) return true;
+    }
+    return false;
+}
 
 static bool validate_gzip_readable(const string& filename){
     gzFile test_gz = gzopen(filename.c_str(), "r");
@@ -646,92 +724,389 @@ static vector<vector<pair<int, double>>> build_indiv_to_species_weights(
     return out;
 }
 
-static void aggregate_cellcounts_to_species_native(
-    const robin_hood::unordered_map<unsigned long, CellCounts>& indiv_counts,
-    robin_hood::unordered_map<unsigned long, CellCounts>& species_counts,
-    const PanelMetadata& pm,
-    int n_indiv){
 
-    const int n_species = (int)pm.species_list.size();
-    if (n_species <= 0){
-        fprintf(stderr, "ERROR: panel metadata contains zero species; cannot write native .species_counts\n");
-        exit(1);
+struct NativeSpeciesNormalization {
+    vector<double> singlet_weight;
+    vector<vector<double>> pair_weight;
+};
+
+/**
+ * Compute the total panel-membership weight represented by each native species
+ * singlet row and each heterotypic species-pair row.
+ *
+ * These are the exact multiplicities introduced when individual-native count
+ * rows are folded into species-native rows.  Hybrid samples can contribute to
+ * multiple species with fractional weights.  For pair rows, only distinct
+ * individual pairs are represented by CellCounts, so the normalization is
+ * accumulated over i<j rather than using a simple product of species totals.
+ */
+static NativeSpeciesNormalization build_native_species_normalization(
+    const vector<vector<pair<int, double>>>& i2sp,
+    int n_species){
+
+    NativeSpeciesNormalization norm;
+    norm.singlet_weight.assign(n_species, 0.0);
+    norm.pair_weight.assign(n_species, vector<double>(n_species, 0.0));
+
+    for (int i = 0; i < (int)i2sp.size(); ++i){
+        for (const auto& mi : i2sp[i]){
+            if (mi.first < 0 || mi.first >= n_species || mi.second <= 0.0) continue;
+            norm.singlet_weight[mi.first] += mi.second;
+        }
     }
 
-    vector<vector<pair<int, double>>> i2sp = build_indiv_to_species_weights(pm, n_indiv);
-    species_counts.clear();
-    species_counts.reserve(indiv_counts.size());
-
-    size_t unmapped_count_rows = 0;
-    for (const auto& kv : indiv_counts){
-        unsigned long bc = kv.first;
-        const CellCounts& in = kv.second;
-        CellCounts out(n_species);
-
-        // Aggregate singlet/total rows: individual -> species at same genotype state.
-        for (int i = 0; i < n_indiv; ++i){
-            if (i2sp[i].empty()) continue;
-            for (int g = 0; g < GENOTYPE_STATES; ++g){
-                auto total = in.get_total(i, g);
-                if (total.first == 0.0f && total.second == 0.0f) continue;
-                for (const auto& m : i2sp[i]){
-                    out.add_total(m.first, g,
-                        scaled_from_float((double)total.first * m.second),
-                        scaled_from_float((double)total.second * m.second));
+    for (int i = 0; i < (int)i2sp.size(); ++i){
+        for (int j = i + 1; j < (int)i2sp.size(); ++j){
+            for (const auto& mi : i2sp[i]){
+                for (const auto& mj : i2sp[j]){
+                    if (mi.first == mj.first || mi.second <= 0.0 || mj.second <= 0.0) continue;
+                    int a = std::min(mi.first, mj.first);
+                    int b = std::max(mi.first, mj.first);
+                    norm.pair_weight[a][b] += mi.second * mj.second;
                 }
             }
         }
+    }
 
-        // Aggregate heterotypic rows: individual pairs -> species pairs.
-        for (int i = 0; i < n_indiv; ++i){
-            if (i2sp[i].empty()) continue;
-            for (int j = i + 1; j < n_indiv; ++j){
-                if (i2sp[j].empty()) continue;
-                for (int gi = 0; gi < GENOTYPE_STATES; ++gi){
-                    for (int gj = 0; gj < GENOTYPE_STATES; ++gj){
-                        auto pair_counts = in.get(i, gi, j, gj);
-                        if (pair_counts.first == 0.0f && pair_counts.second == 0.0f) continue;
-                        for (const auto& mi : i2sp[i]){
-                            for (const auto& mj : i2sp[j]){
-                                int sp_i = mi.first;
-                                int sp_j = mj.first;
-                                if (sp_i == sp_j) continue; // homospecies doublets are singlet-like at this resolution
-                                double w = mi.second * mj.second;
-                                if (sp_i < sp_j){
-                                    out.add(sp_i, gi, sp_j, gj,
-                                        scaled_from_float((double)pair_counts.first * w),
-                                        scaled_from_float((double)pair_counts.second * w));
-                                } else {
-                                    out.add(sp_j, gj, sp_i, gi,
-                                        scaled_from_float((double)pair_counts.first * w),
-                                        scaled_from_float((double)pair_counts.second * w));
-                                }
-                            }
+    for (int sp = 0; sp < n_species; ++sp){
+        if (norm.singlet_weight[sp] <= 0.0){
+            fprintf(stderr,
+                "ERROR: native species %d has zero panel-membership weight; cannot normalize counts\n",
+                sp);
+            exit(1);
+        }
+    }
+    for (int a = 0; a < n_species; ++a){
+        for (int b = a + 1; b < n_species; ++b){
+            if (norm.pair_weight[a][b] <= 0.0){
+                fprintf(stderr,
+                    "WARNING: native species pair %d+%d has zero distinct-individual panel weight; "
+                    "its pair rows will remain empty\n",
+                    a, b);
+            }
+        }
+    }
+    return norm;
+}
+
+static void report_native_species_normalization(
+    const NativeSpeciesNormalization& norm,
+    const vector<string>& species_names,
+    const char* context){
+
+    fprintf(stderr, "Native species normalization (%s):\n", context);
+    for (int sp = 0; sp < (int)species_names.size(); ++sp){
+        fprintf(stderr, "  singlet %s weight %.9g\n",
+            species_names[sp].c_str(), norm.singlet_weight[sp]);
+    }
+    for (int a = 0; a < (int)species_names.size(); ++a){
+        for (int b = a + 1; b < (int)species_names.size(); ++b){
+            fprintf(stderr, "  pair %s+%s weight %.9g\n",
+                species_names[a].c_str(), species_names[b].c_str(),
+                norm.pair_weight[a][b]);
+        }
+    }
+}
+
+/**
+ * Convert a legacy, panel-multiplicity-inflated native species count bundle to
+ * the normalized v2.09 representation in memory.  This is used only by the
+ * no-BAM reassignment diagnostic when --panel_metadata is supplied.
+ */
+struct NativeSpeciesTargetStats {
+    uint64_t n_sites = 0;
+    uint64_t n_sites_with_any_species = 0;
+    vector<uint64_t> singlet_available_sites;
+    vector<vector<uint64_t>> pair_available_sites;
+};
+
+/**
+ * Precompute native-species accumulation targets independently at every SNP.
+ *
+ * Each species singlet and heterotypic species-pair hypothesis receives one
+ * normalized unit of evidence per observed SNP, distributed across genotype
+ * states according to the panel members that have valid genotypes at that SNP.
+ * This makes count evidence invariant to unequal panel representation and to
+ * site-specific missing genotypes.  It is the count-side analogue of the
+ * target-species normalization used by compute_species_condf_native().
+ */
+static NativeSpeciesTargetStats precompute_native_species_targets(
+    robin_hood::unordered_map<int, ChromSNPs>& species_snpdat,
+    const PanelMetadata& pm,
+    int n_indiv,
+    NativeSpeciesTargetTable& target_table,
+    int required_panel_id = -1){
+
+    const int n_species = (int)pm.species_list.size();
+    const int n_pairs = n_species * (n_species - 1) / 2;
+    const uint64_t singlet_bins = (uint64_t)n_species * GENOTYPE_STATES;
+    const uint64_t pair_bins =
+        (uint64_t)n_pairs * GENOTYPE_STATES * GENOTYPE_STATES;
+    const uint64_t weights_per_site = singlet_bins + pair_bins;
+    const vector<vector<pair<int, double>>> i2sp =
+        build_indiv_to_species_weights(pm, n_indiv);
+
+    if (n_species <= 0 || weights_per_site == 0 ||
+        weights_per_site > (uint64_t)std::numeric_limits<uint32_t>::max()){
+        throw std::runtime_error(
+            "invalid native-species target dimensions for per-site normalization");
+    }
+
+    auto pair_order = [n_species](int a, int b) -> int {
+        return a * (2 * n_species - a - 1) / 2 + (b - a - 1);
+    };
+
+    target_table.clear();
+
+    NativeSpeciesTargetStats stats;
+    stats.singlet_available_sites.assign(n_species, 0);
+    stats.pair_available_sites.assign(
+        n_species, vector<uint64_t>(n_species, 0));
+
+    for (auto& chrom_kv : species_snpdat){
+        const int tid = chrom_kv.first;
+        ChromSNPs& chrom = chrom_kv.second;
+        NativeSpeciesChromTargets chrom_targets;
+        chrom_targets.n_species = n_species;
+        chrom_targets.n_pairs = n_pairs;
+        chrom_targets.weights_per_site = (uint32_t)weights_per_site;
+        chrom_targets.site_offsets.assign(chrom.snps.size(), UINT64_MAX);
+
+        size_t qualifying_sites = 0;
+        for (const auto& snp : chrom.snps){
+            if (required_panel_id < 0 || (int)snp.panel_id == required_panel_id){
+                ++qualifying_sites;
+            }
+        }
+        if (qualifying_sites > 0){
+            const uint64_t reserve_elems =
+                (uint64_t)qualifying_sites * weights_per_site;
+            if (reserve_elems > (uint64_t)chrom_targets.weights.max_size()){
+                throw std::runtime_error(
+                    "native-species target table exceeds vector capacity");
+            }
+            chrom_targets.weights.reserve((size_t)reserve_elems);
+        }
+
+        // Reused per-SNP work buffers. species_geno_weight[sp,g] is the
+        // available panel-membership mass in one genotype bin. The pair table
+        // is then obtained analytically as the outer product of two species'
+        // genotype masses, minus same-individual hybrid membership. This is
+        // exactly the distinct-individual sum used by the historical pair loop
+        // without its O(n_individuals^2) cost.
+        vector<double> species_geno_weight((size_t)singlet_bins, 0.0);
+        vector<double> same_indiv_cross(
+            (size_t)n_pairs * GENOTYPE_STATES, 0.0);
+        vector<double> pair_raw(
+            GENOTYPE_STATES * GENOTYPE_STATES, 0.0);
+        vector<int32_t> block((size_t)weights_per_site, 0);
+
+        auto scale_hypothesis = [&](const double* raw, int n_bins,
+                                    double denom, size_t block_offset){
+            if (denom <= 0.0) return;
+            int best_bin = -1;
+            double best_weight = -1.0;
+            int64_t scaled_sum = 0;
+            for (int bin = 0; bin < n_bins; ++bin){
+                double weight = raw[bin] / denom;
+                if (weight <= 0.0) continue;
+                const int64_t scaled = scaled_from_float(weight);
+                block[block_offset + (size_t)bin] = (int32_t)scaled;
+                scaled_sum += scaled;
+                if (weight > best_weight){
+                    best_weight = weight;
+                    best_bin = bin;
+                }
+            }
+            if (best_bin >= 0){
+                const int64_t corrected =
+                    (int64_t)block[block_offset + (size_t)best_bin] +
+                    (FIXED_POINT_SCALE - scaled_sum);
+                block[block_offset + (size_t)best_bin] = (int32_t)corrected;
+            }
+        };
+
+        for (size_t snp_index = 0; snp_index < chrom.snps.size(); ++snp_index){
+            SNPData& snp = chrom.snps[snp_index];
+            if (required_panel_id >= 0 && (int)snp.panel_id != required_panel_id){
+                continue;
+            }
+            if ((int)snp.geno.size() != n_indiv){
+                snp.precompute_genotypes(n_indiv);
+            }
+            ++stats.n_sites;
+
+            std::fill(
+                species_geno_weight.begin(), species_geno_weight.end(), 0.0);
+            std::fill(same_indiv_cross.begin(), same_indiv_cross.end(), 0.0);
+            std::fill(block.begin(), block.end(), 0);
+
+            for (int i = 0; i < n_indiv; ++i){
+                const int gi = (int)snp.geno[i];
+                if (gi < 0 || gi >= GENOTYPE_STATES) continue;
+
+                for (const auto& membership : i2sp[i]){
+                    const int sp = membership.first;
+                    const double weight = membership.second;
+                    if (sp < 0 || sp >= n_species || weight <= 0.0) continue;
+                    const size_t bin =
+                        (size_t)sp * GENOTYPE_STATES + (size_t)gi;
+                    species_geno_weight[bin] += weight;
+                }
+
+                for (size_t m = 0; m < i2sp[i].size(); ++m){
+                    for (size_t n = m + 1; n < i2sp[i].size(); ++n){
+                        const auto& left = i2sp[i][m];
+                        const auto& right = i2sp[i][n];
+                        if (left.first == right.first || left.second <= 0.0 ||
+                            right.second <= 0.0){
+                            continue;
                         }
+                        const int a = std::min(left.first, right.first);
+                        const int b = std::max(left.first, right.first);
+                        const int ord = pair_order(a, b);
+                        same_indiv_cross[
+                            (size_t)ord * GENOTYPE_STATES + (size_t)gi] +=
+                            left.second * right.second;
+                    }
+                }
+            }
+
+            bool any_hypothesis = false;
+            bool any_species = false;
+
+            for (int sp = 0; sp < n_species; ++sp){
+                const double* raw = species_geno_weight.data() +
+                    (size_t)sp * GENOTYPE_STATES;
+                double denom = 0.0;
+                for (int g = 0; g < GENOTYPE_STATES; ++g) denom += raw[g];
+                if (denom <= 0.0) continue;
+                ++stats.singlet_available_sites[sp];
+                any_species = true;
+                any_hypothesis = true;
+                scale_hypothesis(
+                    raw, GENOTYPE_STATES, denom,
+                    (size_t)sp * GENOTYPE_STATES);
+            }
+            if (any_species) ++stats.n_sites_with_any_species;
+
+            int ord = 0;
+            for (int a = 0; a < n_species; ++a){
+                for (int b = a + 1; b < n_species; ++b, ++ord){
+                    std::fill(pair_raw.begin(), pair_raw.end(), 0.0);
+                    double denom = 0.0;
+                    for (int ga = 0; ga < GENOTYPE_STATES; ++ga){
+                        const double wa = species_geno_weight[
+                            (size_t)a * GENOTYPE_STATES + (size_t)ga];
+                        for (int gb = 0; gb < GENOTYPE_STATES; ++gb){
+                            const double wb = species_geno_weight[
+                                (size_t)b * GENOTYPE_STATES + (size_t)gb];
+                            double raw = wa * wb;
+                            if (ga == gb){
+                                raw -= same_indiv_cross[
+                                    (size_t)ord * GENOTYPE_STATES + (size_t)ga];
+                            }
+                            if (raw < 0.0 && raw > -1e-12) raw = 0.0;
+                            if (raw <= 0.0) continue;
+                            const int bin = ga * GENOTYPE_STATES + gb;
+                            pair_raw[(size_t)bin] = raw;
+                            denom += raw;
+                        }
+                    }
+                    if (denom <= 0.0) continue;
+                    ++stats.pair_available_sites[a][b];
+                    any_hypothesis = true;
+                    scale_hypothesis(
+                        pair_raw.data(),
+                        GENOTYPE_STATES * GENOTYPE_STATES,
+                        denom,
+                        (size_t)singlet_bins +
+                            (size_t)ord * GENOTYPE_STATES * GENOTYPE_STATES);
+                }
+            }
+
+            if (!any_hypothesis) continue;
+            chrom_targets.site_offsets[snp_index] =
+                (uint64_t)chrom_targets.weights.size();
+            chrom_targets.weights.insert(
+                chrom_targets.weights.end(), block.begin(), block.end());
+        }
+
+        target_table[tid] = std::move(chrom_targets);
+    }
+
+    fprintf(stderr,
+        "Native species per-site targets: %llu sites (%llu with at least one species hypothesis), %d species, %llu fixed weights/site\n",
+        (unsigned long long)stats.n_sites,
+        (unsigned long long)stats.n_sites_with_any_species,
+        n_species,
+        (unsigned long long)weights_per_site);
+    for (int sp = 0; sp < n_species; ++sp){
+        fprintf(stderr, "  singlet %s available at %llu sites\n",
+            pm.species_list[sp].c_str(),
+            (unsigned long long)stats.singlet_available_sites[sp]);
+    }
+    for (int a = 0; a < n_species; ++a){
+        for (int b = a + 1; b < n_species; ++b){
+            fprintf(stderr, "  pair %s+%s available at %llu sites\n",
+                pm.species_list[a].c_str(), pm.species_list[b].c_str(),
+                (unsigned long long)stats.pair_available_sites[a][b]);
+        }
+    }
+    return stats;
+}
+
+static void normalize_existing_species_counts_in_place(
+    robin_hood::unordered_map<unsigned long, CellCounts>& species_counts,
+    const NativeSpeciesNormalization& norm,
+    int n_species){
+
+    for (auto& kv : species_counts){
+        CellCounts& counts = kv.second;
+        if (counts.n_samples != n_species){
+            fprintf(stderr,
+                "ERROR: native species count dimension mismatch while normalizing: expected %d, got %d\n",
+                n_species, counts.n_samples);
+            exit(1);
+        }
+
+        for (int sp = 0; sp < n_species; ++sp){
+            const double denom = norm.singlet_weight[sp];
+            for (int g = 0; g < GENOTYPE_STATES; ++g){
+                const int idx = sp * GENOTYPE_STATES + g;
+                counts.total_ref[idx] = (int64_t)llround((double)counts.total_ref[idx] / denom);
+                counts.total_alt[idx] = (int64_t)llround((double)counts.total_alt[idx] / denom);
+            }
+        }
+
+        for (int a = 0; a < n_species; ++a){
+            for (int b = a + 1; b < n_species; ++b){
+                const double denom = norm.pair_weight[a][b];
+                if (denom <= 0.0) continue;
+                for (int ga = 0; ga < GENOTYPE_STATES; ++ga){
+                    const int idx_a = a * GENOTYPE_STATES + ga;
+                    for (int gb = 0; gb < GENOTYPE_STATES; ++gb){
+                        const int idx_b = b * GENOTYPE_STATES + gb;
+                        const size_t flat = (size_t)idx_a * counts.state_count + idx_b;
+                        counts.ref_counts[flat] =
+                            (int64_t)llround((double)counts.ref_counts[flat] / denom);
+                        counts.alt_counts[flat] =
+                            (int64_t)llround((double)counts.alt_counts[flat] / denom);
                     }
                 }
             }
         }
-        species_counts.emplace(bc, std::move(out));
     }
-
-    for (int i = 0; i < n_indiv; ++i){
-        if (i2sp[i].empty()) unmapped_count_rows++;
-    }
-    if (unmapped_count_rows > 0){
-        fprintf(stderr, "WARNING: %lu VCF samples had no species mapping and were excluded from native species aggregation\n",
-            unmapped_count_rows);
-    }
-    fprintf(stderr, "Native species aggregation: %lu cells, %d individuals -> %d species\n",
-        indiv_counts.size(), n_indiv, n_species);
 }
 
-static void compute_species_condf_native(
+static ConditionalWeightStats compute_species_condf_native(
     robin_hood::unordered_map<int, ChromSNPs>& species_snpdat,
     map<pair<int, int>, map<int, float>>& species_condf,
     const PanelMetadata& pm,
-    int n_indiv){
+    int n_indiv,
+    const AcceptedSiteWeightMap* accepted_site_weights = nullptr){
 
+    ConditionalWeightStats stats;
     const int n_species = (int)pm.species_list.size();
     vector<vector<pair<int, double>>> i2sp = build_indiv_to_species_weights(pm, n_indiv);
 
@@ -747,7 +1122,19 @@ static void compute_species_condf_native(
     map<pair<int, int>, map<int, double>> tots;
 
     for (auto& chrom_kv : species_snpdat){
+        const int tid = chrom_kv.first;
         for (auto& snp : chrom_kv.second.snps){
+            double site_weight = 1.0;
+            if (accepted_site_weights != nullptr){
+                auto wit = accepted_site_weights->find(accepted_site_weight_key(tid, snp.pos));
+                if (wit == accepted_site_weights->end() || wit->second <= 0) continue;
+                site_weight = (double)wit->second;
+            }
+            ++stats.observed_sites;
+            stats.accepted_weight += accepted_site_weights != nullptr
+                ? site_weight / (double)FIXED_POINT_SCALE
+                : 0.0;
+
             const int8_t* geno = snp.geno.data();
 
             vector<double> target_avg(n_species, 0.0);
@@ -769,11 +1156,14 @@ static void compute_species_condf_native(
                 if (gi < 0 || gi >= GENOTYPE_STATES) continue;
                 if (i2sp[i].empty()) continue;
                 for (const auto& mi : i2sp[i]){
+                    const double source_denom = target_wsum[mi.first];
+                    if (source_denom <= 0.0 || mi.second <= 0.0) continue;
+                    const double source_weight = mi.second / source_denom;
                     pair<int, int> row = make_pair(mi.first, (int)gi);
                     for (int sp_t = 0; sp_t < n_species; ++sp_t){
                         if (target_wsum[sp_t] <= 0.0) continue;
-                        sums[row][sp_t] += mi.second * target_avg[sp_t];
-                        tots[row][sp_t] += mi.second;
+                        sums[row][sp_t] += site_weight * source_weight * target_avg[sp_t];
+                        tots[row][sp_t] += site_weight * source_weight;
                     }
                 }
             }
@@ -790,8 +1180,10 @@ static void compute_species_condf_native(
         }
     }
 
-    fprintf(stderr, "Native species condf: %lu row entries, %d species\n",
-        species_condf.size(), n_species);
+    fprintf(stderr, "Native species condf: %lu row entries, %d species, %llu observed sites, %.6f accepted weight\n",
+        species_condf.size(), n_species,
+        (unsigned long long)stats.observed_sites, stats.accepted_weight);
+    return stats;
 }
 
 static void load_panel_metadata_if_needed(
@@ -814,6 +1206,7 @@ static void write_native_species_assignments(
     const string& output_prefix,
     robin_hood::unordered_map<unsigned long, CellCounts>& species_counts_native,
     const vector<string>& species_samples,
+    const string& species_idfile,
     double doublet_rate,
     double error_ref,
     double error_alt,
@@ -835,6 +1228,37 @@ static void write_native_species_assignments(
     set<int> allowed_ids2;
     map<int, double> prior_weights;
 
+    // Species candidate restriction, the exact analogue of -i/-I on the
+    // individual path. Without it the species pass considers every singleton
+    // and every pair over the species panel, so cross-species ambient RNA can
+    // append (or substitute) a species that was never in the cell.
+    //
+    // Measured on a 60%-ambient diploid unit before this option existed:
+    // species assignments drifted 86.3% from the designed labels, and the
+    // swaps were additive (O -> H+O, B -> B+H) or substitutive (B -> C+H).
+    // Lowering --species_doublet_rate from 0.5 to the true 0.0152 moved only
+    // 2 of 566 cells: at 28.7% human reads the likelihood evidence for "human
+    // present" dwarfs any prior, so a prior cannot do this job. A candidate
+    // restriction can, exactly as -I took individual drift 86.9% -> 0.0% on
+    // the same unit.
+    //
+    // parse_idfile is panel-agnostic: it maps names in the supplied samples
+    // vector, so species labels ("B", "O") and species pairs ("B+C") work
+    // unchanged. "A+A" collapses to the singleton, as on the individual path.
+    if (species_idfile.length() > 0){
+        string idfile_copy = species_idfile;
+        vector<string> samples_copy = species_samples;
+        parse_idfile(idfile_copy, samples_copy, allowed_ids, allowed_ids2, false);
+        if (allowed_ids.size() == 0){
+            fprintf(stderr, "ERROR: no valid species labels found in %s; refusing to ignore "
+                "--species_ids\n", species_idfile.c_str());
+            exit(1);
+        }
+        fprintf(stderr, "Species candidate restriction active: %lu singlet label(s), "
+            "%lu pair label(s) from %s\n",
+            allowed_ids.size(), allowed_ids2.size(), species_idfile.c_str());
+    }
+
     assign_ids_parallel(species_counts_native, const_cast<vector<string>&>(species_samples),
         sp_assn, sp_assn_llr, allowed_ids, allowed_ids2, doublet_rate,
         error_ref, error_alt, false, prior_weights, n_threads, n_target);
@@ -851,6 +1275,333 @@ static void write_native_species_assignments(
     fclose(outf);
     fprintf(stderr, "Wrote native species assignments for %lu cells to %s\n",
         sp_assn.size(), fname.c_str());
+}
+
+
+/**
+ * Re-run native species assignment from an existing species-native count bundle.
+ *
+ * This diagnostic path deliberately reads only:
+ *   INPUT_PREFIX.species_samples
+ *   INPUT_PREFIX.species_counts
+ * and writes a distinct output prefix.  It never opens a BAM or VCF and never
+ * modifies the source count bundle.  When --panel_metadata is supplied, legacy
+ * pre-v2.09 panel-multiplicity inflation is normalized in memory before the
+ * reassignment test.
+ */
+static int reassign_native_species_from_existing(
+    const string& input_prefix,
+    const string& output_prefix,
+    double species_doublet_rate,
+    double error_ref,
+    double error_alt,
+    int n_threads,
+    int n_target,
+    int n_runner_ups,
+    double close_threshold,
+    const string& barcode_group,
+    bool cellranger,
+    bool seurat,
+    bool underscore,
+    const string& panel_metadata_file){
+
+    if (input_prefix.empty()){
+        fprintf(stderr, "ERROR: --species_reassign_from_prefix requires a non-empty prefix\n");
+        return 1;
+    }
+    if (input_prefix == output_prefix){
+        fprintf(stderr,
+            "ERROR: diagnostic output prefix must differ from the source count-bundle prefix\n"
+            "  source/output: %s\n",
+            input_prefix.c_str());
+        return 1;
+    }
+    if (species_doublet_rate < 0.0 || species_doublet_rate > 1.0){
+        fprintf(stderr, "ERROR: --species_doublet_rate must be between 0 and 1\n");
+        return 1;
+    }
+
+    string samples_file = input_prefix + ".species_samples";
+    string counts_file = input_prefix + ".species_counts";
+    if (!file_exists(samples_file)){
+        fprintf(stderr, "ERROR: missing native species sample file: %s\n", samples_file.c_str());
+        return 1;
+    }
+    if (!file_exists(counts_file)){
+        fprintf(stderr, "ERROR: missing native species counts file: %s\n", counts_file.c_str());
+        return 1;
+    }
+    if (!validate_gzip_readable(counts_file)){
+        fprintf(stderr, "ERROR: native species counts file is not gzip-readable: %s\n", counts_file.c_str());
+        return 1;
+    }
+
+    vector<string> species_samples;
+    load_samples(samples_file, species_samples);
+    if (species_samples.size() < 2){
+        fprintf(stderr, "ERROR: expected at least two native species in %s; found %lu\n",
+            samples_file.c_str(), species_samples.size());
+        return 1;
+    }
+
+    robin_hood::unordered_map<unsigned long, CellCounts> species_counts;
+    int n_lines = load_cellcounts_optimized(counts_file, species_counts, species_samples.size());
+    if (n_lines <= 0 || species_counts.empty()){
+        fprintf(stderr, "ERROR: no native species counts loaded from %s\n", counts_file.c_str());
+        return 1;
+    }
+
+    bool panel_normalized = false;
+    NativeSpeciesNormalization reassign_norm;
+    if (!panel_metadata_file.empty()){
+        string indiv_samples_file = input_prefix + ".samples";
+        if (!file_exists(indiv_samples_file)){
+            fprintf(stderr,
+                "ERROR: --panel_metadata normalization requires the original individual sample file: %s\n",
+                indiv_samples_file.c_str());
+            return 1;
+        }
+        vector<string> indiv_samples;
+        load_samples(indiv_samples_file, indiv_samples);
+        PanelMetadata pm = load_panel_metadata(panel_metadata_file, indiv_samples, true);
+        if (pm.species_list != species_samples){
+            fprintf(stderr,
+                "ERROR: panel metadata native species order does not match %s\n",
+                samples_file.c_str());
+            fprintf(stderr, "  panel:");
+            for (const auto& x : pm.species_list) fprintf(stderr, " %s", x.c_str());
+            fprintf(stderr, "\n  bundle:");
+            for (const auto& x : species_samples) fprintf(stderr, " %s", x.c_str());
+            fprintf(stderr, "\n");
+            return 1;
+        }
+        vector<vector<pair<int, double>>> i2sp =
+            build_indiv_to_species_weights(pm, indiv_samples.size());
+        reassign_norm = build_native_species_normalization(i2sp, species_samples.size());
+        report_native_species_normalization(
+            reassign_norm, species_samples, "legacy count-bundle diagnostic correction");
+        normalize_existing_species_counts_in_place(
+            species_counts, reassign_norm, species_samples.size());
+        panel_normalized = true;
+    }
+
+    fprintf(stderr, "Native species reassignment diagnostic\n");
+    fprintf(stderr, "  input prefix: %s\n", input_prefix.c_str());
+    fprintf(stderr, "  output prefix: %s\n", output_prefix.c_str());
+    fprintf(stderr, "  species: %lu\n", species_samples.size());
+    fprintf(stderr, "  cells: %lu\n", species_counts.size());
+    fprintf(stderr, "  count rows: %d\n", n_lines);
+    fprintf(stderr, "  species doublet rate: %.9g\n", species_doublet_rate);
+    fprintf(stderr, "  panel-normalized legacy counts: %s\n", panel_normalized ? "true" : "false");
+    fprintf(stderr, "  error ref/alt: %.9g / %.9g\n", error_ref, error_alt);
+
+    vector<unsigned long> barcodes;
+    barcodes.reserve(species_counts.size());
+    for (const auto& kv : species_counts) barcodes.push_back(kv.first);
+    sort(barcodes.begin(), barcodes.end());
+
+    enum ReassignStatus {
+        REASSIGN_ASSIGNED = 0,
+        REASSIGN_EMPTY_COUNTS = 1,
+        REASSIGN_LLR_FAILED = 2,
+        REASSIGN_NONPOSITIVE_MARGIN = 3,
+        REASSIGN_NO_WINNER = 4
+    };
+
+    vector<int> statuses(barcodes.size(), REASSIGN_LLR_FAILED);
+    vector<int> winners(barcodes.size(), -1);
+    vector<double> winner_scores(barcodes.size(), 0.0);
+    vector<CellDiagnostics> diagnostics(barcodes.size());
+    vector<vector<RunnerUp> > runners(barcodes.size());
+
+    const int n_species = (int)species_samples.size();
+    set<int> allowed_ids;
+    set<int> allowed_ids2;
+    map<int, double> prior_weights;
+
+    fprintf(stderr, "Assigning native species identities to %lu cells using %d threads...\n",
+        barcodes.size(), n_threads);
+
+    #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 100)
+    for (size_t idx = 0; idx < barcodes.size(); ++idx){
+        unsigned long bc = barcodes[idx];
+        const CellCounts& counts = species_counts.at(bc);
+        if (counts.is_empty()){
+            statuses[idx] = REASSIGN_EMPTY_COUNTS;
+            continue;
+        }
+
+        map<int, map<int, double> > llrs;
+        llr_table tab(n_species);
+        bool success = populate_llr_table_optimized(
+            counts, llrs, tab, n_species,
+            allowed_ids, allowed_ids2,
+            species_doublet_rate, error_ref, error_alt,
+            NULL, false, 0.0, 0.0, NULL, n_target);
+        if (!success){
+            statuses[idx] = REASSIGN_LLR_FAILED;
+            continue;
+        }
+
+        int winner = -1;
+        double score = 0.0;
+        tab.get_max(winner, score);
+        winners[idx] = winner;
+        winner_scores[idx] = score;
+        if (winner < 0){
+            statuses[idx] = REASSIGN_NO_WINNER;
+            continue;
+        }
+
+        CellDiagnostics diag;
+        vector<RunnerUp> cell_runners;
+        get_diagnostics_from_llrs(
+            llrs, tab, winner, score, n_species,
+            n_runner_ups, close_threshold, diag, cell_runners);
+        compute_posterior_entropy(llrs, tab, winner, n_species, diag);
+        tab.get_max_by_maxllr(diag.maxllr_winner, diag.maxllr_winner_score);
+        diag.total_depth = compute_total_depth(counts, n_species);
+        diagnostics[idx] = diag;
+        runners[idx] = cell_runners;
+
+        statuses[idx] = (score > 0.0)
+            ? REASSIGN_ASSIGNED
+            : REASSIGN_NONPOSITIVE_MARGIN;
+    }
+
+    robin_hood::unordered_map<unsigned long, int> assignments;
+    robin_hood::unordered_map<unsigned long, double> assignments_llr;
+    map<string, long long> status_counts;
+    map<string, long long> identity_counts;
+    long long n_singlet = 0;
+    long long n_pair = 0;
+
+    auto status_name = [](int status) -> const char* {
+        switch(status){
+            case REASSIGN_ASSIGNED: return "assigned";
+            case REASSIGN_EMPTY_COUNTS: return "empty_counts";
+            case REASSIGN_LLR_FAILED: return "llr_construction_failed";
+            case REASSIGN_NONPOSITIVE_MARGIN: return "nonpositive_winner_margin";
+            case REASSIGN_NO_WINNER: return "no_winner";
+            default: return "unknown";
+        }
+    };
+
+    for (size_t idx = 0; idx < barcodes.size(); ++idx){
+        status_counts[status_name(statuses[idx])]++;
+        if (statuses[idx] == REASSIGN_ASSIGNED){
+            assignments.emplace(barcodes[idx], winners[idx]);
+            assignments_llr.emplace(barcodes[idx], winner_scores[idx]);
+            string identity = idx2name(winners[idx], species_samples);
+            identity_counts[identity]++;
+            if (winners[idx] < n_species) n_singlet++;
+            else n_pair++;
+        }
+    }
+
+    string assignment_file = output_prefix + ".species_assignments";
+    FILE* assignment_out = fopen(assignment_file.c_str(), "w");
+    if (!assignment_out){
+        fprintf(stderr, "ERROR: could not open %s for writing\n", assignment_file.c_str());
+        return 1;
+    }
+    vector<string> tmp_samples = species_samples;
+    string tmp_group = barcode_group;
+    dump_assignments(assignment_out, assignments, assignments_llr, tmp_samples,
+        tmp_group, cellranger, seurat, underscore);
+    fclose(assignment_out);
+
+    string diag_file = output_prefix + ".species_assignment_diagnostics.tsv";
+    FILE* diag_out = fopen(diag_file.c_str(), "w");
+    if (!diag_out){
+        fprintf(stderr, "ERROR: could not open %s for writing\n", diag_file.c_str());
+        return 1;
+    }
+    fprintf(diag_out,
+        "barcode\tstatus\twinning_identity\tsinglet_doublet\twinner_min_margin\t"
+        "llr_vs_runner_up\tworst_competitor\tn_close\ttotal_depth\tposterior\tentropy\t"
+        "runner_up_1\trunner_up_1_llr_vs_winner\trunner_up_1_min_margin\n");
+
+    for (size_t idx = 0; idx < barcodes.size(); ++idx){
+        string bc_str = bc2str(barcodes[idx]);
+        mod_bc_libname(bc_str, barcode_group, cellranger, seurat, underscore);
+        string winner_name = ".";
+        string sd = ".";
+        string worst_name = ".";
+        string runner_name = ".";
+        double runner_llr = 0.0;
+        double runner_margin = 0.0;
+
+        if (winners[idx] >= 0){
+            winner_name = idx2name(winners[idx], species_samples);
+            sd = (winners[idx] < n_species) ? "S" : "D";
+        }
+        if (diagnostics[idx].worst_competitor >= 0){
+            worst_name = idx2name(diagnostics[idx].worst_competitor, species_samples);
+        }
+        if (!runners[idx].empty() && runners[idx][0].identity >= 0){
+            runner_name = idx2name(runners[idx][0].identity, species_samples);
+            runner_llr = runners[idx][0].llr_vs_winner;
+            runner_margin = runners[idx][0].min_margin;
+        }
+
+        fprintf(diag_out,
+            "%s\t%s\t%s\t%s\t%.9g\t%.9g\t%s\t%d\t%.9g\t%.9g\t%.9g\t%s\t%.9g\t%.9g\n",
+            bc_str.c_str(), status_name(statuses[idx]), winner_name.c_str(), sd.c_str(),
+            winner_scores[idx], diagnostics[idx].llr_vs_runnerup,
+            worst_name.c_str(), diagnostics[idx].n_close, diagnostics[idx].total_depth,
+            diagnostics[idx].posterior, diagnostics[idx].entropy,
+            runner_name.c_str(), runner_llr, runner_margin);
+    }
+    fclose(diag_out);
+
+    string summary_file = output_prefix + ".species_assignment_summary.tsv";
+    FILE* summary_out = fopen(summary_file.c_str(), "w");
+    if (!summary_out){
+        fprintf(stderr, "ERROR: could not open %s for writing\n", summary_file.c_str());
+        return 1;
+    }
+    fprintf(summary_out, "section\tkey\tvalue\n");
+    fprintf(summary_out, "setting\tinput_prefix\t%s\n", input_prefix.c_str());
+    fprintf(summary_out, "setting\toutput_prefix\t%s\n", output_prefix.c_str());
+    fprintf(summary_out, "setting\tspecies_doublet_rate\t%.17g\n", species_doublet_rate);
+    fprintf(summary_out, "setting\tpanel_normalized_legacy_counts\t%s\n",
+        panel_normalized ? "true" : "false");
+    if (panel_normalized){
+        fprintf(summary_out, "setting\tpanel_metadata\t%s\n", panel_metadata_file.c_str());
+        for (int sp = 0; sp < (int)species_samples.size(); ++sp){
+            fprintf(summary_out, "normalization_singlet\t%s\t%.17g\n",
+                species_samples[sp].c_str(), reassign_norm.singlet_weight[sp]);
+        }
+        for (int a = 0; a < (int)species_samples.size(); ++a){
+            for (int b = a + 1; b < (int)species_samples.size(); ++b){
+                fprintf(summary_out, "normalization_pair\t%s+%s\t%.17g\n",
+                    species_samples[a].c_str(), species_samples[b].c_str(),
+                    reassign_norm.pair_weight[a][b]);
+            }
+        }
+    }
+    fprintf(summary_out, "setting\terror_ref\t%.17g\n", error_ref);
+    fprintf(summary_out, "setting\terror_alt\t%.17g\n", error_alt);
+    fprintf(summary_out, "count\tinput_cells\t%lu\n", barcodes.size());
+    fprintf(summary_out, "count\tassigned_cells\t%lu\n", assignments.size());
+    fprintf(summary_out, "count\tassigned_singlets\t%lld\n", n_singlet);
+    fprintf(summary_out, "count\tassigned_pairs\t%lld\n", n_pair);
+    for (const auto& kv : status_counts){
+        fprintf(summary_out, "status\t%s\t%lld\n", kv.first.c_str(), kv.second);
+    }
+    for (const auto& kv : identity_counts){
+        fprintf(summary_out, "identity\t%s\t%lld\n", kv.first.c_str(), kv.second);
+    }
+    fclose(summary_out);
+
+    fprintf(stderr, "Native species reassignment complete\n");
+    fprintf(stderr, "  assigned: %lu / %lu (%lld singlets, %lld pairs)\n",
+        assignments.size(), barcodes.size(), n_singlet, n_pair);
+    fprintf(stderr, "  assignments: %s\n", assignment_file.c_str());
+    fprintf(stderr, "  diagnostics: %s\n", diag_file.c_str());
+    fprintf(stderr, "  summary: %s\n", summary_file.c_str());
+    return 0;
 }
 
 /**
@@ -886,6 +1637,7 @@ void help(int code){
     fprintf(stderr, "    --underscore -U Use underscore instead of hyphen for libname\n");
     fprintf(stderr, "    --disable_conditional -f Disable computing conditional match fractions\n");
     fprintf(stderr, "    --dump_conditional -F Load VCF, compute conditional match fractions, write\n");
+    fprintf(stderr, "    --accepted_weighted_conditional Build .condf using accepted BAM-observation site weights (parallel recount only)\n");
     fprintf(stderr, "       .condf file, and exit. No BAM required. Use this to generate .condf after\n");
     fprintf(stderr, "       a run that used -f.\n");
     fprintf(stderr, "    --n_target -N Max singlets to keep before doublet eval [-1=auto, 0=no limit]\n");
@@ -907,6 +1659,14 @@ void help(int code){
     fprintf(stderr, "\n===== PILEUP (variant-consistency benchmark) =====\n");
     fprintf(stderr, "    --dump_pileup PREFIX Emit PREFIX.pileup_sites.tsv.gz and PREFIX.pileup_obs.tsv.gz\n");
     fprintf(stderr, "    --dump_selection_audit  Append maximin-vs-maxllr winner columns to .diagnostics.gz\n");
+    fprintf(stderr, "    --dump_source_observations PREFIX  Emit PREFIX.source_observations.tsv.gz from accepted YI-tagged read-SNP observations\n");
+    fprintf(stderr, "    --source_provenance_tag TAG  Two-character BAM tag carrying injected source identity [YI]\n");
+    fprintf(stderr, "    --synthetic_id_tag TAG  Two-character BAM tag carrying synthetic unit ID [YS]\n");
+    fprintf(stderr, "    --expected_synthetic_id ID  Required unit ID; non-native YI reads must carry matching YS; YI=__NATIVE__ is retained and exempt\n");
+    fprintf(stderr, "    --source_receiver_map FILE  Optional two-column barcode/receiver_identity map; adds receiver and (nalt_A,nalt_B) to individual source rows\n");
+    fprintf(stderr, "    --source_reconciliation_mode  Account every accepted individual-panel observation into explicit provenance buckets and emit PREFIX.source_reconciliation.tsv.gz\n");
+    fprintf(stderr, "    --source_donor_site_audit  Audit every accepted injected observation against its YI donor genotype; emit PREFIX.donor_genotype_audit.tsv.gz and a deterministic exact-site sample\n");
+    fprintf(stderr, "    --source_donor_site_sample_mod N  Retain exact-site evidence when stable_hash(site) %% N == 0 [256; 1=all sites]\n");
     fprintf(stderr, "                            (maximin_winner, maximin_score, maxllr_winner, maxllr_score, selection_agree).\n");
     fprintf(stderr, "                            For comparing the current selection criterion against the original maxllr elimination.\n");
     fprintf(stderr, "                         for the interindividual panel. Use with -B (candidate\n");
@@ -933,7 +1693,16 @@ void help(int code){
     fprintf(stderr, "    --allow_legacy_mixed_species_panel  Permit old species-panel filter/augment/both behavior (not V1_R3 native)\n");
     fprintf(stderr, "    --species_assignment_output Produce .species_assignments (species-only scoring pass)\n");
     fprintf(stderr, "    --species_counts_output     Write .species_counts, .species_condf alongside .counts\n");
-    fprintf(stderr, "    --panel_metadata FILE  Tab-separated indiv_id/species mapping (required for species output)\n");
+    fprintf(stderr, "    --panel_metadata FILE  Tab-separated indiv_id/species mapping (required for species output;\n");
+    fprintf(stderr, "                           in --species_reassign_from_prefix mode, normalize legacy counts in memory)\n");
+    fprintf(stderr, "    --species_ids FILE  A file listing allowed species labels (singlets) and\n");
+    fprintf(stderr, "                        species pairs (A+B). Species analogue of -i/-I; without it\n");
+    fprintf(stderr, "                        the species pass considers every label and every pair.\n");
+    fprintf(stderr, "    --species_doublet_rate F  Species-assignment pair prior; defaults to --doublet_rate\n");
+    fprintf(stderr, "    --species_reassign_from_prefix PREFIX\n");
+    fprintf(stderr, "                         Re-run species assignment from PREFIX.species_counts and\n");
+    fprintf(stderr, "                         PREFIX.species_samples only; no BAM/VCF access or recount.\n");
+    fprintf(stderr, "                         -o must be a distinct diagnostic output prefix.\n");
     fprintf(stderr, "\n    --help -h Display this message and exit\n");
     exit(code);
 }
@@ -1179,6 +1948,15 @@ int main(int argc, char *argv[]) {
        // Variant-consistency benchmark: per-SNP pileup sidecars
        {"dump_pileup", required_argument, 0, 1099},
        {"dump_selection_audit", no_argument, 0, 1100},
+       {"dump_source_observations", required_argument, 0, 1101},
+       {"source_provenance_tag", required_argument, 0, 1102},
+       {"synthetic_id_tag", required_argument, 0, 1103},
+       {"expected_synthetic_id", required_argument, 0, 1104},
+       {"source_receiver_map", required_argument, 0, 1105},
+       {"source_reconciliation_mode", no_argument, 0, 1106},
+       {"source_donor_site_audit", no_argument, 0, 1107},
+       {"source_donor_site_sample_mod", required_argument, 0, 1108},
+       {"accepted_weighted_conditional", no_argument, 0, 1109},
        // 2A: ATAC dual-modality
        {"atac_bam", required_argument, 0, 1020},
        {"atac_vcf", required_argument, 0, 1021},
@@ -1195,6 +1973,9 @@ int main(int argc, char *argv[]) {
        {"species_assignment_output", no_argument, 0, 1043},
        {"species_counts_output", no_argument, 0, 1045},
        {"panel_metadata", required_argument, 0, 1044},
+       {"species_doublet_rate", required_argument, 0, 1060},
+       {"species_ids", required_argument, 0, 1062},
+       {"species_reassign_from_prefix", required_argument, 0, 1061},
        {"reuse_counts", no_argument, 0, 1050},
        {"force_recount", no_argument, 0, 1051},
        {"help", no_argument, 0, 'h'},
@@ -1254,6 +2035,16 @@ int main(int argc, char *argv[]) {
     // Variant-consistency benchmark: emit per-SNP pileup sidecars
     bool dump_pileup = false;
     string dump_pileup_prefix = "";
+    bool dump_source_observations = false;
+    string dump_source_observations_prefix = "";
+    string source_provenance_tag = "YI";
+    string synthetic_id_tag = "YS";
+    string expected_synthetic_id = "";
+    string source_receiver_map = "";
+    bool source_reconciliation_mode = false;
+    bool source_donor_site_audit = false;
+    int source_donor_site_sample_mod = 256;
+    bool accepted_weighted_conditional = false;
 
     // 2A: ATAC dual-modality
     string atac_bamfile = "";
@@ -1273,6 +2064,9 @@ int main(int argc, char *argv[]) {
     bool species_assignment_output = false;
     bool species_counts_output = false;
     string panel_metadata_file = "";
+    double species_doublet_rate = -1.0;  // <0 means inherit --doublet_rate
+    string species_idfile;               // empty means unrestricted (legacy)
+    string species_reassign_from_prefix = "";
 
     // Counts file reuse safety
     bool reuse_counts = false;
@@ -1414,6 +2208,34 @@ int main(int argc, char *argv[]) {
             case 1100:  // --dump_selection_audit
                 dump_selection_audit = true;
                 break;
+            case 1101:  // --dump_source_observations
+                dump_source_observations = true;
+                dump_source_observations_prefix = optarg;
+                break;
+            case 1102:  // --source_provenance_tag
+                source_provenance_tag = optarg;
+                break;
+            case 1103:  // --synthetic_id_tag
+                synthetic_id_tag = optarg;
+                break;
+            case 1104:  // --expected_synthetic_id
+                expected_synthetic_id = optarg;
+                break;
+            case 1105:  // --source_receiver_map
+                source_receiver_map = optarg;
+                break;
+            case 1106:  // --source_reconciliation_mode
+                source_reconciliation_mode = true;
+                break;
+            case 1107:  // --source_donor_site_audit
+                source_donor_site_audit = true;
+                break;
+            case 1108:  // --source_donor_site_sample_mod
+                source_donor_site_sample_mod = atoi(optarg);
+                break;
+            case 1109:  // --accepted_weighted_conditional
+                accepted_weighted_conditional = true;
+                break;
             case 1020:  // --atac_bam
                 atac_bamfile = optarg;
                 break;
@@ -1452,6 +2274,15 @@ int main(int argc, char *argv[]) {
                 break;
             case 1044:  // --panel_metadata
                 panel_metadata_file = optarg;
+                break;
+            case 1062:  // --species_ids
+                species_idfile = optarg;
+                break;
+            case 1060:  // --species_doublet_rate
+                species_doublet_rate = atof(optarg);
+                break;
+            case 1061:  // --species_reassign_from_prefix
+                species_reassign_from_prefix = optarg;
                 break;
             case 1050:  // --reuse_counts
                 reuse_counts = true;
@@ -1498,6 +2329,70 @@ int main(int argc, char *argv[]) {
     }
     if (n_threads < 1){
         n_threads = 1;
+    }
+    if (species_doublet_rate < 0.0){
+        species_doublet_rate = doublet_rate;
+    }
+    if (species_doublet_rate < 0.0 || species_doublet_rate > 1.0){
+        fprintf(stderr, "ERROR: species doublet rate must be between 0 and 1\n");
+        exit(1);
+    }
+
+    // Counts-only native species reassignment is an isolated diagnostic mode.
+    // Return before BAM/VCF/species-panel validation so it cannot trigger a recount.
+    if (!species_reassign_from_prefix.empty()){
+        return reassign_native_species_from_existing(
+            species_reassign_from_prefix, output_prefix, species_doublet_rate,
+            error_ref, error_alt, n_threads, n_target, n_runner_ups, close_threshold,
+            barcode_group, cellranger, seurat, underscore, panel_metadata_file);
+    }
+
+    if (source_provenance_tag.size() != 2){
+        fprintf(stderr, "ERROR: --source_provenance_tag must be exactly two characters (got '%s')\n", source_provenance_tag.c_str());
+        exit(1);
+    }
+    if (synthetic_id_tag.size() != 2){
+        fprintf(stderr, "ERROR: --synthetic_id_tag must be exactly two characters (got '%s')\n", synthetic_id_tag.c_str());
+        exit(1);
+    }
+    if (dump_source_observations && dump_source_observations_prefix.empty()){
+        fprintf(stderr, "ERROR: --dump_source_observations requires a non-empty prefix\n");
+        exit(1);
+    }
+    if (dump_source_observations && expected_synthetic_id.empty()){
+        fprintf(stderr, "ERROR: --dump_source_observations requires --expected_synthetic_id so YS provenance can be validated\n");
+        exit(1);
+    }
+    if (!source_receiver_map.empty() && !dump_source_observations){
+        fprintf(stderr, "ERROR: --source_receiver_map is meaningful only with --dump_source_observations\n");
+        exit(1);
+    }
+    if (source_reconciliation_mode && !dump_source_observations){
+        fprintf(stderr, "ERROR: --source_reconciliation_mode requires --dump_source_observations\n");
+        exit(1);
+    }
+    if (source_reconciliation_mode && source_receiver_map.empty()){
+        fprintf(stderr, "ERROR: --source_reconciliation_mode requires --source_receiver_map\n");
+        exit(1);
+    }
+    if (source_donor_site_audit && !dump_source_observations){
+        fprintf(stderr, "ERROR: --source_donor_site_audit requires --dump_source_observations\n");
+        exit(1);
+    }
+    if (source_donor_site_audit && source_receiver_map.empty()){
+        fprintf(stderr, "ERROR: --source_donor_site_audit requires --source_receiver_map\n");
+        exit(1);
+    }
+    if (source_donor_site_sample_mod < 1){
+        fprintf(stderr, "ERROR: --source_donor_site_sample_mod must be >= 1\n");
+        exit(1);
+    }
+    if (!source_receiver_map.empty()){
+        struct stat st;
+        if (stat(source_receiver_map.c_str(), &st) != 0 || st.st_size <= 0){
+            fprintf(stderr, "ERROR: --source_receiver_map missing or empty: %s\n", source_receiver_map.c_str());
+            exit(1);
+        }
     }
     
     // Auto-calculate htslib threads per reader
@@ -1580,10 +2475,14 @@ int main(int argc, char *argv[]) {
             string stale_condf = output_prefix + ".condf";
             string stale_sp_counts = output_prefix + ".species_counts";
             string stale_sp_condf = output_prefix + ".species_condf";
+            string stale_condf_basis = output_prefix + ".condf_basis.tsv";
+            string stale_sp_condf_basis = output_prefix + ".species_condf_basis.tsv";
             if (file_exists(stale_samples)) remove(stale_samples.c_str());
             if (file_exists(stale_condf)) remove(stale_condf.c_str());
             if (file_exists(stale_sp_counts)) remove(stale_sp_counts.c_str());
             if (file_exists(stale_sp_condf)) remove(stale_sp_condf.c_str());
+            if (file_exists(stale_condf_basis)) remove(stale_condf_basis.c_str());
+            if (file_exists(stale_sp_condf_basis)) remove(stale_sp_condf_basis.c_str());
         } else if (reuse_counts){
             // Validate the existing file before trusting it
             fprintf(stderr, "Found existing counts file: %s\n", countsfilename.c_str());
@@ -1605,6 +2504,20 @@ int main(int argc, char *argv[]) {
                 exit(1);
             }
 
+            if (accepted_weighted_conditional){
+                const string condf_file = output_prefix + ".condf";
+                const string condf_basis = output_prefix + ".condf_basis.tsv";
+                if (!file_exists(condf_file) || !file_exists(condf_basis) ||
+                    !text_file_contains(condf_basis, "weighting\taccepted_observation_weighted") ||
+                    !text_file_contains(condf_basis, "truth_inputs_used\tfalse")){
+                    fprintf(stderr,
+                        "ERROR: --reuse_counts with --accepted_weighted_conditional requires "
+                        "a truth-free accepted-observation-weighted .condf and .condf_basis.tsv\n");
+                    fprintf(stderr, "  Use --force_recount to regenerate a matched-basis bundle.\n");
+                    exit(1);
+                }
+            }
+
             // If species output is requested, the species companion outputs must
             // be present and readable too.  Otherwise a reused main .counts can
             // silently coexist with stale or missing .species_counts/.species_condf.
@@ -1622,6 +2535,18 @@ int main(int argc, char *argv[]) {
                         sp_condf.c_str());
                     fprintf(stderr, "  Use --force_recount to regenerate the full dual-panel output set.\n");
                     exit(1);
+                }
+                if (accepted_weighted_conditional){
+                    const string sp_basis = output_prefix + ".species_condf_basis.tsv";
+                    if (!file_exists(sp_basis) ||
+                        !text_file_contains(sp_basis, "weighting\taccepted_observation_weighted") ||
+                        !text_file_contains(sp_basis, "truth_inputs_used\tfalse")){
+                        fprintf(stderr,
+                            "ERROR: reused species bundle lacks a truth-free "
+                            "accepted-observation-weighted .species_condf_basis.tsv\n");
+                        fprintf(stderr, "  Use --force_recount to regenerate the full matched-basis bundle.\n");
+                        exit(1);
+                    }
                 }
                 if (!validate_gzip_readable(sp_counts)){
                     fprintf(stderr, "ERROR: --reuse_counts: .species_counts appears truncated or corrupt: %s\n",
@@ -1649,6 +2574,19 @@ int main(int argc, char *argv[]) {
         }
         // BAM readability/header validation is performed by direct HTSlib helpers
         // when chromosome/TID mapping is needed.
+    }
+
+    if (accepted_weighted_conditional && disable_conditional){
+        fprintf(stderr, "ERROR: --accepted_weighted_conditional is incompatible with --disable_conditional/-f\n");
+        exit(1);
+    }
+    if (accepted_weighted_conditional && dump_conditional){
+        fprintf(stderr, "ERROR: --accepted_weighted_conditional requires a BAM recount and cannot be used with VCF-only --dump_conditional\n");
+        exit(1);
+    }
+    if (accepted_weighted_conditional && n_threads <= 1 && !load_counts){
+        fprintf(stderr, "ERROR: --accepted_weighted_conditional requires --threads > 1 for a BAM recount\n");
+        exit(1);
     }
 
     // Load sample names
@@ -1796,6 +2734,10 @@ int main(int argc, char *argv[]) {
     
     map<pair<int, int>, map<int, float> > conditional_match_fracs;
     map<pair<int, int>, map<int, float> > conditional_match_tots;
+    AcceptedSiteWeightMap accepted_site_weights_individual;
+    AcceptedSiteWeightMap accepted_site_weights_species;
+    ConditionalWeightStats individual_condf_stats;
+    ConditionalWeightStats species_condf_stats;
 
     // Position set for species panel dedup (§5.5)
     // Populated from demux VCF snpdat before it goes out of scope;
@@ -1807,6 +2749,8 @@ int main(int argc, char *argv[]) {
     robin_hood::unordered_map<int, ChromSNPs> species_snpdat;
     robin_hood::unordered_map<unsigned long, CellCounts> species_cell_counts_rna;
     robin_hood::unordered_map<unsigned long, CellCounts> species_cell_counts_atac;
+    robin_hood::unordered_map<unsigned long, CellCounts> species_cell_counts_native;
+    vector<string> species_samples_native;
     PanelMetadata panel_meta;
     bool panel_meta_loaded = false;
     bool species_counted_dual = false;  // Set by WP3 dual counting path
@@ -2066,6 +3010,12 @@ int main(int argc, char *argv[]) {
                 }
             }
             
+            if (species_counts_output || species_assignment_output){
+                load_panel_metadata_if_needed(
+                    panel_metadata_file, samples, panel_meta, panel_meta_loaded);
+                species_samples_native = panel_meta.species_list;
+            }
+
             // Step 5: Tag species SNPs with panel_id = 1
             for (auto& kv : species_snpdat){
                 for (auto& snp : kv.second.snps){
@@ -2094,39 +3044,64 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Combined SNP set: %ld interindividual + %ld species = %ld total\n",
                 n_interindiv, n_species, n_interindiv + n_species);
             
-            // Precompute genotypes and targets for the combined set
+            // Precompute individual-shaped targets for both panels. Native
+            // species targets remain in a separate compact table so SNPData
+            // and the shared-VCF memory layout are unchanged.
+            NativeSpeciesTargetTable species_native_targets;
             precompute_all_genotypes(combined_snpdat, samples.size());
+            if (species_counts_output || species_assignment_output){
+                precompute_native_species_targets(
+                    combined_snpdat, panel_meta, samples.size(),
+                    species_native_targets, 1);
+            }
             
             // Step 7: Single BAM pass with dual output
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> dual_panel0;
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> dual_panel1;
+            robin_hood::unordered_map<unsigned long, AlignedCellCounts> dual_panel1_native;
             count_alleles_parallel_dual(bamfile, combined_snpdat,
                 dual_panel0, dual_panel1,
-                cell_barcodes, samples.size(), n_threads, htslib_threads);
+                cell_barcodes, samples.size(), samples, n_threads, htslib_threads,
+                dump_source_observations, dump_source_observations_prefix, source_provenance_tag,
+                synthetic_id_tag, expected_synthetic_id, source_receiver_map,
+                source_reconciliation_mode, source_donor_site_audit,
+                source_donor_site_sample_mod,
+                accepted_weighted_conditional ? &accepted_site_weights_individual : nullptr,
+                accepted_weighted_conditional ? &accepted_site_weights_species : nullptr,
+                (species_counts_output || species_assignment_output)
+                    ? &species_native_targets : nullptr,
+                (species_counts_output || species_assignment_output)
+                    ? &dual_panel1_native : nullptr,
+                (species_counts_output || species_assignment_output)
+                    ? (int)species_samples_native.size() : 0);
             
             // Step 8: Finalize each panel separately
             finalize_parallel_counts(dual_panel0, cell_counts);
             finalize_parallel_counts(dual_panel1, species_cell_counts_rna);
-            
-            fprintf(stderr, "Dual counting complete: %lu interindiv cells, %lu species cells\n",
-                cell_counts.size(), species_cell_counts_rna.size());
-            
-            // Step 9: Load panel metadata if needed (for later use)
-            if (panel_metadata_file.length() > 0){
-                panel_meta = load_panel_metadata(panel_metadata_file, samples);
-                panel_meta_loaded = true;
+            if (species_counts_output || species_assignment_output){
+                finalize_parallel_counts(dual_panel1_native, species_cell_counts_native);
             }
             
+            fprintf(stderr,
+                "Dual counting complete: %lu interindiv cells, %lu individual-shaped species cells, %lu native species cells\n",
+                cell_counts.size(), species_cell_counts_rna.size(),
+                species_cell_counts_native.size());
+
             // Mark species RNA counting as done so the later block skips it
             species_counted_dual = true;
         }
         else if (n_threads > 1){
+            if (dump_source_observations){
+                fprintf(stderr, "ERROR: --dump_source_observations currently requires the dual-panel counting path (--species_counts_output).\n");
+                exit(1);
+            }
             // Parallel processing
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> parallel_counts;
         
             count_alleles_parallel(bamfile, snpdat_optimized, parallel_counts,
                 cell_barcodes, samples.size(), n_threads, htslib_threads,
-                dump_pileup, dump_pileup_prefix);
+                dump_pileup, dump_pileup_prefix,
+                accepted_weighted_conditional ? &accepted_site_weights_individual : nullptr);
         
             // Finalize counts
             finalize_parallel_counts(parallel_counts, cell_counts);
@@ -2140,9 +3115,21 @@ int main(int argc, char *argv[]) {
     
         // Compute conditional match fractions if parallel (didn't do it during counting)
         if (n_threads > 1 && !disable_conditional){
-            fprintf(stderr, "Computing conditional match fractions...\n");
-            compute_conditional_match_fracs_parallel(snpdat_optimized,
-                conditional_match_fracs, samples.size(), n_threads);
+            if (accepted_weighted_conditional){
+                if (accepted_site_weights_individual.empty()){
+                    fprintf(stderr, "ERROR: no accepted individual-panel site weights were collected; cannot build accepted-weighted .condf\n");
+                    exit(1);
+                }
+                fprintf(stderr, "Computing accepted-observation-weighted conditional match fractions...\n");
+                individual_condf_stats = compute_conditional_match_fracs_weighted(
+                    snpdat_optimized, accepted_site_weights_individual,
+                    conditional_match_fracs, samples.size(), n_threads);
+            }
+            else{
+                fprintf(stderr, "Computing VCF-site-weighted conditional match fractions...\n");
+                compute_conditional_match_fracs_parallel(snpdat_optimized,
+                    conditional_match_fracs, samples.size(), n_threads);
+            }
         }
     
         if (!disable_conditional){
@@ -2156,6 +3143,22 @@ int main(int argc, char *argv[]) {
             FILE* outf = fopen(outname.c_str(), "w");
             dump_exp_fracs(outf, conditional_match_fracs);
             fclose(outf);
+
+            string basis_name = output_prefix + ".condf_basis.tsv";
+            FILE* basis_out = fopen(basis_name.c_str(), "w");
+            if (!basis_out){
+                fprintf(stderr, "ERROR: could not open %s for writing\n", basis_name.c_str());
+                exit(1);
+            }
+            fprintf(basis_out, "contract_version\tcondf_basis_V1_R1\n");
+            fprintf(basis_out, "panel\tindividual\n");
+            fprintf(basis_out, "weighting\t%s\n",
+                accepted_weighted_conditional ? "accepted_observation_weighted" : "vcf_site_weighted");
+            fprintf(basis_out, "truth_inputs_used\tfalse\n");
+            fprintf(basis_out, "observed_sites\t%llu\n",
+                (unsigned long long)individual_condf_stats.observed_sites);
+            fprintf(basis_out, "accepted_weight\t%.17g\n", individual_condf_stats.accepted_weight);
+            fclose(basis_out);
         }
 
         // Build position set from demux VCF for species panel dedup (§5.5)
@@ -2355,18 +3358,44 @@ int main(int argc, char *argv[]) {
             // Also needed for filter mode when --species_counts_output requests persisting counts.
             if (species_mode == SpeciesPanelMode::AUGMENT || species_mode == SpeciesPanelMode::BOTH
                 || species_counts_output){
+                NativeSpeciesTargetTable species_native_targets;
                 precompute_all_genotypes(species_snpdat, samples.size());
+                if (species_counts_output || species_assignment_output){
+                    species_samples_native = panel_meta.species_list;
+                    precompute_native_species_targets(
+                        species_snpdat, panel_meta, samples.size(),
+                        species_native_targets);
+                }
                 print_elapsed(start_time, "Counting alleles at species panel sites (RNA)...");
                 if (n_threads > 1){
                     robin_hood::unordered_map<unsigned long, AlignedCellCounts> sp_parallel;
+                    robin_hood::unordered_map<unsigned long, AlignedCellCounts> sp_native_parallel;
                     count_alleles_parallel(bamfile, species_snpdat, sp_parallel,
-                        cell_barcodes, samples.size(), n_threads, htslib_threads);
+                        cell_barcodes, samples.size(), n_threads, htslib_threads,
+                        false, "",
+                        accepted_weighted_conditional ? &accepted_site_weights_species : nullptr,
+                        (species_counts_output || species_assignment_output)
+                            ? &species_native_targets : nullptr,
+                        (species_counts_output || species_assignment_output)
+                            ? &sp_native_parallel : nullptr,
+                        (species_counts_output || species_assignment_output)
+                            ? (int)species_samples_native.size() : 0);
                     finalize_parallel_counts(sp_parallel, species_cell_counts_rna);
+                    if (species_counts_output || species_assignment_output){
+                        finalize_parallel_counts(
+                            sp_native_parallel, species_cell_counts_native);
+                    }
                 }
                 else{
                     map<pair<int, int>, map<int, float>> sp_cond, sp_tots;
                     count_alleles_single_threaded(bamfile, species_snpdat, species_cell_counts_rna,
-                        cell_barcodes, samples.size(), sp_cond, sp_tots, false);
+                        cell_barcodes, samples.size(), sp_cond, sp_tots, false,
+                        (species_counts_output || species_assignment_output)
+                            ? &species_native_targets : nullptr,
+                        (species_counts_output || species_assignment_output)
+                            ? &species_cell_counts_native : nullptr,
+                        (species_counts_output || species_assignment_output)
+                            ? (int)species_samples_native.size() : 0);
                 }
                 fprintf(stderr, "Species RNA counts for %lu cells\n", species_cell_counts_rna.size());
 
@@ -2412,14 +3441,15 @@ int main(int argc, char *argv[]) {
     // ================================================================
     // Write native species counts / condf / samples to disk (if requested)
     // ================================================================
-    robin_hood::unordered_map<unsigned long, CellCounts> species_cell_counts_native;
-    vector<string> species_samples_native;
-
-    if ((species_counts_output || species_assignment_output) && !species_cell_counts_rna.empty()){
-        load_panel_metadata_if_needed(panel_metadata_file, samples, panel_meta, panel_meta_loaded);
+    if (species_counts_output || species_assignment_output){
+        load_panel_metadata_if_needed(
+            panel_metadata_file, samples, panel_meta, panel_meta_loaded);
         species_samples_native = panel_meta.species_list;
-        aggregate_cellcounts_to_species_native(species_cell_counts_rna,
-            species_cell_counts_native, panel_meta, samples.size());
+        if (species_cell_counts_native.empty()){
+            fprintf(stderr,
+                "ERROR: native species output requested but no per-site normalized native species counts were produced\n");
+            exit(1);
+        }
     }
 
     if (species_counts_output && !species_cell_counts_native.empty()){
@@ -2435,12 +3465,30 @@ int main(int argc, char *argv[]) {
 
         {
             map<pair<int, int>, map<int, float>> sp_condf;
-            compute_species_condf_native(species_snpdat, sp_condf, panel_meta, samples.size());
+            species_condf_stats = compute_species_condf_native(
+                species_snpdat, sp_condf, panel_meta, samples.size(),
+                accepted_weighted_conditional ? &accepted_site_weights_species : nullptr);
             string fname = output_prefix + ".species_condf";
             FILE* outf = fopen(fname.c_str(), "w");
             dump_exp_fracs(outf, sp_condf);
             fclose(outf);
             fprintf(stderr, "Wrote native species conditional match fracs to %s\n", fname.c_str());
+
+            string basis_name = output_prefix + ".species_condf_basis.tsv";
+            FILE* basis_out = fopen(basis_name.c_str(), "w");
+            if (!basis_out){
+                fprintf(stderr, "ERROR: could not open %s for writing\n", basis_name.c_str());
+                exit(1);
+            }
+            fprintf(basis_out, "contract_version\tcondf_basis_V1_R1\n");
+            fprintf(basis_out, "panel\tspecies\n");
+            fprintf(basis_out, "weighting\t%s\n",
+                accepted_weighted_conditional ? "accepted_observation_weighted" : "vcf_site_weighted");
+            fprintf(basis_out, "truth_inputs_used\tfalse\n");
+            fprintf(basis_out, "observed_sites\t%llu\n",
+                (unsigned long long)species_condf_stats.observed_sites);
+            fprintf(basis_out, "accepted_weight\t%.17g\n", species_condf_stats.accepted_weight);
+            fclose(basis_out);
         }
 
         {
@@ -2539,18 +3587,22 @@ int main(int argc, char *argv[]) {
     // Handle doublet-specific ID filtering
     bool do_again = true;
     if (idfile_doublet_given){
-        // The user gave an allowed list of specific doublet combinations, and we included
-        // all possible singlets from the allowable doublets in the first round. If any of 
-        // these singlet identities turned out to be uncommon, we will assume the user was
-        // right and that those singlet identities truly do not exist in the pool -- and
-        // perform one more round of assignments without them.
+        // The user gave an allowed list of specific identities. parse_idfile also placed
+        // the singlet halves of every declared combination into allowed_ids so the
+        // doublet likelihood has both halves, and kept them out of allowed_ids2 so they
+        // are not answers. The rounds above therefore could not select them.
+        // filter_identities decides whether any half earned a place in the answer set on
+        // its own evidence. It reports a change only when one did, and in that case the
+        // answer set is wider than the one round 2 used, so assignments are recomputed.
+        // When nothing is promoted the answer set is unchanged and round 2 already holds
+        // the result for it.
         if (allowed_ids.size() > allowed_ids2.size()){
             bool altered = filter_identities(assn, assn_llr, samples.size(), allowed_ids, 
                 allowed_ids2);
 
             if (altered){
                 print_elapsed(start_time, "Re-inferring identities (round 3)...");
-                fprintf(stderr, "Re-inferring with unlikely singlet identities removed...\n");
+                fprintf(stderr, "Re-inferring with data-supported singlet identities restored...\n");
                 assign_ids_parallel(cell_counts, samples, assn, assn_llr,
                     allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior,
                     error_alt_posterior,
@@ -2788,14 +3840,14 @@ int main(int argc, char *argv[]) {
     // the individual-native demux call from the individual SNP panel.  The species
     // panel writes its own species-native assignment file with species labels only.
     if (species_assignment_output){
-        if (species_cell_counts_native.empty() && !species_cell_counts_rna.empty()){
-            load_panel_metadata_if_needed(panel_metadata_file, samples, panel_meta, panel_meta_loaded);
-            species_samples_native = panel_meta.species_list;
-            aggregate_cellcounts_to_species_native(species_cell_counts_rna,
-                species_cell_counts_native, panel_meta, samples.size());
+        if (species_cell_counts_native.empty()){
+            fprintf(stderr,
+                "ERROR: --species_assignment_output requested but native species counts are unavailable\n");
+            exit(1);
         }
         write_native_species_assignments(output_prefix, species_cell_counts_native,
-            species_samples_native, doublet_rate, error_ref_posterior, error_alt_posterior,
+            species_samples_native, species_idfile,
+            species_doublet_rate, error_ref_posterior, error_alt_posterior,
             n_threads, n_target, barcode_group, cellranger, seurat, underscore);
     }
 
