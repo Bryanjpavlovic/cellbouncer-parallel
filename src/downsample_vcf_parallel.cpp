@@ -39,6 +39,973 @@
 #include <iomanip>
 #include "common.h"
 #include "downsample_vcf_parallel.h"
+// ============================================================================
+// MITOCHONDRIAL PANEL SELECTION (integrated)
+//
+// This implementation is intentionally compiled into downsample_vcf_parallel.
+// There is no standalone panel-selection executable or second VCF scan.
+// Supplying --mt_output enables the optional mitochondrial panel during the
+// same source-VCF load used for the nuclear panels.
+// ============================================================================
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <stdexcept>
+
+namespace mtpanel {
+
+struct Config {
+    std::string output;
+    std::string pool_combinations;
+    std::string mito_chrom = "chrM";
+    std::string coverage;
+    std::string blacklist_bed;
+    std::string mt_mask_bed;
+    std::string pair_audit;
+    std::string site_manifest;
+    std::string haplotype_groups;
+    std::string haplotype_pairwise;
+    std::string sample_audit;
+    std::string sites_bed;
+    int threads = 4;
+    int min_depth = 10;
+    int min_pair_sites = 20;
+    int min_ambient_sites = 1;
+    double homoplasmy_af = 0.95;
+    double min_coverage = 0.0;
+    double min_qual = 0.0;
+    bool require_pair_targets = false;
+    bool require_coverage = true;
+    bool all_pairs = false;
+};
+
+struct Summary {
+    int64_t records_scanned = 0;
+    int64_t selected_sites = 0;
+    int64_t rejected_blacklist = 0;
+    int64_t rejected_mt_mask = 0;
+    int64_t rejected_non_snv = 0;
+    int64_t rejected_quality = 0;
+    int64_t rejected_coverage = 0;
+    int64_t rejected_no_use = 0;
+    int libraries = 0;
+    int expected_donors = 0;
+    int expected_pairs = 0;
+    int pairs_below_ratio_target = 0;
+    int pairs_without_ambient_anchor = 0;
+};
+
+// Build the production mitochondrial panel from records already read during the
+// downsample_vcf_parallel input pass. Records are borrowed and remain owned by
+// the caller. Only records on Config::mito_chrom should normally be supplied.
+Summary build_panel(bcf_hdr_t* header,
+                    const std::vector<bcf1_t*>& records,
+                    const Config& config);
+
+}  // namespace mtpanel
+
+namespace mtpanel {
+namespace {
+
+struct Interval {
+    int64_t start;
+    int64_t end;
+    Interval() : start(0), end(0) {}
+    Interval(int64_t start_in, int64_t end_in) : start(start_in), end(end_in) {}
+};
+
+struct CoverageInterval {
+    int64_t start;
+    int64_t end;
+    double value;
+    CoverageInterval() : start(0), end(0), value(0.0) {}
+    CoverageInterval(int64_t start_in, int64_t end_in, double value_in)
+        : start(start_in), end(end_in), value(value_in) {}
+};
+
+struct PairDef {
+    std::string first;
+    std::string second;
+    int first_index = -1;
+    int second_index = -1;
+};
+
+struct LibraryDef {
+    std::string id;
+    std::vector<std::string> donors;
+    std::vector<int> donor_indices;
+    std::vector<PairDef> pairs;
+};
+
+struct Evidence {
+    int8_t state = -1;  // 0 REF, 1 ALT, -1 not a clean homoplasmic call
+    int ref_depth = -1;
+    int alt_depth = -1;
+    int total_depth = -1;
+    double alt_fraction = std::numeric_limits<double>::quiet_NaN();
+    std::string depth_source;
+    std::string failure;
+};
+
+enum SiteClass {
+    CLASS_A_ALT_B_REF = 0,
+    CLASS_A_REF_B_ALT = 1,
+    CLASS_AMBIENT_ONLY = 2
+};
+
+const char* class_name(SiteClass value) {
+    switch (value) {
+        case CLASS_A_ALT_B_REF: return "A_ALT_B_REF";
+        case CLASS_A_REF_B_ALT: return "A_REF_B_ALT";
+        case CLASS_AMBIENT_ONLY: return "AMBIENT_ONLY";
+    }
+    return "UNKNOWN";
+}
+
+struct SiteUse {
+    int library_index = -1;
+    int pair_index = -1;
+    SiteClass site_class = CLASS_AMBIENT_ONLY;
+    std::vector<std::string> opposite_donors;
+};
+
+struct Candidate {
+    bcf1_t* record = nullptr;  // borrowed
+    int64_t pos = -1;
+    char ref = 'N';
+    char alt = 'N';
+    double qual = 0.0;
+    double coverage = 0.0;
+    std::vector<Evidence> evidence;
+    std::vector<SiteUse> uses;
+};
+
+struct PairCounts {
+    int a_alt_b_ref = 0;
+    int a_ref_b_alt = 0;
+    int ambient_only = 0;
+};
+
+std::string trim(std::string value) {
+    const char* ws = " \t\r\n";
+    const std::string::size_type first = value.find_first_not_of(ws);
+    if (first == std::string::npos) return "";
+    const std::string::size_type last = value.find_last_not_of(ws);
+    return value.substr(first, last - first + 1);
+}
+
+std::vector<std::string> split(const std::string& value, char delim) {
+    std::vector<std::string> out;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, delim)) out.push_back(item);
+    return out;
+}
+
+std::string join(const std::vector<std::string>& values, const char* delim) {
+    std::ostringstream out;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) out << delim;
+        out << values[i];
+    }
+    return out.str();
+}
+
+std::string default_path(const std::string& configured,
+                         const std::string& output,
+                         const std::string& suffix) {
+    return configured.empty() ? output + suffix : configured;
+}
+
+bool valid_base_string(const char* allele) {
+    if (!allele || allele[0] == '\0' || allele[1] != '\0') return false;
+    const char b = static_cast<char>(std::toupper(static_cast<unsigned char>(allele[0])));
+    return b == 'A' || b == 'C' || b == 'G' || b == 'T';
+}
+
+std::vector<Interval> load_bed_for_contig(const std::string& filename,
+                                          const std::string& contig) {
+    std::vector<Interval> result;
+    if (filename.empty()) return result;
+    std::ifstream in(filename.c_str());
+    if (!in) throw std::runtime_error("Could not open chrM mask BED: " + filename);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::stringstream ss(line);
+        std::string chrom;
+        int64_t start = 0, end = 0;
+        if (!(ss >> chrom >> start >> end)) continue;
+        if (chrom == contig && start >= 0 && end > start) result.push_back(Interval{start, end});
+    }
+    std::sort(result.begin(), result.end(), [](const Interval& a, const Interval& b) {
+        return a.start < b.start || (a.start == b.start && a.end < b.end);
+    });
+    std::vector<Interval> merged;
+    for (size_t i = 0; i < result.size(); ++i) {
+        if (merged.empty() || result[i].start > merged.back().end) {
+            merged.push_back(result[i]);
+        } else if (result[i].end > merged.back().end) {
+            merged.back().end = result[i].end;
+        }
+    }
+    return merged;
+}
+
+bool in_intervals(int64_t pos, const std::vector<Interval>& intervals) {
+    std::vector<Interval>::const_iterator it = std::upper_bound(
+        intervals.begin(), intervals.end(), pos,
+        [](int64_t value, const Interval& interval) { return value < interval.start; });
+    if (it == intervals.begin()) return false;
+    --it;
+    return it->start <= pos && pos < it->end;
+}
+
+std::vector<CoverageInterval> load_coverage_for_contig(const std::string& filename,
+                                                       const std::string& contig) {
+    std::vector<CoverageInterval> result;
+    if (filename.empty()) return result;
+    const bool compressed =
+        (filename.size() >= 3 && filename.substr(filename.size() - 3) == ".gz") ||
+        (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".bgz");
+    if (compressed) {
+        tbx_t* tbx = tbx_index_load(filename.c_str());
+        if (!tbx) throw std::runtime_error(
+            "Compressed coverage track requires a tabix index: " + filename);
+        htsFile* fp = hts_open(filename.c_str(), "r");
+        if (!fp) {
+            tbx_destroy(tbx);
+            throw std::runtime_error("Could not open coverage track: " + filename);
+        }
+        hts_itr_t* itr = tbx_itr_querys(tbx, contig.c_str());
+        if (!itr) {
+            hts_close(fp);
+            tbx_destroy(tbx);
+            return result;
+        }
+        kstring_t line = {0, 0, NULL};
+        while (tbx_itr_next(fp, tbx, itr, &line) >= 0) {
+            std::stringstream ss(std::string(line.s, line.l));
+            std::string chrom;
+            int64_t start = 0, end = 0;
+            double value = 0.0;
+            if (ss >> chrom >> start >> end >> value) {
+                if (chrom == contig && start >= 0 && end > start) {
+                    result.push_back(CoverageInterval{start, end, value});
+                }
+            }
+        }
+        std::free(line.s);
+        hts_itr_destroy(itr);
+        hts_close(fp);
+        tbx_destroy(tbx);
+    } else {
+        std::ifstream in(filename.c_str());
+        if (!in) throw std::runtime_error("Could not open coverage track: " + filename);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::stringstream ss(line);
+            std::string chrom;
+            int64_t start = 0, end = 0;
+            double value = 0.0;
+            if (ss >> chrom >> start >> end >> value) {
+                if (chrom == contig && start >= 0 && end > start) {
+                    result.push_back(CoverageInterval{start, end, value});
+                }
+            }
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const CoverageInterval& a,
+                                               const CoverageInterval& b) {
+        return a.start < b.start || (a.start == b.start && a.end < b.end);
+    });
+    return result;
+}
+
+double coverage_at(int64_t pos, const std::vector<CoverageInterval>& coverage) {
+    if (coverage.empty()) return 0.0;
+    std::vector<CoverageInterval>::const_iterator it = std::upper_bound(
+        coverage.begin(), coverage.end(), pos,
+        [](int64_t value, const CoverageInterval& interval) {
+            return value < interval.start;
+        });
+    if (it == coverage.begin()) return 0.0;
+    --it;
+    return (it->start <= pos && pos < it->end) ? it->value : 0.0;
+}
+
+void add_unique(std::vector<std::string>& values,
+                std::unordered_set<std::string>& seen,
+                const std::string& value) {
+    if (!value.empty() && seen.insert(value).second) values.push_back(value);
+}
+
+std::vector<LibraryDef> load_libraries(const Config& config,
+                                       const std::vector<std::string>& samples,
+                                       std::set<std::string>& expected_donors) {
+    std::unordered_map<std::string, int> sample_index;
+    for (size_t i = 0; i < samples.size(); ++i) sample_index[samples[i]] = static_cast<int>(i);
+
+    std::vector<LibraryDef> libraries;
+    if (config.all_pairs) {
+        LibraryDef lib;
+        lib.id = "ALL_VCF_SAMPLES";
+        lib.donors = samples;
+        for (size_t i = 0; i < samples.size(); ++i) {
+            lib.donor_indices.push_back(static_cast<int>(i));
+            expected_donors.insert(samples[i]);
+        }
+        for (size_t i = 0; i < samples.size(); ++i) {
+            for (size_t j = i + 1; j < samples.size(); ++j) {
+                PairDef pair;
+                pair.first = samples[i];
+                pair.second = samples[j];
+                pair.first_index = static_cast<int>(i);
+                pair.second_index = static_cast<int>(j);
+                lib.pairs.push_back(pair);
+            }
+        }
+        libraries.push_back(lib);
+        return libraries;
+    }
+
+    std::ifstream in(config.pool_combinations.c_str());
+    if (!in) throw std::runtime_error(
+        "Could not open metadata-derived pool combinations: " + config.pool_combinations);
+    std::string line;
+    bool first_data_line = true;
+    std::set<std::string> seen_library_ids;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const std::string::size_type tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        const std::string library_id = trim(line.substr(0, tab));
+        const std::string identities_field = trim(line.substr(tab + 1));
+        if (first_data_line && library_id == "library_id") {
+            first_data_line = false;
+            continue;
+        }
+        first_data_line = false;
+        if (library_id.empty() || identities_field.empty()) continue;
+        if (!seen_library_ids.insert(library_id).second) {
+            throw std::runtime_error("Duplicate library_id in pool combinations: " + library_id);
+        }
+
+        LibraryDef lib;
+        lib.id = library_id;
+        std::unordered_set<std::string> donor_seen;
+        std::set<std::pair<std::string, std::string> > pair_seen;
+        const std::vector<std::string> identities = split(identities_field, ',');
+        for (size_t i = 0; i < identities.size(); ++i) {
+            const std::string identity = trim(identities[i]);
+            if (identity.empty()) continue;
+            const std::vector<std::string> parts_raw = split(identity, '+');
+            std::vector<std::string> parts;
+            for (size_t j = 0; j < parts_raw.size(); ++j) {
+                const std::string donor = trim(parts_raw[j]);
+                if (!donor.empty()) parts.push_back(donor);
+            }
+            if (parts.empty() || parts.size() > 2) {
+                throw std::runtime_error("Unsupported identity in library " + library_id + ": " + identity);
+            }
+            for (size_t j = 0; j < parts.size(); ++j) add_unique(lib.donors, donor_seen, parts[j]);
+            if (parts.size() == 2 && parts[0] != parts[1]) {
+                std::string a = parts[0];
+                std::string b = parts[1];
+                if (a > b) std::swap(a, b);
+                if (pair_seen.insert(std::make_pair(a, b)).second) {
+                    PairDef pair;
+                    pair.first = a;
+                    pair.second = b;
+                    lib.pairs.push_back(pair);
+                }
+            }
+        }
+        if (lib.donors.empty()) {
+            throw std::runtime_error("No donors resolved for library: " + library_id);
+        }
+        for (size_t i = 0; i < lib.donors.size(); ++i) {
+            const std::unordered_map<std::string, int>::const_iterator it = sample_index.find(lib.donors[i]);
+            if (it == sample_index.end()) {
+                throw std::runtime_error("Metadata donor is absent from VCF samples: " + lib.donors[i] +
+                                         " (library " + library_id + ")");
+            }
+            lib.donor_indices.push_back(it->second);
+            expected_donors.insert(lib.donors[i]);
+        }
+        for (size_t i = 0; i < lib.pairs.size(); ++i) {
+            lib.pairs[i].first_index = sample_index[lib.pairs[i].first];
+            lib.pairs[i].second_index = sample_index[lib.pairs[i].second];
+        }
+        libraries.push_back(lib);
+    }
+    if (libraries.empty()) throw std::runtime_error("No library definitions were loaded");
+    return libraries;
+}
+
+bool valid_format_value(int32_t value) {
+    return value != bcf_int32_missing && value != bcf_int32_vector_end && value >= 0;
+}
+
+int format_value(const int32_t* data, int total_values, int n_samples,
+                 int sample, int offset) {
+    if (!data || total_values <= 0 || n_samples <= 0 || total_values % n_samples != 0) return -1;
+    const int stride = total_values / n_samples;
+    if (offset < 0 || offset >= stride) return -1;
+    const int32_t value = data[sample * stride + offset];
+    return valid_format_value(value) ? static_cast<int>(value) : -1;
+}
+
+int gt_homoplasmic_state(const int32_t* gt, int total_values, int n_samples, int sample) {
+    if (!gt || total_values <= 0 || total_values % n_samples != 0) return -1;
+    const int stride = total_values / n_samples;
+    int state = -1;
+    bool saw = false;
+    for (int k = 0; k < stride; ++k) {
+        const int32_t value = gt[sample * stride + k];
+        if (value == bcf_int32_vector_end) break;
+        if (bcf_gt_is_missing(value)) return -1;
+        const int allele = bcf_gt_allele(value);
+        if (allele < 0 || allele > 1) return -3;
+        if (!saw) {
+            state = allele;
+            saw = true;
+        } else if (state != allele) {
+            return -2;
+        }
+    }
+    return saw ? state : -1;
+}
+
+std::vector<Evidence> extract_evidence(bcf_hdr_t* header,
+                                       bcf1_t* record,
+                                       const Config& config) {
+    const int n_samples = bcf_hdr_nsamples(header);
+    int32_t* ro = NULL;
+    int32_t* ao = NULL;
+    int32_t* ad = NULL;
+    int32_t* gt = NULL;
+    int n_ro = 0, n_ao = 0, n_ad = 0, n_gt = 0;
+    const int ret_ro = bcf_get_format_int32(header, record, "RO", &ro, &n_ro);
+    const int ret_ao = bcf_get_format_int32(header, record, "AO", &ao, &n_ao);
+    const int ret_ad = bcf_get_format_int32(header, record, "AD", &ad, &n_ad);
+    const int ret_gt = bcf_get_genotypes(header, record, &gt, &n_gt);
+
+    std::vector<Evidence> result(n_samples);
+    for (int i = 0; i < n_samples; ++i) {
+        Evidence evidence;
+        int ref_depth = -1;
+        int alt_depth = -1;
+        if (ret_ro > 0 && ret_ao > 0) {
+            ref_depth = format_value(ro, ret_ro, n_samples, i, 0);
+            alt_depth = format_value(ao, ret_ao, n_samples, i, 0);
+            if (ref_depth >= 0 && alt_depth >= 0) evidence.depth_source = "RO_AO";
+        }
+        if ((ref_depth < 0 || alt_depth < 0) && ret_ad > 0) {
+            ref_depth = format_value(ad, ret_ad, n_samples, i, 0);
+            alt_depth = format_value(ad, ret_ad, n_samples, i, 1);
+            if (ref_depth >= 0 && alt_depth >= 0) evidence.depth_source = "AD";
+        }
+        evidence.ref_depth = ref_depth;
+        evidence.alt_depth = alt_depth;
+        if (ref_depth < 0 || alt_depth < 0) {
+            evidence.failure = "NO_ALLELE_DEPTH";
+            result[i] = evidence;
+            continue;
+        }
+        evidence.total_depth = ref_depth + alt_depth;
+        if (evidence.total_depth < config.min_depth) {
+            evidence.failure = "LOW_DEPTH";
+            result[i] = evidence;
+            continue;
+        }
+        evidence.alt_fraction = static_cast<double>(alt_depth) /
+                                static_cast<double>(evidence.total_depth);
+        int depth_state = -1;
+        if (evidence.alt_fraction <= 1.0 - config.homoplasmy_af) depth_state = 0;
+        if (evidence.alt_fraction >= config.homoplasmy_af) depth_state = 1;
+        if (depth_state < 0) {
+            evidence.failure = "MIXED_ALLELE_FRACTION";
+            result[i] = evidence;
+            continue;
+        }
+        const int gt_state = gt_homoplasmic_state(gt, ret_gt, n_samples, i);
+        if (gt_state == -2) {
+            evidence.failure = "HETEROZYGOUS_GT";
+            result[i] = evidence;
+            continue;
+        }
+        if (gt_state == -3) {
+            evidence.failure = "UNSUPPORTED_GT_ALLELE";
+            result[i] = evidence;
+            continue;
+        }
+        if (gt_state >= 0 && gt_state != depth_state) {
+            evidence.failure = "GT_DEPTH_CONFLICT";
+            result[i] = evidence;
+            continue;
+        }
+        evidence.state = static_cast<int8_t>(depth_state);
+        evidence.failure = "PASS";
+        result[i] = evidence;
+    }
+
+    std::free(ro);
+    std::free(ao);
+    std::free(ad);
+    std::free(gt);
+    return result;
+}
+
+
+uint64_t fnv1a64(const std::string& text) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < text.size(); ++i) {
+        hash ^= static_cast<unsigned char>(text[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::string hex64(uint64_t value) {
+    std::ostringstream out;
+    out << std::hex << std::setw(16) << std::setfill('0') << value;
+    return out.str();
+}
+
+std::string output_mode(const std::string& output) {
+    if (output.size() >= 7 && output.substr(output.size() - 7) == ".vcf.gz") return "wz";
+    if (output.size() >= 4 && output.substr(output.size() - 4) == ".vcf") return "w";
+    return "wb";
+}
+
+void write_sample_audit(const std::string& path,
+                        const std::vector<std::string>& samples,
+                        const std::vector<LibraryDef>& libraries,
+                        const std::set<std::string>& expected_donors) {
+    std::map<std::string, std::vector<std::string> > donor_libraries;
+    for (size_t l = 0; l < libraries.size(); ++l) {
+        for (size_t d = 0; d < libraries[l].donors.size(); ++d) {
+            donor_libraries[libraries[l].donors[d]].push_back(libraries[l].id);
+        }
+    }
+    std::ofstream out(path.c_str());
+    if (!out) throw std::runtime_error("Could not write mt sample audit: " + path);
+    out << "vcf_sample\texpected_in_any_library\tlibrary_count\tlibraries\tselection_role\n";
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const bool expected = expected_donors.count(samples[i]) != 0;
+        const std::vector<std::string>& libs = donor_libraries[samples[i]];
+        out << samples[i] << '\t' << (expected ? 1 : 0) << '\t' << libs.size() << '\t'
+            << join(libs, ",") << '\t'
+            << (expected ? "METADATA_EXPECTED_DONOR" : "EXCLUDED_UNRELATED_VCF_SAMPLE") << '\n';
+    }
+}
+
+}  // namespace
+
+Summary build_panel(bcf_hdr_t* header,
+                    const std::vector<bcf1_t*>& records,
+                    const Config& config) {
+    if (!header) throw std::runtime_error("Mito panel builder received a null VCF header");
+    if (config.output.empty()) throw std::runtime_error("Mito panel output path is empty");
+    if (!config.all_pairs && config.pool_combinations.empty()) {
+        throw std::runtime_error("Mito panel requires metadata-derived --pool_combinations");
+    }
+    if (config.min_depth < 1 || config.homoplasmy_af <= 0.5 ||
+        config.homoplasmy_af > 1.0 || config.min_pair_sites < 0 ||
+        config.min_ambient_sites < 0 || config.min_coverage < 0.0 ||
+        config.threads < 1) {
+        throw std::runtime_error("Invalid mitochondrial panel threshold");
+    }
+
+    Summary summary;
+    const int n_samples = bcf_hdr_nsamples(header);
+    if (n_samples < 2) throw std::runtime_error("Mito panel requires at least two VCF samples");
+    std::vector<std::string> samples;
+    for (int i = 0; i < n_samples; ++i) samples.push_back(header->samples[i]);
+
+    std::set<std::string> expected_donors;
+    const std::vector<LibraryDef> libraries = load_libraries(config, samples, expected_donors);
+    summary.libraries = static_cast<int>(libraries.size());
+    summary.expected_donors = static_cast<int>(expected_donors.size());
+    for (size_t l = 0; l < libraries.size(); ++l) {
+        summary.expected_pairs += static_cast<int>(libraries[l].pairs.size());
+    }
+    if (summary.expected_pairs == 0) {
+        throw std::runtime_error("No heterotypic fusion pairs were found in library metadata");
+    }
+
+    const int mt_rid = bcf_hdr_name2id(header, config.mito_chrom.c_str());
+    if (mt_rid < 0) throw std::runtime_error(
+        "Mitochondrial contig is absent from VCF header: " + config.mito_chrom);
+    const std::vector<Interval> blacklist =
+        load_bed_for_contig(config.blacklist_bed, config.mito_chrom);
+    const std::vector<Interval> mt_mask =
+        load_bed_for_contig(config.mt_mask_bed, config.mito_chrom);
+    const std::vector<CoverageInterval> coverage =
+        load_coverage_for_contig(config.coverage, config.mito_chrom);
+    if (config.require_coverage && coverage.empty()) {
+        throw std::runtime_error(
+            "Mito panel selection requires a coverage track containing " + config.mito_chrom +
+            "; use require_coverage=false only for an explicit diagnostic run");
+    }
+
+    const std::string pair_audit_path = default_path(
+        config.pair_audit, config.output, ".pair_audit.tsv");
+    const std::string site_manifest_path = default_path(
+        config.site_manifest, config.output, ".site_manifest.tsv");
+    const std::string haplotype_groups_path = default_path(
+        config.haplotype_groups, config.output, ".haplotype_groups.tsv");
+    const std::string haplotype_pairwise_path = default_path(
+        config.haplotype_pairwise, config.output, ".haplotype_pairwise.tsv");
+    const std::string sample_audit_path = default_path(
+        config.sample_audit, config.output, ".sample_audit.tsv");
+    const std::string sites_bed_path = default_path(
+        config.sites_bed, config.output, ".sites.bed");
+
+    write_sample_audit(sample_audit_path, samples, libraries, expected_donors);
+
+    std::vector<Candidate> candidates;
+    for (size_t r = 0; r < records.size(); ++r) {
+        bcf1_t* record = records[r];
+        if (!record) continue;
+        ++summary.records_scanned;
+        if (record->rid != mt_rid) continue;
+        if (in_intervals(record->pos, blacklist)) {
+            ++summary.rejected_blacklist;
+            continue;
+        }
+        if (in_intervals(record->pos, mt_mask)) {
+            ++summary.rejected_mt_mask;
+            continue;
+        }
+        bcf_unpack(record, BCF_UN_STR | BCF_UN_FMT);
+        if (record->n_allele != 2 || !valid_base_string(record->d.allele[0]) ||
+            !valid_base_string(record->d.allele[1]) ||
+            record->d.allele[0][0] == record->d.allele[1][0]) {
+            ++summary.rejected_non_snv;
+            continue;
+        }
+        const double qual = bcf_float_is_missing(record->qual) ? 0.0 : record->qual;
+        if (qual < config.min_qual) {
+            ++summary.rejected_quality;
+            continue;
+        }
+        const double cov = coverage.empty() ? 0.0 : coverage_at(record->pos, coverage);
+        if (!coverage.empty() && cov < config.min_coverage) {
+            ++summary.rejected_coverage;
+            continue;
+        }
+
+        Candidate candidate;
+        candidate.record = record;
+        candidate.pos = record->pos;
+        candidate.ref = static_cast<char>(std::toupper(record->d.allele[0][0]));
+        candidate.alt = static_cast<char>(std::toupper(record->d.allele[1][0]));
+        candidate.qual = qual;
+        candidate.coverage = cov;
+        candidate.evidence = extract_evidence(header, record, config);
+
+        for (size_t l = 0; l < libraries.size(); ++l) {
+            const LibraryDef& lib = libraries[l];
+            for (size_t p = 0; p < lib.pairs.size(); ++p) {
+                const PairDef& pair = lib.pairs[p];
+                const int a = candidate.evidence[pair.first_index].state;
+                const int b = candidate.evidence[pair.second_index].state;
+                if (a < 0 || b < 0) continue;
+                SiteUse use;
+                use.library_index = static_cast<int>(l);
+                use.pair_index = static_cast<int>(p);
+                if (a != b) {
+                    use.site_class = (a == 1) ? CLASS_A_ALT_B_REF : CLASS_A_REF_B_ALT;
+                    candidate.uses.push_back(use);
+                    continue;
+                }
+                for (size_t d = 0; d < lib.donors.size(); ++d) {
+                    const std::string& donor = lib.donors[d];
+                    if (donor == pair.first || donor == pair.second) continue;
+                    const int donor_state = candidate.evidence[lib.donor_indices[d]].state;
+                    if (donor_state >= 0 && donor_state != a) use.opposite_donors.push_back(donor);
+                }
+                if (!use.opposite_donors.empty()) {
+                    use.site_class = CLASS_AMBIENT_ONLY;
+                    candidate.uses.push_back(use);
+                }
+            }
+        }
+        if (candidate.uses.empty()) {
+            ++summary.rejected_no_use;
+            continue;
+        }
+        candidates.push_back(candidate);
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.record->rid != b.record->rid) return a.record->rid < b.record->rid;
+        return a.pos < b.pos;
+    });
+    summary.selected_sites = static_cast<int64_t>(candidates.size());
+    if (candidates.empty()) {
+        throw std::runtime_error("No chrM sites passed depth, homoplasmy, expression, and library-use filters");
+    }
+
+    std::vector<std::vector<PairCounts> > pair_counts(libraries.size());
+    for (size_t l = 0; l < libraries.size(); ++l) pair_counts[l].resize(libraries[l].pairs.size());
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        for (size_t u = 0; u < candidates[c].uses.size(); ++u) {
+            const SiteUse& use = candidates[c].uses[u];
+            PairCounts& counts = pair_counts[use.library_index][use.pair_index];
+            if (use.site_class == CLASS_A_ALT_B_REF) ++counts.a_alt_b_ref;
+            else if (use.site_class == CLASS_A_REF_B_ALT) ++counts.a_ref_b_alt;
+            else ++counts.ambient_only;
+        }
+    }
+
+    {
+        std::ofstream out(pair_audit_path.c_str());
+        if (!out) throw std::runtime_error("Could not write mt pair audit: " + pair_audit_path);
+        out << "library_id\tparent1\tparent2\tpair\ta_alt_b_ref_sites\ta_ref_b_alt_sites"
+            << "\tratio_sites\tambient_only_sites\trequested_min_ratio_sites"
+            << "\trequested_min_ambient_sites\tstatus\n";
+        for (size_t l = 0; l < libraries.size(); ++l) {
+            for (size_t p = 0; p < libraries[l].pairs.size(); ++p) {
+                const PairDef& pair = libraries[l].pairs[p];
+                const PairCounts& counts = pair_counts[l][p];
+                const int ratio_total = counts.a_alt_b_ref + counts.a_ref_b_alt;
+                std::vector<std::string> failures;
+                if (ratio_total < config.min_pair_sites) {
+                    failures.push_back(ratio_total == 0 ? "NO_RATIO_MARKERS" : "BELOW_RATIO_TARGET");
+                    ++summary.pairs_below_ratio_target;
+                }
+                if (counts.ambient_only < config.min_ambient_sites) {
+                    failures.push_back("NO_AMBIENT_ANCHOR");
+                    ++summary.pairs_without_ambient_anchor;
+                }
+                out << libraries[l].id << '\t' << pair.first << '\t' << pair.second << '\t'
+                    << pair.first << '+' << pair.second << '\t'
+                    << counts.a_alt_b_ref << '\t' << counts.a_ref_b_alt << '\t'
+                    << ratio_total << '\t' << counts.ambient_only << '\t'
+                    << config.min_pair_sites << '\t' << config.min_ambient_sites << '\t'
+                    << (failures.empty() ? "PASS" : join(failures, ";")) << '\n';
+            }
+        }
+    }
+
+    {
+        std::ofstream out(site_manifest_path.c_str());
+        if (!out) throw std::runtime_error("Could not write mt site manifest: " + site_manifest_path);
+        out << "library_id\tparent1\tparent2\tchrom\tpos\tref\talt\tsite_class"
+            << "\tparent1_state\tparent2_state\topposite_donors"
+            << "\tparent1_depth\tparent1_alt_fraction\tparent1_depth_source"
+            << "\tparent2_depth\tparent2_alt_fraction\tparent2_depth_source"
+            << "\tcoverage\tqual\n";
+        out << std::setprecision(10);
+        for (size_t c = 0; c < candidates.size(); ++c) {
+            const Candidate& candidate = candidates[c];
+            for (size_t u = 0; u < candidate.uses.size(); ++u) {
+                const SiteUse& use = candidate.uses[u];
+                const LibraryDef& lib = libraries[use.library_index];
+                const PairDef& pair = lib.pairs[use.pair_index];
+                const Evidence& a = candidate.evidence[pair.first_index];
+                const Evidence& b = candidate.evidence[pair.second_index];
+                out << lib.id << '\t' << pair.first << '\t' << pair.second << '\t'
+                    << config.mito_chrom << '\t' << candidate.pos + 1 << '\t'
+                    << candidate.ref << '\t' << candidate.alt << '\t'
+                    << class_name(use.site_class) << '\t' << static_cast<int>(a.state) << '\t'
+                    << static_cast<int>(b.state) << '\t' << join(use.opposite_donors, ",") << '\t'
+                    << a.total_depth << '\t' << a.alt_fraction << '\t' << a.depth_source << '\t'
+                    << b.total_depth << '\t' << b.alt_fraction << '\t' << b.depth_source << '\t'
+                    << candidate.coverage << '\t' << candidate.qual << '\n';
+            }
+        }
+    }
+
+    {
+        std::ofstream groups(haplotype_groups_path.c_str());
+        std::ofstream pairwise(haplotype_pairwise_path.c_str());
+        if (!groups) throw std::runtime_error("Could not write mt haplotype groups: " + haplotype_groups_path);
+        if (!pairwise) throw std::runtime_error("Could not write mt haplotype pairwise report: " + haplotype_pairwise_path);
+        groups << "library_id\thaplotype_group\tdonors\tdonor_count\tcommon_callable_sites"
+               << "\tsignature_hash\tresolution_status\n";
+        pairwise << "library_id\tdonor1\tdonor2\tjoint_callable_sites\tdistinguishing_sites"
+                 << "\tidentical_on_retained_panel\tstatus\n";
+        for (size_t l = 0; l < libraries.size(); ++l) {
+            const LibraryDef& lib = libraries[l];
+            std::vector<size_t> common_sites;
+            for (size_t c = 0; c < candidates.size(); ++c) {
+                bool all_called = true;
+                for (size_t d = 0; d < lib.donor_indices.size(); ++d) {
+                    if (candidates[c].evidence[lib.donor_indices[d]].state < 0) {
+                        all_called = false;
+                        break;
+                    }
+                }
+                if (all_called) common_sites.push_back(c);
+            }
+            std::map<std::string, std::vector<std::string> > signature_groups;
+            for (size_t d = 0; d < lib.donors.size(); ++d) {
+                std::string signature;
+                signature.reserve(common_sites.size());
+                for (size_t k = 0; k < common_sites.size(); ++k) {
+                    const int state = candidates[common_sites[k]].evidence[lib.donor_indices[d]].state;
+                    signature.push_back(state == 1 ? '1' : '0');
+                }
+                signature_groups[signature].push_back(lib.donors[d]);
+            }
+            int group_number = 0;
+            for (std::map<std::string, std::vector<std::string> >::const_iterator it =
+                     signature_groups.begin(); it != signature_groups.end(); ++it) {
+                ++group_number;
+                std::ostringstream group_id;
+                group_id << "MTG" << std::setw(3) << std::setfill('0') << group_number;
+                std::string status;
+                if (common_sites.empty()) status = "NO_COMMON_CALLABLE_SITES";
+                else if (it->second.size() > 1) status = "COLLAPSED_SHARED_HAPLOTYPE";
+                else status = "UNIQUE_ON_RETAINED_PANEL";
+                groups << lib.id << '\t' << group_id.str() << '\t' << join(it->second, ",") << '\t'
+                       << it->second.size() << '\t' << common_sites.size() << '\t'
+                       << hex64(fnv1a64(it->first)) << '\t' << status << '\n';
+            }
+            for (size_t i = 0; i < lib.donors.size(); ++i) {
+                for (size_t j = i + 1; j < lib.donors.size(); ++j) {
+                    int callable = 0;
+                    int differences = 0;
+                    for (size_t c = 0; c < candidates.size(); ++c) {
+                        const int a = candidates[c].evidence[lib.donor_indices[i]].state;
+                        const int b = candidates[c].evidence[lib.donor_indices[j]].state;
+                        if (a < 0 || b < 0) continue;
+                        ++callable;
+                        if (a != b) ++differences;
+                    }
+                    const bool identical = callable > 0 && differences == 0;
+                    const char* status = callable == 0 ? "NO_JOINT_CALLABLE_SITES" :
+                        (identical ? "COLLAPSED_SHARED_HAPLOTYPE" : "DISTINGUISHABLE");
+                    pairwise << lib.id << '\t' << lib.donors[i] << '\t' << lib.donors[j] << '\t'
+                             << callable << '\t' << differences << '\t' << (identical ? 1 : 0)
+                             << '\t' << status << '\n';
+                }
+            }
+        }
+    }
+
+    if (config.require_pair_targets &&
+        (summary.pairs_below_ratio_target > 0 || summary.pairs_without_ambient_anchor > 0)) {
+        throw std::runtime_error(
+            "At least one library/pair failed mitochondrial ratio or ambient-anchor targets; see " +
+            pair_audit_path);
+    }
+
+    bcf_hdr_t* out_header = bcf_hdr_dup(header);
+    if (!out_header) throw std::runtime_error("Could not duplicate mt panel header");
+    bcf_hdr_append(out_header,
+        "##INFO=<ID=MT_LIBRARY_COUNT,Number=1,Type=Integer,Description=\"Libraries for which this site is useful\">");
+    bcf_hdr_append(out_header,
+        "##INFO=<ID=MT_PAIR_USE_COUNT,Number=1,Type=Integer,Description=\"Library-parent-pair uses for this site\">");
+    bcf_hdr_append(out_header,
+        "##INFO=<ID=MT_RATIO_USE_COUNT,Number=1,Type=Integer,Description=\"Parent-discriminating library-pair uses\">");
+    bcf_hdr_append(out_header,
+        "##INFO=<ID=MT_AMBIENT_USE_COUNT,Number=1,Type=Integer,Description=\"Ambient-only library-pair uses\">");
+    bcf_hdr_append(out_header,
+        "##INFO=<ID=MT_COV_SCORE,Number=1,Type=Float,Description=\"Mitochondrial expression coverage score\">");
+    bcf_hdr_append(out_header,
+        "##INFO=<ID=MT_DEPTH_FILTER,Number=1,Type=Integer,Description=\"Minimum parental allele depth required by selector\">");
+    bcf_hdr_append(out_header,
+        "##INFO=<ID=MT_HOMOPLASMY_AF_FILTER,Number=1,Type=Float,Description=\"Near-fixed parental allele-fraction threshold\">");
+    bcf_hdr_append(out_header,
+        "##mt_panel_selection=depth_based_homoplasmy;library_specific_three_site_classes;metadata_expected_donors_only");
+    if (bcf_hdr_sync(out_header) < 0) {
+        bcf_hdr_destroy(out_header);
+        throw std::runtime_error("Could not sync mt panel output header");
+    }
+
+    htsFile* output = hts_open(config.output.c_str(), output_mode(config.output).c_str());
+    if (!output) {
+        bcf_hdr_destroy(out_header);
+        throw std::runtime_error("Could not open mt panel output: " + config.output);
+    }
+    hts_set_threads(output, config.threads);
+    if (bcf_hdr_write(output, out_header) < 0) {
+        hts_close(output);
+        bcf_hdr_destroy(out_header);
+        throw std::runtime_error("Could not write mt panel header");
+    }
+    std::ofstream bed(sites_bed_path.c_str());
+    if (!bed) {
+        hts_close(output);
+        bcf_hdr_destroy(out_header);
+        throw std::runtime_error("Could not write mt site BED: " + sites_bed_path);
+    }
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        const Candidate& candidate = candidates[c];
+        std::set<int> library_ids;
+        int ratio_uses = 0;
+        int ambient_uses = 0;
+        for (size_t u = 0; u < candidate.uses.size(); ++u) {
+            library_ids.insert(candidate.uses[u].library_index);
+            if (candidate.uses[u].site_class == CLASS_AMBIENT_ONLY) ++ambient_uses;
+            else ++ratio_uses;
+        }
+        bcf1_t* record = bcf_dup(candidate.record);
+        if (!record) {
+            hts_close(output);
+            bcf_hdr_destroy(out_header);
+            throw std::runtime_error("Could not duplicate mt panel record");
+        }
+        int32_t library_count = static_cast<int32_t>(library_ids.size());
+        int32_t pair_use_count = static_cast<int32_t>(candidate.uses.size());
+        int32_t ratio_use_count = ratio_uses;
+        int32_t ambient_use_count = ambient_uses;
+        int32_t depth_filter = config.min_depth;
+        float cov = static_cast<float>(candidate.coverage);
+        float hom_af = static_cast<float>(config.homoplasmy_af);
+        bcf_update_info_int32(out_header, record, "MT_LIBRARY_COUNT", &library_count, 1);
+        bcf_update_info_int32(out_header, record, "MT_PAIR_USE_COUNT", &pair_use_count, 1);
+        bcf_update_info_int32(out_header, record, "MT_RATIO_USE_COUNT", &ratio_use_count, 1);
+        bcf_update_info_int32(out_header, record, "MT_AMBIENT_USE_COUNT", &ambient_use_count, 1);
+        bcf_update_info_float(out_header, record, "MT_COV_SCORE", &cov, 1);
+        bcf_update_info_int32(out_header, record, "MT_DEPTH_FILTER", &depth_filter, 1);
+        bcf_update_info_float(out_header, record, "MT_HOMOPLASMY_AF_FILTER", &hom_af, 1);
+        if (bcf_write(output, out_header, record) < 0) {
+            bcf_destroy(record);
+            hts_close(output);
+            bcf_hdr_destroy(out_header);
+            throw std::runtime_error("Failed while writing mt panel record");
+        }
+        bcf_destroy(record);
+        bed << config.mito_chrom << '\t' << candidate.pos << '\t' << candidate.pos + 1 << '\n';
+    }
+    hts_close(output);
+    bcf_hdr_destroy(out_header);
+    if (bcf_index_build(config.output.c_str(), 14) < 0) {
+        std::fprintf(stderr, "WARNING: could not build CSI index for %s\n", config.output.c_str());
+    }
+
+    std::fprintf(stderr, "\nMitochondrial panel selection complete\n");
+    std::fprintf(stderr, "  metadata libraries: %d\n", summary.libraries);
+    std::fprintf(stderr, "  expected donors: %d of %d VCF samples\n", summary.expected_donors, n_samples);
+    std::fprintf(stderr, "  expected heterotypic pairs: %d\n", summary.expected_pairs);
+    std::fprintf(stderr, "  chrM records supplied: %lld\n", static_cast<long long>(summary.records_scanned));
+    std::fprintf(stderr, "  selected union sites: %lld\n", static_cast<long long>(summary.selected_sites));
+    std::fprintf(stderr,
+        "  rejected: blacklist=%lld mt_mask=%lld non_snv=%lld quality=%lld coverage=%lld no_library_use=%lld\n",
+        static_cast<long long>(summary.rejected_blacklist),
+        static_cast<long long>(summary.rejected_mt_mask),
+        static_cast<long long>(summary.rejected_non_snv),
+        static_cast<long long>(summary.rejected_quality),
+        static_cast<long long>(summary.rejected_coverage),
+        static_cast<long long>(summary.rejected_no_use));
+    std::fprintf(stderr, "  pair target failures: ratio=%d ambient_anchor=%d\n",
+        summary.pairs_below_ratio_target, summary.pairs_without_ambient_anchor);
+    std::fprintf(stderr, "  output: %s\n", config.output.c_str());
+    std::fprintf(stderr, "  site manifest: %s\n", site_manifest_path.c_str());
+    std::fprintf(stderr, "  haplotype groups: %s\n", haplotype_groups_path.c_str());
+    return summary;
+}
+
+}  // namespace mtpanel
+
 #include <chrono>
 #include <omp.h>
 #include <mutex>
@@ -226,8 +1193,13 @@ void load_gtf(const string& gtf_file, map<string, vector<Interval>>& annotations
 }
 
 // B11: Load blacklist BED file (0-based half-open intervals)
-void load_bed(const string& bed_file, map<string, vector<Interval>>& blacklist) {
+void load_bed(const string& bed_file, map<string, vector<Interval>>& blacklist,
+              const char* label = "blacklist") {
     ifstream file(bed_file);
+    if (!file.is_open()) {
+        fprintf(stderr, "ERROR: Could not open %s BED file: %s\n", label, bed_file.c_str());
+        exit(1);
+    }
     string line;
     long count = 0;
     while (getline(file, line)) {
@@ -243,8 +1215,21 @@ void load_bed(const string& bed_file, map<string, vector<Interval>>& blacklist) 
     }
     for (auto& pair : blacklist) {
         sort(pair.second.begin(), pair.second.end());
+        // Merge overlapping/adjacent records so interval lookup remains correct
+        // even when a BED contains nested annotations.
+        vector<Interval> merged;
+        merged.reserve(pair.second.size());
+        for (const Interval& iv : pair.second) {
+            if (merged.empty() || iv.start > merged.back().end) {
+                merged.push_back(iv);
+            } else if (iv.end > merged.back().end) {
+                merged.back().end = iv.end;
+            }
+        }
+        pair.second.swap(merged);
     }
-    fprintf(stderr, "Loaded %ld blacklist intervals for %lu chromosomes.\n", count, blacklist.size());
+    fprintf(stderr, "Loaded %ld %s intervals for %lu chromosomes.\n",
+        count, label, blacklist.size());
 }
 
 bool is_blacklisted(const string& chrom, int pos,
@@ -258,6 +1243,49 @@ bool is_blacklisted(const string& chrom, int pos,
         if (prev->start <= pos && prev->end > pos) return true;
     }
     return false;
+}
+
+// Nuclear-panel exclusion bits. The annotated-all output retains excluded
+// records and reports the reason, while every selected nuclear panel omits them.
+enum NuclearExclusion : uint8_t {
+    NUCLEAR_EXCLUDE_NONE      = 0,
+    NUCLEAR_EXCLUDE_MITO      = 1u << 0,
+    NUCLEAR_EXCLUDE_NUMT      = 1u << 1,
+    NUCLEAR_EXCLUDE_BLACKLIST = 1u << 2
+};
+
+uint8_t nuclear_exclusion_mask(const string& chrom, int pos,
+                               const string& mito_chrom,
+                               bool include_mito,
+                               const map<string, vector<Interval>>& numts,
+                               bool include_numts,
+                               const map<string, vector<Interval>>& blacklist) {
+    uint8_t mask = NUCLEAR_EXCLUDE_NONE;
+    if (!include_mito && chrom == mito_chrom) {
+        mask |= NUCLEAR_EXCLUDE_MITO;
+    }
+    if (!include_numts && !numts.empty() && is_blacklisted(chrom, pos, numts)) {
+        mask |= NUCLEAR_EXCLUDE_NUMT;
+    }
+    if (!blacklist.empty() && is_blacklisted(chrom, pos, blacklist)) {
+        mask |= NUCLEAR_EXCLUDE_BLACKLIST;
+    }
+    return mask;
+}
+
+string nuclear_exclusion_reason(uint8_t mask) {
+    if (mask == NUCLEAR_EXCLUDE_NONE) return "PASS";
+    string reason;
+    if (mask & NUCLEAR_EXCLUDE_MITO) reason += "MITO";
+    if (mask & NUCLEAR_EXCLUDE_NUMT) {
+        if (!reason.empty()) reason += "+";
+        reason += "NUMT";
+    }
+    if (mask & NUCLEAR_EXCLUDE_BLACKLIST) {
+        if (!reason.empty()) reason += "+";
+        reason += "BLACKLIST";
+    }
+    return reason;
 }
 
 float get_annot_score(const string& chrom, int pos, const map<string, vector<Interval>>& annotations) {
@@ -550,6 +1578,7 @@ struct StoredVariant {
     // Precomputed by proc_bcf_record logic (only valid for biallelic)
     bool is_biallelic;          // n_alleles == 2
     bool passes_qc;             // What proc_bcf_record would return
+    uint8_t nuclear_exclusion;  // NuclearExclusion bit mask (chrM/NUMT/blacklist)
     bitset<NBITS> alt;          // Dosage-aware: bit 2i = alt_present, bit 2i+1 = homo_alt
     bitset<NBITS> alt_flip;     // Dosage-flipped version of alt
     bitset<NBITS> present;      // 1-bit-per-sample at position i
@@ -591,7 +1620,28 @@ void help(int code){
     fprintf(stderr, "    --cov -c     Tabix-indexed bedgraph coverage file (RNA). Adds COV_SCORE INFO field.\n");
     fprintf(stderr, "    --min_cov -m Minimum coverage threshold (default: 1.0). Sites below this are excluded.\n");
     fprintf(stderr, "    --seed -s    Random seed (currently unused; selection is deterministic).\n");
-    fprintf(stderr, "    --blacklist  BED file of regions to exclude (0-based half-open).\n");
+    fprintf(stderr, "    --blacklist  Additional BED regions to exclude (0-based half-open).\n");
+    fprintf(stderr, "    --mito_chrom Contig name for the mitochondrial genome (default: chrM).\n");
+    fprintf(stderr, "    --include_mito  Allow mitochondrial variants in nuclear panels (default: excluded).\n");
+    fprintf(stderr, "    --numts_bed BED of nuclear mitochondrial insertions to exclude (0-based half-open).\n");
+    fprintf(stderr, "                May also be supplied via CELLBOUNCER_NUMTS_BED.\n");
+    fprintf(stderr, "    --include_numts  Do not apply --numts_bed/CELLBOUNCER_NUMTS_BED.\n");
+    fprintf(stderr, "===== MITOCHONDRIAL FUSION-RATIO PANEL (optional) =====\n");
+    fprintf(stderr, "    --mt_output FILE              Emit the dedicated chrM panel in this same VCF load.\n");
+    fprintf(stderr, "    --mt_min_depth INT            Minimum parental RO+AO/AD depth (default: 10).\n");
+    fprintf(stderr, "    --mt_homoplasmy_af FLOAT      Near-fixed parental allele fraction (default: 0.95).\n");
+    fprintf(stderr, "    --mt_min_coverage FLOAT       chrM expression floor (default: inherit --min_cov).\n");
+    fprintf(stderr, "    --mt_min_pair_sites INT       Requested ratio markers per library/pair (default: 20).\n");
+    fprintf(stderr, "    --mt_min_ambient_sites INT    Requested ambient-only anchors per pair (default: 1).\n");
+    fprintf(stderr, "    --mt_require_pair_targets     Fail after writing audits if either target is missed.\n");
+    fprintf(stderr, "    --mt_allow_missing_coverage   Diagnostic only; permit no chrM coverage track.\n");
+    fprintf(stderr, "    --mt_mask_bed FILE            Optional chrM-coordinate ambiguity mask.\n");
+    fprintf(stderr, "    --mt_site_manifest FILE       Three-class per-library site manifest.\n");
+    fprintf(stderr, "    --mt_pair_audit FILE          Per-library/pair marker audit.\n");
+    fprintf(stderr, "    --mt_haplotype_groups FILE    Per-library mt haplotype equivalence groups.\n");
+    fprintf(stderr, "    --mt_haplotype_pairwise FILE  Pairwise retained-panel distinction report.\n");
+    fprintf(stderr, "    --mt_sample_audit FILE        VCF sample versus metadata role report.\n");
+    fprintf(stderr, "    --mt_sites_bed FILE           BED for retaining chrM sites in subset BAMs.\n");
     fprintf(stderr, "===== HET SITE SELECTION =====\n");
     fprintf(stderr, "    --het_output -H  Output file for het-enriched SNP set (optional).\n");
     fprintf(stderr, "    --het_num -N     Target number of het sites (default: half of --num).\n");
@@ -1085,6 +2135,25 @@ int main(int argc, char *argv[]) {
        {"species_max_per_bin", required_argument, 0, 1103},
        {"max_het_per_bin", required_argument, 0, 1200},
        {"blacklist", required_argument, 0, 1203},
+       {"numts_bed", required_argument, 0, 1205},
+       {"include_mito", no_argument, 0, 1206},
+       {"include_numts", no_argument, 0, 1207},
+       {"mito_chrom", required_argument, 0, 1208},
+       {"mt_output", required_argument, 0, 1400},
+       {"mt_site_manifest", required_argument, 0, 1401},
+       {"mt_pair_audit", required_argument, 0, 1402},
+       {"mt_haplotype_groups", required_argument, 0, 1403},
+       {"mt_haplotype_pairwise", required_argument, 0, 1404},
+       {"mt_sample_audit", required_argument, 0, 1405},
+       {"mt_sites_bed", required_argument, 0, 1406},
+       {"mt_mask_bed", required_argument, 0, 1407},
+       {"mt_min_depth", required_argument, 0, 1408},
+       {"mt_homoplasmy_af", required_argument, 0, 1409},
+       {"mt_min_coverage", required_argument, 0, 1410},
+       {"mt_min_pair_sites", required_argument, 0, 1411},
+       {"mt_min_ambient_sites", required_argument, 0, 1412},
+       {"mt_require_pair_targets", no_argument, 0, 1413},
+       {"mt_allow_missing_coverage", no_argument, 0, 1414},
        {"het_pool_weight", required_argument, 0, 1201},
        {"het_max_excess_z", required_argument, 0, 1202},
        {"min_pair_score", required_argument, 0, 'Q'},
@@ -1107,7 +2176,17 @@ int main(int argc, char *argv[]) {
     string atac_outfile = "";
     string atac_het_outfile = "";
     string species_outfile = "";
-    string blacklist_file = "";  // B11
+    string blacklist_file = "";  // Additional user blacklist
+    string numts_bed_file = "";
+    string mito_chrom = "chrM";
+    string mt_outfile = "";
+    string mt_site_manifest_file = "";
+    string mt_pair_audit_file = "";
+    string mt_haplotype_groups_file = "";
+    string mt_haplotype_pairwise_file = "";
+    string mt_sample_audit_file = "";
+    string mt_sites_bed_file = "";
+    string mt_mask_bed_file = "";
     string species_coverage_mode = "rna";
     int num = -1;
     int het_num = -1;
@@ -1132,10 +2211,19 @@ int main(int argc, char *argv[]) {
     long max_pairwise_rescue = -1;  // B8: -1 = default to num/10
     int pairwise_rescue_max_per_bin = -1;  // B8: -1 = use species_max_per_bin
     float pairwise_rescue_min_call_rate = 0.5f;  // B8
+    int mt_min_depth = 10;
+    int mt_min_pair_sites = 20;
+    int mt_min_ambient_sites = 1;
+    float mt_homoplasmy_af = 0.95f;
+    float mt_min_coverage = -1.0f;  // -1 = inherit --min_cov
     int n_threads = omp_get_max_threads();
     int seed = -1;
     bool annotate_only = false;
     bool enable_pool_scoring = false;
+    bool include_mito = false;
+    bool include_numts = false;
+    bool mt_require_pair_targets = false;
+    bool mt_require_coverage = true;
 
     int option_index = 0;
     int ch;
@@ -1256,6 +2344,63 @@ int main(int argc, char *argv[]) {
             case 1203:
                 blacklist_file = optarg;
                 break;
+            case 1205:
+                numts_bed_file = optarg;
+                break;
+            case 1206:
+                include_mito = true;
+                break;
+            case 1207:
+                include_numts = true;
+                break;
+            case 1208:
+                mito_chrom = optarg;
+                break;
+            case 1400:
+                mt_outfile = optarg;
+                break;
+            case 1401:
+                mt_site_manifest_file = optarg;
+                break;
+            case 1402:
+                mt_pair_audit_file = optarg;
+                break;
+            case 1403:
+                mt_haplotype_groups_file = optarg;
+                break;
+            case 1404:
+                mt_haplotype_pairwise_file = optarg;
+                break;
+            case 1405:
+                mt_sample_audit_file = optarg;
+                break;
+            case 1406:
+                mt_sites_bed_file = optarg;
+                break;
+            case 1407:
+                mt_mask_bed_file = optarg;
+                break;
+            case 1408:
+                mt_min_depth = atoi(optarg);
+                break;
+            case 1409:
+                mt_homoplasmy_af = atof(optarg);
+                break;
+            case 1410:
+                mt_min_coverage = atof(optarg);
+                break;
+            case 1411:
+                mt_min_pair_sites = atoi(optarg);
+                break;
+            case 1412:
+                mt_min_ambient_sites = atoi(optarg);
+                break;
+            case 1413:
+                mt_require_pair_targets = true;
+                break;
+            case 1414:
+                mt_require_coverage = false;
+                break;
             case 1201:
                 het_pool_weight = atof(optarg);
                 // C10: het_pool_weight is clamped to [0, 1]. pool_discrim_norm is bounded
@@ -1288,6 +2433,11 @@ int main(int argc, char *argv[]) {
         }    
     }
     
+    if (numts_bed_file.empty()) {
+        const char* env_numts = getenv("CELLBOUNCER_NUMTS_BED");
+        if (env_numts && *env_numts) numts_bed_file = env_numts;
+    }
+
     if (vcf_file == ""){
         fprintf(stderr, "ERROR: VCF file required\n");
         exit(1);
@@ -1370,6 +2520,35 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "ERROR: --pool_combinations/-L is required when --enable_pool_scoring is set\n");
         exit(1);
     }
+    if (!mt_outfile.empty()) {
+        if (annotate_only) {
+            fprintf(stderr, "ERROR: --mt_output is not supported with --annotate_only; run the normal multi-output path\n");
+            exit(1);
+        }
+        if (pool_combinations_file.empty()) {
+            fprintf(stderr, "ERROR: --pool_combinations/-L is required when --mt_output is set\n");
+            exit(1);
+        }
+        if (mt_min_depth < 1 || mt_homoplasmy_af <= 0.5f || mt_homoplasmy_af > 1.0f ||
+            mt_min_pair_sites < 0 || mt_min_ambient_sites < 0) {
+            fprintf(stderr, "ERROR: invalid mitochondrial panel threshold\n");
+            exit(1);
+        }
+        if (mt_min_coverage < 0.0f) mt_min_coverage = min_cov;
+        if (mt_min_coverage < 0.0f) {
+            fprintf(stderr, "ERROR: --mt_min_coverage must be nonnegative\n");
+            exit(1);
+        }
+        if (mt_require_coverage && cov_file.empty()) {
+            fprintf(stderr,
+                "ERROR: --mt_output requires --cov with chrM coverage. "
+                "Use --mt_allow_missing_coverage only for an explicit diagnostic run.\n");
+            exit(1);
+        }
+        if (mt_outfile.rfind(".bcf") == string::npos && mt_outfile.rfind(".vcf") == string::npos) {
+            mt_outfile += ".bcf";
+        }
+    }
     
     if (!species_outfile.empty()) {
         if (panel_metadata_file.empty()) {
@@ -1407,6 +2586,24 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Using %d threads\n", n_threads);
     fprintf(stderr, "Bin size for evenness scoring: %d bp\n", bin_size);
     fprintf(stderr, "Minimum coverage threshold: %.1f\n", min_cov);
+    fprintf(stderr, "Mitochondrial contig: %s (%s in nuclear panels)\n",
+        mito_chrom.c_str(), include_mito ? "included" : "excluded by default");
+    if (!mt_outfile.empty()) {
+        fprintf(stderr,
+            "Dedicated mt panel: %s (same VCF load; min_depth=%d, homoplasmy_af=%.3f, "
+            "min_coverage=%.3f, ratio_target=%d, ambient_anchor_target=%d)\n",
+            mt_outfile.c_str(), mt_min_depth, mt_homoplasmy_af, mt_min_coverage,
+            mt_min_pair_sites, mt_min_ambient_sites);
+    }
+    if (include_numts) {
+        fprintf(stderr, "NUMT exclusion: disabled by --include_numts\n");
+    } else if (!numts_bed_file.empty()) {
+        fprintf(stderr, "NUMT exclusion BED: %s\n", numts_bed_file.c_str());
+    } else {
+        fprintf(stderr,
+            "WARNING: no NUMT BED was supplied. chrM is still excluded, but nuclear "
+            "NUMT loci cannot be removed. Use --numts_bed or CELLBOUNCER_NUMTS_BED.\n");
+    }
     if (atac_min_cov < 0.0f) atac_min_cov = min_cov;  // B14: default to min_cov
     if (seed != -1) {
         fprintf(stderr, "WARNING: --seed is currently unused; selection is fully "
@@ -1438,10 +2635,15 @@ int main(int argc, char *argv[]) {
         load_gtf(gtf_file, annotations);
     }
 
-    // B11: Load blacklist BED if provided
+    // Load optional interval exclusions. NUMTs are kept separate from the
+    // generic blacklist so annotate_all can report the exact exclusion reason.
     map<string, vector<Interval>> blacklist;
     if (!blacklist_file.empty()) {
-        load_bed(blacklist_file, blacklist);
+        load_bed(blacklist_file, blacklist, "blacklist");
+    }
+    map<string, vector<Interval>> numts;
+    if (!include_numts && !numts_bed_file.empty()) {
+        load_bed(numts_bed_file, numts, "NUMT");
     }
 
     // Load coverage into memory for fast lookup
@@ -1499,6 +2701,7 @@ int main(int argc, char *argv[]) {
             bcf_hdr_append(hdr, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"Coverage score from bedgraph\">");
         }
         bcf_hdr_append(hdr, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index for evenness tracking\">");
+        bcf_hdr_append(hdr, "##INFO=<ID=NUCLEAR_PANEL_STATUS,Number=1,Type=String,Description=\"PASS or exclusion reason(s): MITO, NUMT, BLACKLIST\">");
         
         if (bcf_hdr_sync(hdr) < 0) {
             fprintf(stderr, "ERROR: Failed to sync header\n");
@@ -1611,11 +2814,16 @@ int main(int argc, char *argv[]) {
                 bcf_update_info_float(hdr, rec, "COV_SCORE", &cov_score, 1);
             }
             
-            // Add BIN_ID
+            // Add BIN_ID and nuclear-panel exclusion status.
             const char* chrom = bcf_hdr_id2name(hdr, rec->rid);
             int bin_idx_val = get_bin_idx(rec->pos, bin_size);
             string bin_id = make_bin_id(chrom, bin_idx_val);
             bcf_update_info_string(hdr, rec, "BIN_ID", bin_id.c_str());
+            uint8_t exclusion = nuclear_exclusion_mask(
+                chrom, rec->pos, mito_chrom, include_mito,
+                numts, include_numts, blacklist);
+            string exclusion_reason = nuclear_exclusion_reason(exclusion);
+            bcf_update_info_string(hdr, rec, "NUCLEAR_PANEL_STATUS", exclusion_reason.c_str());
             
             // Write record
             if (bcf_write(out_fp, hdr, rec) < 0) {
@@ -1790,11 +2998,36 @@ int main(int argc, char *argv[]) {
     int load_n_gts = 0;
     
     vector<StoredVariant> all_variants;
-    all_variants.reserve(150000000);  // Pre-allocate for ~150M variants
+    // chrM is tiny (~2K source records). Preserve only those raw records so the
+    // dedicated mitochondrial panel can be emitted from this same full VCF load
+    // with RO/AO/AD intact, rather than reopening and rescanning the 73-GB panel.
+    vector<bcf1_t*> mt_source_records;
+    if (!mt_outfile.empty()) mt_source_records.reserve(4096);
+    // Reserve from CSI/BCF index statistics instead of unconditionally reserving
+    // space for 150M records. This preserves the no-reallocation fast path on
+    // production panels while avoiding an enormous virtual allocation for small
+    // tests or targeted VCFs.
+    uint64_t indexed_variant_count = 0;
+    for (int rid = 0; rid < (int)chroms.size(); ++rid) {
+        uint64_t mapped = 0, unmapped = 0;
+        if (hts_idx_get_stat(vcf_idx, rid, &mapped, &unmapped) == 0) {
+            indexed_variant_count += mapped + unmapped;
+        }
+    }
+    const size_t reserve_count = indexed_variant_count > 0
+        ? (size_t)min<uint64_t>(indexed_variant_count + indexed_variant_count / 100 + 1024,
+                                150000000ULL)
+        : 5000000ULL;
+    all_variants.reserve(reserve_count);
+    fprintf(stderr, "  Reserving in-memory capacity for %zu variants (index estimate: %llu)\n",
+        reserve_count, (unsigned long long)indexed_variant_count);
     
     long n_loaded = 0;
     long n_biallelic = 0;
     long n_pass_qc = 0;
+    long n_excluded_mito = 0;
+    long n_excluded_numt = 0;
+    long n_excluded_blacklist = 0;
     
     while (bcf_read(load_fp, load_hdr, load_rec) >= 0) {
         StoredVariant sv;
@@ -1803,10 +3036,22 @@ int main(int argc, char *argv[]) {
         sv.n_alleles = load_rec->n_allele;
         sv.is_biallelic = (load_rec->n_allele == 2);
         sv.passes_qc = false;
+        const string& load_chrom = chroms[sv.chrom_idx];
+        sv.nuclear_exclusion = nuclear_exclusion_mask(
+            load_chrom, sv.pos, mito_chrom, include_mito,
+            numts, include_numts, blacklist);
         sv.qual = load_rec->qual;
         
         // Get alleles - store ALL alleles for ALL variants
-        bcf_unpack(load_rec, BCF_UN_STR);
+        bcf_unpack(load_rec, BCF_UN_STR | BCF_UN_FMT);
+        if (!mt_outfile.empty() && load_chrom == mito_chrom) {
+            bcf1_t* mt_copy = bcf_dup(load_rec);
+            if (!mt_copy) {
+                fprintf(stderr, "ERROR: failed to preserve chrM record for mitochondrial panel\n");
+                exit(1);
+            }
+            mt_source_records.push_back(mt_copy);
+        }
         if (load_rec->n_allele > 0) {
             sv.alleles = load_rec->d.allele[0];
             for (int i = 1; i < load_rec->n_allele; i++) {
@@ -1896,6 +3141,10 @@ int main(int argc, char *argv[]) {
             }
         }
         
+        if (sv.nuclear_exclusion & NUCLEAR_EXCLUDE_MITO) n_excluded_mito++;
+        if (sv.nuclear_exclusion & NUCLEAR_EXCLUDE_NUMT) n_excluded_numt++;
+        if (sv.nuclear_exclusion & NUCLEAR_EXCLUDE_BLACKLIST) n_excluded_blacklist++;
+
         sv.variant_idx = n_loaded;  // Store index for back-reference
         
         all_variants.push_back(std::move(sv));
@@ -1908,6 +3157,47 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    if (!mt_outfile.empty()) {
+        mtpanel::Config mt_config;
+        mt_config.output = mt_outfile;
+        mt_config.pool_combinations = pool_combinations_file;
+        mt_config.mito_chrom = mito_chrom;
+        mt_config.coverage = cov_file;
+        mt_config.blacklist_bed = blacklist_file;
+        mt_config.mt_mask_bed = mt_mask_bed_file;
+        mt_config.pair_audit = mt_pair_audit_file;
+        mt_config.site_manifest = mt_site_manifest_file;
+        mt_config.haplotype_groups = mt_haplotype_groups_file;
+        mt_config.haplotype_pairwise = mt_haplotype_pairwise_file;
+        mt_config.sample_audit = mt_sample_audit_file;
+        mt_config.sites_bed = mt_sites_bed_file;
+        mt_config.threads = n_threads;
+        mt_config.min_depth = mt_min_depth;
+        mt_config.min_pair_sites = mt_min_pair_sites;
+        mt_config.min_ambient_sites = mt_min_ambient_sites;
+        mt_config.homoplasmy_af = mt_homoplasmy_af;
+        mt_config.min_coverage = mt_min_coverage;
+        mt_config.require_pair_targets = mt_require_pair_targets;
+        mt_config.require_coverage = mt_require_coverage;
+        try {
+            mtpanel::build_panel(load_hdr, mt_source_records, mt_config);
+        } catch (const std::exception& error) {
+            for (size_t i = 0; i < mt_source_records.size(); ++i) {
+                bcf_destroy(mt_source_records[i]);
+            }
+            free(load_gts);
+            bcf_destroy(load_rec);
+            bcf_hdr_destroy(load_hdr);
+            hts_close(load_fp);
+            fprintf(stderr, "ERROR: mitochondrial panel build failed: %s\n", error.what());
+            exit(1);
+        }
+    }
+    for (size_t i = 0; i < mt_source_records.size(); ++i) {
+        bcf_destroy(mt_source_records[i]);
+    }
+    mt_source_records.clear();
+
     free(load_gts);
     bcf_destroy(load_rec);
     bcf_hdr_destroy(load_hdr);
@@ -1923,6 +3213,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "\n  Loaded %ld variants in %ld seconds\n", n_loaded, load_duration.count());
     fprintf(stderr, "  Biallelic: %ld (%.1f%%)\n", n_biallelic, 100.0 * n_biallelic / n_loaded);
     fprintf(stderr, "  Pass QC: %ld (%.1f%%)\n", n_pass_qc, 100.0 * n_pass_qc / n_loaded);
+    fprintf(stderr, "  Excluded from nuclear panels: chrM=%ld, NUMT=%ld, blacklist=%ld\n",
+        n_excluded_mito, n_excluded_numt, n_excluded_blacklist);
     
     // Build chromosome -> variant range index
     vector<pair<size_t, size_t>> chrom_ranges(chroms.size(), {0, 0});
@@ -1998,6 +3290,7 @@ int main(int argc, char *argv[]) {
             // Iterate over stored variants for this chromosome
             for (size_t vi = range_start; vi < range_end; vi++) {
                 const StoredVariant& sv = all_variants[vi];
+                if (sv.nuclear_exclusion != NUCLEAR_EXCLUDE_NONE) continue;
                 
                 // Skip non-biallelic (same as original: if n_allele != 2 continue)
                 if (!sv.is_biallelic) continue;
@@ -2045,8 +3338,7 @@ int main(int argc, char *argv[]) {
                     }
                     
                     if (het_pass) {
-                        // B11: Blacklist filter
-                        if (!blacklist.empty() && is_blacklisted(chrom, sv.pos, blacklist)) {
+                        if (sv.nuclear_exclusion != NUCLEAR_EXCLUDE_NONE) {
                             het_pass = false;
                         }
                     }
@@ -3418,7 +4710,7 @@ int main(int argc, char *argv[]) {
                 cov_score = get_coverage_score_fast(chrom, sv.pos, coverage_map);
             }
             if (cov_score < min_cov) continue;
-            if (!blacklist.empty() && is_blacklisted(chrom, sv.pos, blacklist)) continue;
+            if (sv.nuclear_exclusion != NUCLEAR_EXCLUDE_NONE) continue;
             
             selected_variant_indices.insert(vi);
             keep_all_count++;
@@ -3461,7 +4753,7 @@ int main(int argc, char *argv[]) {
         }
         
         // B11: Blacklist filter
-        if (!blacklist.empty() && is_blacklisted(chrom, sv.pos, blacklist)) continue;
+        if (sv.nuclear_exclusion != NUCLEAR_EXCLUDE_NONE) continue;
         
         // Determine the canonical clade bitset (dosage-aware: A8)
         int ta = sv.total_alt;
@@ -3778,6 +5070,7 @@ int main(int argc, char *argv[]) {
                 if (selected_variant_indices.count(vi) > 0) continue; // already selected
                 
                 const StoredVariant& sv = all_variants[vi];
+                if (sv.nuclear_exclusion != NUCLEAR_EXCLUDE_NONE) continue;
                 if (!sv.is_biallelic || !sv.passes_qc) continue;
                 if (sv.genotypes_packed.empty()) continue;
                 
@@ -4013,6 +5306,7 @@ int main(int argc, char *argv[]) {
         
         for (size_t vi = 0; vi < all_variants.size(); vi++) {
             const StoredVariant& sv = all_variants[vi];
+            if (sv.nuclear_exclusion != NUCLEAR_EXCLUDE_NONE) continue;
             if (!sv.is_biallelic || !sv.passes_qc) continue;
             if (sv.present.count() != (size_t)num_samples) continue;
             
@@ -4215,11 +5509,10 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "WARNING: Failed to create index for %s\n", het_outfile.c_str());
         }
         
-        // Free het candidates (large memory)
-        all_het_candidates.clear();
-        all_het_candidates.shrink_to_fit();
-        selected_het_indices.clear();
-        selected_het_indices.shrink_to_fit();
+        // Retain het candidates until the optional ATAC-het writer has finished.
+        // selected_atac_het_indices indexes this same vector; freeing it here caused
+        // a use-after-free/segmentation fault whenever RNA-het and ATAC-het outputs
+        // were requested in the same run.
         
         end_time = chrono::high_resolution_clock::now();
         duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
@@ -4320,6 +5613,17 @@ int main(int argc, char *argv[]) {
         duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
         fprintf(stderr, "ATAC-het output complete: %zu sites in %ld seconds\n",
             selected_atac_het_sites.size(), duration.count());
+    }
+
+    // Het and ATAC-het writers are both complete; release their shared
+    // candidate storage before the remaining large output passes.
+    if (collect_het) {
+        all_het_candidates.clear();
+        all_het_candidates.shrink_to_fit();
+        selected_het_indices.clear();
+        selected_het_indices.shrink_to_fit();
+        selected_atac_het_indices.clear();
+        selected_atac_het_indices.shrink_to_fit();
     }
 
     // ========================================================================
@@ -4568,6 +5872,7 @@ int main(int argc, char *argv[]) {
     bcf_hdr_append(out_header, "##INFO=<ID=COV_SCORE,Number=1,Type=Float,Description=\"Coverage score from bedgraph\">");
     bcf_hdr_append(out_header, "##INFO=<ID=BIN_ID,Number=1,Type=String,Description=\"Chromosome:bin_index for evenness tracking\">");
     bcf_hdr_append(out_header, "##INFO=<ID=SELECTION_SCORE,Number=1,Type=Float,Description=\"Within-clade selection score: log2(cov+1) + 0.1*annot_boost\">");
+    bcf_hdr_append(out_header, "##INFO=<ID=NUCLEAR_PANEL_STATUS,Number=1,Type=String,Description=\"PASS or exclusion reason(s): MITO, NUMT, BLACKLIST\">");
     if (bcf_hdr_sync(out_header) < 0) {
         fprintf(stderr, "ERROR: Failed to sync header\n");
         exit(1);
@@ -4740,6 +6045,8 @@ int main(int argc, char *argv[]) {
                 bcf_update_info_float(thread_out_header, out_rec, "ANNOT_SCORE", &annot_score, 1);
                 bcf_update_info_float(thread_out_header, out_rec, "COV_SCORE", &cov_score, 1);
                 bcf_update_info_string(thread_out_header, out_rec, "BIN_ID", bin_id.c_str());
+                string exclusion_reason = nuclear_exclusion_reason(sv.nuclear_exclusion);
+                bcf_update_info_string(thread_out_header, out_rec, "NUCLEAR_PANEL_STATUS", exclusion_reason.c_str());
                 
                 // Write to annotate_all output (ALL records)
                 if (annot_out) {
