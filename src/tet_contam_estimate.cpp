@@ -1,3 +1,6 @@
+#include <limits>
+#include <cfloat>
+#include <cerrno>
 // ============================================================================
 // tet_contam_estimate.cpp
 // Tetraploid contamination estimator with panel selection and warm start
@@ -23,6 +26,7 @@
 #include <stdlib.h>
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <sys/stat.h>
 #include <map>
@@ -33,6 +37,7 @@
 #include <regex>
 #include <math.h>
 #include <cctype>
+#include <stdexcept>
 #include <zlib.h>
 #include <htswrapper/robin_hood/robin_hood.h>
 #include <htswrapper/mex.h>
@@ -46,16 +51,211 @@ using std::endl;
 using namespace std;
 
 // Version tracking
-const string QC_VERSION = "3.0-tet";
-const string QC_VERSION_MSG = "Tetraploid contamination estimator with panel selection and warm start";
+const string QC_VERSION = "4.6-ck-crossfit-closeout";
+const string QC_VERSION_MSG = "Adds receiver-data profile cross-fitting, exact per-cell source-profile ledgers, and internally consistent r-feedback/source-exclusion scoring while preserving historical behavior when the new options are unused";
 const string TOOL_NAME = "tet_contam_estimate";
 
+static string json_escape(const string& value){
+    string out;
+    out.reserve(value.size() + 8);
+    for (char ch : value){
+        switch(ch){
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+static long long file_size_or_minus_one(const string& path){
+    if (path.empty()) return -1;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return -1;
+    return (long long)st.st_size;
+}
+
+static void write_run_contract_json(
+    const string& path,
+    const string& output_prefix,
+    const string& run_class,
+    bool production_contract_pass,
+    const string& production_contract_reason,
+    bool use_interspecies,
+    const string& counts_path,
+    const string& condf_path,
+    const string& assignments_path,
+    const string& samples_path,
+    const string& expected_lines_path,
+    const string& ambient_candidates_path,
+    const string& warm_start_path,
+    const string& fixed_ambient_path,
+    const string& fix_r_path,
+    const string& assignments_basis,
+    const string& expected_lines_basis,
+    const string& ambient_candidates_basis,
+    const string& warm_start_basis,
+    const string& fixed_ambient_basis,
+    const string& fix_r_basis,
+    bool strict_condf,
+    const string& condition_key,
+    const string& synthetic_id,
+    double source_exclusion_strength,
+    bool source_exclusion_explicit,
+    const string& profile_holdout_path,
+    const string& profile_holdout_basis,
+    unsigned long profile_holdout_count,
+    const string& surface_selector_path,
+    const string& surface_output_path){
+
+    ofstream out(path.c_str());
+    if (!out.is_open()){
+        fprintf(stderr, "ERROR: could not write run contract %s\n", path.c_str());
+        exit(1);
+    }
+    auto field = [&](const string& key, const string& value, bool comma=true){
+        out << "  \"" << json_escape(key) << "\": \"" << json_escape(value) << "\"";
+        if (comma) out << ",";
+        out << "\n";
+    };
+    auto path_field = [&](const string& key, const string& value, bool comma=true){
+        out << "  \"" << json_escape(key) << "\": {\"path\": \""
+            << json_escape(value) << "\", \"size_bytes\": " << file_size_or_minus_one(value) << "}";
+        if (comma) out << ",";
+        out << "\n";
+    };
+    out << "{\n";
+    field("contract_version", "tet_contam_estimate_run_contract_V1_R3");
+    field("tool", TOOL_NAME);
+    field("tool_version", QC_VERSION);
+    field("run_class", run_class);
+    out << "  \"production_contract_pass\": " << (production_contract_pass ? "true" : "false") << ",\n";
+    field("production_contract_reason", production_contract_reason);
+    field("panel_mode", use_interspecies ? "interspecies" : "interindividual");
+    field("output_prefix", output_prefix);
+    out << "  \"strict_condf\": " << (strict_condf ? "true" : "false") << ",\n";
+    field("assignments_basis", assignments_basis);
+    field("expected_lines_basis", expected_lines_basis);
+    field("ambient_candidates_basis", ambient_candidates_basis);
+    field("warm_start_basis", warm_start_basis);
+    field("fixed_ambient_basis", fixed_ambient_basis);
+    field("fixed_r_basis", fix_r_basis);
+    field("fix_r_basis", fix_r_basis);
+    field("condition_key", condition_key);
+    field("synthetic_id", synthetic_id);
+    out << "  \"source_exclusion_strength\": " << std::setprecision(17)
+        << source_exclusion_strength << ",\n";
+    out << "  \"source_exclusion_explicit\": "
+        << (source_exclusion_explicit ? "true" : "false") << ",\n";
+    field("profile_holdout_basis", profile_holdout_basis);
+    out << "  \"profile_holdout_count\": " << profile_holdout_count << ",\n";
+    out << "  \"all_source_columns_retained\": "
+        << (source_exclusion_strength <= 1e-12 ? "true" : "false") << ",\n";
+    out << "  \"fixed_r_enabled\": " << (!fix_r_path.empty() ? "true" : "false") << ",\n";
+    out << "  \"fixed_ambient_enabled\": "
+        << (!fixed_ambient_path.empty() ? "true" : "false") << ",\n";
+    out << "  \"truth_assisted\": "
+        << ((run_class == "oracle") ? "true" : "false") << ",\n";
+    path_field("counts", counts_path);
+    path_field("condf", condf_path);
+    path_field("assignments", assignments_path);
+    path_field("samples", samples_path);
+    path_field("expected_lines", expected_lines_path);
+    path_field("ambient_candidates", ambient_candidates_path);
+    path_field("warm_start", warm_start_path);
+    path_field("fixed_ambient", fixed_ambient_path);
+    path_field("fix_r", fix_r_path);
+    path_field("profile_holdout_barcodes", profile_holdout_path);
+    path_field("r_c_surface_selector", surface_selector_path);
+    path_field("r_c_surface_out", surface_output_path, false);
+    out << "}\n";
+    out.close();
+}
 
 static string trim_copy(const string& x){
     size_t a = x.find_first_not_of(" \t\r\n");
     if (a == string::npos) return "";
     size_t b = x.find_last_not_of(" \t\r\n");
     return x.substr(a, b - a + 1);
+}
+
+static set<unsigned long> load_profile_holdout_barcodes(
+    const string& path){
+    set<unsigned long> out;
+    if (path.empty()) return out;
+    ifstream in(path.c_str());
+    if (!in.is_open()){
+        fprintf(stderr, "ERROR: could not open --profile_holdout_barcodes file %s\n",
+            path.c_str());
+        exit(1);
+    }
+    string line;
+    while (getline(in, line)){
+        line = trim_copy(line);
+        if (line.empty() || line[0] == '#') continue;
+        istringstream iss(line);
+        string barcode;
+        iss >> barcode;
+        if (barcode.empty() || barcode == "barcode") continue;
+        out.insert(bc_ul(barcode));
+    }
+    if (out.empty()){
+        fprintf(stderr, "ERROR: --profile_holdout_barcodes %s contained no barcodes.\n",
+            path.c_str());
+        exit(1);
+    }
+    return out;
+}
+
+static set<string> load_r_c_surface_selector(
+    const string& path, const string& synthetic_id){
+    set<string> selected;
+    if (path.empty()) return selected;
+    ifstream in(path.c_str());
+    if (!in.is_open()){
+        fprintf(stderr, "ERROR: could not open --r_c_surface_selector %s\n", path.c_str());
+        exit(1);
+    }
+    string line;
+    if (!getline(in, line)){
+        fprintf(stderr, "ERROR: empty --r_c_surface_selector %s\n", path.c_str());
+        exit(1);
+    }
+    vector<string> header;
+    string field;
+    stringstream hs(line);
+    while (getline(hs, field, '\t')) header.push_back(trim_copy(field));
+    int sid_col = -1, barcode_col = -1;
+    for (size_t i = 0; i < header.size(); ++i){
+        if (header[i] == "synthetic_id") sid_col = (int)i;
+        if (header[i] == "selected_barcode" || header[i] == "barcode") barcode_col = (int)i;
+    }
+    if (sid_col < 0 || barcode_col < 0){
+        fprintf(stderr, "ERROR: %s must contain synthetic_id and selected_barcode columns\n",
+            path.c_str());
+        exit(1);
+    }
+    int line_no = 1;
+    while (getline(in, line)){
+        ++line_no;
+        if (trim_copy(line).empty()) continue;
+        vector<string> fields;
+        stringstream ss(line);
+        while (getline(ss, field, '\t')) fields.push_back(trim_copy(field));
+        if ((size_t)std::max(sid_col, barcode_col) >= fields.size()){
+            fprintf(stderr, "ERROR: malformed selector row %d in %s\n", line_no, path.c_str());
+            exit(1);
+        }
+        if (fields[sid_col] == synthetic_id && !fields[barcode_col].empty()){
+            selected.insert(fields[barcode_col]);
+        }
+    }
+    fprintf(stderr, "Loaded %lu r-C surface barcode(s) for synthetic_id=%s from %s\n",
+        selected.size(), synthetic_id.c_str(), path.c_str());
+    return selected;
 }
 
 static bool is_chinobo_or_hybrid_label(const string& x){
@@ -333,26 +533,68 @@ void help(int code){
     fprintf(stderr, "                        With --panel_metadata plus .assignments/.samples, derives weighted native species composition\n");
     fprintf(stderr, "                        from original individual calls (e.g. Chinobo+O -> B:0.25,C:0.25,O:0.5).\n");
     fprintf(stderr, "    --condf FILE        Override .condf file path (interindividual mode)\n");
-    fprintf(stderr, "    --species_condf FILE  Override .species_condf file path (interspecies mode)\n\n");
+    fprintf(stderr, "    --species_condf FILE  Override .species_condf file path (interspecies mode)\n");
+    fprintf(stderr, "    --strict_condf       Fail before fitting if any observed category x active donor conditional is missing.\n\n");
+
+    fprintf(stderr, "===== AMBIENT PROFILE ROW DESIGN (individual path only) =====\n");
+    fprintf(stderr, "    --candidate_keyed_rows      Also fit the ambient profile on the marginal allele-count bins of every\n");
+    fprintf(stderr, "                                ambient candidate, not only the bins keyed on each cell's own assigned\n");
+    fprintf(stderr, "                                identity. The assignment-keyed design alone is rank deficient by 13 to 16\n");
+    fprintf(stderr, "                                of 23 free profile directions, so those donors cannot be separated at any\n");
+    fprintf(stderr, "                                depth. Adds no new data: the bins are already loaded.\n");
+    fprintf(stderr, "    --candidate_keyed_split F   Fraction of the per-read weight budget kept by the assignment-keyed block,\n");
+    fprintf(stderr, "                                default 0.05, measured. The candidate-keyed block receives 1-F over the candidate\n");
+    fprintf(stderr, "                                count, so total evidence per read is unchanged. 1.0 reproduces the historical\n");
+    fprintf(stderr, "                                design; 0.0 uses candidate-keyed marginals alone.\n\n");
 
     fprintf(stderr, "===== AMBIENT PROFILE INITIALIZATION (at most one) =====\n");
     fprintf(stderr, "    --warm_start -W FILE   Load ambient profile as solver starting point.\n");
     fprintf(stderr, "                           FILE is .contam_prof_empty or .species_prof_empty.\n");
     fprintf(stderr, "                           Profile is freely refined during estimation.\n");
-    fprintf(stderr, "    --fixed_ambient -A FILE  Lock ambient profile (no estimation). Use with caution.\n\n");
+    fprintf(stderr, "    --fixed_ambient -A FILE  Lock ambient profile (oracle/diagnostic only).\n");
+    fprintf(stderr, "    --run_class CLASS  unspecified, production, or oracle. Production rejects answer-key inputs.\n");
+    fprintf(stderr, "    --run_contract FILE  Write machine-readable input/run contract (default: <prefix>.run_contract.json).\n\n");
 
     fprintf(stderr, "===== TETRAPLOID-AWARE =====\n");
-    fprintf(stderr, "    --expected_lines -X FILE  Expected lines file (locks combo identities)\n\n");
+    fprintf(stderr, "    --expected_lines -X FILE  Expected receiver lines file (locks/restricts receiver identities)\n");
+    fprintf(stderr, "    --ambient_candidates FILE  Legal ambient source singlets, separate from receiver identities\n");
+    fprintf(stderr, "    --assignments_basis BASIS  library, truth, or unspecified (required=library for production).\n");
+    fprintf(stderr, "    --expected_lines_basis BASIS  library, truth, or unspecified.\n");
+    fprintf(stderr, "    --ambient_candidates_basis BASIS  library, truth, or unspecified.\n");
+    fprintf(stderr, "    --warm_start_basis BASIS  library, truth, or unspecified.\n");
+    fprintf(stderr, "    --fixed_ambient_basis BASIS  library, truth, or unspecified.\n");
+    fprintf(stderr, "    --fix_r_basis BASIS  library, truth, or unspecified.\n\n");
 
     fprintf(stderr, "===== SOLVER OPTIONS =====\n");
-    fprintf(stderr, "    --loo               Leave-one-out ambient profiles\n");
+    fprintf(stderr, "    --leave_source_out  Diagnostic: exact legacy hard source exclusion (lambda=1)\n");
+    fprintf(stderr, "    --loo               Deprecated alias for --leave_source_out\n");
+    fprintf(stderr, "    --source_exclusion_strength FLOAT  Continuous source exclusion in [0,1]; 0 is exact global profile, 1 is exact hard exclusion\n");
+    fprintf(stderr, "    --profile_holdout_barcodes FILE  Exclude listed receiver cells from ambient-profile training only; all cells remain scored\n");
+    fprintf(stderr, "    --profile_holdout_basis BASIS  library, truth, or unspecified; production cross-fitting requires library\n");
+    fprintf(stderr, "    --r_c_surface_selector FILE  Signed selector TSV with synthetic_id and selected_barcode\n");
+    fprintf(stderr, "    --r_c_surface_out FILE  Write selector-limited r-C likelihood surface TSV\n");
+    fprintf(stderr, "    --condition_key KEY  Condition provenance written to surfaces/contracts\n");
+    fprintf(stderr, "    --synthetic_id ID  Unit provenance and selector filter\n");
     fprintf(stderr, "    --r_feedback        Feed per-cell allele ratios into ambient profile estimation\n");
+    fprintf(stderr, "    --fix_r FILE        Do NOT fit r. Read a fixed allele ratio per identity from\n");
+    fprintf(stderr, "                        FILE (2 cols: identity<TAB>r, e.g. C40670+CongoA4B<TAB>0.4941)\n");
+    fprintf(stderr, "                        and solve c alone. Identities absent from FILE keep the\n");
+    fprintf(stderr, "                        normal free-r fit. The pooling policy is FILE's business.\n");
     fprintf(stderr, "    --adaptive_prior    Auto-detect pathological distributions, apply fixed prior fallback\n");
     fprintf(stderr, "    --run_once -r       Single pass, no iterative convergence\n");
     fprintf(stderr, "    --num_threads -T    Parallel threads (default: 1)\n");
     fprintf(stderr, "    --bootstrap -b      Bootstrap replicates (default: 100)\n");
-    fprintf(stderr, "    --thorough_multistart  Always run r=0.2/0.8 alternate BFGS starts for\n");
-    fprintf(stderr, "                           heterotypic cells (slower, maximum robustness).\n");
+    fprintf(stderr, "    --heterotypic_start_mode MODE  single, topk (default), or exhaustive\n");
+    fprintf(stderr, "    --heterotypic_start_top_k N   BFGS-refine top N deterministic basins (default: 5)\n");
+    fprintf(stderr, "    --thorough_multistart  Deprecated alias for exhaustive start mode\n");
+    fprintf(stderr, "    --no_profile_intervals  Disable adaptive ridge-aware profile intervals\n");
+    fprintf(stderr, "    --contam_prior_mode MODE  none, global, heterotypic, or fusion (default)\n");
+    fprintf(stderr, "    --contam_prior_min_cells N  Minimum supported cells per prior group (default: 20)\n");
+    fprintf(stderr, "    --contam_prior_max_ci_width X  Maximum MLE c interval width for prior training (default: 0.50)\n");
+    fprintf(stderr, "    --contam_prior_min_weight X  Minimum informative allele weight (default: 10)\n");
+    fprintf(stderr, "    --contam_prior_max_gradient X  DEPRECATED compatibility option; ignored\n");
+    fprintf(stderr, "    --profile_restarts N  Exact total ambient-profile starts (>=1; supplied/warm,\n");
+    fprintf(stderr, "                           uniform, then deterministic Dirichlet starts).\n");
     fprintf(stderr, "    --no_adaptive_multistart  Disable boundary-triggered alternate BFGS starts.\n\n");
 
     fprintf(stderr, "===== SPECIES REGULARIZATION (Mode 1/3 enhancement) =====\n");
@@ -532,6 +774,38 @@ static void enforce_native_dimensions(
     }
 }
 
+static void restrict_profile_to_explicit_candidates(
+    map<int, double>& profile,
+    map<int, double>& concentration,
+    const set<int>& candidates,
+    const string& label){
+    if (candidates.empty()) return;
+    int removed = 0;
+    for (auto it = profile.begin(); it != profile.end(); ){
+        if (candidates.count(it->first) == 0){
+            concentration.erase(it->first);
+            it = profile.erase(it);
+            removed++;
+        }
+        else ++it;
+    }
+    double total = 0.0;
+    for (const auto& kv : profile){
+        if (std::isfinite(kv.second) && kv.second > 0.0) total += kv.second;
+    }
+    if (!(total > 0.0)){
+        fprintf(stderr, "ERROR: %s has no positive mass on the explicit ambient candidate set.\n", label.c_str());
+        exit(1);
+    }
+    for (auto& kv : profile){
+        kv.second = std::max(0.0, kv.second) / total;
+    }
+    if (removed > 0){
+        fprintf(stderr, "WARNING: removed %d %s entries outside the explicit ambient candidate set.\n",
+            removed, label.c_str());
+    }
+}
+
 void infer_from_genotypes(string& output_prefix,
     robin_hood::unordered_map<unsigned long, int>& assn,
     robin_hood::unordered_map<unsigned long, double>& assn_llr,
@@ -560,12 +834,31 @@ void infer_from_genotypes(string& output_prefix,
     bool ids_restricted,
     const set<int>& expected_allowed_ids,
     const set<int>& expected_allowed_ids2,
+    const set<int>& ambient_candidate_ids,
     // Solver options
     bool leave_one_out,
+    double source_exclusion_strength,
     bool r_feedback,
+    const std::string& fix_r_file,
+    const std::string& fixed_r_basis,
+    const std::string& fixed_ambient_basis,
+    bool truth_assisted_condition,
+    const std::set<std::string>& surface_selector_barcodes,
+    const std::string& surface_output_file,
+    const std::string& condition_key,
+    const std::string& synthetic_id,
     bool adaptive_prior,
     bool thorough_multistart,
     bool adaptive_multistart,
+    int profile_restarts,
+    const string& heterotypic_start_mode,
+    int heterotypic_start_top_k,
+    bool adaptive_profile_intervals,
+    const string& contam_prior_mode,
+    int contam_prior_min_cells,
+    double contam_prior_max_ci_width,
+    double contam_prior_min_weight,
+    double contam_prior_max_gradient,
     // Warm start / fixed ambient
     const string& warm_start_file,
     const string& fixed_ambient_file,
@@ -578,8 +871,15 @@ void infer_from_genotypes(string& output_prefix,
     // Explicit condf path overrides
     const string& user_condf_file,
     const string& user_species_condf_file,
+    bool strict_condf,
     // Optional native species composition overrides derived from original individual calls
-    const map<unsigned long, map<int, double> >& species_composition_overrides){
+    const map<unsigned long, map<int, double> >& species_composition_overrides,
+    // Receiver-data cross-fitting: exclude these cells only from profile training.
+    const set<unsigned long>& profile_holdout_barcodes,
+    const string& profile_holdout_basis,
+    // O53 step 2: candidate-keyed ambient-profile rows
+    bool candidate_keyed_rows,
+    double candidate_keyed_split){
 
     // Hardcoded solver parameters (no longer CLI-configurable)
     int n_mixprop_trials = 10;
@@ -667,6 +967,25 @@ void infer_from_genotypes(string& output_prefix,
         }
     }
 
+    // Ambient source candidates are a distinct model dimension.  When the new
+    // file is supplied, it controls only the profile simplex; expected-lines
+    // continues to control receiver locking/reassignment.  Legacy runs without
+    // --ambient_candidates retain the old expected-lines behavior.
+    set<int> profile_allowed_ids = ambient_candidate_ids.empty() ? allowed_ids : ambient_candidate_ids;
+    if (!ambient_candidate_ids.empty()){
+        fprintf(stderr, "Separate ambient candidate restriction active: %lu source singlets; "
+            "receiver reassignment remains restricted to %lu identities.\n",
+            profile_allowed_ids.size(), allowed_ids.size());
+    }
+    if (profile_allowed_ids.empty()){
+        fprintf(stderr, "ERROR: ambient source candidate set is empty.\n");
+        exit(1);
+    }
+
+    // Counts must retain both receiver identity rows and source singlet rows.
+    set<int> count_allowed_ids = allowed_ids;
+    count_allowed_ids.insert(profile_allowed_ids.begin(), profile_allowed_ids.end());
+
     enforce_native_dimensions(use_interspecies ? NativePanelMode::INTERSPECIES_NATIVE : NativePanelMode::INTERINDIVIDUAL_NATIVE,
         counts_name, condf_name, samples);
 
@@ -675,7 +994,7 @@ void infer_from_genotypes(string& output_prefix,
         map<pair<int, int>, pair<float, float> > > > indv_allelecounts;
     if (file_exists(counts_name)){
         fprintf(stderr, "Loading counts from %s...\n", counts_name.c_str());
-        load_counts_from_file(indv_allelecounts, samples, counts_name, allowed_ids);
+        load_counts_from_file(indv_allelecounts, samples, counts_name, count_allowed_ids);
     }
     else{
         fprintf(stderr, "ERROR: no counts found: %s\n", counts_name.c_str());
@@ -689,11 +1008,31 @@ void infer_from_genotypes(string& output_prefix,
     fprintf(stderr, "%s v%s: %s\n", TOOL_NAME.c_str(), QC_VERSION.c_str(), QC_VERSION_MSG.c_str());
 
     map<int, double> contam_prof_conc;
+
+    // Carried out of the iteration loop with contam_prof, because the
+    // contamFinder is scoped to one iteration and goes out of scope before the
+    // outputs are written.
+    double final_loglik_out = 0.0;
+    bool final_loglik_valid_out = false;
     robin_hood::unordered_map<unsigned long, double> contam_rate_se;
     robin_hood::unordered_map<unsigned long, double> allele_ratio;
     robin_hood::unordered_map<unsigned long, double> allele_ratio_se;
     map<string, double> species_contam_prof_out;
     map<string, double> species_contam_prof_conc_out;
+    int profile_successful_starts_out = 0;
+    int profile_near_optimal_count_out = 0;
+    double profile_best_ll_out = -DBL_MAX;
+    double profile_second_best_ll_out = -DBL_MAX;
+    double profile_near_optimal_l1_spread_out = std::numeric_limits<double>::quiet_NaN();
+    // Multistart diagnostics are carried separately from the refinement-solve
+    // diagnostics above. See ambient_rna_three_ap.h for why the two differ.
+    bool multistart_attempted_out = false;
+    int multistart_configured_starts_out = 0;
+    int multistart_successful_starts_out = 0;
+    int multistart_near_optimal_count_out = 0;
+    double multistart_best_ll_out = -DBL_MAX;
+    double multistart_second_best_ll_out = -DBL_MAX;
+    double multistart_near_optimal_l1_spread_out = std::numeric_limits<double>::quiet_NaN();
 
     // Fixed ambient profile is immutable state.  Native species mode uses the
     // same integer-keyed contam profile path as interindividual mode because
@@ -709,6 +1048,8 @@ void infer_from_genotypes(string& output_prefix,
                 fixed_ambient_file.c_str(), use_interspecies ? "species" : "individual");
             exit(1);
         }
+        restrict_profile_to_explicit_candidates(
+            fixed_indiv_prof, fixed_indiv_conc, ambient_candidate_ids, "fixed ambient profile");
         fixed_ambient_loaded = true;
     }
 
@@ -716,7 +1057,18 @@ void infer_from_genotypes(string& output_prefix,
     while (delta > delta_thresh){
         fprintf(stderr, "===== ITERATION %d =====\n", nits+1);
         contamFinder3 cf(indv_allelecounts, assn, assn_llr, exp_match_fracs, samples.size(),
-            allowed_ids, allowed_ids2);
+            profile_allowed_ids, allowed_ids, allowed_ids2);
+        if (nits == 0){
+            contamFinder3::CondfCoverageReport condf_report = cf.write_condf_coverage_report(
+                output_prefix + ".condf_coverage.tsv", samples);
+            if (strict_condf && condf_report.missing_lookups > 0){
+                fprintf(stderr,
+                    "ERROR: --strict_condf rejected %llu missing conditional-fraction lookups "
+                    "covering %.6g weighted observations. See %s.condf_coverage.tsv\n",
+                    condf_report.missing_lookups, condf_report.missing_weight, output_prefix.c_str());
+                exit(1);
+            }
+        }
         if (!species_composition_overrides.empty()){
             cf.set_cell_composition_overrides(species_composition_overrides);
             if (nits == 0){
@@ -727,7 +1079,16 @@ void infer_from_genotypes(string& output_prefix,
         cf.set_doublet_rate(doublet_rate);
         cf.set_num_threads(num_threads);
         cf.set_thorough_multistart(thorough_multistart);
+        cf.set_heterotypic_start_mode(thorough_multistart ? "exhaustive" : heterotypic_start_mode,
+            heterotypic_start_top_k);
         cf.set_adaptive_multistart(adaptive_multistart);
+        cf.set_adaptive_profile_intervals(adaptive_profile_intervals);
+        cf.set_contam_prior_mode(contam_prior_mode);
+        cf.set_contam_prior_support(contam_prior_min_cells, contam_prior_max_ci_width,
+            contam_prior_min_weight, contam_prior_max_gradient);
+        if (profile_restarts > 0){
+            cf.set_profile_total_starts(profile_restarts);
+        }
         if (run_once){
             cf.no_reassign();
         }
@@ -746,15 +1107,105 @@ void infer_from_genotypes(string& output_prefix,
             }
         }
 
-        // Solver options
-        if (leave_one_out){
-            cf.set_use_loo(true);
+        // O53 step 2: candidate-keyed ambient-profile rows.
+        //
+        // Individual path only. Candidate-keyed expansion of the species path
+        // was measured and rejected, worse on 20 of 20 native species units, so
+        // requesting it there is refused rather than silently honoured.
+        if (candidate_keyed_rows && use_interspecies){
+            fprintf(stderr, "ERROR: --candidate_keyed_rows applies to the individual path "
+                "only.\n");
+            fprintf(stderr, "       Candidate-keyed expansion of the species path was measured "
+                "and rejected.\n");
+            exit(1);
+        }
+        if (candidate_keyed_rows){
+            cf.set_candidate_keyed_rows(true, candidate_keyed_split);
             if (nits == 0){
-                fprintf(stderr, "Leave-one-out ambient profile enabled\n");
+                fprintf(stderr, "Candidate-keyed profile rows enabled: assignment-keyed weight "
+                    "share %.3f, candidate-keyed share %.3f split over the ambient candidate "
+                    "roster\n", candidate_keyed_split, 1.0 - candidate_keyed_split);
             }
         }
 
+        // Source exclusion. The explicit strength setter owns both endpoints;
+        // --loo/--leave_source_out are resolved to lambda=1 in main().
+        cf.set_source_exclusion_strength(source_exclusion_strength);
+        if (!profile_holdout_barcodes.empty()){
+            cf.set_profile_holdout_barcodes(profile_holdout_barcodes, profile_holdout_basis);
+            if (nits == 0){
+                fprintf(stderr, "Cross-fitted profile training excludes %lu held-out cells; "
+                    "all cells remain in C/r scoring.\n",
+                    (unsigned long)profile_holdout_barcodes.size());
+            }
+        }
+        if (source_exclusion_strength > 0.0 && nits == 0){
+            fprintf(stderr, "Source exclusion enabled at lambda=%.6g%s\n",
+                source_exclusion_strength, leave_one_out ? " (legacy hard-exclusion request)" : "");
+        }
+
         // Ambient profile refinements: r-feedback and adaptive prior
+        // ---- Fixed-r mode (pooled-r experiment) --------------------------
+        // r is supplied, not fitted. See --fix_r in the usage text. The file
+        // maps an identity string, exactly as written into the `identity`
+        // column of .allele_ratio, to a fixed allele ratio.
+        if (fix_r_file != ""){
+            map<int, double> fixed_r;
+            set<int> idents_seen;
+            for (robin_hood::unordered_map<unsigned long, int>::iterator ai = assn.begin();
+                ai != assn.end(); ++ai){
+                idents_seen.insert(ai->second);
+            }
+            map<string, int> name2idx;
+            int n_heterotypic_identities = 0;
+            for (set<int>::iterator ii = idents_seen.begin(); ii != idents_seen.end(); ++ii){
+                name2idx.insert(make_pair(idx2name(*ii, samples), *ii));
+                if (*ii >= (int)samples.size()){
+                    pair<int,int> combo = idx_to_hap_comb(*ii, (int)samples.size());
+                    if (combo.first != combo.second) n_heterotypic_identities++;
+                }
+            }
+            ifstream frf(fix_r_file.c_str());
+            if (!frf.is_open()){
+                fprintf(stderr, "ERROR: could not open --fix_r file %s\n", fix_r_file.c_str());
+                exit(1);
+            }
+            string line;
+            int nline = 0;
+            int nmatched = 0;
+            while (getline(frf, line)){
+                nline++;
+                if (line.size() == 0 || line[0] == '#') continue;
+                size_t tab = line.find('\t');
+                if (tab == string::npos) continue;
+                string ident = line.substr(0, tab);
+                string rstr = line.substr(tab + 1);
+                if (ident == "identity") continue;   // tolerate a header row
+                double rv = atof(rstr.c_str());
+                if (rv < 0.0 || rv > 1.0){
+                    fprintf(stderr, "ERROR: --fix_r line %d: r=%f is outside [0,1]\n", nline, rv);
+                    exit(1);
+                }
+                map<string, int>::iterator ni = name2idx.find(ident);
+                if (ni != name2idx.end()){
+                    fixed_r.insert(make_pair(ni->second, rv));
+                    nmatched++;
+                }
+            }
+            frf.close();
+            fprintf(stderr, "--fix_r: %d identity/identities matched in this library.\n", nmatched);
+            if (nmatched == 0 && n_heterotypic_identities > 0){
+                fprintf(stderr, "ERROR: --fix_r matched no heterotypic identity present in this library. "
+                    "Nothing would be fixed, which is silently not the requested experiment.\n");
+                exit(1);
+            }
+            if (nmatched == 0){
+                fprintf(stderr, "--fix_r: this unit contains no heterotypic identities; "
+                    "the signed header-only artifact leaves diploid fits unchanged.\n");
+            }
+            cf.set_fixed_r(fixed_r);
+        }
+
         if (r_feedback){
             cf.set_r_feedback(true);
         }
@@ -762,51 +1213,68 @@ void infer_from_genotypes(string& output_prefix,
             cf.set_adaptive_prior(true, adaptive_mean, adaptive_init_var, 0.001, adaptive_thresh);
         }
 
-        // Initialize to whatever was the final estimate last time,
-        // but only if the individual set hasn't changed between iterations.
-        // reclassify_cells() can add/remove individuals from assignments,
-        // causing idx2samp to differ from the previous contam_prof keys.
-        if (nits > 0){
-            // Build the set of singlet IDs that the new contamFinder will use
-            set<int> new_singlets;
-            for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin();
-                a != assn.end(); ++a){
-                if (a->second < (int)samples.size()){
-                    new_singlets.insert(a->second);
-                }
-                else{
-                    pair<int, int> combo = idx_to_hap_comb(a->second, samples.size());
-                    new_singlets.insert(combo.first);
-                    new_singlets.insert(combo.second);
-                }
-            }
-            // Also include any from allowed_ids/allowed_ids2
-            for (set<int>::iterator ai = allowed_ids.begin(); ai != allowed_ids.end(); ++ai){
-                if (*ai < (int)samples.size()){
-                    new_singlets.insert(*ai);
-                }
-            }
-            for (set<int>::iterator ai = allowed_ids2.begin(); ai != allowed_ids2.end(); ++ai){
-                if (*ai < (int)samples.size()){
-                    new_singlets.insert(*ai);
-                }
-            }
-
-            // Check if old contam_prof keys (excluding -1) match new singlets
-            set<int> old_keys;
-            for (map<int, double>::iterator cp = contam_prof.begin();
-                cp != contam_prof.end(); ++cp){
-                if (cp->first >= 0){
-                    old_keys.insert(cp->first);
-                }
-            }
-            if (old_keys == new_singlets){
+        // Initialize to the final profile from the previous outer iteration.
+        //
+        // With --ambient_candidates, the ambient-profile simplex is explicitly
+        // fixed for the entire run and is intentionally independent of receiver
+        // assignments.  Reclassification can change assn/allowed receiver IDs,
+        // but it must not be interpreted as a change in the source-candidate
+        // universe.  set_init_contam_prof() already filters/fills against the
+        // constructor's profile_allowed_ids, so carry the profile forward
+        // unconditionally in this mode.
+        //
+        // Legacy runs without --ambient_candidates retain the historical
+        // assignment-derived compatibility check because their source universe
+        // is still coupled to active/allowed receiver identities.
+        if (nits > 0 && !contam_prof.empty()){
+            if (!ambient_candidate_ids.empty()){
                 cf.set_init_contam_prof(contam_prof);
+                fprintf(stderr, "  Carrying forward ambient profile across fixed explicit "
+                    "source candidate set (%lu singlets)\n",
+                    profile_allowed_ids.size());
             }
             else{
-                fprintf(stderr, "  Individual set changed (%lu -> %lu singlets); "
-                    "re-initializing contamination profile\n",
-                    old_keys.size(), new_singlets.size());
+                // Build the set of singlet IDs that the new contamFinder will use.
+                set<int> new_singlets;
+                for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin();
+                    a != assn.end(); ++a){
+                    if (a->second < (int)samples.size()){
+                        new_singlets.insert(a->second);
+                    }
+                    else{
+                        pair<int, int> combo = idx_to_hap_comb(a->second, samples.size());
+                        new_singlets.insert(combo.first);
+                        new_singlets.insert(combo.second);
+                    }
+                }
+                // Also include any from allowed_ids/allowed_ids2.
+                for (set<int>::iterator ai = allowed_ids.begin(); ai != allowed_ids.end(); ++ai){
+                    if (*ai < (int)samples.size()){
+                        new_singlets.insert(*ai);
+                    }
+                }
+                for (set<int>::iterator ai = allowed_ids2.begin(); ai != allowed_ids2.end(); ++ai){
+                    if (*ai < (int)samples.size()){
+                        new_singlets.insert(*ai);
+                    }
+                }
+
+                // Check if old contam_prof keys (excluding -1) match new singlets.
+                set<int> old_keys;
+                for (map<int, double>::iterator cp = contam_prof.begin();
+                    cp != contam_prof.end(); ++cp){
+                    if (cp->first >= 0){
+                        old_keys.insert(cp->first);
+                    }
+                }
+                if (old_keys == new_singlets){
+                    cf.set_init_contam_prof(contam_prof);
+                }
+                else{
+                    fprintf(stderr, "  Individual set changed (%lu -> %lu singlets); "
+                        "re-initializing contamination profile\n",
+                        old_keys.size(), new_singlets.size());
+                }
             }
         }
         if (nits > 0){
@@ -834,6 +1302,8 @@ void infer_from_genotypes(string& output_prefix,
             load_contam_prof(warm_start_file, loaded_prof, loaded_conc, samples, false);
 
             if (!loaded_prof.empty()){
+                restrict_profile_to_explicit_candidates(
+                    loaded_prof, loaded_conc, ambient_candidate_ids, "warm-start ambient profile");
                 cf.set_init_contam_prof(loaded_prof);
                 contam_prof_initialized_from_warm_start = true;
                 fprintf(stderr, "Warm start loaded from: %s (%lu entries, %s)\n",
@@ -872,6 +1342,9 @@ void infer_from_genotypes(string& output_prefix,
                 fprintf(stderr, "Fixed ambient profile reapplied for iteration %d\n", nits + 1);
             }
         }
+
+        cf.set_diagnostic_context(fixed_r_basis, fixed_ambient_basis,
+            truth_assisted_condition);
 
         // Species regularization (Mode 1/3 enhancement)
         // Do NOT call set_species_mode() for --interspecies (Mode 2/4).
@@ -941,12 +1414,26 @@ void infer_from_genotypes(string& output_prefix,
             assn = cf.assn;
             assn_llr = cf.assn_llr;
             contam_prof = cf.contam_prof;
+            final_loglik_out = cf.final_loglik;
+            final_loglik_valid_out = cf.final_loglik_valid;
             contam_rate = cf.contam_rate;
             contam_rate_se = cf.contam_rate_se;
             allele_ratio = cf.allele_ratio;
             allele_ratio_se = cf.allele_ratio_se;
             species_contam_prof_out = cf.species_contam_prof;
             species_contam_prof_conc_out = cf.species_contam_prof_conc;
+            profile_successful_starts_out = cf.profile_successful_starts;
+            profile_near_optimal_count_out = cf.profile_near_optimal_count;
+            profile_best_ll_out = cf.profile_best_ll;
+            profile_second_best_ll_out = cf.profile_second_best_ll;
+            profile_near_optimal_l1_spread_out = cf.profile_near_optimal_l1_spread;
+            multistart_attempted_out = cf.multistart_attempted;
+            multistart_configured_starts_out = cf.multistart_configured_starts;
+            multistart_successful_starts_out = cf.multistart_successful_starts;
+            multistart_near_optimal_count_out = cf.multistart_near_optimal_count;
+            multistart_best_ll_out = cf.multistart_best_ll;
+            multistart_second_best_ll_out = cf.multistart_second_best_ll;
+            multistart_near_optimal_l1_spread_out = cf.multistart_near_optimal_l1_spread;
 
             delta = 0;
         }
@@ -956,12 +1443,26 @@ void infer_from_genotypes(string& output_prefix,
                 assn = cf.assn;
                 assn_llr = cf.assn_llr;
                 contam_prof = cf.contam_prof;
+                final_loglik_out = cf.final_loglik;
+                final_loglik_valid_out = cf.final_loglik_valid;
                 contam_rate = cf.contam_rate;
                 contam_rate_se = cf.contam_rate_se;
                 allele_ratio = cf.allele_ratio;
                 allele_ratio_se = cf.allele_ratio_se;
                 species_contam_prof_out = cf.species_contam_prof;
                 species_contam_prof_conc_out = cf.species_contam_prof_conc;
+                profile_successful_starts_out = cf.profile_successful_starts;
+                profile_near_optimal_count_out = cf.profile_near_optimal_count;
+                profile_best_ll_out = cf.profile_best_ll;
+                profile_second_best_ll_out = cf.profile_second_best_ll;
+                profile_near_optimal_l1_spread_out = cf.profile_near_optimal_l1_spread;
+                multistart_attempted_out = cf.multistart_attempted;
+                multistart_configured_starts_out = cf.multistart_configured_starts;
+                multistart_successful_starts_out = cf.multistart_successful_starts;
+                multistart_near_optimal_count_out = cf.multistart_near_optimal_count;
+                multistart_best_ll_out = cf.multistart_best_ll;
+                multistart_second_best_ll_out = cf.multistart_second_best_ll;
+                multistart_near_optimal_l1_spread_out = cf.multistart_near_optimal_l1_spread;
                 last_iter_accepted = true;
             }
             else{
@@ -981,6 +1482,19 @@ void infer_from_genotypes(string& output_prefix,
                 llprev = ll;
             }
             nits++;
+        }
+
+        if (last_iter_accepted){
+            cf.write_cell_fit_diagnostics(output_prefix + ".contam_diagnostics.tsv",
+                samples, libname, cellranger, seurat, underscore);
+            cf.write_cell_source_profile(output_prefix + ".cell_source_profile.tsv",
+                samples, libname, cellranger, seurat, underscore);
+            cf.write_class_residual_report(output_prefix + ".class_residuals.tsv", samples);
+            if (!surface_output_file.empty()){
+                cf.write_r_c_likelihood_surface(surface_output_file,
+                    surface_selector_barcodes, samples, libname, cellranger,
+                    seurat, underscore, condition_key, synthetic_id);
+            }
         }
 
         // After iteration 1, write single-pass results to .pass1.* files
@@ -1056,6 +1570,40 @@ void infer_from_genotypes(string& output_prefix,
         dump_contam_prof(outf, contam_prof, contam_prof_conc, samples);
         fclose(outf);
     }
+    // Write the full-model objective to disk.
+    //
+    // Running one condition with a fitted profile and one with a supplied
+    // profile, on the same unit and the same count bundle, and differencing
+    // this value tells whether the likelihood maximum sits at the supplied
+    // profile.
+    //
+    // ⚠️ Both conditions must use the same prior mode. compute_ll() adds a
+    // per-cell beta prior term, so a fitted run under --contam_prior_mode none
+    // and a fixed run under any other mode are sums over different objectives
+    // and are not comparable.
+    //
+    // ⚠️ The profile is fit over compile_amb_prof_dat rows and this is
+    // evaluated over compile_data rows, so a fitted profile has no obligation
+    // to beat a fixed one here. A negative difference is a finding.
+    {
+        string fname = output_prefix + ".model_fit.tsv";
+        FILE* outf = fopen(fname.c_str(), "w");
+        if (outf == NULL){
+            fprintf(stderr, "ERROR: could not write model fit summary %s\n", fname.c_str());
+            exit(1);
+        }
+        fprintf(outf, "metric\tvalue\n");
+        fprintf(outf, "tool_version\t%s\n", QC_VERSION.c_str());
+        fprintf(outf, "panel_mode\t%s\n", use_interspecies ? "interspecies" : "interindividual");
+        fprintf(outf, "final_loglik\t%.10f\n", final_loglik_out);
+        fprintf(outf, "final_loglik_valid\t%s\n", final_loglik_valid_out ? "true" : "false");
+        fprintf(outf, "ambient_profile_fixed\t%s\n", fixed_ambient_file.empty() ? "false" : "true");
+        fprintf(outf, "candidate_keyed_rows\t%s\n", candidate_keyed_rows ? "true" : "false");
+        fprintf(outf, "candidate_keyed_split\t%.6f\n", candidate_keyed_split);
+        fprintf(outf, "n_ambient_candidates\t%lu\n", (unsigned long)contam_prof.size());
+        fclose(outf);
+        fprintf(stderr, "Wrote model fit summary to %s\n", fname.c_str());
+    }
     // Write species-level profile when any species-level solver was active
     if ((species_regularize || use_interspecies) && !species_contam_prof_out.empty()){
         string fname = output_prefix + ".species_prof";
@@ -1109,6 +1657,63 @@ void infer_from_genotypes(string& output_prefix,
             fprintf(outf, "%s\t%f\t%f\t%f\t%f\t%s\n",
                 bc_out.c_str(), r_val, r_se_val, c_val, c_se_val, ident.c_str());
         }
+        fclose(outf);
+    }
+
+    // Write ambient-profile optimizer stability diagnostics.  These values make
+    // flat/non-unique mixture fits explicit instead of presenting one arbitrary
+    // simplex point as a uniquely identified biological source profile.
+    {
+        string fname = output_prefix + ".profile_fit_diagnostics.tsv";
+        FILE* outf = fopen(fname.c_str(), "w");
+        if (outf == NULL){
+            fprintf(stderr, "ERROR: could not open profile diagnostics output: %s\n", fname.c_str());
+            exit(1);
+        }
+        // Columns 1-6 keep their existing names, order, and meaning: they
+        // describe the final (refinement) profile solve exactly as before.
+        //
+        // COLUMN 7 CHANGES MEANING. profile_nonunique_flag previously derived
+        // from profile_near_optimal_count_out, which the refinement path
+        // hardcodes to 1, so the "> 1" test could never fire and the column was
+        // a constant 0. It now derives from the multistart, which is the only
+        // solve that compares starting points, and can therefore read 1.
+        // Consumers diffing this file across builds must expect column 7 to
+        // differ. Estimate outputs (.contam_prof, .contam_rate, .allele_ratio)
+        // are unaffected by this change and remain byte-identical.
+        //
+        // Columns 8-14 are new and describe the multistart solve.
+        //
+        // Column 1 (profile_restarts, the CLI request) and column 9
+        // (multistart_configured_starts, what the loop actually stood up)
+        // should agree. A disagreement means --profile_restarts is not
+        // reaching the trial count, so warn rather than let it pass silently.
+        fprintf(outf, "configured_starts\tsuccessful_starts\tnear_optimal_starts"
+            "\tbest_log_likelihood\tsecond_best_log_likelihood\tnear_optimal_l1_spread"
+            "\tprofile_nonunique_flag\tmultistart_attempted\tmultistart_configured_starts"
+            "\tmultistart_successful_starts\tmultistart_near_optimal_starts"
+            "\tmultistart_best_log_likelihood\tmultistart_second_best_log_likelihood"
+            "\tmultistart_near_optimal_l1_spread\n");
+        if (multistart_attempted_out && profile_restarts > 0 &&
+            multistart_configured_starts_out != profile_restarts){
+            fprintf(stderr, "WARNING: requested --profile_restarts %d but the ambient "
+                "profile multistart configured %d starts; the restart flag is not "
+                "reaching the trial count.\n",
+                profile_restarts, multistart_configured_starts_out);
+        }
+        bool nonunique = multistart_attempted_out &&
+            multistart_near_optimal_count_out > 1 &&
+            std::isfinite(multistart_near_optimal_l1_spread_out) &&
+            multistart_near_optimal_l1_spread_out > 0.10;
+        fprintf(outf, "%d\t%d\t%d\t%.17g\t%.17g\t%.17g\t%d"
+            "\t%d\t%d\t%d\t%d\t%.17g\t%.17g\t%.17g\n",
+            profile_restarts, profile_successful_starts_out, profile_near_optimal_count_out,
+            profile_best_ll_out, profile_second_best_ll_out,
+            profile_near_optimal_l1_spread_out, nonunique ? 1 : 0,
+            multistart_attempted_out ? 1 : 0,
+            multistart_configured_starts_out, multistart_successful_starts_out,
+            multistart_near_optimal_count_out, multistart_best_ll_out,
+            multistart_second_best_ll_out, multistart_near_optimal_l1_spread_out);
         fclose(outf);
     }
 
@@ -1363,15 +1968,49 @@ int main(int argc, char *argv[]) {
        {"species_counts", required_argument, 0, 2005},
        {"allow_legacy_species_regularize", no_argument, 0, 2012},
        {"r_feedback", no_argument, 0, 2006},
+       {"fix_r", required_argument, 0, 2101},
        {"adaptive_prior", no_argument, 0, 2007},
        {"condf", required_argument, 0, 2008},
        {"species_condf", required_argument, 0, 2009},
        {"thorough_multistart", no_argument, 0, 2010},
        {"no_adaptive_multistart", no_argument, 0, 2011},
+       {"ambient_candidates", required_argument, 0, 2013},
+       {"profile_restarts", required_argument, 0, 2014},
+       {"leave_source_out", no_argument, 0, 2015},
+       {"heterotypic_start_mode", required_argument, 0, 2016},
+       {"heterotypic_start_top_k", required_argument, 0, 2017},
+       {"no_profile_intervals", no_argument, 0, 2018},
+       {"contam_prior_mode", required_argument, 0, 2019},
+       {"contam_prior_min_cells", required_argument, 0, 2020},
+       {"contam_prior_max_ci_width", required_argument, 0, 2021},
+       {"contam_prior_min_weight", required_argument, 0, 2022},
+       {"contam_prior_max_gradient", required_argument, 0, 2023},
+       {"strict_condf", no_argument, 0, 2024},
+       {"run_class", required_argument, 0, 2025},
+       {"run_contract", required_argument, 0, 2026},
+       {"assignments_basis", required_argument, 0, 2027},
+       {"expected_lines_basis", required_argument, 0, 2028},
+       {"ambient_candidates_basis", required_argument, 0, 2029},
+       {"warm_start_basis", required_argument, 0, 2030},
+       {"fixed_ambient_basis", required_argument, 0, 2031},
+       {"fix_r_basis", required_argument, 0, 2032},
+       {"candidate_keyed_rows", no_argument, 0, 2033},
+       {"candidate_keyed_split", required_argument, 0, 2034},
+       {"source_exclusion_strength", required_argument, 0, 2035},
+       {"r_c_surface_selector", required_argument, 0, 2036},
+       {"r_c_surface_out", required_argument, 0, 2037},
+       {"condition_key", required_argument, 0, 2038},
+       {"synthetic_id", required_argument, 0, 2039},
+       {"profile_holdout_barcodes", required_argument, 0, 2040},
+       {"profile_holdout_basis", required_argument, 0, 2041},
        {0, 0, 0, 0}
     };
 
     // Set default values
+    // O53 step 2: candidate-keyed ambient-profile rows, off by default so the
+    // historical design is reproduced byte for byte unless requested.
+    bool candidate_keyed_rows = false;
+    double candidate_keyed_split = 0.05;
     string output_prefix = "";
     double error_ref = 0.001;
     double error_alt = 0.001;
@@ -1402,6 +2041,7 @@ int main(int argc, char *argv[]) {
 
     // Tetraploid-aware mode
     string expected_lines_file = "";
+    string ambient_candidates_file = "";
 
     // Panel selection
     bool use_interindividual = false;
@@ -1419,14 +2059,45 @@ int main(int argc, char *argv[]) {
 
     // Solver options
     bool leave_one_out = false;
+    double source_exclusion_strength = 0.0;
+    bool source_exclusion_explicit = false;
+    string r_c_surface_selector_file = "";
+    string r_c_surface_out_file = "";
+    string condition_key = "";
+    string synthetic_id = "";
+    string profile_holdout_barcodes_file = "";
+    string profile_holdout_basis = "unspecified";
     bool r_feedback = false;
+    string fix_r_file = "";
     bool adaptive_prior = false;
     bool thorough_multistart = false;
     bool adaptive_multistart = true;
+    int profile_restarts = -1;
+    string heterotypic_start_mode = "topk";
+    int heterotypic_start_top_k = 5;
+    bool adaptive_profile_intervals = true;
+    string contam_prior_mode = "fusion";
+    int contam_prior_min_cells = 20;
+    double contam_prior_max_ci_width = 0.50;
+    double contam_prior_min_weight = 10.0;
+    double contam_prior_max_gradient = 1e-3;
+    bool contam_prior_max_gradient_supplied = false;
 
     // Explicit condf/species_condf paths (override prefix-derived defaults)
     string user_condf_file = "";
     string user_species_condf_file = "";
+    bool strict_condf = false;
+
+    // Run/input contract.  Existing users remain in unspecified mode; the
+    // benchmark explicitly requests production or oracle and supplies provenance.
+    string run_class = "unspecified";
+    string run_contract_file = "";
+    string assignments_basis = "unspecified";
+    string expected_lines_basis = "unspecified";
+    string ambient_candidates_basis = "unspecified";
+    string warm_start_basis = "unspecified";
+    string fixed_ambient_basis = "unspecified";
+    string fix_r_basis = "unspecified";
 
     int option_index = 0;
     int ch;
@@ -1467,6 +2138,7 @@ int main(int argc, char *argv[]) {
                 break;
             case 2004:
                 leave_one_out = true;
+                fprintf(stderr, "WARNING: --loo is deprecated; use --leave_source_out.\n");
                 break;
             case 2005:
                 species_counts_file = optarg;
@@ -1476,6 +2148,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 2006:
                 r_feedback = true;
+                break;
+            case 2101:
+                fix_r_file = optarg;
                 break;
             case 2007:
                 adaptive_prior = true;
@@ -1491,6 +2166,128 @@ int main(int argc, char *argv[]) {
                 break;
             case 2011:
                 adaptive_multistart = false;
+                break;
+            case 2013:
+                ambient_candidates_file = optarg;
+                break;
+            case 2014:
+                profile_restarts = atoi(optarg);
+                if (profile_restarts < 1){
+                    fprintf(stderr, "ERROR: --profile_restarts must be >= 1.\n");
+                    exit(1);
+                }
+                break;
+            case 2015:
+                leave_one_out = true;
+                break;
+            case 2016:
+                heterotypic_start_mode = optarg;
+                if (heterotypic_start_mode != "single" && heterotypic_start_mode != "topk" &&
+                    heterotypic_start_mode != "exhaustive") {
+                    fprintf(stderr, "ERROR: --heterotypic_start_mode must be single, topk, or exhaustive.\n");
+                    exit(1);
+                }
+                break;
+            case 2017:
+                heterotypic_start_top_k = atoi(optarg);
+                if (heterotypic_start_top_k < 1 || heterotypic_start_top_k > 25){
+                    fprintf(stderr, "ERROR: --heterotypic_start_top_k must be 1..25.\n");
+                    exit(1);
+                }
+                break;
+            case 2018:
+                adaptive_profile_intervals = false;
+                break;
+            case 2019:
+                contam_prior_mode = optarg;
+                if (contam_prior_mode != "none" && contam_prior_mode != "global" &&
+                    contam_prior_mode != "heterotypic" && contam_prior_mode != "fusion") {
+                    fprintf(stderr, "ERROR: --contam_prior_mode must be none, global, heterotypic, or fusion.\n");
+                    exit(1);
+                }
+                break;
+            case 2020:
+                contam_prior_min_cells = atoi(optarg);
+                if (contam_prior_min_cells < 2){
+                    fprintf(stderr, "ERROR: --contam_prior_min_cells must be >=2.\n");
+                    exit(1);
+                }
+                break;
+            case 2021:
+                contam_prior_max_ci_width = atof(optarg);
+                break;
+            case 2022:
+                contam_prior_min_weight = atof(optarg);
+                break;
+            case 2023:
+                contam_prior_max_gradient = atof(optarg);
+                contam_prior_max_gradient_supplied = true;
+                break;
+            case 2024:
+                strict_condf = true;
+                break;
+            case 2025:
+                run_class = optarg;
+                break;
+            case 2026:
+                run_contract_file = optarg;
+                break;
+            case 2027:
+                assignments_basis = optarg;
+                break;
+            case 2028:
+                expected_lines_basis = optarg;
+                break;
+            case 2029:
+                ambient_candidates_basis = optarg;
+                break;
+            case 2030:
+                warm_start_basis = optarg;
+                break;
+            case 2031:
+                fixed_ambient_basis = optarg;
+                break;
+            case 2032:
+                fix_r_basis = optarg;
+                break;
+            case 2033:
+                candidate_keyed_rows = true;
+                break;
+            case 2034:
+                candidate_keyed_split = atof(optarg);
+                break;
+            case 2035: {
+                errno = 0;
+                char* parse_end = NULL;
+                const double parsed_strength = strtod(optarg, &parse_end);
+                if (parse_end == optarg || parse_end == NULL || *parse_end != '\0' ||
+                    errno == ERANGE || !std::isfinite(parsed_strength)){
+                    fprintf(stderr,
+                        "ERROR: --source_exclusion_strength requires a finite numeric value in [0,1]; received %s.\n",
+                        optarg);
+                    exit(1);
+                }
+                source_exclusion_strength = parsed_strength;
+                source_exclusion_explicit = true;
+                break;
+            }
+            case 2036:
+                r_c_surface_selector_file = optarg;
+                break;
+            case 2037:
+                r_c_surface_out_file = optarg;
+                break;
+            case 2038:
+                condition_key = optarg;
+                break;
+            case 2039:
+                synthetic_id = optarg;
+                break;
+            case 2040:
+                profile_holdout_barcodes_file = optarg;
+                break;
+            case 2041:
+                profile_holdout_basis = optarg;
                 break;
             case 'g':
                 skipgenesfile = optarg;
@@ -1569,10 +2366,108 @@ int main(int argc, char *argv[]) {
     // ========================================================================
     // Validation
     // ========================================================================
+    if (source_exclusion_explicit){
+        if (!std::isfinite(source_exclusion_strength) ||
+            source_exclusion_strength < 0.0 || source_exclusion_strength > 1.0){
+            fprintf(stderr, "ERROR: --source_exclusion_strength must be finite and in [0,1].\n");
+            exit(1);
+        }
+        if (leave_one_out && fabs(source_exclusion_strength - 1.0) > 1e-12){
+            fprintf(stderr, "ERROR: --loo/--leave_source_out conflicts with explicit --source_exclusion_strength %.17g; legacy flags require exactly 1.\n",
+                source_exclusion_strength);
+            exit(1);
+        }
+    } else {
+        source_exclusion_strength = leave_one_out ? 1.0 : 0.0;
+    }
+    if (!r_c_surface_selector_file.empty() != !r_c_surface_out_file.empty()){
+        fprintf(stderr, "ERROR: --r_c_surface_selector and --r_c_surface_out must be supplied together.\n");
+        exit(1);
+    }
+    if (!r_c_surface_selector_file.empty() && synthetic_id.empty()){
+        fprintf(stderr, "ERROR: --synthetic_id is required with --r_c_surface_selector.\n");
+        exit(1);
+    }
+    if (!r_c_surface_selector_file.empty() && condition_key.empty()){
+        fprintf(stderr, "ERROR: --condition_key is required with --r_c_surface_selector.\n");
+        exit(1);
+    }
+
+    if (!(contam_prior_max_ci_width > 0.0 && contam_prior_max_ci_width <= 1.0)){
+        fprintf(stderr, "ERROR: --contam_prior_max_ci_width must be in (0,1].\n");
+        exit(1);
+    }
+    if (contam_prior_min_weight < 0.0){
+        fprintf(stderr, "ERROR: --contam_prior_min_weight must be >=0.\n");
+        exit(1);
+    }
+    if (contam_prior_max_gradient_supplied){
+        fprintf(stderr, "WARNING: --contam_prior_max_gradient is deprecated and ignored; "
+            "prior training now uses scale-invariant profile-likelihood evidence.\n");
+    }
+    const set<string> valid_run_classes = {"unspecified", "production", "oracle"};
+    const set<string> valid_bases = {"unspecified", "library", "truth"};
+    if (valid_run_classes.count(run_class) == 0){
+        fprintf(stderr, "ERROR: --run_class must be unspecified, production, or oracle.\n");
+        exit(1);
+    }
+    for (const auto& named_basis : vector<pair<string,string> >{
+            {"assignments_basis", assignments_basis},
+            {"expected_lines_basis", expected_lines_basis},
+            {"ambient_candidates_basis", ambient_candidates_basis},
+            {"warm_start_basis", warm_start_basis},
+            {"fixed_ambient_basis", fixed_ambient_basis},
+            {"fix_r_basis", fix_r_basis},
+            {"profile_holdout_basis", profile_holdout_basis}}){
+        if (valid_bases.count(named_basis.second) == 0){
+            fprintf(stderr, "ERROR: --%s must be unspecified, library, or truth.\n",
+                named_basis.first.c_str());
+            exit(1);
+        }
+    }
+    bool production_contract_pass = true;
+    string production_contract_reason = "not_requested";
+    if (run_class == "production"){
+        vector<string> violations;
+        if (!fixed_ambient_file.empty() && fixed_ambient_basis != "library")
+            violations.push_back("fixed_ambient_basis_not_library");
+        if (!fix_r_file.empty() && fix_r_basis != "library")
+            violations.push_back("fix_r_basis_not_library");
+        if (assignments_basis != "library") violations.push_back("assignments_basis_not_library");
+        if (!expected_lines_file.empty() && expected_lines_basis != "library")
+            violations.push_back("expected_lines_basis_not_library");
+        if (!ambient_candidates_file.empty() && ambient_candidates_basis != "library")
+            violations.push_back("ambient_candidates_basis_not_library");
+        if (!warm_start_file.empty() && warm_start_basis != "library")
+            violations.push_back("warm_start_basis_not_library");
+        if (!profile_holdout_barcodes_file.empty() && profile_holdout_basis != "library")
+            violations.push_back("profile_holdout_basis_not_library");
+        if (!strict_condf) violations.push_back("strict_condf_required");
+        if (!violations.empty()){
+            production_contract_pass = false;
+            production_contract_reason.clear();
+            for (size_t i = 0; i < violations.size(); ++i){
+                if (i) production_contract_reason += ";";
+                production_contract_reason += violations[i];
+            }
+            fprintf(stderr, "ERROR: production input contract failed: %s\n",
+                production_contract_reason.c_str());
+            exit(1);
+        }
+        production_contract_reason = "ok";
+    } else if (run_class == "oracle"){
+        production_contract_pass = false;
+        production_contract_reason = "oracle_run_not_eligible_for_production_scoring";
+    }
     if (output_prefix == ""){
         fprintf(stderr, "ERROR: output_prefix required\n");
         exit(1);
     }
+    const string effective_fixed_r_basis = fix_r_file.empty() ? "none" : fix_r_basis;
+    const string effective_fixed_ambient_basis = fixed_ambient_file.empty() ? "none" : fixed_ambient_basis;
+    const bool truth_assisted_condition = run_class == "oracle";
+    const set<string> r_c_surface_barcodes = load_r_c_surface_selector(
+        r_c_surface_selector_file, synthetic_id);
     if (!use_interindividual && !use_interspecies){
         fprintf(stderr, "ERROR: exactly one of --interindividual or --interspecies is required\n");
         exit(1);
@@ -1691,6 +2586,37 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    const set<unsigned long> profile_holdout_barcodes =
+        load_profile_holdout_barcodes(profile_holdout_barcodes_file);
+    if (!profile_holdout_barcodes.empty()){
+        if (use_interspecies){
+            fprintf(stderr, "ERROR: --profile_holdout_barcodes is currently supported only "
+                "for the interindividual CK path.\n");
+            exit(1);
+        }
+        unsigned long missing = 0;
+        for (set<unsigned long>::const_iterator it = profile_holdout_barcodes.begin();
+            it != profile_holdout_barcodes.end(); ++it){
+            if (assn.count(*it) == 0) missing++;
+        }
+        if (missing > 0){
+            fprintf(stderr, "ERROR: --profile_holdout_barcodes contains %lu barcodes "
+                "not present after assignment/LLR filtering.\n", missing);
+            exit(1);
+        }
+        if (profile_holdout_barcodes.size() >= assn.size()){
+            fprintf(stderr, "ERROR: profile holdout contains all %lu scored cells; "
+                "profile training would be empty.\n", (unsigned long)assn.size());
+            exit(1);
+        }
+        if (source_exclusion_strength > 1e-12){
+            fprintf(stderr, "ERROR: receiver-data profile cross-fitting must retain all source "
+                "columns; combine --profile_holdout_barcodes only with "
+                "--source_exclusion_strength 0.\n");
+            exit(1);
+        }
+    }
+
     // Optional weighted native species-composition model for --interspecies.
     // This uses the original individual assignment file as the biological identity
     // source, while still fitting contamination against native B/C/H/O species counts.
@@ -1722,6 +2648,12 @@ int main(int argc, char *argv[]) {
     }
 
     // Parse expected_lines for tetraploid-aware mode
+    if (candidate_keyed_split < 0.0 || candidate_keyed_split > 1.0){
+        fprintf(stderr, "ERROR: --candidate_keyed_split must lie in [0, 1]; got %f\n",
+            candidate_keyed_split);
+        exit(1);
+    }
+
     set<int> locked_identities;
     set<int> safe_singlets;
     set<int> expected_allowed_ids;
@@ -1829,6 +2761,44 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  Safe singlets: %lu (pure diploids, reassignment allowed)\n", safe_singlets.size());
     }
 
+    set<int> ambient_candidate_ids;
+    if (!ambient_candidates_file.empty()){
+        ifstream acf(ambient_candidates_file);
+        if (!acf.is_open()){
+            fprintf(stderr, "ERROR: cannot open ambient candidate file: %s\n", ambient_candidates_file.c_str());
+            exit(1);
+        }
+        map<string, int> name_to_idx;
+        for (int i = 0; i < (int)samples.size(); i++) name_to_idx[samples[i]] = i;
+        string line;
+        vector<string> unknown_candidates;
+        while (getline(acf, line)){
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+            size_t start = line.find_first_not_of(" \t");
+            if (start == string::npos) continue;
+            line = line.substr(start);
+            if (line.empty() || line[0] == '#') continue;
+            if (line.find('+') != string::npos){
+                fprintf(stderr, "ERROR: ambient candidate entries must be singlet source IDs, not combinations: %s\n", line.c_str());
+                exit(1);
+            }
+            auto it = name_to_idx.find(line);
+            if (it == name_to_idx.end()) unknown_candidates.push_back(line);
+            else ambient_candidate_ids.insert(it->second);
+        }
+        if (!unknown_candidates.empty()){
+            fprintf(stderr, "ERROR: %lu ambient candidates were not present in the active sample universe:\n", unknown_candidates.size());
+            for (const string& x : unknown_candidates) fprintf(stderr, "  %s\n", x.c_str());
+            exit(1);
+        }
+        if (ambient_candidate_ids.empty()){
+            fprintf(stderr, "ERROR: ambient candidate file %s contained no valid source IDs.\n", ambient_candidates_file.c_str());
+            exit(1);
+        }
+        fprintf(stderr, "Loaded %lu explicit ambient source candidates from %s\n",
+            ambient_candidate_ids.size(), ambient_candidates_file.c_str());
+    }
+
     // ========================================================================
     // Check for existing outputs / run estimation
     // ========================================================================
@@ -1882,11 +2852,30 @@ int main(int argc, char *argv[]) {
             ids_restricted,
             expected_allowed_ids,
             expected_allowed_ids2,
+            ambient_candidate_ids,
             leave_one_out,
+            source_exclusion_strength,
             r_feedback,
+            fix_r_file,
+            effective_fixed_r_basis,
+            effective_fixed_ambient_basis,
+            truth_assisted_condition,
+            r_c_surface_barcodes,
+            r_c_surface_out_file,
+            condition_key,
+            synthetic_id,
             adaptive_prior,
             thorough_multistart,
             adaptive_multistart,
+            profile_restarts,
+            heterotypic_start_mode,
+            heterotypic_start_top_k,
+            adaptive_profile_intervals,
+            contam_prior_mode,
+            contam_prior_min_cells,
+            contam_prior_max_ci_width,
+            contam_prior_min_weight,
+            contam_prior_max_gradient,
             warm_start_file,
             fixed_ambient_file,
             species_regularize,
@@ -1895,8 +2884,30 @@ int main(int argc, char *argv[]) {
             use_interspecies,
             user_condf_file,
             user_species_condf_file,
-            species_composition_overrides);
+            strict_condf,
+            species_composition_overrides,
+            profile_holdout_barcodes,
+            profile_holdout_basis,
+            candidate_keyed_rows,
+            candidate_keyed_split);
     }
+
+    if (run_contract_file.empty()) run_contract_file = output_prefix + ".run_contract.json";
+    const string counts_contract_path = output_prefix + (use_interspecies ? ".species_counts" : ".counts");
+    const string condf_contract_path = !use_interspecies
+        ? (user_condf_file.empty() ? output_prefix + ".condf" : user_condf_file)
+        : (user_species_condf_file.empty() ? output_prefix + ".species_condf" : user_species_condf_file);
+    write_run_contract_json(
+        run_contract_file, output_prefix, run_class, production_contract_pass,
+        production_contract_reason, use_interspecies, counts_contract_path,
+        condf_contract_path, assn_name, sample_name, expected_lines_file,
+        ambient_candidates_file, warm_start_file, fixed_ambient_file, fix_r_file,
+        assignments_basis, expected_lines_basis, ambient_candidates_basis,
+        warm_start_basis, effective_fixed_ambient_basis, effective_fixed_r_basis,
+        strict_condf, condition_key, synthetic_id, source_exclusion_strength,
+        source_exclusion_explicit, profile_holdout_barcodes_file,
+        profile_holdout_basis, (unsigned long)profile_holdout_barcodes.size(),
+        r_c_surface_selector_file, r_c_surface_out_file);
 
     if (load_gex){
         process_gex_data(output_prefix,

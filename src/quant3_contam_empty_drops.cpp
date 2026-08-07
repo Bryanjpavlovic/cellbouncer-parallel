@@ -255,7 +255,7 @@ int main(int argc, char *argv[]){
     // ---- Create contamFinder3 in bulk mode ----
     fprintf(stderr, "Setting up bulk-mode contamFinder3...\n");
     contamFinder3 cf(indv_allelecounts, assn, assn_llr, exp_match_fracs,
-        samples.size(), allowed_ids, allowed_ids2);
+        samples.size(), allowed_ids, allowed_ids, allowed_ids2);
     cf.set_error_rates(error_ref, error_alt);
     cf.set_num_threads(num_threads);
     cf.set_bulk_mode(true);
