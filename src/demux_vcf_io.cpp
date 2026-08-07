@@ -1,3 +1,21 @@
+// =============================================================================
+// demux_vcf_io.cpp
+// Provenance: V1_R1 (conversation: QUANT3_CONTAM_V2 SP_FIXED_EMPTY missing-species fix)
+//
+// Revision history:
+//   V1_R1: load_contam_prof no longer aborts when a VCF sample is absent from a
+//          contam_prof file. A missing sample is now assigned 0 mass
+//          (contam_prof[i] = 0.0) with a warning, in both the strict and
+//          non-strict branches. This lets --fixed_ambient run on libraries whose
+//          pool genuinely lacks a panel species (e.g. no orangutan), where the
+//          empty-drops profile correctly omits that species. set_init_contam_prof
+//          carries the explicit 0 through and renormalizes, so the absent species
+//          contributes no ambient mass. No other logic, signature, or path
+//          changed; the error_on_vcf_sample_missing_from_file parameter is
+//          retained for call-site compatibility and now only controls warning
+//          verbosity, not abort behavior.
+// =============================================================================
+
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -829,17 +847,25 @@ void load_contam_prof(const string& filename,
         }
     }
 
-    // Check for VCF samples missing from the file
+    // Check for VCF samples missing from the file. A sample can be legitimately
+    // absent when the library's pool does not contain that species/individual
+    // (e.g. an interspecies pool with no orangutan donor produces an empty-drops
+    // profile with no O row). Treat a missing sample as 0 ambient mass rather
+    // than aborting: assign contam_prof[i] = 0.0 and continue. Downstream
+    // set_init_contam_prof carries the explicit 0 through and renormalizes, so
+    // the absent species contributes nothing. The
+    // error_on_vcf_sample_missing_from_file flag now only governs whether the
+    // event is reported as a WARNING (strict callers) or a quieter note.
     for (int i = 0; i < (int)samples.size(); ++i){
         if (found_indices.count(i) == 0){
+            contam_prof[i] = 0.0;
             if (error_on_vcf_sample_missing_from_file){
-                fprintf(stderr, "ERROR: VCF sample %s not found in contam_prof file %s\n",
-                    samples[i].c_str(), filename.c_str());
-                exit(1);
+                fprintf(stderr, "WARNING: VCF sample %s not found in contam_prof file %s "
+                    "(assigned 0 ambient mass)\n", samples[i].c_str(), filename.c_str());
             }
             else{
-                fprintf(stderr, "WARNING: VCF sample %s not found in contam_prof file %s "
-                    "(effective prior = 0)\n", samples[i].c_str(), filename.c_str());
+                fprintf(stderr, "NOTE: VCF sample %s not found in contam_prof file %s "
+                    "(assigned 0 ambient mass)\n", samples[i].c_str(), filename.c_str());
             }
         }
     }
