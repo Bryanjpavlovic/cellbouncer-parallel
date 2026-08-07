@@ -4,6 +4,18 @@ CCOMP = gcc
 PREFIX ?= /usr/local
 
 # -----------------------------------------------------------------------------
+# Cluster HTSlib location
+# -----------------------------------------------------------------------------
+# Compile and link against the shared HTSlib installation used by the cluster,
+# and embed its library directory as a runtime search path.  LIBRARY_PATH helps
+# only at link time; without an rpath deployed executables fail at startup with:
+#   libhts.so.3: cannot open shared object file
+HTSLIB_PREFIX ?= /nvme/software/packages/htslib/1.20
+HTSLIB_INCLUDE ?= $(HTSLIB_PREFIX)/include
+HTSLIB_LIB ?= $(HTSLIB_PREFIX)/lib
+HTSLIB_RPATH_FLAG = -Wl,-rpath,$(HTSLIB_LIB)
+
+# -----------------------------------------------------------------------------
 # Cluster-portable CPU target
 # -----------------------------------------------------------------------------
 # This tree is compiled once on ash and synced to pika/char/squirtle.
@@ -28,10 +40,10 @@ CXXFLAGS_PARALLEL = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$
                     -O3 $(ARCHFLAGS) -fopenmp
 
 CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 $(ARCHFLAGS)
-CXXIFLAGS = -I$(PREFIX)/include -Iinclude
-CIFLAGS = -I$(PREFIX)/include -Iinclude
-LFLAGS = -L$(PREFIX)/lib -Llib
-LFLAGS_PARALLEL = -L$(PREFIX)/lib -Llib -fopenmp -flto=auto
+CXXIFLAGS = -I$(HTSLIB_INCLUDE) -I$(PREFIX)/include -Iinclude
+CIFLAGS = -I$(HTSLIB_INCLUDE) -I$(PREFIX)/include -Iinclude
+LFLAGS = -L$(HTSLIB_LIB) $(HTSLIB_RPATH_FLAG) -L$(PREFIX)/lib -Llib
+LFLAGS_PARALLEL = -L$(HTSLIB_LIB) $(HTSLIB_RPATH_FLAG) -L$(PREFIX)/lib -Llib -fopenmp -flto=auto
 
 # Optimized flags for tet contamination tools.  These deliberately use a
 # separate ambient_rna_three_ap_tet.o object so legacy quant3_contam_ap remains
@@ -39,7 +51,24 @@ LFLAGS_PARALLEL = -L$(PREFIX)/lib -Llib -fopenmp -flto=auto
 # optimization and OpenMP linkage.
 CXXFLAGS_TET = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) \
                -O3 $(ARCHFLAGS) -fopenmp
-LFLAGS_TET = -L$(PREFIX)/lib -Llib -fopenmp
+LFLAGS_TET = -L$(HTSLIB_LIB) $(HTSLIB_RPATH_FLAG) -L$(PREFIX)/lib -Llib -fopenmp
+
+# Standalone barcode-cache extractor.  It uses std::filesystem, so it must
+# be compiled as C++17 without changing the legacy CellBouncer C++11 tools.
+CXXFLAGS_CACHE = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
+DEPS_CACHE = -lhts -lz -lpthread
+
+# Dedicated mitochondrial fusion-ratio estimator.  Mito panel selection itself
+# is compiled directly into utils/downsample_vcf_parallel and is enabled there
+# with --mt_output; there is no separate panel-selection executable.
+CXXFLAGS_MT = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
+DEPS_MT = -lhts -lz -lpthread
+
+# Standalone genotype scrubber used when materializing synthetic benchmark BAMs.
+# It uses htslib's codec thread pool but does not link CellBouncer objects.
+CXXFLAGS_SCRUB = -std=c++11 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra
+DEPS_SCRUB = -lhts -lz -lpthread
+
 NBITS ?= 2048
 
 ifeq ($(findstring cellbouncer, ${CONDA_PREFIX}), cellbouncer)
@@ -59,30 +88,49 @@ DEPS = lib/libmixturedist.a lib/libhtswrapper.a lib/liboptimml.a
 DEPS2 = -lz -lhts -lpthread
 DEPS2_PARALLEL = -lz -lhts -lpthread -lrt
 
+# optimML is an external dependency, but CellBouncer needs two STLBFGS
+# assertions converted into catchable exceptions.  Never patch the vendored
+# dependency tree in place: build an isolated patched copy under build/ so a
+# clean checkout remains byte-for-byte unchanged.  The versioned stamp makes an
+# already-existing lib/liboptimml.a rebuild whenever this patch recipe changes.
+OPTIMML_PATCH_DIR = build/optimML_cellbouncer
+OPTIMML_PATCH_STAMP = $(OPTIMML_PATCH_DIR)/.cellbouncer_patch_v3
+OPTIMML_SOURCE_FILES = $(shell find dependencies/optimML -type f \
+    -not -path '*/build/*' -not -path '*/lib/*')
+
 # ============================================================================
 # MAIN TARGETS
 # ============================================================================
 
-all: dependencies original_tools parallel_tools tet_tools qc_tools
+all: dependencies original_tools parallel_tools tet_tools qc_tools mitochondrial_tools
 
 original_tools: demux_vcf demux_mt demux_tags demux_species quant_contam doublet_dragon bulkprops utils
 
-parallel_tools: demux_parallel vcf_loader_daemon utils/downsample_vcf_parallel tetra_refine
+parallel_tools: demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam utils/downsample_vcf_parallel tetra_refine
 
-tet_tools: tet_ambient_profile tet_contam_estimate
+tet_tools: tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate
 
-qc_tools: tetra_score_calls
+qc_tools: tetra_score_calls snps_per_read
 
-utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts utils/downsample_vcf
+mitochondrial_tools: mt_fusion_ratio
+
+utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/get_unique_kmers utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts utils/downsample_vcf
 
 dependencies: lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a
 
 print_flags:
+	@echo "HTSLIB_PREFIX=$(HTSLIB_PREFIX)"
+	@echo "HTSLIB_INCLUDE=$(HTSLIB_INCLUDE)"
+	@echo "HTSLIB_LIB=$(HTSLIB_LIB)"
+	@echo "HTSLIB_RPATH_FLAG=$(HTSLIB_RPATH_FLAG)"
 	@echo "CPU_ARCH=$(CPU_ARCH)"
 	@echo "CPU_TUNE=$(CPU_TUNE)"
 	@echo "ARCHFLAGS=$(ARCHFLAGS)"
 	@echo "CXXFLAGS_PARALLEL=$(CXXFLAGS_PARALLEL)"
 	@echo "CXXFLAGS_TET=$(CXXFLAGS_TET)"
+	@echo "CXXFLAGS_CACHE=$(CXXFLAGS_CACHE)"
+	@echo "CXXFLAGS_SCRUB=$(CXXFLAGS_SCRUB)"
+	@echo "DEPS_SCRUB=$(DEPS_SCRUB)"
 	@echo "CFLAGS=$(CFLAGS)"
 
 # ============================================================================
@@ -104,6 +152,12 @@ demux_tags: src/demux_tags.cpp src/common.h build/common.o $(DEPS)
 quant_contam: src/common.h src/quant_contam.cpp src/ambient_rna.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o build/ambient_rna_gex.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o build/ambient_rna_gex.o src/quant_contam.cpp $(LFLAGS) $(DEPS) -o quant_contam $(DEPS2)
 
+# Compiled current-code two-component compatibility estimator.  This is a
+# standalone C++ executable linked directly to the hardened ambient_rna model;
+# it does not invoke or wrap quant_contam at runtime.
+legacy2c_contam_estimate: src/legacy2c_contam_estimate.cpp src/ambient_rna.h src/common.h src/demux_vcf_io.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 $(ARCHFLAGS) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o src/legacy2c_contam_estimate.cpp $(LFLAGS) $(DEPS) -o legacy2c_contam_estimate $(DEPS2)
+
 doublet_dragon: src/doublet_dragon.cpp src/common.h build/common.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/doublet_dragon.cpp $(LFLAGS) $(DEPS) -o doublet_dragon $(DEPS2)
 
@@ -120,8 +174,32 @@ demux_parallel: src/demux_parallel.cpp build/common_parallel.o build/demux_vcf_i
 vcf_loader_daemon: src/vcf_loader_daemon.cpp build/common_parallel.o build/demux_parallel_hts.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o build/demux_parallel_hts.o src/vcf_loader_daemon.cpp -o vcf_loader_daemon $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
+# bam_ram_host_daemon stages cache BAM files into node-local tmpfs (/dev/shm) as
+# real files and publishes hosted_manifest.tsv. It is a standalone file-staging
+# daemon (POSIX I/O + pthreads only, no htslib/CellBouncer deps), built C++11 with
+# the cluster-portable ARCHFLAGS so the one binary runs on pika/char (Zen4) and
+# squirtle (Zen3).
+bam_ram_host_daemon: src/bam_ram_host_daemon.cpp
+	$(COMP) -std=c++11 -O3 $(ARCHFLAGS) src/bam_ram_host_daemon.cpp -o bam_ram_host_daemon -lpthread
+
+# Two-pass, per-cell dosage-projection scrubber for synthetic benchmark BAMs.
+# Standalone executable: htslib + zlib + pthread only. Build through an object
+# so the existing `make clean_build` workflow always forces a fresh rebuild.
+build/genotype_scrub_bam.o: src/genotype_scrub_bam.cpp Makefile
+	mkdir -p build
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_SCRUB) -c src/genotype_scrub_bam.cpp \
+	    -o build/genotype_scrub_bam.o
+
+genotype_scrub_bam: build/genotype_scrub_bam.o
+	$(COMP) build/genotype_scrub_bam.o -o genotype_scrub_bam \
+	    $(LFLAGS) $(DEPS_SCRUB)
+
 utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp src/downsample_vcf_parallel.h build/common_parallel.o $(DEPS)
+	mkdir -p utils
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o src/downsample_vcf_parallel.cpp -o utils/downsample_vcf_parallel $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
+
+mt_fusion_ratio: src/mt_fusion_ratio.cpp
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) src/mt_fusion_ratio.cpp -o mt_fusion_ratio $(LFLAGS) $(DEPS_MT)
 
 tetra_refine: src/tetra_refine.cpp lib/libhtswrapper.a
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 src/tetra_refine.cpp -o tetra_refine $(LFLAGS) lib/libhtswrapper.a -lz
@@ -181,6 +259,15 @@ tetra_score_calls: src/tetra_score_calls.cpp lib/libhtswrapper.a
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g src/tetra_score_calls.cpp \
 	    -o tetra_score_calls $(LFLAGS_TET) lib/libhtswrapper.a -lz
 
+# Standalone per-read SNP-coverage counter: htslib + zlib + pthread + OpenMP.
+# robin_hood is header-only, resolved via -Iinclude from the installed htswrapper
+# headers. Built as C++17 like bam_cb_cache_extract. The order-only
+# lib/libhtswrapper.a prerequisite installs include/htswrapper/robin_hood/robin_hood.h;
+# the archive itself is not linked.
+snps_per_read: src/snps_per_read.cpp | lib/libhtswrapper.a
+	$(COMP) $(CXXIFLAGS) -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -fopenmp -Wall -Wextra \
+	    src/snps_per_read.cpp -o snps_per_read $(LFLAGS) -lhts -lz -lpthread
+
 # ============================================================================
 # UTILITY TOOLS
 # ============================================================================
@@ -193,6 +280,9 @@ utils/bam_indiv_rg: src/bam_indiv_rg.cpp src/common.h build/common.o $(DEPS)
 
 utils/bam_split_bcs: src/bam_split_bcs.cpp src/common.h build/common.o $(DEPS)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/bam_split_bcs.cpp $(LFLAGS) $(DEPS) -o utils/bam_split_bcs $(DEPS2)
+
+utils/bam_cb_cache_extract: src/bam_cb_cache_extract.cpp
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_CACHE) src/bam_cb_cache_extract.cpp -o utils/bam_cb_cache_extract $(LFLAGS) $(DEPS_CACHE)
 
 utils/get_unique_kmers: src/get_unique_kmers.c src/FASTK/libfastk.c build/libfastk.o
 	$(CCOMP) $(CIFLAGS) $(CFLAGS) build/libfastk.o src/get_unique_kmers.c -o utils/get_unique_kmers $(LFLAGS) -lz
@@ -267,24 +357,85 @@ build/demux_parallel_llr.o: src/demux_parallel_llr.cpp src/demux_parallel_llr.h 
 
 # ============================================================================
 # DEPENDENCIES
-# Patch stlbfgs assert -> throw before building optimML so that BFGS
-# solver failures become catchable exceptions instead of process aborts.
-# The sed is idempotent: if already patched, it matches nothing.
+#
+# optimML/STLBFGS handling is intentionally implemented only here, in the
+# top-level build.  The vendored dependencies/optimML source is never edited.
+# A private copy is created in build/, patched there, compiled, and installed
+# into this project's lib/ and include/ directories.
 # ============================================================================
 
 lib/libhtswrapper.a:
+	mkdir -p dependencies/htswrapper/build dependencies/htswrapper/lib
 	cd dependencies/htswrapper && $(MAKE) PREFIX=../.. BC_LENX2=$(BC_LENX2) KX2=$(KX2)
 	cd dependencies/htswrapper && $(MAKE) install PREFIX=../..
 
 lib/libmixturedist.a:
+	mkdir -p dependencies/mixtureDist/build dependencies/mixtureDist/lib
 	cd dependencies/mixtureDist && $(MAKE) PREFIX=../..
 	cd dependencies/mixtureDist && $(MAKE) install PREFIX=../..
 
-lib/liboptimml.a:
-	cd dependencies/optimML && sed -i 's/assert(-dot(g, p)<0);/if (-dot(g, p) >= 0) throw 1;/' src/stlbfgs/stlbfgs.cpp
-	cd dependencies/optimML && sed -i 's/assert(std::isfinite(alpha));/if (!std::isfinite(alpha)) throw 2;/' src/stlbfgs/stlbfgs.cpp
-	cd dependencies/optimML && $(MAKE) PREFIX=../..
-	cd dependencies/optimML && $(MAKE) install PREFIX=../..
+$(OPTIMML_PATCH_STAMP): $(OPTIMML_SOURCE_FILES) Makefile
+	rm -rf $(OPTIMML_PATCH_DIR)
+	mkdir -p build
+	cp -a dependencies/optimML $(OPTIMML_PATCH_DIR)
+	rm -rf $(OPTIMML_PATCH_DIR)/build $(OPTIMML_PATCH_DIR)/lib
+	mkdir -p $(OPTIMML_PATCH_DIR)/build $(OPTIMML_PATCH_DIR)/lib
+	sed -i \
+	    -e 's/assert(-dot(g, p)<0);/if (-dot(g, p) >= 0) throw 1;/' \
+	    -e 's/assert(-dot(g, p) < 0);/if (-dot(g, p) >= 0) throw 1;/' \
+	    -e 's/assert(std::isfinite(alpha));/if (!std::isfinite(alpha)) throw 2;/' \
+	    $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
+	# CellBouncer requires optimML's mixture logistic coordinates to use the
+	# actual mixture block when one or more external parameters precede it.
+	# Apply this only to the private build copy; never edit dependencies/optimML.
+	sed -i \
+	    -e 's|mixcompsum_f += mixcompfracs_sparse\[i\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
+	    -e 's|mixcompsum_f += mixcompfracs\[i\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
+	    $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
+	sed -i \
+	    -e 's|mixcompsum_f += mixcompfracs_sparse\[jid\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs_sparse[jid][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
+	    $(OPTIMML_PATCH_DIR)/src/multivar.cpp
+	grep -Fq 'if (-dot(g, p) >= 0) throw 1;' $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
+	grep -Fq 'if (!std::isfinite(alpha)) throw 2;' $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
+	! grep -Fq 'assert(std::isfinite(alpha));' $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
+	grep -Fq 'mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
+	grep -Fq 'mixcompsum_f += mixcompfracs[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
+	grep -Fq 'mixcompsum_f += mixcompfracs_sparse[jid][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar.cpp
+	! grep -Fq 'mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
+	! grep -Fq 'mixcompsum_f += mixcompfracs[i][k] / (exp(-x[k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
+	! grep -Fq 'mixcompsum_f += mixcompfracs_sparse[jid][k] / (exp(-x[k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar.cpp
+	touch $@
+
+lib/liboptimml.a: $(OPTIMML_PATCH_STAMP)
+	mkdir -p lib include/optimML
+	$(MAKE) -C $(OPTIMML_PATCH_DIR) PREFIX=$(abspath .)
+	$(MAKE) -C $(OPTIMML_PATCH_DIR) install PREFIX=$(abspath .)
+	test -s $@
+
+
+# ============================================================================
+# AMBIENT MODEL MATHEMATICAL TESTS
+# ============================================================================
+
+# Stage only the headers required by the isolated math-test build without
+# compiling or modifying the htswrapper dependency.
+include/htswrapper/robin_hood/robin_hood.h: dependencies/htswrapper/src/robin_hood/robin_hood.h
+	mkdir -p include/htswrapper/robin_hood
+	cp $< $@
+
+include/htswrapper/bc.h: dependencies/htswrapper/src/bc.h include/htswrapper/robin_hood/robin_hood.h
+	mkdir -p include/htswrapper
+	cp $< $@
+
+build/ambient_rna_three_ap_test.o: src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/common.h lib/liboptimml.a lib/libmixturedist.a include/htswrapper/bc.h include/htswrapper/robin_hood/robin_hood.h
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap_test.o
+
+build/test_ambient_support.o: src/test_ambient_support.cpp
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/test_ambient_support.cpp -c -o build/test_ambient_support.o
+
+test_ambient_math: src/test_ambient_gradients.cpp build/ambient_rna_three_ap_test.o build/test_ambient_support.o lib/liboptimml.a lib/libmixturedist.a
+	$(COMP) $(CXXIFLAGS) -Isrc $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/test_ambient_gradients.cpp build/ambient_rna_three_ap_test.o build/test_ambient_support.o -o test_ambient_math $(LFLAGS_TET) -Wl,--gc-sections lib/liboptimml.a lib/libmixturedist.a -lz -lpthread
+	./test_ambient_math
 
 # ============================================================================
 # CLEAN TARGETS
@@ -294,20 +445,23 @@ clean: clean_build clean_binaries
 
 clean_build:
 	rm -f build/*.o
+	rm -rf $(OPTIMML_PATCH_DIR)
+	rm -f lib/liboptimml.a
+	rm -rf include/optimML
 
 clean_binaries:
 	rm -f demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops
-	rm -f demux_parallel vcf_loader_daemon tetra_refine
+	rm -f demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam tetra_refine
 	rm -f quant3_contam quant3_contam_ap quant3_contam_empty_drops
-	rm -f tet_ambient_profile tet_contam_estimate tetra_score_calls
-	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers
+	rm -f tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate tetra_score_calls snps_per_read test_ambient_math mt_fusion_ratio
+	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/get_unique_kmers
 	rm -f utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts
 	rm -f utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel
 
 clean_deps:
 	cd dependencies/htswrapper && $(MAKE) clean || true
 	cd dependencies/mixtureDist && $(MAKE) clean || true
-	cd dependencies/optimML && $(MAKE) clean || true
+	rm -rf $(OPTIMML_PATCH_DIR)
 
 clean_all: clean clean_deps
 	rm -f lib/libmixturedist.a lib/liboptimml.a lib/libhtswrapper.a
@@ -319,10 +473,10 @@ clean_all: clean clean_deps
 install: all quant3_contam quant3_contam_ap quant3_contam_empty_drops install_scripts
 	mkdir -p $(PREFIX)/bin
 	cp demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops $(PREFIX)/bin/
-	cp demux_parallel vcf_loader_daemon tetra_refine $(PREFIX)/bin/
+	cp demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam tetra_refine $(PREFIX)/bin/
 	cp quant3_contam quant3_contam_ap quant3_contam_empty_drops $(PREFIX)/bin/
-	cp tet_ambient_profile tet_contam_estimate tetra_score_calls $(PREFIX)/bin/
-	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/get_unique_kmers $(PREFIX)/bin/
+	cp tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate tetra_score_calls snps_per_read mt_fusion_ratio $(PREFIX)/bin/
+	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/get_unique_kmers $(PREFIX)/bin/
 	cp utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts $(PREFIX)/bin/
 	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
 
@@ -332,4 +486,4 @@ install_scripts:
 	cp scripts/*.py $(PREFIX)/bin/
 	chmod +x $(PREFIX)/bin/*.py
 
-.PHONY: all original_tools parallel_tools tet_tools utils dependencies print_flags clean clean_build clean_binaries clean_deps clean_all install install_scripts
+.PHONY: all original_tools parallel_tools tet_tools qc_tools mitochondrial_tools utils dependencies print_flags test_ambient_math clean clean_build clean_binaries clean_deps clean_all install install_scripts
