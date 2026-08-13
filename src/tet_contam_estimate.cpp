@@ -2809,6 +2809,7 @@ int main(int argc, char *argv[]) {
     map<int, double> contam_prof;
 
     bool load_gex = (barcodesfile != "" && featuresfile != "" && matrixfile != "");
+    bool genotype_inference_ran = false;
 
     if (file_exists(prof_name) && file_exists(rate_name)){
         if (!load_gex){
@@ -2825,6 +2826,7 @@ int main(int argc, char *argv[]) {
         parse_prof(prof_name, contam_prof, samples);
     }
     else{
+        genotype_inference_ran = true;
         infer_from_genotypes(output_prefix,
             assn,
             assn_llr,
@@ -2892,22 +2894,28 @@ int main(int argc, char *argv[]) {
             candidate_keyed_split);
     }
 
-    if (run_contract_file.empty()) run_contract_file = output_prefix + ".run_contract.json";
-    const string counts_contract_path = output_prefix + (use_interspecies ? ".species_counts" : ".counts");
-    const string condf_contract_path = !use_interspecies
-        ? (user_condf_file.empty() ? output_prefix + ".condf" : user_condf_file)
-        : (user_species_condf_file.empty() ? output_prefix + ".species_condf" : user_species_condf_file);
-    write_run_contract_json(
-        run_contract_file, output_prefix, run_class, production_contract_pass,
-        production_contract_reason, use_interspecies, counts_contract_path,
-        condf_contract_path, assn_name, sample_name, expected_lines_file,
-        ambient_candidates_file, warm_start_file, fixed_ambient_file, fix_r_file,
-        assignments_basis, expected_lines_basis, ambient_candidates_basis,
-        warm_start_basis, effective_fixed_ambient_basis, effective_fixed_r_basis,
-        strict_condf, condition_key, synthetic_id, source_exclusion_strength,
-        source_exclusion_explicit, profile_holdout_barcodes_file,
-        profile_holdout_basis, (unsigned long)profile_holdout_barcodes.size(),
-        r_c_surface_selector_file, r_c_surface_out_file);
+    if (genotype_inference_ran){
+        if (run_contract_file.empty()) run_contract_file = output_prefix + ".run_contract.json";
+        const string counts_contract_path = output_prefix + (use_interspecies ? ".species_counts" : ".counts");
+        const string condf_contract_path = !use_interspecies
+            ? (user_condf_file.empty() ? output_prefix + ".condf" : user_condf_file)
+            : (user_species_condf_file.empty() ? output_prefix + ".species_condf" : user_species_condf_file);
+        write_run_contract_json(
+            run_contract_file, output_prefix, run_class, production_contract_pass,
+            production_contract_reason, use_interspecies, counts_contract_path,
+            condf_contract_path, assn_name, sample_name, expected_lines_file,
+            ambient_candidates_file, warm_start_file, fixed_ambient_file, fix_r_file,
+            assignments_basis, expected_lines_basis, ambient_candidates_basis,
+            warm_start_basis, effective_fixed_ambient_basis, effective_fixed_r_basis,
+            strict_condf, condition_key, synthetic_id, source_exclusion_strength,
+            source_exclusion_explicit, profile_holdout_barcodes_file,
+            profile_holdout_basis, (unsigned long)profile_holdout_barcodes.size(),
+            r_c_surface_selector_file, r_c_surface_out_file);
+    }
+    else{
+        fprintf(stderr, "Existing contamination estimates reused for GEX processing; "
+            "estimator run contract was not rewritten.\n");
+    }
 
     if (load_gex){
         process_gex_data(output_prefix,
