@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -7,6 +9,8 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <limits>
+#include <initializer_list>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -34,9 +38,11 @@ struct ScoreAccum {
 };
 
 struct Diagnostics {
-    double llr = NAN;
+    double llr_vs_runner_up = NAN;
+    string runnerup_comparison_state = "unavailable";
     double total_depth = NAN;
     long n_close = 0;
+    double margin_softmax_score = NAN;
 };
 
 struct CellInfo {
@@ -46,6 +52,7 @@ struct CellInfo {
     double assignment_llr = NAN;
     vector<Identity> runnerups;
     vector<string> runnerup_names;
+    vector<string> runnerup_comparison_states;
     ScoreAccum assigned_acc;
     vector<ScoreAccum> runner_acc;
     Diagnostics diag;
@@ -63,12 +70,141 @@ static string trim(const string& s){
     return s.substr(a, b-a+1);
 }
 
+static void die(const string& msg);
+
 static vector<string> split(const string& s, char delim){
     vector<string> out;
     string item;
     stringstream ss(s);
     while (getline(ss, item, delim)) out.push_back(item);
     return out;
+}
+
+static vector<string> split_tsv_strict(const string& s){
+    vector<string> out;
+    size_t start = 0;
+    while (true){
+        size_t pos = s.find('\t', start);
+        if (pos == string::npos){
+            out.push_back(s.substr(start));
+            break;
+        }
+        out.push_back(s.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return out;
+}
+
+static string lowercase(string s){
+    transform(s.begin(), s.end(), s.begin(),
+        [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static bool is_missing_diagnostic_token(const string& raw){
+    const string token = lowercase(trim(raw));
+    return token.empty() || token == "." || token == "na" ||
+           token == "unavailable" || token == "partial_support" ||
+           token == "not_applicable";
+}
+
+static double parse_optional_diagnostic_number(
+    const string& raw, const string& context){
+    if (is_missing_diagnostic_token(raw)) return NAN;
+    errno = 0;
+    char* end = NULL;
+    const double value = strtod(raw.c_str(), &end);
+    if (errno != 0 || end == raw.c_str() || *end != '\0' || !isfinite(value)){
+        die(context + ": expected a finite number or an explicit missing state, saw '" + raw + "'");
+    }
+    return value;
+}
+
+static long parse_required_long(const string& raw, const string& context){
+    errno = 0;
+    char* end = NULL;
+    const long value = strtol(raw.c_str(), &end, 10);
+    if (errno != 0 || end == raw.c_str() || *end != '\0'){
+        die(context + ": expected an integer, saw '" + raw + "'");
+    }
+    return value;
+}
+
+static map<string,int> diagnostic_header_index(
+    const vector<string>& header, const string& path){
+    map<string,int> index;
+    for (int i = 0; i < (int)header.size(); ++i){
+        if (header[i].empty()) die(path + ": empty diagnostic column name");
+        if (index.count(header[i]) > 0) die(path + ": duplicate diagnostic column: " + header[i]);
+        index[header[i]] = i;
+    }
+    return index;
+}
+
+static int optional_column(const map<string,int>& index,
+                           initializer_list<const char*> names){
+    for (const char* name : names){
+        auto it = index.find(name);
+        if (it != index.end()) return it->second;
+    }
+    return -1;
+}
+
+static int required_column(const map<string,int>& index,
+                           initializer_list<const char*> names,
+                           const string& path){
+    const int col = optional_column(index, names);
+    if (col >= 0) return col;
+    string wanted;
+    for (const char* name : names){
+        if (!wanted.empty()) wanted += " or ";
+        wanted += name;
+    }
+    die(path + ": required diagnostic column missing: " + wanted);
+    return -1;
+}
+
+static bool comparison_state_is_present(const string& state){
+    return state == "present_nonzero" || state == "present_zero";
+}
+
+static string parse_comparison_state(
+    const string& raw_state,
+    double numeric_value,
+    bool explicit_state,
+    const string& context){
+    if (!explicit_state){
+        if (!isfinite(numeric_value)) return "unavailable";
+        return numeric_value == 0.0 ? "present_zero" : "present_nonzero";
+    }
+    const string state = lowercase(trim(raw_state));
+    static const set<string> supported = {
+        "present_nonzero", "present_zero", "unavailable",
+        "partial_support", "not_applicable"
+    };
+    if (supported.count(state) == 0){
+        die(context + ": unsupported comparison state '" + raw_state + "'");
+    }
+    if (comparison_state_is_present(state)){
+        if (!isfinite(numeric_value)){
+            die(context + ": state " + state + " requires a numeric direct comparison");
+        }
+        if (state == "present_zero" && numeric_value != 0.0){
+            die(context + ": present_zero requires numeric zero");
+        }
+        if (state == "present_nonzero" && numeric_value == 0.0){
+            die(context + ": present_nonzero cannot carry numeric zero");
+        }
+    } else if (isfinite(numeric_value)){
+        die(context + ": missing comparison state " + state +
+            " must not carry a numeric value");
+    }
+    return state;
+}
+
+static bool supported_schema(const string& schema,
+                             const string& prefix){
+    return schema == prefix + "_v2" || schema == prefix + "_v3";
 }
 
 static bool file_exists(const string& path){
@@ -338,75 +474,165 @@ static void load_diagnostics(const string& path, unordered_map<unsigned long, Ce
     gzFile gz = gzopen(path.c_str(), "rb");
     if (!gz) die("could not open diagnostics: " + path);
     char buf[1<<20];
-    if (!gzgets(gz, buf, sizeof(buf))){ gzclose(gz); return; }
-    string header(buf);
-    header.erase(remove(header.begin(), header.end(), '\n'), header.end());
-    header.erase(remove(header.begin(), header.end(), '\r'), header.end());
-    vector<string> h = split(header, '\t');
-    int bc_i=-1, llr_i=-1, nc_i=-1, td_i=-1;
-    for (int i=0; i<(int)h.size(); ++i){
-        if (h[i] == "barcode") bc_i = i;
-        else if (h[i] == "llr") llr_i = i;
-        else if (h[i] == "n_close") nc_i = i;
-        else if (h[i] == "total_depth") td_i = i;
+    if (!gzgets(gz, buf, sizeof(buf))){
+        gzclose(gz);
+        die(path + ": empty diagnostics file");
     }
+    string header_line(buf);
+    header_line.erase(remove(header_line.begin(), header_line.end(), '\n'), header_line.end());
+    header_line.erase(remove(header_line.begin(), header_line.end(), '\r'), header_line.end());
+    const vector<string> header = split_tsv_strict(header_line);
+    const map<string,int> index = diagnostic_header_index(header, path);
+    const int bc_i = required_column(index, {"barcode"}, path);
+    const int llr_i = required_column(index, {"llr_vs_runner_up", "llr"}, path);
+    const int nc_i = required_column(index, {"n_close"}, path);
+    const int td_i = required_column(index, {"total_depth"}, path);
+    const int state_i = optional_column(index,
+        {"runnerup_comparison_state", "runner_up_comparison_state"});
+    const int softmax_i = optional_column(index,
+        {"margin_softmax_score", "posterior"});
+    const int schema_i = optional_column(index, {"schema_version"});
+    const bool versioned = schema_i >= 0;
+    if (versioned){
+        if (index.count("llr_vs_runner_up") == 0){
+            gzclose(gz);
+            die(path + ": versioned diagnostics require llr_vs_runner_up");
+        }
+        if (state_i < 0){
+            gzclose(gz);
+            die(path + ": versioned diagnostics require runnerup_comparison_state");
+        }
+        if (index.count("margin_softmax_score") == 0){
+            gzclose(gz);
+            die(path + ": versioned diagnostics require margin_softmax_score");
+        }
+    }
+
+    long line_no = 1;
     while (gzgets(gz, buf, sizeof(buf))){
+        ++line_no;
         string line(buf);
-        if (line.empty()) continue;
         line.erase(remove(line.begin(), line.end(), '\n'), line.end());
         line.erase(remove(line.begin(), line.end(), '\r'), line.end());
-        vector<string> f = split(line, '\t');
-        if (bc_i < 0 || bc_i >= (int)f.size()) continue;
-        unsigned long ul = bc_ul(f[bc_i]);
+        if (line.empty()) continue;
+        const vector<string> f = split_tsv_strict(line);
+        const string context = path + ": line " + to_string(line_no);
+        if (f.size() != header.size()){
+            gzclose(gz);
+            die(context + ": malformed row has " + to_string(f.size()) +
+                " fields; expected " + to_string(header.size()));
+        }
+        if (versioned && !supported_schema(
+                f[schema_i], "demux_parallel_diagnostics")){
+            gzclose(gz);
+            die(context + ": unsupported diagnostics schema '" + f[schema_i] + "'");
+        }
+        const double direct = parse_optional_diagnostic_number(f[llr_i],
+            context + " llr_vs_runner_up");
+        const string state = parse_comparison_state(
+            state_i >= 0 ? f[state_i] : "", direct, state_i >= 0,
+            context + " runner-up comparison");
+        const long n_close = parse_required_long(f[nc_i], context + " n_close");
+        const double total_depth = parse_optional_diagnostic_number(
+            f[td_i], context + " total_depth");
+        const double softmax = softmax_i >= 0
+            ? parse_optional_diagnostic_number(
+                f[softmax_i], context + " margin_softmax_score")
+            : NAN;
+
+        string barcode = f[bc_i];
+        const unsigned long ul = bc_ul(barcode);
         auto it = cells.find(ul);
         if (it == cells.end()) continue;
-        if (llr_i >= 0 && llr_i < (int)f.size()) it->second.diag.llr = atof(f[llr_i].c_str());
-        if (nc_i >= 0 && nc_i < (int)f.size()) it->second.diag.n_close = atol(f[nc_i].c_str());
-        if (td_i >= 0 && td_i < (int)f.size()) it->second.diag.total_depth = atof(f[td_i].c_str());
+        it->second.diag.llr_vs_runner_up = direct;
+        it->second.diag.runnerup_comparison_state = state;
+        it->second.diag.n_close = n_close;
+        it->second.diag.total_depth = total_depth;
+        it->second.diag.margin_softmax_score = softmax;
     }
-    gzclose(gz);
+    if (gzclose(gz) != Z_OK) die("failed closing diagnostics: " + path);
 }
 
 static void load_runnerups(const string& path, const unordered_map<string,int>& sample2idx,
                            unordered_map<unsigned long, CellInfo>& cells){
     if (path.empty()) return;
     gzFile gz = gzopen(path.c_str(), "rb");
-    if (!gz) return;
+    if (!gz) die("could not open runner-ups: " + path);
     char buf[1<<20];
-    if (!gzgets(gz, buf, sizeof(buf))){ gzclose(gz); return; }
-    string header(buf);
-    header.erase(remove(header.begin(), header.end(), '\n'), header.end());
-    header.erase(remove(header.begin(), header.end(), '\r'), header.end());
-    vector<string> h = split(header, '\t');
-    int bc_i=-1, id_i=-1;
-    for (int i=0; i<(int)h.size(); ++i){
-        if (h[i] == "barcode") bc_i = i;
-        else if (h[i] == "identity") id_i = i;
+    if (!gzgets(gz, buf, sizeof(buf))){
+        gzclose(gz);
+        die(path + ": empty runner-up file");
     }
+    string header_line(buf);
+    header_line.erase(remove(header_line.begin(), header_line.end(), '\n'), header_line.end());
+    header_line.erase(remove(header_line.begin(), header_line.end(), '\r'), header_line.end());
+    const vector<string> header = split_tsv_strict(header_line);
+    const map<string,int> index = diagnostic_header_index(header, path);
+    const int bc_i = required_column(index, {"barcode"}, path);
+    const int id_i = required_column(index, {"identity"}, path);
+    const int rank_i = required_column(index, {"rank"}, path);
+    const int value_i = required_column(index, {"llr_vs_winner"}, path);
+    const int state_i = optional_column(index, {"comparison_state"});
+    const int schema_i = optional_column(index, {"schema_version"});
+    const bool versioned = schema_i >= 0;
+    if (versioned && state_i < 0){
+        gzclose(gz);
+        die(path + ": versioned runner-ups require comparison_state");
+    }
+
+    long line_no = 1;
     while (gzgets(gz, buf, sizeof(buf))){
+        ++line_no;
         string line(buf);
-        if (line.empty()) continue;
         line.erase(remove(line.begin(), line.end(), '\n'), line.end());
         line.erase(remove(line.begin(), line.end(), '\r'), line.end());
-        vector<string> f = split(line, '\t');
-        if (bc_i < 0 || id_i < 0 || bc_i >= (int)f.size() || id_i >= (int)f.size()) continue;
-        unsigned long ul = bc_ul(f[bc_i]);
+        if (line.empty()) continue;
+        const vector<string> f = split_tsv_strict(line);
+        const string context = path + ": line " + to_string(line_no);
+        if (f.size() != header.size()){
+            gzclose(gz);
+            die(context + ": malformed row has " + to_string(f.size()) +
+                " fields; expected " + to_string(header.size()));
+        }
+        if (versioned && !supported_schema(
+                f[schema_i], "demux_parallel_runner_ups")){
+            gzclose(gz);
+            die(context + ": unsupported runner-up schema '" + f[schema_i] + "'");
+        }
+        const long rank = parse_required_long(f[rank_i], context + " rank");
+        if (rank <= 0){
+            gzclose(gz);
+            die(context + ": runner-up rank must be positive");
+        }
+        const double direct = parse_optional_diagnostic_number(
+            f[value_i], context + " llr_vs_winner");
+        const string state = parse_comparison_state(
+            state_i >= 0 ? f[state_i] : "", direct, state_i >= 0,
+            context + " runner-up comparison");
+        Identity r;
+        try{
+            r = parse_identity(f[id_i], sample2idx);
+        } catch (const exception& e) {
+            gzclose(gz);
+            die(context + ": invalid runner-up identity '" + f[id_i] + "': " + e.what());
+        }
+
+        string barcode = f[bc_i];
+        const unsigned long ul = bc_ul(barcode);
         auto it = cells.find(ul);
         if (it == cells.end()) continue;
-        try{
-            Identity r = parse_identity(f[id_i], sample2idx);
-            if (r.name == it->second.assignment.name) continue;
-            bool dup = false;
-            for (const auto& existing : it->second.runnerups){ if (existing.name == r.name){ dup = true; break; } }
-            if (!dup){
-                it->second.runnerups.push_back(r);
-                it->second.runnerup_names.push_back(r.name);
-            }
-        } catch (...) {
-            continue;
+        if (r.name == it->second.assignment.name) continue;
+        bool dup = false;
+        for (const auto& existing : it->second.runnerups){
+            if (existing.name == r.name){ dup = true; break; }
+        }
+        if (!dup){
+            it->second.runnerups.push_back(r);
+            it->second.runnerup_names.push_back(r.name);
+            it->second.runnerup_comparison_states.push_back(state);
         }
     }
-    gzclose(gz);
+    if (gzclose(gz) != Z_OK) die("failed closing runner-ups: " + path);
     for (auto& kv : cells) kv.second.runner_acc.resize(kv.second.runnerups.size());
 }
 
@@ -668,7 +894,7 @@ int main(int argc, char** argv){
 
     gzFile out = gzopen(output.c_str(), "wb");
     if (!out) die("could not open output: " + output);
-    string header = "barcode\tlibname\tassignment\tassignment_type\tploidy_status\tllr\ttotal_depth\tn_informative_bins\tn_informative_depth\tn_close\tdnllr\tdosage_concordance\tdosage_runnerup_identity\trunnerup_dosage_concordance\tdosage_gap_constrained\tresidual_mismatch\texpected_species_set\tspecies_support_expected\tspecies_conflict_flag\tspecies_relation\tspecies_missing_expected_component\tspecies_has_unexpected_component\tspecies_disjoint_wrong_species\tspecies_best_identity\tspecies_best_support\tspecies_gap\tcall_qc_flags\twarnings\n";
+    string header = "barcode\tlibname\tassignment\tassignment_type\tploidy_status\tllr_vs_runner_up\trunnerup_comparison_state\tmargin_softmax_score\ttotal_depth\tn_informative_bins\tn_informative_depth\tn_close\tdepth_normalized_llr_vs_runner_up\tdosage_concordance\tdosage_runnerup_identity\tdosage_runnerup_comparison_state\trunnerup_dosage_concordance\tdosage_gap_constrained\tresidual_mismatch\texpected_species_set\tspecies_support_expected\tspecies_conflict_flag\tspecies_relation\tspecies_missing_expected_component\tspecies_has_unexpected_component\tspecies_disjoint_wrong_species\tspecies_best_identity\tspecies_best_support\tspecies_gap\tcall_qc_flags\twarnings\n";
     gzwrite(out, header.c_str(), header.size());
 
     vector<double> species_supports;
@@ -685,11 +911,24 @@ int main(int argc, char** argv){
         double conc = concordance(c.assigned_acc, min_evidence);
         double best_runner = NAN;
         string best_runner_name = "NA";
+        string best_runner_state = "not_applicable";
+        if (!c.runnerups.empty()) {
+            best_runner_name = c.runnerups[0].name;
+            best_runner_state = !c.runnerup_comparison_states.empty()
+                ? c.runnerup_comparison_states[0] : "unavailable";
+        }
         for (size_t i=0; i<c.runner_acc.size(); ++i){
+            const string state = i < c.runnerup_comparison_states.size()
+                ? c.runnerup_comparison_states[i] : "unavailable";
+            // Missing/partial comparison states are not usable confidence
+            // comparators. Preserve their explicit state for reporting when no
+            // complete runner exists, but never turn them into a numeric gap.
+            if (!comparison_state_is_present(state)) continue;
             double rc = concordance(c.runner_acc[i], min_evidence);
             if (isfinite(rc) && (!isfinite(best_runner) || rc > best_runner)){
                 best_runner = rc;
                 best_runner_name = c.runnerups[i].name;
+                best_runner_state = state;
             }
         }
         double gap = (isfinite(conc) && isfinite(best_runner)) ? (conc - best_runner) : NAN;
@@ -754,11 +993,22 @@ int main(int argc, char** argv){
         string ploidy = "singlet";
         if (c.assignment.b >= 0 && c.assignment.a == c.assignment.b) ploidy = "unresolved_by_SNPs";
         else if (c.assignment.b >= 0) ploidy = "heterotypic";
-        double dnllr = (isfinite(c.diag.llr) && c.diag.total_depth > 0) ? c.diag.llr / c.diag.total_depth : NAN;
+        double dnllr = (comparison_state_is_present(c.diag.runnerup_comparison_state) &&
+                        isfinite(c.diag.llr_vs_runner_up) && c.diag.total_depth > 0)
+            ? c.diag.llr_vs_runner_up / c.diag.total_depth : NAN;
+        if (!comparison_state_is_present(c.diag.runnerup_comparison_state)){
+            warnings.push_back("RUNNER_UP_COMPARISON_" +
+                lowercase(c.diag.runnerup_comparison_state));
+        }
         string line;
         line += c.barcode + "\t" + libname + "\t" + c.assignment.name + "\t" + assignment_type + "\t" + ploidy + "\t";
-        line += fmt(c.diag.llr) + "\t" + fmt(c.diag.total_depth) + "\t" + to_string(c.assigned_acc.bins) + "\t" + fmt(c.assigned_acc.depth) + "\t" + to_string(c.diag.n_close) + "\t" + fmt(dnllr) + "\t";
-        line += fmt(conc) + "\t" + best_runner_name + "\t" + fmt(best_runner) + "\t" + fmt(gap) + "\t" + (isfinite(conc) ? fmt(1.0-conc) : "NA") + "\t";
+        line += fmt(c.diag.llr_vs_runner_up) + "\t" + c.diag.runnerup_comparison_state + "\t" +
+                fmt(c.diag.margin_softmax_score) + "\t" + fmt(c.diag.total_depth) + "\t" +
+                to_string(c.assigned_acc.bins) + "\t" + fmt(c.assigned_acc.depth) + "\t" +
+                to_string(c.diag.n_close) + "\t" + fmt(dnllr) + "\t";
+        line += fmt(conc) + "\t" + best_runner_name + "\t" + best_runner_state + "\t" +
+                fmt(best_runner) + "\t" + fmt(gap) + "\t" +
+                (isfinite(conc) ? fmt(1.0-conc) : "NA") + "\t";
         line += species + "\t" + fmt(species_support) + "\t" + species_conflict + "\t" + sp_relation + "\t" + sp_missing_expected + "\t" + sp_has_unexpected + "\t" + sp_disjoint_wrong + "\t" + species_best + "\t" + fmt(species_best_support) + "\t" + fmt(species_gap) + "\t" + join_flags(flags) + "\t" + join_flags(warnings) + "\n";
         gzwrite(out, line.c_str(), line.size());
     }

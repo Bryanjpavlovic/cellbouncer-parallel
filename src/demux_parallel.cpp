@@ -4,23 +4,42 @@
 // header block. Stable pipeline source name; version is tracked in-file.
 //
 // Revision history
-//   V1_R1  Repair the -I / --ids_doublet declared-identity contract.
-//          parse_idfile places the singlet halves of every declared combination
-//          into allowed_ids so the doublet likelihood and the llr_table have both
-//          halves available, and deliberately keeps them out of allowed_ids2 so
-//          they are not answers. populate_llr_table_optimized therefore bars them
-//          from round 1 onward, which means their assigned-cell count is zero by
-//          construction. filter_identities was testing that zero against each
-//          parent combination's cell count, the rank arm of the test always
-//          returned "significant" for an empty group, and the decision collapsed
-//          onto ppois(0, parent_cells). Any declared combination holding fewer
-//          than about three cells therefore promoted both of its halves into
-//          allowed_ids2, and the final diagnostic assignment handed cells to
-//          identities the user never declared. filter_identities now requires
-//          positive evidence before promoting a half, ignores empty parent
-//          combinations as evidence, and reports a change only when the answer
-//          set actually widened.
-//          Version bumped to 2.11 so deployed binaries are identifiable in logs.
+//   V2.13.3 Targeted reliability repair: skip BAM targets with no active panel
+//          SNPs, fall back to synchronous I/O when optional HTSlib helper-thread
+//          setup fails, and preserve staged-output cleanup even when a legacy
+//          deep helper exits instead of returning through C++ stack unwinding.
+//   V2.13.2 BAM-index scheduling-stat compatibility: valid BAI/CSI indexes may
+//          lack mapped/unmapped metadata for empty header targets. Both single-
+//          and dual-panel counting now use a zero read-count estimate only for
+//          work-unit sizing/ordering instead of aborting; target iterators and
+//          allele counting remain unchanged.
+//   V2.13.1 Compatibility rollback: demux VCF loading no longer reads,
+//          validates, or filters on FORMAT/GQ. Historical Float GQ, canonical
+//          Integer GQ, absent GQ, and other GQ encodings are all ignored. A
+//          record with unavailable or unsupported GT structure is skipped rather
+//          than aborting the complete panel load.
+//   V2.13  --dump_pileup dual-panel support. The pileup sidecars
+//          (.pileup_sites.tsv.gz / .pileup_obs.tsv.gz, consumed by the ambient
+//          benchmark variant-consistency producer) were previously emitted only
+//          by the single-panel count_alleles_parallel path; the production
+//          launch uses --species_counts_output, which routes counting through
+//          count_alleles_parallel_dual, so the flag was silently ignored.
+//          count_alleles_parallel_dual now accepts dump_pileup/pileup_prefix
+//          (appended trailing parameters, defaulted off, so every existing
+//          caller is unchanged), writes the interindividual-only sites sidecar
+//          from the combined panel (panel_id == 0), records per-thread
+//          per-(cell,SNP) evidence at panel-0 sites in the same fixed-point
+//          units as the single-panel path, and flushes observations after the
+//          count merge. Both sidecars stage through the output transaction as
+//          before. Two fail-closed guards added in main: --dump_pileup with
+//          loaded counts (reuse path) and --dump_pileup with --threads <= 1
+//          are refused, because both paths would otherwise publish a bundle
+//          without the promised pileup files.
+//   V2.12  Harden the production demux_parallel path: strict half-open alignment
+//          mapping, fail-closed parallel counting,
+//          authoritative pairwise diagnostics, complete-edge maximin acceptance,
+//          transactional output publication, and strict preservation of the
+//          declared -I identity set as the only legal final-answer set.
 
 #include <getopt.h>
 #include <argp.h>
@@ -35,6 +54,9 @@
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <errno.h>
 #include <map>
 #include <unordered_map>
 #include <set>
@@ -67,10 +89,14 @@ using std::cout;
 using std::endl;
 using namespace std;
 
-// Version information
-const string VERSION = "2.11";
-const string VERSION_MESSAGE = "per-site normalized native species counting with reassignment diagnostics";
-const string VERSION_NEW = "v2.11: -I restricts the answer set to declared identities; singlet halves of declared combinations are promoted only on positive evidence";
+// Version/build information
+#ifndef CELLBOUNCER_SOURCE_REVISION
+#define CELLBOUNCER_SOURCE_REVISION "unknown"
+#endif
+
+const string VERSION = "2.13.3";
+const string VERSION_MESSAGE = "parallel production demultiplexer with fail-closed counting and explicit comparison semantics";
+const string VERSION_NEW = "v2.13.3: SNP-bearing BAM targets only, synchronous fallback for optional HTSlib helper threads, and exit-safe staged-output cleanup; includes the v2.13.2 index-statistics fix";
 
 // Global verbose flag (defined in demux_parallel_llr.cpp)
 extern bool g_verbose;
@@ -80,6 +106,376 @@ extern bool g_debug;
 
 // Species panel mode (used in main and potentially in helper functions)
 enum class SpeciesPanelMode { NONE, COUNT_ONLY, FILTER, AUGMENT, BOTH };
+
+
+class OutputTransaction {
+    struct PrefixPair {
+        string final_prefix;
+        string staged_prefix;
+    };
+    struct PublishedFile {
+        string staged;
+        string final_name;
+        string backup;
+        bool had_backup;
+        bool installed;
+    };
+
+    vector<PrefixPair> prefixes_;
+    string token_;
+    bool committed_;
+    OutputTransaction* previous_active_;
+
+    static OutputTransaction* active_;
+    static bool exit_handler_registered_;
+
+    static void cleanup_active_at_exit() {
+        if (active_ != NULL && !active_->committed_) {
+            active_->cleanup_staged();
+        }
+    }
+
+    static void split_prefix(const string& prefix, string& directory, string& base) {
+        const size_t slash = prefix.find_last_of('/');
+        if (slash == string::npos) {
+            directory = ".";
+            base = prefix;
+        } else {
+            directory = slash == 0 ? "/" : prefix.substr(0, slash);
+            base = prefix.substr(slash + 1);
+        }
+    }
+
+    static string join_path(const string& directory, const string& name) {
+        if (directory == "/") return "/" + name;
+        if (directory == ".") return name;
+        return directory + "/" + name;
+    }
+
+    vector<PublishedFile> discover_files() const {
+        vector<PublishedFile> files;
+        set<string> staged_seen;
+        for (const PrefixPair& pair : prefixes_) {
+            string directory;
+            string staged_base;
+            string final_directory;
+            string final_base;
+            split_prefix(pair.staged_prefix, directory, staged_base);
+            split_prefix(pair.final_prefix, final_directory, final_base);
+            DIR* dirp = opendir(directory.c_str());
+            if (dirp == NULL) continue;
+            while (dirent* entry = readdir(dirp)) {
+                const string name = entry->d_name;
+                if (name.compare(0, staged_base.size(), staged_base) != 0) continue;
+                const string staged_path = join_path(directory, name);
+                if (!staged_seen.insert(staged_path).second) continue;
+                const string suffix = name.substr(staged_base.size());
+                PublishedFile file;
+                file.staged = staged_path;
+                file.final_name = join_path(final_directory, final_base + suffix);
+                file.backup = file.final_name + ".backup.demux_parallel." + token_;
+                file.had_backup = false;
+                file.installed = false;
+                files.push_back(file);
+            }
+            closedir(dirp);
+        }
+        sort(files.begin(), files.end(), [](const PublishedFile& a, const PublishedFile& b) {
+            return a.final_name < b.final_name;
+        });
+        return files;
+    }
+
+    void cleanup_staged() const {
+        const vector<PublishedFile> files = discover_files();
+        for (const PublishedFile& file : files) unlink(file.staged.c_str());
+    }
+
+public:
+    OutputTransaction() : committed_(false), previous_active_(active_) {
+        const long long stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        token_ = std::to_string((long long)getpid()) + "." + std::to_string(stamp);
+        active_ = this;
+        if (!exit_handler_registered_) {
+            if (std::atexit(&OutputTransaction::cleanup_active_at_exit) == 0) {
+                exit_handler_registered_ = true;
+            } else {
+                fprintf(stderr,
+                    "WARNING: could not register emergency staged-output cleanup; "
+                    "normal return-path cleanup remains active\n");
+            }
+        }
+    }
+
+    ~OutputTransaction() {
+        if (!committed_) cleanup_staged();
+        if (active_ == this) active_ = previous_active_;
+    }
+
+    string stage_prefix(const string& final_prefix) {
+        for (const PrefixPair& pair : prefixes_) {
+            if (pair.final_prefix == final_prefix) return pair.staged_prefix;
+        }
+        PrefixPair pair;
+        pair.final_prefix = final_prefix;
+        pair.staged_prefix = final_prefix + ".tmp.demux_parallel." + token_;
+        prefixes_.push_back(pair);
+        return pair.staged_prefix;
+    }
+
+    bool publish(string* error_message = NULL) {
+        vector<PublishedFile> files = discover_files();
+        if (files.empty()) {
+            if (error_message) *error_message = "no staged output files were produced";
+            return false;
+        }
+        for (PublishedFile& file : files) {
+            struct stat st;
+            if (lstat(file.final_name.c_str(), &st) == 0) {
+                unlink(file.backup.c_str());
+                if (rename(file.final_name.c_str(), file.backup.c_str()) != 0) {
+                    if (error_message) {
+                        *error_message = "could not back up " + file.final_name + ": " + strerror(errno);
+                    }
+                    for (PublishedFile& rollback : files) {
+                        if (rollback.had_backup) rename(rollback.backup.c_str(), rollback.final_name.c_str());
+                    }
+                    return false;
+                }
+                file.had_backup = true;
+            }
+        }
+
+        for (PublishedFile& file : files) {
+            if (rename(file.staged.c_str(), file.final_name.c_str()) != 0) {
+                if (error_message) {
+                    *error_message = "could not publish " + file.final_name + ": " + strerror(errno);
+                }
+                for (PublishedFile& rollback : files) {
+                    if (rollback.installed) unlink(rollback.final_name.c_str());
+                }
+                for (PublishedFile& rollback : files) {
+                    if (rollback.had_backup) rename(rollback.backup.c_str(), rollback.final_name.c_str());
+                }
+                return false;
+            }
+            file.installed = true;
+        }
+
+        for (const PublishedFile& file : files) {
+            if (file.had_backup) unlink(file.backup.c_str());
+        }
+        committed_ = true;
+        return true;
+    }
+};
+
+OutputTransaction* OutputTransaction::active_ = NULL;
+bool OutputTransaction::exit_handler_registered_ = false;
+
+static string optional_number(double value) {
+    if (!std::isfinite(value)) return "NA";
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), "%.17g", value);
+    return string(buffer);
+}
+
+static string optional_identity(int identity, vector<string>& samples) {
+    return identity >= 0 ? idx2name(identity, samples) : "NA";
+}
+
+static string join_identity_names(const vector<int>& identities, vector<string>& samples) {
+    if (identities.empty()) return "none";
+    string result;
+    for (size_t i = 0; i < identities.size(); ++i) {
+        if (i > 0) result += ",";
+        result += idx2name(identities[i], samples);
+    }
+    return result;
+}
+
+static bool publish_outputs(OutputTransaction& transaction, const char* context) {
+    string error;
+    if (!transaction.publish(&error)) {
+        fprintf(stderr, "ERROR: could not publish %s outputs atomically: %s\n",
+            context, error.c_str());
+        return false;
+    }
+    return true;
+}
+
+struct PanelUsabilitySummary {
+    size_t nonempty_panel_contigs;
+    size_t shared_bam_contigs;
+    size_t usable_snps;
+    size_t removed_nonshared_contigs;
+
+    PanelUsabilitySummary()
+        : nonempty_panel_contigs(0), shared_bam_contigs(0), usable_snps(0),
+          removed_nonshared_contigs(0) {}
+};
+
+static bool panel_snp_is_usable(const SNPData& snp) {
+    // A loaded record whose every sample has unavailable GT is not usable
+    // evidence. Keep partially covered sites; downstream comparison
+    // completeness decides whether a particular identity edge is evaluable.
+    return snp.data.haps_covered.any();
+}
+
+static size_t count_panel_snps(
+    const robin_hood::unordered_map<int, ChromSNPs>& panel,
+    size_t* nonempty_contigs = NULL) {
+    size_t contigs = 0;
+    size_t snps = 0;
+    for (const auto& kv : panel) {
+        size_t usable_on_contig = 0;
+        for (const SNPData& snp : kv.second.snps) {
+            if (panel_snp_is_usable(snp)) ++usable_on_contig;
+        }
+        if (usable_on_contig == 0) continue;
+        ++contigs;
+        snps += usable_on_contig;
+    }
+    if (nonempty_contigs != NULL) *nonempty_contigs = contigs;
+    return snps;
+}
+
+static bool validate_panel_without_bam(
+    const robin_hood::unordered_map<int, ChromSNPs>& panel,
+    const string& panel_label,
+    bool allow_empty) {
+    size_t nonempty_contigs = 0;
+    const size_t usable_snps = count_panel_snps(panel, &nonempty_contigs);
+    if (nonempty_contigs == 0 || usable_snps == 0) {
+        if (allow_empty) {
+            fprintf(stderr,
+                "WARNING: optional %s contains no usable SNPs after loading/filtering; "
+                "diagnostic panel will be unavailable\n",
+                panel_label.c_str());
+            return true;
+        }
+        fprintf(stderr,
+            "ERROR: required %s contains zero usable SNPs after loading/filtering\n",
+            panel_label.c_str());
+        return false;
+    }
+    fprintf(stderr, "%s usability: %lu nonempty contigs, %lu usable SNPs\n",
+        panel_label.c_str(), (unsigned long)nonempty_contigs,
+        (unsigned long)usable_snps);
+    return true;
+}
+
+static bool validate_and_restrict_panel_to_bam(
+    robin_hood::unordered_map<int, ChromSNPs>& panel,
+    const map<string, int>& bam_seq2tid,
+    const string& panel_label,
+    bool allow_empty) {
+    set<int> bam_tids;
+    for (const auto& kv : bam_seq2tid) bam_tids.insert(kv.second);
+
+    PanelUsabilitySummary summary;
+    for (auto it = panel.begin(); it != panel.end();) {
+        vector<SNPData>& snps = it->second.snps;
+        const bool panel_contig_has_records = !snps.empty();
+        if (panel_contig_has_records) {
+            ++summary.nonempty_panel_contigs;
+            if (bam_tids.count(it->first) > 0) {
+                // Track physical BAM/panel overlap independently from whether
+                // any records retain usable GT data. This keeps the two
+                // release-blocker states distinguishable.
+                ++summary.shared_bam_contigs;
+            }
+        }
+
+        snps.erase(
+            std::remove_if(snps.begin(), snps.end(),
+                [](const SNPData& snp) { return !panel_snp_is_usable(snp); }),
+            snps.end());
+        if (bam_tids.count(it->first) == 0) {
+            if (panel_contig_has_records) ++summary.removed_nonshared_contigs;
+            panel.erase(it++);
+            continue;
+        }
+        if (snps.empty()) {
+            panel.erase(it++);
+            continue;
+        }
+        summary.usable_snps += snps.size();
+        ++it;
+    }
+
+    if (summary.shared_bam_contigs == 0) {
+        if (allow_empty) {
+            fprintf(stderr,
+                "WARNING: optional %s has zero shared BAM/panel contigs; "
+                "diagnostic panel will be unavailable\n",
+                panel_label.c_str());
+            return true;
+        }
+        fprintf(stderr,
+            "ERROR: required %s has zero shared BAM/panel contigs\n",
+            panel_label.c_str());
+        return false;
+    }
+    if (summary.usable_snps == 0) {
+        if (allow_empty) {
+            fprintf(stderr,
+                "WARNING: optional %s has zero usable SNPs after loading/filtering; "
+                "diagnostic panel will be unavailable\n",
+                panel_label.c_str());
+            return true;
+        }
+        fprintf(stderr,
+            "ERROR: required %s contains zero usable SNPs after loading/filtering\n",
+            panel_label.c_str());
+        return false;
+    }
+
+    fprintf(stderr,
+        "%s usability: %lu shared BAM/panel contigs, %lu usable SNPs",
+        panel_label.c_str(), (unsigned long)summary.shared_bam_contigs,
+        (unsigned long)summary.usable_snps);
+    if (summary.removed_nonshared_contigs > 0) {
+        fprintf(stderr, " (%lu nonshared contigs ignored)",
+            (unsigned long)summary.removed_nonshared_contigs);
+    }
+    fprintf(stderr, "\n");
+    return true;
+}
+
+static set<string> shared_contig_names(
+    const set<string>& panel_contigs,
+    const map<string, int>& bam_seq2tid) {
+    set<string> shared;
+    for (const string& contig : panel_contigs) {
+        if (bam_seq2tid.count(contig) > 0) shared.insert(contig);
+    }
+    return shared;
+}
+
+static bool write_samples_checked(const string& filename, const vector<string>& samples) {
+    FILE* outf = fopen(filename.c_str(), "w");
+    if (outf == NULL) {
+        fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+            filename.c_str(), strerror(errno));
+        return false;
+    }
+    bool ok = true;
+    for (const string& sample : samples) {
+        if (fprintf(outf, "%s\n", sample.c_str()) < 0) {
+            ok = false;
+            break;
+        }
+    }
+    if (ferror(outf)) ok = false;
+    if (fclose(outf) != 0) ok = false;
+    if (!ok) {
+        fprintf(stderr, "ERROR: failed writing %s: %s\n",
+            filename.c_str(), strerror(errno));
+    }
+    return ok;
+}
 
 /**
  * Log likelihood function for computing error rates
@@ -450,112 +846,10 @@ void id_qc(robin_hood::unordered_map<unsigned long, int>& assn,
 }
 
 /**
- * Filter identities based on user-specified doublet ID file.
- *
- * -I declares the exact identities the user believes can occur. parse_idfile also
- * places the singlet halves of every declared combination into allowed_ids, because
- * the doublet likelihood and the llr_table need both halves to exist, and keeps them
- * out of allowed_ids2, because they were not declared. populate_llr_table_optimized
- * disallows every identity that is absent from allowed_ids2, so those halves cannot
- * win a cell in any preceding round.
- *
- * A half may only be promoted into the answer set on positive evidence: it has to
- * have won cells of its own, and it must not be significantly depleted relative to
- * each parent combination that itself won cells. A parent combination with no cells
- * carries no information about whether its half exists alone, so it does not count
- * as support. When the halves were never selectable they all hold zero cells and
- * none of them is promoted, which is exactly what -I promises.
- *
- * Returns true if the allowed answer set changed, meaning assignments computed
- * against the previous set are stale and must be recomputed.
+ * The -I file is an exact final-answer contract. Component singlets may remain
+ * available internally so declared fusion likelihoods can be constructed, but
+ * they are never promoted into allowed_ids2 and can never become final calls.
  */
-bool filter_identities(robin_hood::unordered_map<unsigned long, int>& assn,
-    robin_hood::unordered_map<unsigned long, double>& assn_llr, 
-    int n_samples,
-    set<int>& allowed_ids, 
-    set<int>& allowed_ids2){
-    
-    // Get number of cells per ID
-    map<int, int> cells_per_id;
-    for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin();
-        a != assn.end(); ++a){
-        if (cells_per_id.count(a->second) == 0){
-            cells_per_id.insert(make_pair(a->second, 0));
-        }
-        cells_per_id[a->second]++;
-    }
-
-    // Identities that are not in the declared list, but were added because they are
-    // singlet halves of declared combinations. Decide every one of them before
-    // touching allowed_ids2, so the comparison set is fixed for the whole scan.
-    set<int> promote_ids;
-    for (set<int>::iterator a = allowed_ids.begin(); a != allowed_ids.end(); ++a){
-        if (allowed_ids2.find(*a) != allowed_ids2.end()){
-            continue;
-        }
-
-        int ncell_this = 0;
-        if (cells_per_id.count(*a) > 0){
-            ncell_this = cells_per_id[*a];
-        }
-        if (ncell_this == 0){
-            // No cell preferred this identity. There is nothing to support it.
-            continue;
-        }
-
-        // Check whether this individual has significantly fewer cells than
-        // all "parent" individuals (doublets including this individual)
-        vector<double> p_ncell;
-
-        // Check whether cells assigned to this individual have significantly
-        // lower LLRs than cells assigned to "parent" individuals
-        vector<double> p_llr;
-
-        for (set<int>::iterator a2 = allowed_ids2.begin(); a2 != allowed_ids2.end(); ++a2){
-            if (*a2 >= n_samples){
-                pair<int, int> combo = idx_to_hap_comb(*a2, n_samples);
-                if (combo.first == *a || combo.second == *a){
-                    int ncell_parent = 0;
-                    if (cells_per_id.count(*a2) > 0){
-                        ncell_parent = cells_per_id[*a2];
-                    }
-                    if (ncell_parent == 0){
-                        // An empty parent combination is not evidence about its half.
-                        continue;
-                    }
-                    double p1 = ppois((double)ncell_this, (double)ncell_parent);
-                    double p2 = mannwhitney_llr(*a, *a2, assn, assn_llr);
-                    p_ncell.push_back(p1);
-                    p_llr.push_back(p2);
-                }
-            }
-        }
-        if (p_ncell.size() == 0){
-            // Cells chose this identity and no parent combination drew any, so the
-            // half stands on its own evidence.
-            promote_ids.insert(*a);
-            continue;
-        }
-        bool all_p_signif = true;
-        for (int i = 0; i < p_ncell.size(); ++i){
-            if (p_ncell[i] > 0.05 || p_llr[i] > 0.05){
-                all_p_signif = false;  // At least one comparison not significant
-            }
-        }
-        if (!all_p_signif){
-            // Safe to keep.
-            promote_ids.insert(*a);
-        }
-    }
-    for (set<int>::iterator p = promote_ids.begin(); p != promote_ids.end(); ++p){
-        allowed_ids2.insert(*p);
-    }
-    if (promote_ids.size() > 0){
-        fprintf(stderr, "Identity restriction: %lu declared-combination half(s) promoted on evidence\n",
-            promote_ids.size());
-    }
-    return promote_ids.size() > 0;
-}
 
 /**
  * Dump cell counts from optimized CellCounts structure to file.
@@ -1202,7 +1496,7 @@ static void load_panel_metadata_if_needed(
     }
 }
 
-static void write_native_species_assignments(
+static bool write_native_species_assignments(
     const string& output_prefix,
     robin_hood::unordered_map<unsigned long, CellCounts>& species_counts_native,
     const vector<string>& species_samples,
@@ -1218,8 +1512,8 @@ static void write_native_species_assignments(
     bool underscore){
 
     if (species_counts_native.empty()){
-        fprintf(stderr, "WARNING: native species assignment requested but no species counts are available\n");
-        return;
+        fprintf(stderr, "ERROR: native species assignment requested but no species counts are available\n");
+        return false;
     }
 
     robin_hood::unordered_map<unsigned long, int> sp_assn;
@@ -1228,53 +1522,47 @@ static void write_native_species_assignments(
     set<int> allowed_ids2;
     map<int, double> prior_weights;
 
-    // Species candidate restriction, the exact analogue of -i/-I on the
-    // individual path. Without it the species pass considers every singleton
-    // and every pair over the species panel, so cross-species ambient RNA can
-    // append (or substitute) a species that was never in the cell.
-    //
-    // Measured on a 60%-ambient diploid unit before this option existed:
-    // species assignments drifted 86.3% from the designed labels, and the
-    // swaps were additive (O -> H+O, B -> B+H) or substitutive (B -> C+H).
-    // Lowering --species_doublet_rate from 0.5 to the true 0.0152 moved only
-    // 2 of 566 cells: at 28.7% human reads the likelihood evidence for "human
-    // present" dwarfs any prior, so a prior cannot do this job. A candidate
-    // restriction can, exactly as -I took individual drift 86.9% -> 0.0% on
-    // the same unit.
-    //
-    // parse_idfile is panel-agnostic: it maps names in the supplied samples
-    // vector, so species labels ("B", "O") and species pairs ("B+C") work
-    // unchanged. "A+A" collapses to the singleton, as on the individual path.
+    // Species assignment remains a separate native output. Candidate restriction
+    // is the panel-agnostic analogue of -i/-I and does not alter individual calls.
     if (species_idfile.length() > 0){
         string idfile_copy = species_idfile;
         vector<string> samples_copy = species_samples;
         parse_idfile(idfile_copy, samples_copy, allowed_ids, allowed_ids2, false);
-        if (allowed_ids.size() == 0){
-            fprintf(stderr, "ERROR: no valid species labels found in %s; refusing to ignore "
-                "--species_ids\n", species_idfile.c_str());
-            exit(1);
+        if (allowed_ids.empty()){
+            fprintf(stderr, "ERROR: no valid species labels found in %s; refusing to ignore --species_ids\n",
+                species_idfile.c_str());
+            return false;
         }
         fprintf(stderr, "Species candidate restriction active: %lu singlet label(s), "
             "%lu pair label(s) from %s\n",
             allowed_ids.size(), allowed_ids2.size(), species_idfile.c_str());
     }
 
-    assign_ids_parallel(species_counts_native, const_cast<vector<string>&>(species_samples),
-        sp_assn, sp_assn_llr, allowed_ids, allowed_ids2, doublet_rate,
-        error_ref, error_alt, false, prior_weights, n_threads, n_target);
+    vector<string> tmp_species_samples = species_samples;
+    if (!assign_ids_parallel(species_counts_native, tmp_species_samples,
+            sp_assn, sp_assn_llr, allowed_ids, allowed_ids2, doublet_rate,
+            error_ref, error_alt, false, prior_weights, n_threads, n_target)) {
+        fprintf(stderr, "ERROR: native species identity scoring failed\n");
+        return false;
+    }
 
-    string fname = output_prefix + ".species_assignments";
+    const string fname = output_prefix + ".species_assignments";
     FILE* outf = fopen(fname.c_str(), "w");
     if (!outf){
-        fprintf(stderr, "ERROR: could not open %s for writing\n", fname.c_str());
-        exit(1);
+        fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+            fname.c_str(), strerror(errno));
+        return false;
     }
-    vector<string> tmp_species_samples = species_samples;
+    string tmp_group = barcode_group;
     dump_assignments(outf, sp_assn, sp_assn_llr, tmp_species_samples,
-        const_cast<string&>(barcode_group), cellranger, seurat, underscore);
-    fclose(outf);
+        tmp_group, cellranger, seurat, underscore);
+    if (fclose(outf) != 0){
+        fprintf(stderr, "ERROR: failed closing %s: %s\n", fname.c_str(), strerror(errno));
+        return false;
+    }
     fprintf(stderr, "Wrote native species assignments for %lu cells to %s\n",
         sp_assn.size(), fname.c_str());
+    return true;
 }
 
 
@@ -1284,10 +1572,8 @@ static void write_native_species_assignments(
  * This diagnostic path deliberately reads only:
  *   INPUT_PREFIX.species_samples
  *   INPUT_PREFIX.species_counts
- * and writes a distinct output prefix.  It never opens a BAM or VCF and never
- * modifies the source count bundle.  When --panel_metadata is supplied, legacy
- * pre-v2.09 panel-multiplicity inflation is normalized in memory before the
- * reassignment test.
+ * and writes a distinct output prefix. It never opens a BAM or VCF and never
+ * modifies the source count bundle.
  */
 static int reassign_native_species_from_existing(
     const string& input_prefix,
@@ -1343,9 +1629,17 @@ static int reassign_native_species_from_existing(
             samples_file.c_str(), species_samples.size());
         return 1;
     }
+    string allocation_error;
+    if (!validate_identity_and_allocation_request(
+            (int)species_samples.size(), NULL, NULL, &allocation_error)){
+        fprintf(stderr, "ERROR: native species identity universe is unsupported: %s\n",
+            allocation_error.c_str());
+        return 1;
+    }
 
     robin_hood::unordered_map<unsigned long, CellCounts> species_counts;
-    int n_lines = load_cellcounts_optimized(counts_file, species_counts, species_samples.size());
+    const int n_lines = load_cellcounts_optimized(
+        counts_file, species_counts, species_samples.size());
     if (n_lines <= 0 || species_counts.empty()){
         fprintf(stderr, "ERROR: no native species counts loaded from %s\n", counts_file.c_str());
         return 1;
@@ -1368,11 +1662,6 @@ static int reassign_native_species_from_existing(
             fprintf(stderr,
                 "ERROR: panel metadata native species order does not match %s\n",
                 samples_file.c_str());
-            fprintf(stderr, "  panel:");
-            for (const auto& x : pm.species_list) fprintf(stderr, " %s", x.c_str());
-            fprintf(stderr, "\n  bundle:");
-            for (const auto& x : species_samples) fprintf(stderr, " %s", x.c_str());
-            fprintf(stderr, "\n");
             return 1;
         }
         vector<vector<pair<int, double>>> i2sp =
@@ -1405,26 +1694,27 @@ static int reassign_native_species_from_existing(
         REASSIGN_EMPTY_COUNTS = 1,
         REASSIGN_LLR_FAILED = 2,
         REASSIGN_NONPOSITIVE_MARGIN = 3,
-        REASSIGN_NO_WINNER = 4
+        REASSIGN_NO_WINNER = 4,
+        REASSIGN_MISSING_COMPARISONS = 5
     };
 
     vector<int> statuses(barcodes.size(), REASSIGN_LLR_FAILED);
     vector<int> winners(barcodes.size(), -1);
-    vector<double> winner_scores(barcodes.size(), 0.0);
+    vector<double> winner_scores(
+        barcodes.size(), std::numeric_limits<double>::quiet_NaN());
     vector<CellDiagnostics> diagnostics(barcodes.size());
     vector<vector<RunnerUp> > runners(barcodes.size());
 
     const int n_species = (int)species_samples.size();
     set<int> allowed_ids;
     set<int> allowed_ids2;
-    map<int, double> prior_weights;
 
     fprintf(stderr, "Assigning native species identities to %lu cells using %d threads...\n",
         barcodes.size(), n_threads);
 
     #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 100)
     for (size_t idx = 0; idx < barcodes.size(); ++idx){
-        unsigned long bc = barcodes[idx];
+        const unsigned long bc = barcodes[idx];
         const CellCounts& counts = species_counts.at(bc);
         if (counts.is_empty()){
             statuses[idx] = REASSIGN_EMPTY_COUNTS;
@@ -1433,7 +1723,7 @@ static int reassign_native_species_from_existing(
 
         map<int, map<int, double> > llrs;
         llr_table tab(n_species);
-        bool success = populate_llr_table_optimized(
+        const bool success = populate_llr_table_optimized(
             counts, llrs, tab, n_species,
             allowed_ids, allowed_ids2,
             species_doublet_rate, error_ref, error_alt,
@@ -1444,7 +1734,7 @@ static int reassign_native_species_from_existing(
         }
 
         int winner = -1;
-        double score = 0.0;
+        double score = -std::numeric_limits<double>::infinity();
         tab.get_max(winner, score);
         winners[idx] = winner;
         winner_scores[idx] = score;
@@ -1458,23 +1748,27 @@ static int reassign_native_species_from_existing(
         get_diagnostics_from_llrs(
             llrs, tab, winner, score, n_species,
             n_runner_ups, close_threshold, diag, cell_runners);
-        compute_posterior_entropy(llrs, tab, winner, n_species, diag);
-        tab.get_max_by_maxllr(diag.maxllr_winner, diag.maxllr_winner_score);
+        compute_margin_softmax_scores(llrs, tab, winner, n_species, diag);
+        tab.get_max_by_max_llr_comparator(
+            diag.max_llr_comparator_winner,
+            diag.max_llr_comparator_score);
         diag.total_depth = compute_total_depth(counts, n_species);
         diagnostics[idx] = diag;
         runners[idx] = cell_runners;
 
-        statuses[idx] = (score > 0.0)
-            ? REASSIGN_ASSIGNED
-            : REASSIGN_NONPOSITIVE_MARGIN;
+        if (diag.selection_resolved){
+            statuses[idx] = REASSIGN_ASSIGNED;
+        }
+        else if (!(score > 0.0) || !std::isfinite(score)){
+            statuses[idx] = REASSIGN_NONPOSITIVE_MARGIN;
+        }
+        else if (!diag.missing_comparison_alternatives.empty()){
+            statuses[idx] = REASSIGN_MISSING_COMPARISONS;
+        }
+        else{
+            statuses[idx] = REASSIGN_NO_WINNER;
+        }
     }
-
-    robin_hood::unordered_map<unsigned long, int> assignments;
-    robin_hood::unordered_map<unsigned long, double> assignments_llr;
-    map<string, long long> status_counts;
-    map<string, long long> identity_counts;
-    long long n_singlet = 0;
-    long long n_pair = 0;
 
     auto status_name = [](int status) -> const char* {
         switch(status){
@@ -1483,85 +1777,109 @@ static int reassign_native_species_from_existing(
             case REASSIGN_LLR_FAILED: return "llr_construction_failed";
             case REASSIGN_NONPOSITIVE_MARGIN: return "nonpositive_winner_margin";
             case REASSIGN_NO_WINNER: return "no_winner";
+            case REASSIGN_MISSING_COMPARISONS: return "missing_required_comparisons";
             default: return "unknown";
         }
     };
 
+    robin_hood::unordered_map<unsigned long, int> assignments;
+    robin_hood::unordered_map<unsigned long, double> assignments_llr;
+    map<string, long long> status_counts;
+    map<string, long long> identity_counts;
+    long long n_singlet = 0;
+    long long n_pair = 0;
+
     for (size_t idx = 0; idx < barcodes.size(); ++idx){
         status_counts[status_name(statuses[idx])]++;
-        if (statuses[idx] == REASSIGN_ASSIGNED){
-            assignments.emplace(barcodes[idx], winners[idx]);
-            assignments_llr.emplace(barcodes[idx], winner_scores[idx]);
-            string identity = idx2name(winners[idx], species_samples);
-            identity_counts[identity]++;
-            if (winners[idx] < n_species) n_singlet++;
-            else n_pair++;
-        }
+        if (statuses[idx] != REASSIGN_ASSIGNED) continue;
+        assignments.emplace(barcodes[idx], winners[idx]);
+        assignments_llr.emplace(barcodes[idx], winner_scores[idx]);
+        const string identity = idx2name(winners[idx], species_samples);
+        identity_counts[identity]++;
+        if (winners[idx] < n_species) ++n_singlet;
+        else ++n_pair;
     }
 
-    string assignment_file = output_prefix + ".species_assignments";
-    FILE* assignment_out = fopen(assignment_file.c_str(), "w");
+    OutputTransaction transaction;
+    const string staged_prefix = transaction.stage_prefix(output_prefix);
+    const string assignment_file_staged = staged_prefix + ".species_assignments";
+    const string diag_file_staged = staged_prefix + ".species_assignment_diagnostics.tsv";
+    const string summary_file_staged = staged_prefix + ".species_assignment_summary.tsv";
+
+    FILE* assignment_out = fopen(assignment_file_staged.c_str(), "w");
     if (!assignment_out){
-        fprintf(stderr, "ERROR: could not open %s for writing\n", assignment_file.c_str());
+        fprintf(stderr, "ERROR: could not open staged species assignments: %s\n", strerror(errno));
         return 1;
     }
     vector<string> tmp_samples = species_samples;
     string tmp_group = barcode_group;
     dump_assignments(assignment_out, assignments, assignments_llr, tmp_samples,
         tmp_group, cellranger, seurat, underscore);
-    fclose(assignment_out);
+    if (fclose(assignment_out) != 0){
+        fprintf(stderr, "ERROR: failed closing staged species assignments: %s\n", strerror(errno));
+        return 1;
+    }
 
-    string diag_file = output_prefix + ".species_assignment_diagnostics.tsv";
-    FILE* diag_out = fopen(diag_file.c_str(), "w");
+    FILE* diag_out = fopen(diag_file_staged.c_str(), "w");
     if (!diag_out){
-        fprintf(stderr, "ERROR: could not open %s for writing\n", diag_file.c_str());
+        fprintf(stderr, "ERROR: could not open staged species diagnostics: %s\n", strerror(errno));
         return 1;
     }
     fprintf(diag_out,
         "barcode\tstatus\twinning_identity\tsinglet_doublet\twinner_min_margin\t"
-        "llr_vs_runner_up\tworst_competitor\tn_close\ttotal_depth\tposterior\tentropy\t"
-        "runner_up_1\trunner_up_1_llr_vs_winner\trunner_up_1_min_margin\n");
+        "llr_vs_runner_up\trunner_up_comparison_state\tworst_competitor\t"
+        "worst_comparison_state\tn_close\ttotal_depth\tmargin_softmax_score\t"
+        "margin_entropy\tselection_resolved\tmissing_comparison_alternatives\t"
+        "runner_up_1\trunner_up_1_llr_vs_winner\trunner_up_1_comparison_state\t"
+        "runner_up_1_min_margin\tmax_llr_comparator_winner\t"
+        "max_llr_comparator_score\tschema_version\n");
 
     for (size_t idx = 0; idx < barcodes.size(); ++idx){
         string bc_str = bc2str(barcodes[idx]);
         mod_bc_libname(bc_str, barcode_group, cellranger, seurat, underscore);
-        string winner_name = ".";
-        string sd = ".";
-        string worst_name = ".";
-        string runner_name = ".";
-        double runner_llr = 0.0;
-        double runner_margin = 0.0;
-
-        if (winners[idx] >= 0){
-            winner_name = idx2name(winners[idx], species_samples);
-            sd = (winners[idx] < n_species) ? "S" : "D";
-        }
-        if (diagnostics[idx].worst_competitor >= 0){
-            worst_name = idx2name(diagnostics[idx].worst_competitor, species_samples);
-        }
-        if (!runners[idx].empty() && runners[idx][0].identity >= 0){
-            runner_name = idx2name(runners[idx][0].identity, species_samples);
-            runner_llr = runners[idx][0].llr_vs_winner;
-            runner_margin = runners[idx][0].min_margin;
-        }
+        const CellDiagnostics& diag = diagnostics[idx];
+        const string winner_name = optional_identity(winners[idx], species_samples);
+        const string sd = winners[idx] < 0 ? "NA" :
+            (winners[idx] < n_species ? "S" : "D");
+        const string worst_name = optional_identity(diag.worst_competitor, species_samples);
+        const string missing_names = join_identity_names(
+            diag.missing_comparison_alternatives, species_samples);
+        const RunnerUp* runner = runners[idx].empty() ? NULL : &runners[idx][0];
+        const string runner_name = runner == NULL
+            ? "NA" : optional_identity(runner->identity, species_samples);
+        const string comparator_name = optional_identity(
+            diag.max_llr_comparator_winner, species_samples);
 
         fprintf(diag_out,
-            "%s\t%s\t%s\t%s\t%.9g\t%.9g\t%s\t%d\t%.9g\t%.9g\t%.9g\t%s\t%.9g\t%.9g\n",
+            "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t"
+            "%s\t%s\t%s\t%s\t%s\t%s\tdemux_parallel_species_assignment_v3\n",
             bc_str.c_str(), status_name(statuses[idx]), winner_name.c_str(), sd.c_str(),
-            winner_scores[idx], diagnostics[idx].llr_vs_runnerup,
-            worst_name.c_str(), diagnostics[idx].n_close, diagnostics[idx].total_depth,
-            diagnostics[idx].posterior, diagnostics[idx].entropy,
-            runner_name.c_str(), runner_llr, runner_margin);
+            optional_number(winner_scores[idx]).c_str(),
+            optional_number(diag.llr_vs_runnerup).c_str(),
+            comparison_state_name(diag.runnerup_comparison_state),
+            worst_name.c_str(), comparison_state_name(diag.worst_comparison_state),
+            diag.n_close, optional_number(diag.total_depth).c_str(),
+            optional_number(diag.margin_softmax_score).c_str(),
+            optional_number(diag.margin_entropy).c_str(),
+            diag.selection_resolved ? 1 : 0, missing_names.c_str(), runner_name.c_str(),
+            runner == NULL ? "NA" : optional_number(runner->llr_vs_winner).c_str(),
+            runner == NULL ? comparison_state_name(ComparisonState::NOT_APPLICABLE)
+                           : comparison_state_name(runner->comparison_state),
+            runner == NULL ? "NA" : optional_number(runner->min_margin).c_str(),
+            comparator_name.c_str(), optional_number(diag.max_llr_comparator_score).c_str());
     }
-    fclose(diag_out);
+    if (fclose(diag_out) != 0){
+        fprintf(stderr, "ERROR: failed closing staged species diagnostics: %s\n", strerror(errno));
+        return 1;
+    }
 
-    string summary_file = output_prefix + ".species_assignment_summary.tsv";
-    FILE* summary_out = fopen(summary_file.c_str(), "w");
+    FILE* summary_out = fopen(summary_file_staged.c_str(), "w");
     if (!summary_out){
-        fprintf(stderr, "ERROR: could not open %s for writing\n", summary_file.c_str());
+        fprintf(stderr, "ERROR: could not open staged species summary: %s\n", strerror(errno));
         return 1;
     }
     fprintf(summary_out, "section\tkey\tvalue\n");
+    fprintf(summary_out, "setting\tschema_version\tdemux_parallel_species_assignment_v3\n");
     fprintf(summary_out, "setting\tinput_prefix\t%s\n", input_prefix.c_str());
     fprintf(summary_out, "setting\toutput_prefix\t%s\n", output_prefix.c_str());
     fprintf(summary_out, "setting\tspecies_doublet_rate\t%.17g\n", species_doublet_rate);
@@ -1593,16 +1911,22 @@ static int reassign_native_species_from_existing(
     for (const auto& kv : identity_counts){
         fprintf(summary_out, "identity\t%s\t%lld\n", kv.first.c_str(), kv.second);
     }
-    fclose(summary_out);
+    if (fclose(summary_out) != 0){
+        fprintf(stderr, "ERROR: failed closing staged species summary: %s\n", strerror(errno));
+        return 1;
+    }
+
+    if (!publish_outputs(transaction, "native species reassignment")) return 1;
 
     fprintf(stderr, "Native species reassignment complete\n");
     fprintf(stderr, "  assigned: %lu / %lu (%lld singlets, %lld pairs)\n",
         assignments.size(), barcodes.size(), n_singlet, n_pair);
-    fprintf(stderr, "  assignments: %s\n", assignment_file.c_str());
-    fprintf(stderr, "  diagnostics: %s\n", diag_file.c_str());
-    fprintf(stderr, "  summary: %s\n", summary_file.c_str());
+    fprintf(stderr, "  assignments: %s.species_assignments\n", output_prefix.c_str());
+    fprintf(stderr, "  diagnostics: %s.species_assignment_diagnostics.tsv\n", output_prefix.c_str());
+    fprintf(stderr, "  summary: %s.species_assignment_summary.tsv\n", output_prefix.c_str());
     return 0;
 }
+
 
 /**
  * Print help message
@@ -1611,7 +1935,7 @@ void help(int code){
     fprintf(stderr, "demux_parallel version %s\n", VERSION.c_str());
     fprintf(stderr, "%s\n\n", VERSION_MESSAGE.c_str());
     fprintf(stderr, "demux_parallel [OPTIONS]\n");
-    fprintf(stderr, "Parallel version of demux_vcf - demultiplexes cells based on genotype data.\n");
+    fprintf(stderr, "Supported production parallel demultiplexer for genotype-based cell assignment.\n");
     fprintf(stderr, "\n[OPTIONS]:\n");
     fprintf(stderr, "===== REQUIRED =====\n");
     fprintf(stderr, "    --bam -b The BAM file of interest\n");
@@ -1658,7 +1982,9 @@ void help(int code){
     fprintf(stderr, "    --skip_assignment -K Write .counts and exit (no assignment)\n");
     fprintf(stderr, "\n===== PILEUP (variant-consistency benchmark) =====\n");
     fprintf(stderr, "    --dump_pileup PREFIX Emit PREFIX.pileup_sites.tsv.gz and PREFIX.pileup_obs.tsv.gz\n");
-    fprintf(stderr, "    --dump_selection_audit  Append maximin-vs-maxllr winner columns to .diagnostics.gz\n");
+    fprintf(stderr, "                         (requires an actual counting pass: --force_recount and --threads > 1;\n");
+    fprintf(stderr, "                          supported on the single-panel and dual-panel parallel paths)\n");
+    fprintf(stderr, "    --dump_selection_audit  Append maximin-vs-max_llr_comparator columns to .diagnostics.gz\n");
     fprintf(stderr, "    --dump_source_observations PREFIX  Emit PREFIX.source_observations.tsv.gz from accepted YI-tagged read-SNP observations\n");
     fprintf(stderr, "    --source_provenance_tag TAG  Two-character BAM tag carrying injected source identity [YI]\n");
     fprintf(stderr, "    --synthetic_id_tag TAG  Two-character BAM tag carrying synthetic unit ID [YS]\n");
@@ -1667,23 +1993,23 @@ void help(int code){
     fprintf(stderr, "    --source_reconciliation_mode  Account every accepted individual-panel observation into explicit provenance buckets and emit PREFIX.source_reconciliation.tsv.gz\n");
     fprintf(stderr, "    --source_donor_site_audit  Audit every accepted injected observation against its YI donor genotype; emit PREFIX.donor_genotype_audit.tsv.gz and a deterministic exact-site sample\n");
     fprintf(stderr, "    --source_donor_site_sample_mod N  Retain exact-site evidence when stable_hash(site) %% N == 0 [256; 1=all sites]\n");
-    fprintf(stderr, "                            (maximin_winner, maximin_score, maxllr_winner, maxllr_score, selection_agree).\n");
-    fprintf(stderr, "                            For comparing the current selection criterion against the original maxllr elimination.\n");
+    fprintf(stderr, "                            (maximin_winner, maximin_score, max_llr_comparator_winner, max_llr_comparator_score, selection_agree).\n");
+    fprintf(stderr, "                            The comparator is non-mutating argmax(maxllr), not the historical destructive selector.\n");
     fprintf(stderr, "                         for the interindividual panel. Use with -B (candidate\n");
     fprintf(stderr, "                         barcodes) and -K. Routes through the single-panel path,\n");
     fprintf(stderr, "                         so do not pass a species VCF on the pileup run.\n");
     fprintf(stderr, "\n===== COUNTS FILE SAFETY =====\n");
     fprintf(stderr, "    --reuse_counts       Load existing .counts file after validating integrity\n");
-    fprintf(stderr, "    --force_recount      Delete existing .counts and recount from BAM\n");
+    fprintf(stderr, "    --force_recount      Recount to staged files; replace existing finals only after success\n");
     fprintf(stderr, "    (default: error if .counts exists, to prevent stale/truncated reuse)\n");
     fprintf(stderr, "\n===== ATAC DUAL-MODALITY (2A) =====\n");
-    fprintf(stderr, "    --atac_bam FILE      ATAC BAM (expects RNA-aligned barcodes in CB tag)\n");
+    fprintf(stderr, "    --atac_bam FILE      ATAC BAM for diagnostic/count-only evidence; does not alter individual assignment\n");
     fprintf(stderr, "    --atac_vcf FILE      ATAC-demux VCF panel (required if --atac_bam set)\n");
     fprintf(stderr, "    --atac_het_vcf FILE  ATAC-side het VCF for ATAC het balance diagnostics\n");
     fprintf(stderr, "    --atac_shared_vcf NAME   Shared-memory ATAC VCF (mutually exclusive with --atac_vcf)\n");
     fprintf(stderr, "    --atac_shared_het_vcf NAME   Shared-memory ATAC het VCF\n");
     fprintf(stderr, "\n===== IDENTITY PRIOR (2B) =====\n");
-    fprintf(stderr, "    --identity_prior FILE  .contam_prof_empty file for Bayesian prior on identity\n");
+    fprintf(stderr, "    --identity_prior FILE  NOT IMPLEMENTED / NOT USED IN IDENTITY SCORING; passing it is a fatal error\n");
     fprintf(stderr, "\n===== SPECIES PANEL (2C) =====\n");
     fprintf(stderr, "    --species_vcf FILE         Species-discrimination VCF panel\n");
     fprintf(stderr, "    --species_shared_vcf NAME  Shared-memory species VCF\n");
@@ -1718,13 +2044,11 @@ void print_elapsed(const std::chrono::steady_clock::time_point& start, const cha
 }
 
 // ============================================================================
-// NEW: DIAGNOSTIC OUTPUT FUNCTIONS
+// CORRECTED DIAGNOSTIC OUTPUT FUNCTIONS
 // ============================================================================
 
-/**
- * Write per-cell diagnostics to gzipped TSV file
- */
-void write_diagnostics_gz(
+/** Write per-cell diagnostics with explicit comparison/missing-value semantics. */
+bool write_diagnostics_gz(
     const string& filename,
     vector<string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
@@ -1735,168 +2059,209 @@ void write_diagnostics_gz(
     bool cellranger,
     bool seurat,
     bool underscore,
-    // Optional ATAC het data for extra columns
     robin_hood::unordered_map<unsigned long, CellHetData>* atac_het_data = NULL,
     robin_hood::unordered_map<int, ChromSNPs>* atac_het_snpdat_ptr = NULL,
     vector<pair<int, int>>* atac_idx_to_site_ptr = NULL,
     HetBalanceMethod atac_het_method = HetBalanceMethod::WELFORD,
     int atac_min_het_sites = 100,
     double atac_min_het_depth = 5.0,
-    // When true, append maximin-vs-maxllr selection-audit columns at the end of
-    // each row. Off by default so the standard .diagnostics.gz layout (read
-    // positionally by tetra_refine) is unchanged.
     bool dump_selection_audit = false){
-    
+
+    (void)assignments_llr;
     gzFile outf = gzopen(filename.c_str(), "w");
     if (!outf){
-        fprintf(stderr, "ERROR: Could not open %s for writing\n", filename.c_str());
-        return;
+        fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+            filename.c_str(), strerror(errno));
+        return false;
     }
-    
-    bool write_atac_het = (atac_het_data != NULL && !atac_het_data->empty());
 
-    // Header
-    gzprintf(outf, "barcode\tassignment\tsinglet_doublet\tllr\tmin_margin\tworst_competitor\t"
-                   "n_close\ttotal_depth\thet_balance_var\tn_het_sites\thet_total_depth\t"
-                   "posterior\tentropy");
+    const bool write_atac_het = atac_het_data != NULL;
+    gzprintf(outf,
+        "barcode\tassignment\tsinglet_doublet\tllr_vs_runner_up\tmin_margin\tworst_competitor\t"
+        "n_close\ttotal_depth\thet_balance_var\tn_het_sites\thet_total_depth\t"
+        "margin_softmax_score\tmargin_entropy");
     if (write_atac_het){
-        gzprintf(outf, "\tatac_het_balance_var\tatac_n_het_sites\tatac_het_total_depth");
+        gzprintf(outf,
+            "\tatac_het_balance_var\tatac_n_het_sites\tatac_het_total_depth\t"
+            "atac_het_diagnostic_state");
     }
+    gzprintf(outf,
+        "\trunnerup_comparison_state\tworst_comparison_state\thet_diagnostic_state\t"
+        "selection_resolved\tcandidate_identity\tmissing_comparison_alternatives\t"
+        "schema_version");
     if (dump_selection_audit){
-        gzprintf(outf, "\tmaximin_winner\tmaximin_score\tmaxllr_winner\tmaxllr_score\tselection_agree");
+        gzprintf(outf,
+            "\tmaximin_winner\tmaximin_score\tmax_llr_comparator_winner\t"
+            "max_llr_comparator_score\tselection_agree");
     }
     gzprintf(outf, "\n");
-    
-    for (const auto& kv : assignments){
-        unsigned long bc = kv.first;
-        int assn = kv.second;
-        
+
+    vector<unsigned long> barcodes;
+    barcodes.reserve(diagnostics.size());
+    for (const auto& kv : diagnostics) barcodes.push_back(kv.first);
+    sort(barcodes.begin(), barcodes.end());
+
+    for (unsigned long bc : barcodes){
+        const CellDiagnostics& diag = diagnostics.at(bc);
+        const auto assignment_it = assignments.find(bc);
+        const bool assigned = assignment_it != assignments.end();
+        const int assignment = assigned ? assignment_it->second : -1;
+
         string bc_str = bc2str(bc);
         mod_bc_libname(bc_str, libname, cellranger, seurat, underscore);
-        
-        string identity = idx2name(assn, samples);
-        char s_d = (assn < n_samples) ? 'S' : 'D';
+        const string assignment_name = assigned
+            ? idx2name(assignment, samples) : "unresolved";
+        const string sd = assigned ? (assignment < n_samples ? "S" : "D") : "U";
+        const string worst_name = optional_identity(diag.worst_competitor, samples);
+        const string candidate_name = optional_identity(diag.maximin_candidate, samples);
+        const string missing_names = join_identity_names(
+            diag.missing_comparison_alternatives, samples);
 
-        // Get diagnostics
-        CellDiagnostics diag;
-        if (diagnostics.count(bc) > 0){
-            diag = diagnostics.at(bc);
-        }
+        const string het_var = diag.het_diagnostic_available
+            ? optional_number(diag.het_balance_var) : "NA";
+        const string het_sites = diag.het_diagnostic_available
+            ? std::to_string(diag.n_het_sites) : "NA";
+        const string het_depth = diag.het_diagnostic_available
+            ? optional_number(diag.het_total_depth) : "NA";
 
-        // The `llr` column reports the winner's margin over the rank-1 runner-up
-        // (best vs second-best), distinct from min_margin (worst pairwise margin
-        // over all competitors). assignments_llr holds the maximin selection
-        // score (== min_margin) and is intentionally NOT used here so the two
-        // columns differ. assignments_llr still drives the separate .assignments
-        // file and winner selection, which are unchanged.
-        double llr = diag.llr_vs_runnerup;
-
-        // Format worst competitor
-        string worst_comp = ".";
-        if (diag.worst_competitor >= 0){
-            worst_comp = idx2name(diag.worst_competitor, samples);
-        }
-        
-        gzprintf(outf, "%s\t%s\t%c\t%.4f\t%.4f\t%s\t%d\t%.2f\t%.6f\t%d\t%.2f\t%.6f\t%.4f",
-            bc_str.c_str(),
-            identity.c_str(),
-            s_d,
-            llr,
-            diag.min_margin,
-            worst_comp.c_str(),
-            diag.n_close,
-            diag.total_depth,
-            diag.het_balance_var,
-            diag.n_het_sites,
-            diag.het_total_depth,
-            diag.posterior,
-            diag.entropy);
+        gzprintf(outf,
+            "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s",
+            bc_str.c_str(), assignment_name.c_str(), sd.c_str(),
+            optional_number(diag.llr_vs_runnerup).c_str(),
+            optional_number(diag.min_margin).c_str(), worst_name.c_str(),
+            diag.n_close, optional_number(diag.total_depth).c_str(),
+            het_var.c_str(), het_sites.c_str(), het_depth.c_str(),
+            optional_number(diag.margin_softmax_score).c_str(),
+            optional_number(diag.margin_entropy).c_str());
 
         if (write_atac_het){
-            // Compute ATAC het balance for this cell
             CellDiagnostics atac_diag;
-            auto atac_it = atac_het_data->find(bc);
-            if (atac_it != atac_het_data->end()){
-                const CellHetData& cell_atac_het = atac_it->second;
-                if (atac_het_method == HetBalanceMethod::PERSITE &&
-                    atac_het_snpdat_ptr != NULL && atac_idx_to_site_ptr != NULL){
-                    compute_het_balance_persite(cell_atac_het.persite_data,
-                        *atac_het_snpdat_ptr, *atac_idx_to_site_ptr,
-                        assn, n_samples, atac_min_het_depth, atac_min_het_sites,
-                        atac_diag);
-                }
-                else{
-                    compute_het_balance_welford(cell_atac_het.welford_stats,
-                        assn, n_samples, atac_min_het_sites, atac_diag);
+            if (assigned){
+                const auto atac_it = atac_het_data->find(bc);
+                if (atac_it != atac_het_data->end()){
+                    const CellHetData& cell_atac_het = atac_it->second;
+                    if (atac_het_method == HetBalanceMethod::PERSITE &&
+                        atac_het_snpdat_ptr != NULL && atac_idx_to_site_ptr != NULL){
+                        compute_het_balance_persite(cell_atac_het.persite_data,
+                            *atac_het_snpdat_ptr, *atac_idx_to_site_ptr,
+                            assignment, n_samples, atac_min_het_depth,
+                            atac_min_het_sites, atac_diag);
+                    }
+                    else{
+                        compute_het_balance_welford(cell_atac_het.welford_stats,
+                            assignment, n_samples, atac_min_het_sites, atac_diag);
+                    }
                 }
             }
-            gzprintf(outf, "\t%.6f\t%d\t%.2f",
-                atac_diag.het_balance_var, atac_diag.n_het_sites, atac_diag.het_total_depth);
+            const string atac_var = atac_diag.het_diagnostic_available
+                ? optional_number(atac_diag.het_balance_var) : "NA";
+            const string atac_sites = atac_diag.het_diagnostic_available
+                ? std::to_string(atac_diag.n_het_sites) : "NA";
+            const string atac_depth = atac_diag.het_diagnostic_available
+                ? optional_number(atac_diag.het_total_depth) : "NA";
+            gzprintf(outf, "\t%s\t%s\t%s\t%s",
+                atac_var.c_str(), atac_sites.c_str(), atac_depth.c_str(),
+                atac_diag.het_diagnostic_available ? "available" : "unavailable");
         }
+
+        gzprintf(outf, "\t%s\t%s\t%s\t%d\t%s\t%s\t%s",
+            comparison_state_name(diag.runnerup_comparison_state),
+            comparison_state_name(diag.worst_comparison_state),
+            diag.het_diagnostic_available ? "available" : "unavailable",
+            diag.selection_resolved ? 1 : 0,
+            candidate_name.c_str(), missing_names.c_str(),
+            "demux_parallel_diagnostics_v3");
+
         if (dump_selection_audit){
-            string maxllr_name = (diag.maxllr_winner >= 0)
-                ? idx2name(diag.maxllr_winner, samples) : ".";
-            int agree = (diag.maxllr_winner == assn) ? 1 : 0;
-            gzprintf(outf, "\t%s\t%.4f\t%s\t%.4f\t%d",
-                identity.c_str(),       // maximin_winner == the actual assignment
-                diag.min_margin,        // maximin selection score
-                maxllr_name.c_str(),    // maxllr criterion winner
-                diag.maxllr_winner_score,
-                agree);
+            const string comparator_name = optional_identity(
+                diag.max_llr_comparator_winner, samples);
+            string agree = "NA";
+            if (diag.maximin_candidate >= 0 && diag.max_llr_comparator_winner >= 0){
+                agree = diag.maximin_candidate == diag.max_llr_comparator_winner ? "1" : "0";
+            }
+            gzprintf(outf, "\t%s\t%s\t%s\t%s\t%s",
+                candidate_name.c_str(), optional_number(diag.maximin_score).c_str(),
+                comparator_name.c_str(),
+                optional_number(diag.max_llr_comparator_score).c_str(),
+                agree.c_str());
         }
         gzprintf(outf, "\n");
     }
-    
-    gzclose(outf);
-    fprintf(stderr, "Wrote diagnostics for %lu cells to %s\n", assignments.size(), filename.c_str());
+
+    if (gzclose(outf) != Z_OK){
+        fprintf(stderr, "ERROR: failed closing %s\n", filename.c_str());
+        return false;
+    }
+    fprintf(stderr, "Wrote diagnostics for %lu evaluated cells to %s\n",
+        diagnostics.size(), filename.c_str());
+    return true;
 }
 
-/**
- * Write runner-ups to gzipped TSV file
- */
-void write_runner_ups_gz(
+/** Write ranked retained alternatives with authoritative direct comparisons. */
+bool write_runner_ups_gz(
     const string& filename,
     vector<string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
+    robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
     robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups,
     int n_samples,
     const string& libname,
     bool cellranger,
     bool seurat,
     bool underscore){
-    
+
+    (void)assignments;
+    (void)n_samples;
     gzFile outf = gzopen(filename.c_str(), "w");
     if (!outf){
-        fprintf(stderr, "ERROR: Could not open %s for writing\n", filename.c_str());
-        return;
+        fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+            filename.c_str(), strerror(errno));
+        return false;
     }
-    
-    // Header
-    gzprintf(outf, "barcode\trank\tidentity\tllr_vs_winner\tmin_margin\n");
-    
-    for (const auto& kv : runner_ups){
-        unsigned long bc = kv.first;
-        const vector<RunnerUp>& runners = kv.second;
-        
+
+    gzprintf(outf,
+        "barcode\trank\tidentity\tllr_vs_winner\tmin_margin\tcomparison_state\t"
+        "winner_candidate\tselection_resolved\tschema_version\n");
+
+    vector<unsigned long> barcodes;
+    barcodes.reserve(runner_ups.size());
+    for (const auto& kv : runner_ups) barcodes.push_back(kv.first);
+    sort(barcodes.begin(), barcodes.end());
+
+    size_t rows_written = 0;
+    for (unsigned long bc : barcodes){
+        const vector<RunnerUp>& runners = runner_ups.at(bc);
+        const auto diag_it = diagnostics.find(bc);
+        const CellDiagnostics* diag = diag_it == diagnostics.end() ? NULL : &diag_it->second;
         string bc_str = bc2str(bc);
         mod_bc_libname(bc_str, libname, cellranger, seurat, underscore);
-        
+        const string candidate_name = diag == NULL
+            ? "NA" : optional_identity(diag->maximin_candidate, samples);
+        const int resolved = diag != NULL && diag->selection_resolved ? 1 : 0;
+
         for (size_t i = 0; i < runners.size(); ++i){
             const RunnerUp& runner = runners[i];
-            string identity = idx2name(runner.identity, samples);
-            
-            gzprintf(outf, "%s\t%d\t%s\t%.4f\t%.4f\n",
-                bc_str.c_str(),
-                (int)(i + 1),  // 1-indexed rank
-                identity.c_str(),
-                runner.llr_vs_winner,
-                runner.min_margin);
+            const string identity = optional_identity(runner.identity, samples);
+            gzprintf(outf, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+                bc_str.c_str(), (int)(i + 1), identity.c_str(),
+                optional_number(runner.llr_vs_winner).c_str(),
+                optional_number(runner.min_margin).c_str(),
+                comparison_state_name(runner.comparison_state),
+                candidate_name.c_str(), resolved,
+                "demux_parallel_runner_ups_v3");
+            ++rows_written;
         }
     }
-    
-    gzclose(outf);
-    fprintf(stderr, "Wrote runner-ups for %lu cells to %s\n", runner_ups.size(), filename.c_str());
+
+    if (gzclose(outf) != Z_OK){
+        fprintf(stderr, "ERROR: failed closing %s\n", filename.c_str());
+        return false;
+    }
+    fprintf(stderr, "Wrote %lu runner-up rows for %lu evaluated cells to %s\n",
+        rows_written, runner_ups.size(), filename.c_str());
+    return true;
 }
+
 
 int main(int argc, char *argv[]) {    
     
@@ -1907,6 +2272,13 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "demux_parallel version %s\n", VERSION.c_str());
     fprintf(stderr, "%s\n", VERSION_MESSAGE.c_str());
     fprintf(stderr, "New: %s\n", VERSION_NEW.c_str());
+#ifdef _OPENMP
+    fprintf(stderr, "Build: compiler=%s; OpenMP=%d; HTSlib=%s; source_revision=%s\n",
+        __VERSION__, _OPENMP, hts_version(), CELLBOUNCER_SOURCE_REVISION);
+#else
+    fprintf(stderr, "Build: compiler=%s; OpenMP=disabled; HTSlib=%s; source_revision=%s\n",
+        __VERSION__, hts_version(), CELLBOUNCER_SOURCE_REVISION);
+#endif
    
     static struct option long_options[] = {
        {"bam", required_argument, 0, 'b'},
@@ -1978,6 +2350,7 @@ int main(int argc, char *argv[]) {
        {"species_reassign_from_prefix", required_argument, 0, 1061},
        {"reuse_counts", no_argument, 0, 1050},
        {"force_recount", no_argument, 0, 1051},
+       {"version", no_argument, 0, 1063},
        {"help", no_argument, 0, 'h'},
        {0, 0, 0, 0} 
     };
@@ -2086,6 +2459,8 @@ int main(int argc, char *argv[]) {
             case 'h':
                 help(0);
                 break;
+            case 1063:  // --version
+                return 0;
             case 'b':
                 bamfile = optarg;
                 break;
@@ -2189,7 +2564,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     fprintf(stderr, "ERROR: Unknown het_method: %s\n", optarg);
                     fprintf(stderr, "Valid options: welford, persite\n");
-                    exit(1);
+                    return 1;
                 }
                 break;
             case 1011:  // --min_het_sites
@@ -2305,27 +2680,33 @@ int main(int argc, char *argv[]) {
     // Error check arguments
     if (reuse_counts && force_recount){
         fprintf(stderr, "ERROR: --reuse_counts and --force_recount are mutually exclusive\n");
-        exit(1);
+        return 1;
+    }
+    if (!identity_prior_file.empty()){
+        fprintf(stderr,
+            "ERROR: --identity_prior is NOT IMPLEMENTED / NOT USED IN IDENTITY SCORING. "
+            "Refusing to continue rather than silently ignoring the file.\n");
+        return 1;
     }
     if (vq < 0){
         fprintf(stderr, "ERROR: variant quality must be >= 0\n");
-        exit(1);
+        return 1;
     }
     if (output_prefix.length() == 0){
         fprintf(stderr, "ERROR: output_prefix/-o required\n");
-        exit(1);
+        return 1;
     }
     if (is_dir(output_prefix)){
         fprintf(stderr, "ERROR: output_prefix %s is a directory\n", output_prefix.c_str());
-        exit(1);
+        return 1;
     }
     if (doublet_rate < 0 || doublet_rate > 1){
         fprintf(stderr, "ERROR: doublet rate must be between 0 and 1\n");
-        exit(1);
+        return 1;
     }
     if (idfile_given && idfile_doublet_given){
         fprintf(stderr, "ERROR: only one of -i/-I is allowed\n");
-        exit(1);
+        return 1;
     }
     if (n_threads < 1){
         n_threads = 1;
@@ -2335,7 +2716,7 @@ int main(int argc, char *argv[]) {
     }
     if (species_doublet_rate < 0.0 || species_doublet_rate > 1.0){
         fprintf(stderr, "ERROR: species doublet rate must be between 0 and 1\n");
-        exit(1);
+        return 1;
     }
 
     // Counts-only native species reassignment is an isolated diagnostic mode.
@@ -2349,49 +2730,49 @@ int main(int argc, char *argv[]) {
 
     if (source_provenance_tag.size() != 2){
         fprintf(stderr, "ERROR: --source_provenance_tag must be exactly two characters (got '%s')\n", source_provenance_tag.c_str());
-        exit(1);
+        return 1;
     }
     if (synthetic_id_tag.size() != 2){
         fprintf(stderr, "ERROR: --synthetic_id_tag must be exactly two characters (got '%s')\n", synthetic_id_tag.c_str());
-        exit(1);
+        return 1;
     }
     if (dump_source_observations && dump_source_observations_prefix.empty()){
         fprintf(stderr, "ERROR: --dump_source_observations requires a non-empty prefix\n");
-        exit(1);
+        return 1;
     }
     if (dump_source_observations && expected_synthetic_id.empty()){
         fprintf(stderr, "ERROR: --dump_source_observations requires --expected_synthetic_id so YS provenance can be validated\n");
-        exit(1);
+        return 1;
     }
     if (!source_receiver_map.empty() && !dump_source_observations){
         fprintf(stderr, "ERROR: --source_receiver_map is meaningful only with --dump_source_observations\n");
-        exit(1);
+        return 1;
     }
     if (source_reconciliation_mode && !dump_source_observations){
         fprintf(stderr, "ERROR: --source_reconciliation_mode requires --dump_source_observations\n");
-        exit(1);
+        return 1;
     }
     if (source_reconciliation_mode && source_receiver_map.empty()){
         fprintf(stderr, "ERROR: --source_reconciliation_mode requires --source_receiver_map\n");
-        exit(1);
+        return 1;
     }
     if (source_donor_site_audit && !dump_source_observations){
         fprintf(stderr, "ERROR: --source_donor_site_audit requires --dump_source_observations\n");
-        exit(1);
+        return 1;
     }
     if (source_donor_site_audit && source_receiver_map.empty()){
         fprintf(stderr, "ERROR: --source_donor_site_audit requires --source_receiver_map\n");
-        exit(1);
+        return 1;
     }
     if (source_donor_site_sample_mod < 1){
         fprintf(stderr, "ERROR: --source_donor_site_sample_mod must be >= 1\n");
-        exit(1);
+        return 1;
     }
     if (!source_receiver_map.empty()){
         struct stat st;
         if (stat(source_receiver_map.c_str(), &st) != 0 || st.st_size <= 0){
             fprintf(stderr, "ERROR: --source_receiver_map missing or empty: %s\n", source_receiver_map.c_str());
-            exit(1);
+            return 1;
         }
     }
     
@@ -2410,11 +2791,11 @@ int main(int argc, char *argv[]) {
     if (atac_mode){
         if (atac_vcf_file.length() == 0 && atac_shared_vcf_name.length() == 0){
             fprintf(stderr, "ERROR: --atac_vcf or --atac_shared_vcf required when --atac_bam is set\n");
-            exit(1);
+            return 1;
         }
         if (atac_vcf_file.length() > 0 && atac_shared_vcf_name.length() > 0){
             fprintf(stderr, "ERROR: --atac_vcf and --atac_shared_vcf are mutually exclusive\n");
-            exit(1);
+            return 1;
         }
     }
     if (atac_het_vcf_file.length() > 0 && !atac_mode){
@@ -2427,7 +2808,7 @@ int main(int argc, char *argv[]) {
     if (has_species_vcf){
         if (species_panel_mode_str.length() == 0){
             fprintf(stderr, "ERROR: --species_panel_mode required when --species_vcf is set\n");
-            exit(1);
+            return 1;
         }
         if (species_panel_mode_str == "count_only" || species_panel_mode_str == "native" || species_panel_mode_str == "none") species_mode = SpeciesPanelMode::COUNT_ONLY;
         else if (species_panel_mode_str == "filter" || species_panel_mode_str == "augment" || species_panel_mode_str == "both"){
@@ -2436,7 +2817,7 @@ int main(int argc, char *argv[]) {
                     species_panel_mode_str.c_str());
                 fprintf(stderr, "       Under V1_R3 path separation, use --species_panel_mode count_only.\n");
                 fprintf(stderr, "       Use --allow_legacy_mixed_species_panel only for intentional legacy debugging.\n");
-                exit(1);
+                return 1;
             }
             if (species_panel_mode_str == "filter") species_mode = SpeciesPanelMode::FILTER;
             else if (species_panel_mode_str == "augment") species_mode = SpeciesPanelMode::AUGMENT;
@@ -2444,56 +2825,58 @@ int main(int argc, char *argv[]) {
         }
         else{
             fprintf(stderr, "ERROR: --species_panel_mode must be count_only (or legacy filter/augment/both with --allow_legacy_mixed_species_panel)\n");
-            exit(1);
+            return 1;
         }
         if (species_vcf_file.length() > 0 && species_shared_vcf_name.length() > 0){
             fprintf(stderr, "ERROR: --species_vcf and --species_shared_vcf are mutually exclusive\n");
-            exit(1);
+            return 1;
         }
     }
     if (species_assignment_output && !has_species_vcf){
         fprintf(stderr, "ERROR: --species_assignment_output requires --species_vcf\n");
-        exit(1);
+        return 1;
     }
     if ((species_counts_output || species_assignment_output) && panel_metadata_file.length() == 0){
         fprintf(stderr, "ERROR: --species_counts_output/--species_assignment_output requires --panel_metadata so .species_* artifacts are species-native\n");
-        exit(1);
+        return 1;
     }
+    const bool species_panel_may_be_empty =
+        has_species_vcf && species_mode == SpeciesPanelMode::COUNT_ONLY &&
+        !species_counts_output && !species_assignment_output;
     
     // BAM header/TID mapping is read directly through HTSlib below when needed.
-    
-    // Check if we can load counts from previous run
+
+    const string final_output_prefix = output_prefix;
+    OutputTransaction output_transaction;
+    output_prefix = output_transaction.stage_prefix(final_output_prefix);
+    if (dump_pileup){
+        dump_pileup_prefix = output_transaction.stage_prefix(dump_pileup_prefix);
+    }
+    if (dump_source_observations){
+        dump_source_observations_prefix =
+            output_transaction.stage_prefix(dump_source_observations_prefix);
+    }
+
+    // Check if we can load counts from a previous successful run. All new
+    // artifacts are staged under temporary names and published only at success.
     bool load_counts = false;
-    string countsfilename = output_prefix + ".counts";
+    string countsfilename = final_output_prefix + ".counts";
     if (file_exists(countsfilename)){
         if (force_recount){
             fprintf(stderr, "Found existing counts file: %s\n", countsfilename.c_str());
-            fprintf(stderr, "  --force_recount set: deleting stale counts and recounting from BAM\n");
-            remove(countsfilename.c_str());
-            // Also remove companion files that may be stale
-            string stale_samples = output_prefix + ".samples";
-            string stale_condf = output_prefix + ".condf";
-            string stale_sp_counts = output_prefix + ".species_counts";
-            string stale_sp_condf = output_prefix + ".species_condf";
-            string stale_condf_basis = output_prefix + ".condf_basis.tsv";
-            string stale_sp_condf_basis = output_prefix + ".species_condf_basis.tsv";
-            if (file_exists(stale_samples)) remove(stale_samples.c_str());
-            if (file_exists(stale_condf)) remove(stale_condf.c_str());
-            if (file_exists(stale_sp_counts)) remove(stale_sp_counts.c_str());
-            if (file_exists(stale_sp_condf)) remove(stale_sp_condf.c_str());
-            if (file_exists(stale_condf_basis)) remove(stale_condf_basis.c_str());
-            if (file_exists(stale_sp_condf_basis)) remove(stale_sp_condf_basis.c_str());
+            fprintf(stderr,
+                "  --force_recount set: recounting into staged outputs; existing final files remain intact until success\n");
         } else if (reuse_counts){
             // Validate the existing file before trusting it
             fprintf(stderr, "Found existing counts file: %s\n", countsfilename.c_str());
             fprintf(stderr, "  --reuse_counts set: validating before loading\n");
 
             // Check .samples companion
-            string samplesfile = output_prefix + ".samples";
+            string samplesfile = final_output_prefix + ".samples";
             if (!file_exists(samplesfile)){
                 fprintf(stderr, "ERROR: --reuse_counts: .samples file missing alongside .counts\n");
                 fprintf(stderr, "  Delete %s and rerun, or use --force_recount\n", countsfilename.c_str());
-                exit(1);
+                return 1;
             }
 
             // Check .counts is gzip-readable (not truncated)
@@ -2501,12 +2884,12 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "ERROR: --reuse_counts: .counts file appears truncated or corrupt: %s\n",
                     countsfilename.c_str());
                 fprintf(stderr, "  Delete it and rerun, or use --force_recount\n");
-                exit(1);
+                return 1;
             }
 
             if (accepted_weighted_conditional){
-                const string condf_file = output_prefix + ".condf";
-                const string condf_basis = output_prefix + ".condf_basis.tsv";
+                const string condf_file = final_output_prefix + ".condf";
+                const string condf_basis = final_output_prefix + ".condf_basis.tsv";
                 if (!file_exists(condf_file) || !file_exists(condf_basis) ||
                     !text_file_contains(condf_basis, "weighting\taccepted_observation_weighted") ||
                     !text_file_contains(condf_basis, "truth_inputs_used\tfalse")){
@@ -2514,7 +2897,7 @@ int main(int argc, char *argv[]) {
                         "ERROR: --reuse_counts with --accepted_weighted_conditional requires "
                         "a truth-free accepted-observation-weighted .condf and .condf_basis.tsv\n");
                     fprintf(stderr, "  Use --force_recount to regenerate a matched-basis bundle.\n");
-                    exit(1);
+                    return 1;
                 }
             }
 
@@ -2522,22 +2905,22 @@ int main(int argc, char *argv[]) {
             // be present and readable too.  Otherwise a reused main .counts can
             // silently coexist with stale or missing .species_counts/.species_condf.
             if (species_counts_output){
-                string sp_counts = output_prefix + ".species_counts";
-                string sp_condf = output_prefix + ".species_condf";
+                string sp_counts = final_output_prefix + ".species_counts";
+                string sp_condf = final_output_prefix + ".species_condf";
                 if (!file_exists(sp_counts)){
                     fprintf(stderr, "ERROR: --reuse_counts with --species_counts_output: missing %s\n",
                         sp_counts.c_str());
                     fprintf(stderr, "  Use --force_recount to regenerate the full dual-panel output set.\n");
-                    exit(1);
+                    return 1;
                 }
                 if (!file_exists(sp_condf)){
                     fprintf(stderr, "ERROR: --reuse_counts with --species_counts_output: missing %s\n",
                         sp_condf.c_str());
                     fprintf(stderr, "  Use --force_recount to regenerate the full dual-panel output set.\n");
-                    exit(1);
+                    return 1;
                 }
                 if (accepted_weighted_conditional){
-                    const string sp_basis = output_prefix + ".species_condf_basis.tsv";
+                    const string sp_basis = final_output_prefix + ".species_condf_basis.tsv";
                     if (!file_exists(sp_basis) ||
                         !text_file_contains(sp_basis, "weighting\taccepted_observation_weighted") ||
                         !text_file_contains(sp_basis, "truth_inputs_used\tfalse")){
@@ -2545,14 +2928,14 @@ int main(int argc, char *argv[]) {
                             "ERROR: reused species bundle lacks a truth-free "
                             "accepted-observation-weighted .species_condf_basis.tsv\n");
                         fprintf(stderr, "  Use --force_recount to regenerate the full matched-basis bundle.\n");
-                        exit(1);
+                        return 1;
                     }
                 }
                 if (!validate_gzip_readable(sp_counts)){
                     fprintf(stderr, "ERROR: --reuse_counts: .species_counts appears truncated or corrupt: %s\n",
                         sp_counts.c_str());
                     fprintf(stderr, "  Use --force_recount to regenerate the full dual-panel output set.\n");
-                    exit(1);
+                    return 1;
                 }
             }
 
@@ -2564,13 +2947,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "  A previous run may have left this file truncated or stale.\n");
             fprintf(stderr, "  Use --reuse_counts to load it after validation,\n");
             fprintf(stderr, "  or --force_recount to delete it and recount from BAM.\n");
-            exit(1);
+            return 1;
         }
     }
     else{
         if (bamfile.length() == 0 && !dump_conditional){
             fprintf(stderr, "ERROR: bam file (--bam) required\n");
-            exit(1);
+            return 1;
         }
         // BAM readability/header validation is performed by direct HTSlib helpers
         // when chromosome/TID mapping is needed.
@@ -2578,15 +2961,28 @@ int main(int argc, char *argv[]) {
 
     if (accepted_weighted_conditional && disable_conditional){
         fprintf(stderr, "ERROR: --accepted_weighted_conditional is incompatible with --disable_conditional/-f\n");
-        exit(1);
+        return 1;
     }
     if (accepted_weighted_conditional && dump_conditional){
         fprintf(stderr, "ERROR: --accepted_weighted_conditional requires a BAM recount and cannot be used with VCF-only --dump_conditional\n");
-        exit(1);
+        return 1;
     }
     if (accepted_weighted_conditional && n_threads <= 1 && !load_counts){
         fprintf(stderr, "ERROR: --accepted_weighted_conditional requires --threads > 1 for a BAM recount\n");
-        exit(1);
+        return 1;
+    }
+    // --dump_pileup fail-closed guards. The pileup sidecars are produced inside
+    // the BAM counting pass, so a run that loads existing counts (or takes the
+    // single-threaded fallback, which has no pileup support) would silently
+    // publish a demux bundle without the promised pileup files. Refuse instead.
+    if (dump_pileup && load_counts){
+        fprintf(stderr, "ERROR: --dump_pileup requires a BAM counting pass; existing counts were loaded\n");
+        fprintf(stderr, "  Rerun with --force_recount to produce the pileup sidecars\n");
+        return 1;
+    }
+    if (dump_pileup && n_threads <= 1){
+        fprintf(stderr, "ERROR: --dump_pileup requires --threads > 1 (parallel counting paths only)\n");
+        return 1;
     }
 
     // Load sample names
@@ -2594,14 +2990,14 @@ int main(int argc, char *argv[]) {
     bool samples_from_vcf = false;
 
     if (load_counts){
-        string samplesfile = output_prefix + ".samples";
+        string samplesfile = final_output_prefix + ".samples";
         if (file_exists(samplesfile)){
            load_samples(samplesfile, samples); 
         }
         else{
             if (vcf_file == ""){
                 fprintf(stderr, "ERROR: vcf file is required\n");
-                exit(1);
+                return 1;
             }
             read_vcf_samples(vcf_file, samples);         
         }
@@ -2609,7 +3005,7 @@ int main(int argc, char *argv[]) {
     else{
         if (vcf_file == "" && shared_vcf_name == ""){
             fprintf(stderr, "ERROR: vcf file is required\n");
-            exit(1);
+            return 1;
         }
         if (vcf_file != ""){
             read_vcf_samples(vcf_file, samples);
@@ -2636,14 +3032,14 @@ int main(int argc, char *argv[]) {
             parse_idfile(idfile, samples, allowed_ids, allowed_ids2, true);
             if (allowed_ids.size() == 0){
                 fprintf(stderr, "ERROR: No valid individual names found in %s; refusing to ignore -i\n", idfile.c_str());
-                exit(1);
+                return 1;
             }
         }
         if (idfile_doublet_given){
             parse_idfile(idfile_doublet, samples, allowed_ids, allowed_ids2, false);
             if (allowed_ids.size() == 0){
                 fprintf(stderr, "ERROR: No valid individual names found in %s; refusing to ignore -I\n", idfile_doublet.c_str());
-                exit(1);
+                return 1;
             }
         }
 
@@ -2653,8 +3049,8 @@ int main(int argc, char *argv[]) {
         }
         
         if (samples_from_vcf){
-            string samplesfile = output_prefix + ".samples"; 
-            write_samples(samplesfile, samples);
+            string samplesfile = output_prefix + ".samples";
+            if (!write_samples_checked(samplesfile, samples)) return 1;
         }
     }
     
@@ -2662,7 +3058,7 @@ int main(int argc, char *argv[]) {
     if (dump_conditional){
         if (vcf_file.length() == 0 && shared_vcf_name.length() == 0){
             fprintf(stderr, "ERROR: --vcf/-v or --shared_vcf/-S required for --dump_conditional/-F\n");
-            exit(1);
+            return 1;
         }
         
         robin_hood::unordered_map<int, ChromSNPs> snpdat_optimized;
@@ -2674,7 +3070,7 @@ int main(int argc, char *argv[]) {
             
             if (!attach_shared_vcf(shared_vcf_name, snpdat_optimized, samples)){
                 fprintf(stderr, "ERROR: Could not attach to shared VCF: %s\n", shared_vcf_name.c_str());
-                exit(1);
+                return 1;
             }
             fprintf(stderr, "Attached. %lu chromosomes, %lu samples\n",
                 snpdat_optimized.size(), samples.size());
@@ -2695,8 +3091,11 @@ int main(int argc, char *argv[]) {
             
             int nloaded = read_vcf_chroms_optimized(vcf_file, chroms_vcf,
                 seq2tid_synthetic, snpdat_optimized, vq);
+            if (nloaded < 0) return 1;
             fprintf(stderr, "Loaded %d SNPs from %lu chromosomes\n", nloaded, chroms_vcf.size());
         }
+        if (!validate_panel_without_bam(
+                snpdat_optimized, "main genotype panel", false)) return 1;
         
         // Compute conditional match fractions. The parallel CONDF function now
         // performs genotype-only precompute internally, avoiding unnecessary
@@ -2707,14 +3106,24 @@ int main(int argc, char *argv[]) {
         compute_conditional_match_fracs_parallel(snpdat_optimized,
             conditional_match_fracs, samples.size(), n_threads);
         
-        // Write .condf
+        // Write to a staged name and publish only after the complete operation succeeds.
         string outname = output_prefix + ".condf";
         FILE* outf = fopen(outname.c_str(), "w");
+        if (!outf){
+            fprintf(stderr, "ERROR: could not open staged .condf for writing: %s\n",
+                strerror(errno));
+            return 1;
+        }
         dump_exp_fracs(outf, conditional_match_fracs);
-        fclose(outf);
-        
+        if (fclose(outf) != 0){
+            fprintf(stderr, "ERROR: failed closing staged .condf: %s\n", strerror(errno));
+            return 1;
+        }
+        if (!publish_outputs(output_transaction, "conditional-fraction")) return 1;
+
         print_elapsed(start_time, "Done. Wrote .condf file.");
-        fprintf(stderr, "Wrote conditional match fractions to %s\n", outname.c_str());
+        fprintf(stderr, "Wrote conditional match fractions to %s.condf\n",
+            final_output_prefix.c_str());
         return 0;
     }
     
@@ -2724,7 +3133,7 @@ int main(int argc, char *argv[]) {
         parse_barcode_file(cell_barcode_file, cell_barcodes);
         if (cell_barcodes.size() == 0){
             fprintf(stderr, "ERROR reading cell barcode list\n");
-            exit(1);
+            return 1;
         }
         fprintf(stderr, "Loaded %lu cell barcodes\n", cell_barcodes.size());
     }
@@ -2767,9 +3176,10 @@ int main(int argc, char *argv[]) {
         int n_lines = load_cellcounts_optimized(countsfilename, cell_counts, samples.size());
         fprintf(stderr, "Loaded %d count records for %lu cells\n", n_lines, cell_counts.size());
         
-        // Generate .condf if missing and not disabled
+        // Generate a staged .condf only when the successful final bundle lacks one.
+        const string existing_condf_file = final_output_prefix + ".condf";
         string condf_file = output_prefix + ".condf";
-        if (!disable_conditional && !file_exists(condf_file)){
+        if (!disable_conditional && !file_exists(existing_condf_file)){
             if (vcf_file.length() == 0 && shared_vcf_name.length() == 0){
                 fprintf(stderr, "WARNING: No VCF or shared VCF provided and no .condf file found. "
                                 "Skipping conditional match fraction computation.\n");
@@ -2784,7 +3194,8 @@ int main(int argc, char *argv[]) {
                     
                     vector<string> shm_samples;
                     if (!attach_shared_vcf(shared_vcf_name, snpdat_optimized, shm_samples)){
-                        fprintf(stderr, "WARNING: Could not attach to shared VCF. Skipping .condf.\n");
+                        fprintf(stderr, "ERROR: Could not attach to shared VCF needed for .condf\n");
+                        return 1;
                     }
                 }
                 else{
@@ -2802,20 +3213,30 @@ int main(int argc, char *argv[]) {
                     
                     int nloaded = read_vcf_chroms_optimized(vcf_file, chroms_vcf,
                         seq2tid_synthetic, snpdat_optimized, vq);
+                    if (nloaded < 0) return 1;
                     fprintf(stderr, "Loaded %d SNPs for .condf computation\n", nloaded);
                 }
+                if (!validate_panel_without_bam(
+                        snpdat_optimized, "main genotype panel", false)) return 1;
+                // The parallel CONDF function performs genotype-only precompute
+                // internally, avoiding unnecessary pair_targets allocation here.
+                compute_conditional_match_fracs_parallel(snpdat_optimized,
+                    conditional_match_fracs, samples.size(), n_threads);
                 
-                if (!snpdat_optimized.empty()){
-                    // The parallel CONDF function performs genotype-only precompute
-                    // internally, avoiding unnecessary pair_targets allocation here.
-                    compute_conditional_match_fracs_parallel(snpdat_optimized,
-                        conditional_match_fracs, samples.size(), n_threads);
-                    
-                    FILE* outf = fopen(condf_file.c_str(), "w");
-                    dump_exp_fracs(outf, conditional_match_fracs);
-                    fclose(outf);
-                    fprintf(stderr, "Wrote .condf to %s\n", condf_file.c_str());
+                FILE* outf = fopen(condf_file.c_str(), "w");
+                if (!outf){
+                    fprintf(stderr, "ERROR: could not open staged .condf for writing: %s\n",
+                        strerror(errno));
+                    return 1;
                 }
+                dump_exp_fracs(outf, conditional_match_fracs);
+                if (fclose(outf) != 0){
+                    fprintf(stderr, "ERROR: failed closing staged .condf: %s\n",
+                        strerror(errno));
+                    return 1;
+                }
+                fprintf(stderr, "Prepared replacement .condf for %s\n",
+                    final_output_prefix.c_str());
             }
         }
     }
@@ -2826,7 +3247,12 @@ int main(int argc, char *argv[]) {
         set<string> chroms_to_process;
         
         fprintf(stderr, "Identifying shared chromosomes between BAM and VCF...\n");
-        get_bam_header_chroms_and_seq2tid(bamfile, chroms_bam, bam_seq2tid);
+        string bam_header_error;
+        if (!get_bam_header_chroms_and_seq2tid(
+                bamfile, chroms_bam, bam_seq2tid, &bam_header_error)){
+            fprintf(stderr, "ERROR: %s\n", bam_header_error.c_str());
+            return 1;
+        }
         fprintf(stderr, "BAM header loaded: %lu chromosomes\n", chroms_bam.size());
         
         if (shared_vcf_name.length() > 0){
@@ -2859,6 +3285,11 @@ int main(int argc, char *argv[]) {
             
             fprintf(stderr, "Found %lu chromosomes in BAM, %lu in VCF, %lu shared\n",
                 chroms_bam.size(), chroms_vcf.size(), chroms_to_process.size());
+            if (chroms_to_process.empty()){
+                fprintf(stderr,
+                    "ERROR: required main genotype panel has zero shared BAM/VCF contigs\n");
+                return 1;
+            }
         }
         
         // Load VCF data
@@ -2870,8 +3301,10 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Attaching to shared VCF: %s\n", shared_vcf_name.c_str());
             if (!attach_shared_vcf(shared_vcf_name, snpdat_optimized, samples)){
                 fprintf(stderr, "ERROR: Could not attach to shared VCF\n");
-                exit(1);
+                return 1;
             }
+            if (!validate_and_restrict_panel_to_bam(
+                    snpdat_optimized, bam_seq2tid, "main genotype panel", false)) return 1;
             
             // Deferred samples processing (samples now populated from shared memory)
             fprintf(stderr, "Number of individuals in VCF: %lu\n", samples.size());
@@ -2880,14 +3313,14 @@ int main(int argc, char *argv[]) {
                 parse_idfile(idfile, samples, allowed_ids, allowed_ids2, true);
                 if (allowed_ids.size() == 0){
                     fprintf(stderr, "ERROR: No valid individual names found in %s; refusing to ignore -i\n", idfile.c_str());
-                    exit(1);
+                    return 1;
                 }
             }
             if (idfile_doublet_given){
                 parse_idfile(idfile_doublet, samples, allowed_ids, allowed_ids2, false);
                 if (allowed_ids.size() == 0){
                     fprintf(stderr, "ERROR: No valid individual names found in %s; refusing to ignore -I\n", idfile_doublet.c_str());
-                    exit(1);
+                    return 1;
                 }
             }
 
@@ -2897,8 +3330,8 @@ int main(int argc, char *argv[]) {
             }
             
             // Write samples file
-            string samplesfile = output_prefix + ".samples"; 
-            write_samples(samplesfile, samples);
+            string samplesfile = output_prefix + ".samples";
+            if (!write_samples_checked(samplesfile, samples)) return 1;
             precompute_all_genotypes(snpdat_optimized, samples.size());
         }
         else{
@@ -2909,14 +3342,17 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Loading VCF data into memory...\n");
                 int nloaded = read_vcf_chroms_optimized(vcf_file, chroms_to_process, 
                     bam_seq2tid, snpdat_optimized, vq);
+                if (nloaded < 0) return 1;
                 print_elapsed(start_time, "VCF loading complete");
                 fprintf(stderr, "Loaded %d SNPs from %lu chromosomes\n", 
                     nloaded, chroms_to_process.size());
+                if (!validate_and_restrict_panel_to_bam(
+                        snpdat_optimized, bam_seq2tid, "main genotype panel", false)) return 1;
                 precompute_all_genotypes(snpdat_optimized, samples.size());
             }
             else{
                 fprintf(stderr, "VCF preloading disabled. Use --shared_vcf for large datasets.\n");
-                exit(1);
+                return 1;
             }
         }
         
@@ -2953,15 +3389,24 @@ int main(int argc, char *argv[]) {
                 if (!attach_shared_vcf(species_shared_vcf_name, species_snpdat, species_samples_early)){
                     fprintf(stderr, "ERROR: Could not attach to shared species VCF: %s\n",
                         species_shared_vcf_name.c_str());
-                    exit(1);
+                    return 1;
                 }
+                if (!validate_and_restrict_panel_to_bam(
+                        species_snpdat, bam_seq2tid, "species genotype panel", false)) return 1;
             }
             else{
                 read_vcf_samples(species_vcf_file, species_samples_early);
                 set<string> sp_chroms;
                 get_vcf_chroms(species_vcf_file, sp_chroms);
-                int nloaded = read_vcf_chroms_optimized(species_vcf_file, sp_chroms,
+                set<string> sp_shared_chroms = shared_contig_names(sp_chroms, bam_seq2tid);
+                if (sp_shared_chroms.empty()){
+                    fprintf(stderr,
+                        "ERROR: required species genotype panel has zero shared BAM/VCF contigs\n");
+                    return 1;
+                }
+                int nloaded = read_vcf_chroms_optimized(species_vcf_file, sp_shared_chroms,
                     bam_seq2tid, species_snpdat, vq);
+                if (nloaded < 0) return 1;
                 fprintf(stderr, "Loaded %d species panel SNPs\n", nloaded);
             }
             
@@ -2969,14 +3414,14 @@ int main(int argc, char *argv[]) {
             if (species_samples_early.size() != samples.size()){
                 fprintf(stderr, "ERROR: Species VCF has %lu samples but demux VCF has %lu samples. "
                     "Sample sets must match.\n", species_samples_early.size(), samples.size());
-                exit(1);
+                return 1;
             }
             for (size_t si = 0; si < samples.size(); ++si){
                 if (species_samples_early[si] != samples[si]){
                     fprintf(stderr, "ERROR: Species VCF sample[%lu]='%s' differs from demux VCF sample[%lu]='%s'. "
                         "Sample sets must match in same order.\n",
                         si, species_samples_early[si].c_str(), si, samples[si].c_str());
-                    exit(1);
+                    return 1;
                 }
             }
             fprintf(stderr, "Species VCF sample set matches demux VCF (%lu samples)\n", samples.size());
@@ -3009,6 +3454,8 @@ int main(int argc, char *argv[]) {
                         total_species_sites);
                 }
             }
+            if (!validate_and_restrict_panel_to_bam(
+                    species_snpdat, bam_seq2tid, "species genotype panel", false)) return 1;
             
             if (species_counts_output || species_assignment_output){
                 load_panel_metadata_if_needed(
@@ -3043,6 +3490,16 @@ int main(int argc, char *argv[]) {
             }
             fprintf(stderr, "Combined SNP set: %ld interindividual + %ld species = %ld total\n",
                 n_interindiv, n_species, n_interindiv + n_species);
+            if (n_interindiv <= 0){
+                fprintf(stderr,
+                    "ERROR: required main genotype panel contains zero usable SNPs in dual-panel path\n");
+                return 1;
+            }
+            if (n_species <= 0){
+                fprintf(stderr,
+                    "ERROR: required species genotype panel contains zero usable SNPs in dual-panel path\n");
+                return 1;
+            }
             
             // Precompute individual-shaped targets for both panels. Native
             // species targets remain in a separate compact table so SNPData
@@ -3059,7 +3516,7 @@ int main(int argc, char *argv[]) {
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> dual_panel0;
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> dual_panel1;
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> dual_panel1_native;
-            count_alleles_parallel_dual(bamfile, combined_snpdat,
+            if (!count_alleles_parallel_dual(bamfile, combined_snpdat,
                 dual_panel0, dual_panel1,
                 cell_barcodes, samples.size(), samples, n_threads, htslib_threads,
                 dump_source_observations, dump_source_observations_prefix, source_provenance_tag,
@@ -3073,7 +3530,11 @@ int main(int argc, char *argv[]) {
                 (species_counts_output || species_assignment_output)
                     ? &dual_panel1_native : nullptr,
                 (species_counts_output || species_assignment_output)
-                    ? (int)species_samples_native.size() : 0);
+                    ? (int)species_samples_native.size() : 0,
+                dump_pileup, dump_pileup_prefix)){
+                fprintf(stderr, "ERROR: dual-panel BAM counting failed; no outputs will be published\n");
+                return 1;
+            }
             
             // Step 8: Finalize each panel separately
             finalize_parallel_counts(dual_panel0, cell_counts);
@@ -3086,31 +3547,37 @@ int main(int argc, char *argv[]) {
                 "Dual counting complete: %lu interindiv cells, %lu individual-shaped species cells, %lu native species cells\n",
                 cell_counts.size(), species_cell_counts_rna.size(),
                 species_cell_counts_native.size());
-
+            
             // Mark species RNA counting as done so the later block skips it
             species_counted_dual = true;
         }
         else if (n_threads > 1){
             if (dump_source_observations){
                 fprintf(stderr, "ERROR: --dump_source_observations currently requires the dual-panel counting path (--species_counts_output).\n");
-                exit(1);
+                return 1;
             }
             // Parallel processing
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> parallel_counts;
         
-            count_alleles_parallel(bamfile, snpdat_optimized, parallel_counts,
+            if (!count_alleles_parallel(bamfile, snpdat_optimized, parallel_counts,
                 cell_barcodes, samples.size(), n_threads, htslib_threads,
                 dump_pileup, dump_pileup_prefix,
-                accepted_weighted_conditional ? &accepted_site_weights_individual : nullptr);
+                accepted_weighted_conditional ? &accepted_site_weights_individual : nullptr)){
+                fprintf(stderr, "ERROR: BAM allele counting failed; no outputs will be published\n");
+                return 1;
+            }
         
             // Finalize counts
             finalize_parallel_counts(parallel_counts, cell_counts);
         }
         else{
             // Single-threaded fallback
-            count_alleles_single_threaded(bamfile, snpdat_optimized, cell_counts,
+            if (!count_alleles_single_threaded(bamfile, snpdat_optimized, cell_counts,
                 cell_barcodes, samples.size(), conditional_match_fracs,
-                conditional_match_tots, !disable_conditional);
+                conditional_match_tots, !disable_conditional)){
+                fprintf(stderr, "ERROR: BAM allele counting failed; no outputs will be published\n");
+                return 1;
+            }
         }
     
         // Compute conditional match fractions if parallel (didn't do it during counting)
@@ -3118,7 +3585,7 @@ int main(int argc, char *argv[]) {
             if (accepted_weighted_conditional){
                 if (accepted_site_weights_individual.empty()){
                     fprintf(stderr, "ERROR: no accepted individual-panel site weights were collected; cannot build accepted-weighted .condf\n");
-                    exit(1);
+                    return 1;
                 }
                 fprintf(stderr, "Computing accepted-observation-weighted conditional match fractions...\n");
                 individual_condf_stats = compute_conditional_match_fracs_weighted(
@@ -3141,14 +3608,23 @@ int main(int argc, char *argv[]) {
         
             string outname = output_prefix + ".condf";
             FILE* outf = fopen(outname.c_str(), "w");
+            if (!outf){
+                fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+                    outname.c_str(), strerror(errno));
+                return 1;
+            }
             dump_exp_fracs(outf, conditional_match_fracs);
-            fclose(outf);
+            if (fclose(outf) != 0){
+                fprintf(stderr, "ERROR: failed closing %s: %s\n",
+                    outname.c_str(), strerror(errno));
+                return 1;
+            }
 
             string basis_name = output_prefix + ".condf_basis.tsv";
             FILE* basis_out = fopen(basis_name.c_str(), "w");
             if (!basis_out){
                 fprintf(stderr, "ERROR: could not open %s for writing\n", basis_name.c_str());
-                exit(1);
+                return 1;
             }
             fprintf(basis_out, "contract_version\tcondf_basis_V1_R1\n");
             fprintf(basis_out, "panel\tindividual\n");
@@ -3158,7 +3634,11 @@ int main(int argc, char *argv[]) {
             fprintf(basis_out, "observed_sites\t%llu\n",
                 (unsigned long long)individual_condf_stats.observed_sites);
             fprintf(basis_out, "accepted_weight\t%.17g\n", individual_condf_stats.accepted_weight);
-            fclose(basis_out);
+            if (fclose(basis_out) != 0){
+                fprintf(stderr, "ERROR: failed closing %s: %s\n",
+                    basis_name.c_str(), strerror(errno));
+                return 1;
+            }
         }
 
         // Build position set from demux VCF for species panel dedup (§5.5)
@@ -3179,10 +3659,18 @@ int main(int argc, char *argv[]) {
         {
             string fname = output_prefix + ".counts";
             gzFile outf = gzopen(fname.c_str(), "w");
-            fprintf(stderr, "Writing allele counts to disk...\n");
+            if (!outf){
+                fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+                    fname.c_str(), strerror(errno));
+                return 1;
+            }
+            fprintf(stderr, "Writing allele counts to staged output...\n");
             dump_cellcounts_optimized(outf, cell_counts, samples.size());
-            gzclose(outf);
-            fprintf(stderr, "Done writing counts\n");
+            if (gzclose(outf) != Z_OK){
+                fprintf(stderr, "ERROR: failed closing %s\n", fname.c_str());
+                return 1;
+            }
+            fprintf(stderr, "Done writing staged counts\n");
         }
     }
 
@@ -3194,39 +3682,62 @@ int main(int argc, char *argv[]) {
     if (atac_mode && !load_counts){
         print_elapsed(start_time, "Starting ATAC allele counting...");
         robin_hood::unordered_map<int, ChromSNPs> atac_snpdat;
+        map<string, int> seq2tid_atac;
+        set<string> chroms_atac_header;
+        string atac_header_error;
+        if (!get_bam_header_chroms_and_seq2tid(
+                atac_bamfile, chroms_atac_header, seq2tid_atac, &atac_header_error)){
+            fprintf(stderr, "ERROR: ATAC BAM/header validation failed: %s\n",
+                atac_header_error.c_str());
+            return 1;
+        }
 
         if (atac_shared_vcf_name.length() > 0){
             vector<string> atac_samples;
             if (!attach_shared_vcf(atac_shared_vcf_name, atac_snpdat, atac_samples)){
                 fprintf(stderr, "ERROR: Could not attach to shared ATAC VCF: %s\n",
                     atac_shared_vcf_name.c_str());
-                exit(1);
+                return 1;
             }
+            if (!validate_and_restrict_panel_to_bam(
+                    atac_snpdat, seq2tid_atac, "ATAC genotype panel", false)) return 1;
             fprintf(stderr, "Attached to shared ATAC VCF with %lu chromosomes\n", atac_snpdat.size());
         }
         else{
             set<string> atac_chroms;
             get_vcf_chroms(atac_vcf_file, atac_chroms);
-            map<string, int> seq2tid_atac;
-            set<string> chroms_atac_header;
-            get_bam_header_chroms_and_seq2tid(atac_bamfile, chroms_atac_header, seq2tid_atac);
-            int nloaded = read_vcf_chroms_optimized(atac_vcf_file, atac_chroms,
+            set<string> atac_shared_chroms = shared_contig_names(atac_chroms, seq2tid_atac);
+            if (atac_shared_chroms.empty()){
+                fprintf(stderr,
+                    "ERROR: required ATAC genotype panel has zero shared BAM/VCF contigs\n");
+                return 1;
+            }
+            int nloaded = read_vcf_chroms_optimized(atac_vcf_file, atac_shared_chroms,
                 seq2tid_atac, atac_snpdat, vq);
+            if (nloaded < 0) return 1;
             fprintf(stderr, "Loaded %d ATAC SNPs\n", nloaded);
+            if (!validate_and_restrict_panel_to_bam(
+                    atac_snpdat, seq2tid_atac, "ATAC genotype panel", false)) return 1;
         }
 
         precompute_all_genotypes(atac_snpdat, samples.size());
 
         if (n_threads > 1){
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> atac_parallel_counts;
-            count_alleles_parallel(atac_bamfile, atac_snpdat, atac_parallel_counts,
-                cell_barcodes, samples.size(), n_threads, htslib_threads);
+            if (!count_alleles_parallel(atac_bamfile, atac_snpdat, atac_parallel_counts,
+                    cell_barcodes, samples.size(), n_threads, htslib_threads)){
+                fprintf(stderr, "ERROR: ATAC allele counting failed\n");
+                return 1;
+            }
             finalize_parallel_counts(atac_parallel_counts, atac_cell_counts);
         }
         else{
             map<pair<int, int>, map<int, float>> atac_cond_fracs, atac_cond_tots;
-            count_alleles_single_threaded(atac_bamfile, atac_snpdat, atac_cell_counts,
-                cell_barcodes, samples.size(), atac_cond_fracs, atac_cond_tots, false);
+            if (!count_alleles_single_threaded(atac_bamfile, atac_snpdat, atac_cell_counts,
+                    cell_barcodes, samples.size(), atac_cond_fracs, atac_cond_tots, false)){
+                fprintf(stderr, "ERROR: ATAC allele counting failed\n");
+                return 1;
+            }
         }
 
         // CB tag intersection check
@@ -3244,7 +3755,7 @@ int main(int argc, char *argv[]) {
             if (overlap_frac < 0.10){
                 fprintf(stderr, "ERROR: ATAC/RNA barcode overlap (%.3f) below threshold (0.10).\n"
                     "Check that the ATAC BAM CB tag holds RNA-aligned barcodes.\n", overlap_frac);
-                exit(1);
+                return 1;
             }
         }
 
@@ -3252,9 +3763,17 @@ int main(int argc, char *argv[]) {
         {
             string fname = output_prefix + ".atac.counts";
             gzFile outf = gzopen(fname.c_str(), "w");
+            if (!outf){
+                fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+                    fname.c_str(), strerror(errno));
+                return 1;
+            }
             dump_cellcounts_optimized(outf, atac_cell_counts, samples.size());
-            gzclose(outf);
-            fprintf(stderr, "Wrote ATAC counts for %lu cells\n", atac_cell_counts.size());
+            if (gzclose(outf) != Z_OK){
+                fprintf(stderr, "ERROR: failed closing %s\n", fname.c_str());
+                return 1;
+            }
+            fprintf(stderr, "Wrote staged ATAC counts for %lu cells\n", atac_cell_counts.size());
         }
     }
 
@@ -3266,6 +3785,16 @@ int main(int argc, char *argv[]) {
     // to support the WP3 dual counting optimization path.
 
     if (has_species_vcf){
+        if (bam_seq2tid.empty() && !species_panel_may_be_empty){
+            set<string> species_bam_chroms;
+            string species_bam_header_error;
+            if (!get_bam_header_chroms_and_seq2tid(
+                    bamfile, species_bam_chroms, bam_seq2tid, &species_bam_header_error)){
+                fprintf(stderr, "ERROR: species-panel BAM/header validation failed: %s\n",
+                    species_bam_header_error.c_str());
+                return 1;
+            }
+        }
         // WP3: if dual counting already loaded species VCF, validated samples,
         // performed dedup, and counted RNA, skip those steps here.
         if (!species_counted_dual){
@@ -3277,8 +3806,12 @@ int main(int argc, char *argv[]) {
                 if (!attach_shared_vcf(species_shared_vcf_name, species_snpdat, species_samples)){
                     fprintf(stderr, "ERROR: Could not attach to shared species VCF: %s\n",
                         species_shared_vcf_name.c_str());
-                    exit(1);
+                    return 1;
                 }
+                if (!bam_seq2tid.empty() &&
+                    !validate_and_restrict_panel_to_bam(
+                        species_snpdat, bam_seq2tid, "species genotype panel",
+                        species_panel_may_be_empty)) return 1;
             }
             else if (!load_counts){
                 // Disk-based species VCF requires the BAM reader for tid mapping,
@@ -3286,29 +3819,39 @@ int main(int argc, char *argv[]) {
                 read_vcf_samples(species_vcf_file, species_samples);
                 set<string> sp_chroms;
                 get_vcf_chroms(species_vcf_file, sp_chroms);
-                int nloaded = read_vcf_chroms_optimized(species_vcf_file, sp_chroms,
-                    bam_seq2tid, species_snpdat, vq);
+                set<string> sp_shared_chroms = shared_contig_names(sp_chroms, bam_seq2tid);
+                if (sp_shared_chroms.empty() && !species_panel_may_be_empty){
+                    fprintf(stderr,
+                        "ERROR: required species genotype panel has zero shared BAM/VCF contigs\n");
+                    return 1;
+                }
+                int nloaded = 0;
+                if (!sp_shared_chroms.empty()){
+                    nloaded = read_vcf_chroms_optimized(species_vcf_file, sp_shared_chroms,
+                        bam_seq2tid, species_snpdat, vq);
+                    if (nloaded < 0) return 1;
+                }
                 fprintf(stderr, "Loaded %d species panel SNPs\n", nloaded);
             }
             else{
                 // load_counts + disk-based species VCF: not currently supported
                 fprintf(stderr, "ERROR: Disk-based --species_vcf with cached .counts is not supported. "
                     "Use --species_shared_vcf or delete the .counts file to re-run from BAM.\n");
-                exit(1);
+                return 1;
             }
 
             // §5.3: Sample set alignment check
             if (species_samples.size() != samples.size()){
                 fprintf(stderr, "ERROR: Species VCF has %lu samples but demux VCF has %lu samples. "
                     "Sample sets must match.\n", species_samples.size(), samples.size());
-                exit(1);
+                return 1;
             }
             for (size_t si = 0; si < samples.size(); ++si){
                 if (species_samples[si] != samples[si]){
                     fprintf(stderr, "ERROR: Species VCF sample[%lu]='%s' differs from demux VCF sample[%lu]='%s'. "
                         "Sample sets must match in same order.\n",
                         si, species_samples[si].c_str(), si, samples[si].c_str());
-                    exit(1);
+                    return 1;
                 }
             }
             fprintf(stderr, "Species VCF sample set matches demux VCF (%lu samples)\n", samples.size());
@@ -3346,6 +3889,10 @@ int main(int argc, char *argv[]) {
                         total_species_sites);
                 }
             }
+            if (!bam_seq2tid.empty() &&
+                !validate_and_restrict_panel_to_bam(
+                    species_snpdat, bam_seq2tid, "species genotype panel",
+                    species_panel_may_be_empty)) return 1;
 
             // Load panel metadata if needed
             if (panel_metadata_file.length() > 0){
@@ -3370,16 +3917,19 @@ int main(int argc, char *argv[]) {
                 if (n_threads > 1){
                     robin_hood::unordered_map<unsigned long, AlignedCellCounts> sp_parallel;
                     robin_hood::unordered_map<unsigned long, AlignedCellCounts> sp_native_parallel;
-                    count_alleles_parallel(bamfile, species_snpdat, sp_parallel,
-                        cell_barcodes, samples.size(), n_threads, htslib_threads,
-                        false, "",
-                        accepted_weighted_conditional ? &accepted_site_weights_species : nullptr,
-                        (species_counts_output || species_assignment_output)
-                            ? &species_native_targets : nullptr,
-                        (species_counts_output || species_assignment_output)
-                            ? &sp_native_parallel : nullptr,
-                        (species_counts_output || species_assignment_output)
-                            ? (int)species_samples_native.size() : 0);
+                    if (!count_alleles_parallel(bamfile, species_snpdat, sp_parallel,
+                            cell_barcodes, samples.size(), n_threads, htslib_threads,
+                            false, "",
+                            accepted_weighted_conditional ? &accepted_site_weights_species : nullptr,
+                            (species_counts_output || species_assignment_output)
+                                ? &species_native_targets : nullptr,
+                            (species_counts_output || species_assignment_output)
+                                ? &sp_native_parallel : nullptr,
+                            (species_counts_output || species_assignment_output)
+                                ? (int)species_samples_native.size() : 0)){
+                        fprintf(stderr, "ERROR: species-panel RNA allele counting failed\n");
+                        return 1;
+                    }
                     finalize_parallel_counts(sp_parallel, species_cell_counts_rna);
                     if (species_counts_output || species_assignment_output){
                         finalize_parallel_counts(
@@ -3388,14 +3938,17 @@ int main(int argc, char *argv[]) {
                 }
                 else{
                     map<pair<int, int>, map<int, float>> sp_cond, sp_tots;
-                    count_alleles_single_threaded(bamfile, species_snpdat, species_cell_counts_rna,
-                        cell_barcodes, samples.size(), sp_cond, sp_tots, false,
-                        (species_counts_output || species_assignment_output)
-                            ? &species_native_targets : nullptr,
-                        (species_counts_output || species_assignment_output)
-                            ? &species_cell_counts_native : nullptr,
-                        (species_counts_output || species_assignment_output)
-                            ? (int)species_samples_native.size() : 0);
+                    if (!count_alleles_single_threaded(bamfile, species_snpdat, species_cell_counts_rna,
+                            cell_barcodes, samples.size(), sp_cond, sp_tots, false,
+                            (species_counts_output || species_assignment_output)
+                                ? &species_native_targets : nullptr,
+                            (species_counts_output || species_assignment_output)
+                                ? &species_cell_counts_native : nullptr,
+                            (species_counts_output || species_assignment_output)
+                                ? (int)species_samples_native.size() : 0)){
+                        fprintf(stderr, "ERROR: species-panel RNA allele counting failed\n");
+                        return 1;
+                    }
                 }
                 fprintf(stderr, "Species RNA counts for %lu cells\n", species_cell_counts_rna.size());
 
@@ -3403,14 +3956,20 @@ int main(int argc, char *argv[]) {
                     print_elapsed(start_time, "Counting alleles at species panel sites (ATAC)...");
                     if (n_threads > 1){
                         robin_hood::unordered_map<unsigned long, AlignedCellCounts> sp_atac_parallel;
-                        count_alleles_parallel(atac_bamfile, species_snpdat, sp_atac_parallel,
-                            cell_barcodes, samples.size(), n_threads, htslib_threads);
+                        if (!count_alleles_parallel(atac_bamfile, species_snpdat, sp_atac_parallel,
+                                cell_barcodes, samples.size(), n_threads, htslib_threads)){
+                            fprintf(stderr, "ERROR: species-panel ATAC allele counting failed\n");
+                            return 1;
+                        }
                         finalize_parallel_counts(sp_atac_parallel, species_cell_counts_atac);
                     }
                     else{
                         map<pair<int, int>, map<int, float>> sp_cond2, sp_tots2;
-                        count_alleles_single_threaded(atac_bamfile, species_snpdat, species_cell_counts_atac,
-                            cell_barcodes, samples.size(), sp_cond2, sp_tots2, false);
+                        if (!count_alleles_single_threaded(atac_bamfile, species_snpdat, species_cell_counts_atac,
+                                cell_barcodes, samples.size(), sp_cond2, sp_tots2, false)){
+                            fprintf(stderr, "ERROR: species-panel ATAC allele counting failed\n");
+                            return 1;
+                        }
                     }
                 }
             }
@@ -3425,14 +3984,20 @@ int main(int argc, char *argv[]) {
                 print_elapsed(start_time, "Counting alleles at species panel sites (ATAC)...");
                 if (n_threads > 1){
                     robin_hood::unordered_map<unsigned long, AlignedCellCounts> sp_atac_parallel;
-                    count_alleles_parallel(atac_bamfile, species_snpdat, sp_atac_parallel,
-                        cell_barcodes, samples.size(), n_threads, htslib_threads);
+                    if (!count_alleles_parallel(atac_bamfile, species_snpdat, sp_atac_parallel,
+                            cell_barcodes, samples.size(), n_threads, htslib_threads)){
+                        fprintf(stderr, "ERROR: species-panel ATAC allele counting failed\n");
+                        return 1;
+                    }
                     finalize_parallel_counts(sp_atac_parallel, species_cell_counts_atac);
                 }
                 else{
                     map<pair<int, int>, map<int, float>> sp_cond2, sp_tots2;
-                    count_alleles_single_threaded(atac_bamfile, species_snpdat, species_cell_counts_atac,
-                        cell_barcodes, samples.size(), sp_cond2, sp_tots2, false);
+                    if (!count_alleles_single_threaded(atac_bamfile, species_snpdat, species_cell_counts_atac,
+                            cell_barcodes, samples.size(), sp_cond2, sp_tots2, false)){
+                        fprintf(stderr, "ERROR: species-panel ATAC allele counting failed\n");
+                        return 1;
+                    }
                 }
             }
         }
@@ -3448,7 +4013,7 @@ int main(int argc, char *argv[]) {
         if (species_cell_counts_native.empty()){
             fprintf(stderr,
                 "ERROR: native species output requested but no per-site normalized native species counts were produced\n");
-            exit(1);
+            return 1;
         }
     }
 
@@ -3456,11 +4021,19 @@ int main(int argc, char *argv[]) {
         {
             string fname = output_prefix + ".species_counts";
             gzFile outf = gzopen(fname.c_str(), "w");
+            if (!outf){
+                fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+                    fname.c_str(), strerror(errno));
+                return 1;
+            }
             dump_cellcounts_optimized(outf, species_cell_counts_native,
                 species_samples_native.size());
-            gzclose(outf);
-            fprintf(stderr, "Wrote native species counts for %lu cells to %s (%lu species columns)\n",
-                species_cell_counts_native.size(), fname.c_str(), species_samples_native.size());
+            if (gzclose(outf) != Z_OK){
+                fprintf(stderr, "ERROR: failed closing %s\n", fname.c_str());
+                return 1;
+            }
+            fprintf(stderr, "Wrote staged native species counts for %lu cells (%lu species columns)\n",
+                species_cell_counts_native.size(), species_samples_native.size());
         }
 
         {
@@ -3470,15 +4043,24 @@ int main(int argc, char *argv[]) {
                 accepted_weighted_conditional ? &accepted_site_weights_species : nullptr);
             string fname = output_prefix + ".species_condf";
             FILE* outf = fopen(fname.c_str(), "w");
+            if (!outf){
+                fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+                    fname.c_str(), strerror(errno));
+                return 1;
+            }
             dump_exp_fracs(outf, sp_condf);
-            fclose(outf);
-            fprintf(stderr, "Wrote native species conditional match fracs to %s\n", fname.c_str());
+            if (fclose(outf) != 0){
+                fprintf(stderr, "ERROR: failed closing %s: %s\n",
+                    fname.c_str(), strerror(errno));
+                return 1;
+            }
+            fprintf(stderr, "Wrote staged native species conditional match fracs\n");
 
             string basis_name = output_prefix + ".species_condf_basis.tsv";
             FILE* basis_out = fopen(basis_name.c_str(), "w");
             if (!basis_out){
                 fprintf(stderr, "ERROR: could not open %s for writing\n", basis_name.c_str());
-                exit(1);
+                return 1;
             }
             fprintf(basis_out, "contract_version\tcondf_basis_V1_R1\n");
             fprintf(basis_out, "panel\tspecies\n");
@@ -3488,12 +4070,16 @@ int main(int argc, char *argv[]) {
             fprintf(basis_out, "observed_sites\t%llu\n",
                 (unsigned long long)species_condf_stats.observed_sites);
             fprintf(basis_out, "accepted_weight\t%.17g\n", species_condf_stats.accepted_weight);
-            fclose(basis_out);
+            if (fclose(basis_out) != 0){
+                fprintf(stderr, "ERROR: failed closing %s: %s\n",
+                    basis_name.c_str(), strerror(errno));
+                return 1;
+            }
         }
 
         {
             string fname = output_prefix + ".species_samples";
-            write_samples(fname, species_samples_native);
+            if (!write_samples_checked(fname, species_samples_native)) return 1;
             fprintf(stderr, "Wrote native species sample list to %s\n", fname.c_str());
         }
     }
@@ -3503,47 +4089,15 @@ int main(int argc, char *argv[]) {
     // ================================================================
     if (skip_assignment){
         print_elapsed(start_time, "Skipping identity assignment (--skip_assignment set)");
-        fprintf(stderr, "Wrote %s.counts; exiting (no assignment performed).\n",
-                output_prefix.c_str());
-        if (identity_prior_file.length() > 0){
-            fprintf(stderr, "WARNING: --identity_prior was loaded but unused (--skip_assignment)\n");
-        }
+        if (!publish_outputs(output_transaction, "counts-only")) return 1;
+        fprintf(stderr, "Published %s.counts; exiting (no assignment performed).\n",
+                final_output_prefix.c_str());
         return 0;
     }
 
-    // ================================================================
-    // 2B: Load identity prior if provided
-    // ================================================================
-    map<int, double> identity_prior_map;
-    map<int, double> identity_prior_conc;
-    double z_doublet_prior = 0.0;
-    bool has_identity_prior = false;
-
-    if (identity_prior_file.length() > 0){
-        print_elapsed(start_time, "Loading identity prior...");
-        load_contam_prof(identity_prior_file, identity_prior_map, identity_prior_conc,
-            samples, false);  // false: missing samples get warning, not error
-        has_identity_prior = true;
-
-        // Compute Z_doublet for doublet prior normalization
-        // Sum over allowed doublets of 2 * pi[i] * pi[j]
-        set<int>& aa = allowed_ids;
-        for (int i = 0; i < (int)samples.size() - 1; ++i){
-            if (!aa.empty() && aa.find(i) == aa.end()) continue;
-            for (int j = i + 1; j < (int)samples.size(); ++j){
-                if (!aa.empty() && aa.find(j) == aa.end()) continue;
-                int k = hap_comb_to_idx(i, j, samples.size());
-                if (!aa.empty() && aa.find(k) == aa.end()) continue;
-
-                double pi_i = 0.0, pi_j = 0.0;
-                if (identity_prior_map.count(i) > 0) pi_i = identity_prior_map[i];
-                if (identity_prior_map.count(j) > 0) pi_j = identity_prior_map[j];
-                z_doublet_prior += 2.0 * pi_i * pi_j;
-            }
-        }
-        fprintf(stderr, "Identity prior: %lu entries, Z_doublet=%.6f\n",
-            identity_prior_map.size(), z_doublet_prior);
-    }
+    // Identity priors are deliberately unavailable in the active maximin
+    // scoring path. The command-line parser rejects --identity_prior above.
+    const double z_doublet_prior = 0.0;
 
     // Assign identities
     print_elapsed(start_time, "Starting identity assignment (round 1)...");
@@ -3558,11 +4112,12 @@ int main(int argc, char *argv[]) {
     //       allowed_ids2 contains ONLY what was in the original ID file
     // When -I is used with doublet combinations, allowed_ids2 has only doublets,
     // which causes singlets to be disallowed in the final assignment step.
-    assign_ids_parallel(cell_counts, samples, assn, assn_llr,
-        allowed_ids, allowed_ids2, doublet_rate, error_ref, error_alt,
-        false, prior_weights, n_threads, n_target);
-    
-    robin_hood::unordered_map<unsigned long, int> assncpy = assn;
+    if (!assign_ids_parallel(cell_counts, samples, assn, assn_llr,
+            allowed_ids, allowed_ids2, doublet_rate, error_ref, error_alt,
+            false, prior_weights, n_threads, n_target)) {
+        fprintf(stderr, "ERROR: identity scoring failed in round 1\n");
+        return 1;
+    }
     
     // Re-estimate error rates
     print_elapsed(start_time, "Estimating error rates...");
@@ -3580,36 +4135,18 @@ int main(int argc, char *argv[]) {
     // Re-assign with posterior error rates
     print_elapsed(start_time, "Re-inferring identities (round 2)...");
     fprintf(stderr, "Re-inferring identities of cells...\n");
-    assign_ids_parallel(cell_counts, samples, assn, assn_llr,
-        allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
-        false, prior_weights, n_threads, n_target);
+    if (!assign_ids_parallel(cell_counts, samples, assn, assn_llr,
+            allowed_ids, allowed_ids2, doublet_rate,
+            error_ref_posterior, error_alt_posterior,
+            false, prior_weights, n_threads, n_target)) {
+        fprintf(stderr, "ERROR: identity scoring failed in round 2\n");
+        return 1;
+    }
 
-    // Handle doublet-specific ID filtering
-    bool do_again = true;
-    if (idfile_doublet_given){
-        // The user gave an allowed list of specific identities. parse_idfile also placed
-        // the singlet halves of every declared combination into allowed_ids so the
-        // doublet likelihood has both halves, and kept them out of allowed_ids2 so they
-        // are not answers. The rounds above therefore could not select them.
-        // filter_identities decides whether any half earned a place in the answer set on
-        // its own evidence. It reports a change only when one did, and in that case the
-        // answer set is wider than the one round 2 used, so assignments are recomputed.
-        // When nothing is promoted the answer set is unchanged and round 2 already holds
-        // the result for it.
-        if (allowed_ids.size() > allowed_ids2.size()){
-            bool altered = filter_identities(assn, assn_llr, samples.size(), allowed_ids, 
-                allowed_ids2);
-
-            if (altered){
-                print_elapsed(start_time, "Re-inferring identities (round 3)...");
-                fprintf(stderr, "Re-inferring with data-supported singlet identities restored...\n");
-                assign_ids_parallel(cell_counts, samples, assn, assn_llr,
-                    allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior,
-                    error_alt_posterior,
-                    false, prior_weights, n_threads, n_target); 
-                do_again = false;
-            }
-        }
+    if (idfile_doublet_given && allowed_ids.size() > allowed_ids2.size()) {
+        fprintf(stderr,
+            "Identity restriction: undeclared component singlets retained internally "
+            "for declared fusion likelihoods and remain ineligible as final outputs.\n");
     }
 
     // NEW: Final assignment with diagnostic collection
@@ -3639,8 +4176,9 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Attaching to shared het VCF: %s\n", shared_het_vcf_name.c_str());
                 
                 if (!attach_shared_vcf(shared_het_vcf_name, het_snpdat, het_samples)){
-                    fprintf(stderr, "WARNING: Could not attach to shared het VCF: %s\n", shared_het_vcf_name.c_str());
-                    fprintf(stderr, "Ploidy-related diagnostics will not be computed.\n");
+                    fprintf(stderr, "ERROR: could not attach to required shared het VCF: %s\n",
+                        shared_het_vcf_name.c_str());
+                    return 1;
                 }
                 else{
                     // Count SNPs loaded
@@ -3659,9 +4197,20 @@ int main(int argc, char *argv[]) {
                 
                 // Get chromosome names from BAM header
                 set<string> chroms_for_het;
-                get_bam_header_chroms_and_seq2tid(bamfile, chroms_for_het, seq2tid_het);
+                {
+                    string header_error;
+                    if (!get_bam_header_chroms_and_seq2tid(
+                            bamfile, chroms_for_het, seq2tid_het, &header_error)){
+                        fprintf(stderr, "ERROR: BAM/header validation for het diagnostics failed: %s\n",
+                            header_error.c_str());
+                        return 1;
+                    }
+                }
                 
                 n_het_loaded = load_het_vcf(het_vcf_file, chroms_for_het, seq2tid_het, het_snpdat, vq);
+                if (n_het_loaded < 0){
+                    return 1;
+                }
                 fprintf(stderr, "Loaded %d het sites\n", n_het_loaded);
             }
             
@@ -3673,8 +4222,11 @@ int main(int argc, char *argv[]) {
                 }
                 fprintf(stderr, ")\n");
                 print_elapsed(start_time, "Counting alleles at het sites...");
-                count_het_alleles_extended(bamfile, het_snpdat, het_data, idx_to_site,
-                    cell_barcodes, samples.size(), n_threads, htslib_threads, het_method);
+                if (!count_het_alleles_extended(bamfile, het_snpdat, het_data, idx_to_site,
+                        cell_barcodes, samples.size(), n_threads, htslib_threads, het_method)){
+                    fprintf(stderr, "ERROR: het/ploidy allele counting failed\n");
+                    return 1;
+                }
             }
             else{
                 fprintf(stderr, "WARNING: No het sites available\n");
@@ -3702,8 +4254,9 @@ int main(int argc, char *argv[]) {
             print_elapsed(start_time, "Attaching to shared ATAC het VCF...");
             vector<string> atac_het_samples;
             if (!attach_shared_vcf(atac_shared_het_vcf_name, atac_het_snpdat, atac_het_samples)){
-                fprintf(stderr, "WARNING: Could not attach to shared ATAC het VCF: %s\n",
+                fprintf(stderr, "ERROR: could not attach to required shared ATAC het VCF: %s\n",
                     atac_shared_het_vcf_name.c_str());
+                return 1;
             }
             else{
                 for (auto& kv : atac_het_snpdat){
@@ -3716,17 +4269,31 @@ int main(int argc, char *argv[]) {
             print_elapsed(start_time, "Loading ATAC het VCF...");
             map<string, int> seq2tid_atac_het;
             set<string> chroms_atac_het;
-            get_bam_header_chroms_and_seq2tid(atac_bamfile, chroms_atac_het, seq2tid_atac_het);
+            {
+                string header_error;
+                if (!get_bam_header_chroms_and_seq2tid(
+                        atac_bamfile, chroms_atac_het, seq2tid_atac_het, &header_error)){
+                    fprintf(stderr, "ERROR: ATAC BAM/header validation for het diagnostics failed: %s\n",
+                        header_error.c_str());
+                    return 1;
+                }
+            }
             n_atac_het_loaded = load_het_vcf(atac_het_vcf_file, chroms_atac_het,
                 seq2tid_atac_het, atac_het_snpdat, vq);
+            if (n_atac_het_loaded < 0){
+                return 1;
+            }
             fprintf(stderr, "Loaded %d ATAC het sites\n", n_atac_het_loaded);
         }
 
         if (n_atac_het_loaded > 0){
             print_elapsed(start_time, "Counting alleles at ATAC het sites...");
-            count_het_alleles_extended(atac_bamfile, atac_het_snpdat, atac_het_data,
-                atac_idx_to_site, cell_barcodes, samples.size(), n_threads,
-                htslib_threads, het_method);
+            if (!count_het_alleles_extended(atac_bamfile, atac_het_snpdat, atac_het_data,
+                    atac_idx_to_site, cell_barcodes, samples.size(), n_threads,
+                    htslib_threads, het_method)){
+                fprintf(stderr, "ERROR: ATAC het/ploidy allele counting failed\n");
+                return 1;
+            }
             fprintf(stderr, "ATAC het data for %lu cells\n", atac_het_data.size());
         }
     }
@@ -3734,8 +4301,7 @@ int main(int argc, char *argv[]) {
     // Prepare extended evidence pointers for diagnostic calls
     robin_hood::unordered_map<unsigned long, CellCounts>* atac_ptr =
         atac_mode ? &atac_cell_counts : nullptr;
-    const map<int, double>* prior_ptr =
-        has_identity_prior ? &identity_prior_map : nullptr;
+    const map<int, double>* prior_ptr = nullptr;
     robin_hood::unordered_map<unsigned long, CellCounts>* sp_rna_ptr =
         (species_mode == SpeciesPanelMode::AUGMENT || species_mode == SpeciesPanelMode::BOTH)
         ? &species_cell_counts_rna : nullptr;
@@ -3748,34 +4314,42 @@ int main(int argc, char *argv[]) {
         
         if (het_data.empty()){
             // No het data - use original function
-            assign_ids_parallel_with_diagnostics(
-                cell_counts, samples, assn, assn_llr,
-                allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
-                false, prior_weights, n_threads, n_target,
-                true,  // compute_diagnostics
-                n_runner_ups,
-                close_threshold,
-                NULL,  // no het counts
-                cell_diagnostics,
-                cell_runner_ups,
-                atac_ptr, prior_ptr, z_doublet_prior,
-                sp_rna_ptr, sp_atac_ptr);
+            if (!assign_ids_parallel_with_diagnostics(
+                    cell_counts, samples, assn, assn_llr,
+                    allowed_ids, allowed_ids2, doublet_rate,
+                    error_ref_posterior, error_alt_posterior,
+                    false, prior_weights, n_threads, n_target,
+                    true,  // compute_diagnostics
+                    n_runner_ups,
+                    close_threshold,
+                    NULL,  // no het counts
+                    cell_diagnostics,
+                    cell_runner_ups,
+                    atac_ptr, prior_ptr, z_doublet_prior,
+                    sp_rna_ptr, sp_atac_ptr)) {
+                fprintf(stderr, "ERROR: final identity scoring with diagnostics failed\n");
+                return 1;
+            }
         }
         else{
             // Use extended method (Welford or per-site)
-            assign_ids_parallel_with_diagnostics_extended(
-                cell_counts, samples, assn, assn_llr,
-                allowed_ids, allowed_ids2, doublet_rate, error_ref_posterior, error_alt_posterior,
-                false, prior_weights, n_threads, n_target,
-                true,  // compute_diagnostics
-                n_runner_ups,
-                close_threshold,
-                &het_data, &het_snpdat, &idx_to_site,
-                het_method, min_het_sites, min_het_depth,
-                cell_diagnostics,
-                cell_runner_ups,
-                atac_ptr, prior_ptr, z_doublet_prior,
-                sp_rna_ptr, sp_atac_ptr);
+            if (!assign_ids_parallel_with_diagnostics_extended(
+                    cell_counts, samples, assn, assn_llr,
+                    allowed_ids, allowed_ids2, doublet_rate,
+                    error_ref_posterior, error_alt_posterior,
+                    false, prior_weights, n_threads, n_target,
+                    true,  // compute_diagnostics
+                    n_runner_ups,
+                    close_threshold,
+                    &het_data, &het_snpdat, &idx_to_site,
+                    het_method, min_het_sites, min_het_depth,
+                    cell_diagnostics,
+                    cell_runner_ups,
+                    atac_ptr, prior_ptr, z_doublet_prior,
+                    sp_rna_ptr, sp_atac_ptr)) {
+                fprintf(stderr, "ERROR: final identity scoring with het diagnostics failed\n");
+                return 1;
+            }
         }
     }
 
@@ -3785,25 +4359,44 @@ int main(int argc, char *argv[]) {
     map<int, double> p_llr;
     id_qc(assn, assn_llr, p_ncell, p_llr);
 
-    // Write assignments
-    print_elapsed(start_time, "Writing outputs...");
+    // Write assignments to staged outputs.
+    print_elapsed(start_time, "Writing staged outputs...");
     {
         string fname = output_prefix + ".assignments";
         FILE* outf = fopen(fname.c_str(), "w");
-        fprintf(stderr, "Writing cell-individual assignments to disk...\n");
+        if (!outf){
+            fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+                fname.c_str(), strerror(errno));
+            return 1;
+        }
+        fprintf(stderr, "Writing cell-individual assignments to staged output...\n");
         dump_assignments(outf, assn, assn_llr, samples, barcode_group, cellranger, seurat, underscore);
-        fclose(outf);
+        if (fclose(outf) != 0){
+            fprintf(stderr, "ERROR: failed closing %s: %s\n",
+                fname.c_str(), strerror(errno));
+            return 1;
+        }
     }
-    
-    // Write summary
+
+    // The summary reports the user-visible final prefix, never the temporary name.
     {
         string fname = output_prefix + ".summary";
         FILE* outf = fopen(fname.c_str(), "w");
-        write_summary(outf, output_prefix, assn, samples, error_ref,
+        if (!outf){
+            fprintf(stderr, "ERROR: could not open %s for writing: %s\n",
+                fname.c_str(), strerror(errno));
+            return 1;
+        }
+        string summary_prefix = final_output_prefix;
+        write_summary(outf, summary_prefix, assn, samples, error_ref,
             error_alt, error_sigma, error_ref_posterior,
             error_alt_posterior, vcf_file, vq, doublet_rate,
             p_ncell, p_llr);
-        fclose(outf);
+        if (fclose(outf) != 0){
+            fprintf(stderr, "ERROR: failed closing %s: %s\n",
+                fname.c_str(), strerror(errno));
+            return 1;
+        }
     }
     
     // NEW: Write diagnostic files
@@ -3811,25 +4404,30 @@ int main(int argc, char *argv[]) {
         // Write .diagnostics.gz
         {
             string fname = output_prefix + ".diagnostics.gz";
-            write_diagnostics_gz(fname, samples, assn, assn_llr, cell_diagnostics,
-                samples.size(), barcode_group, cellranger, seurat, underscore,
-                atac_het_available ? &atac_het_data : NULL,
-                atac_het_available ? &atac_het_snpdat : NULL,
-                atac_het_available ? &atac_idx_to_site : NULL,
-                het_method, min_het_sites, min_het_depth,
-                dump_selection_audit);
+            if (!write_diagnostics_gz(fname, samples, assn, assn_llr, cell_diagnostics,
+                    samples.size(), barcode_group, cellranger, seurat, underscore,
+                    atac_het_available ? &atac_het_data : NULL,
+                    atac_het_available ? &atac_het_snpdat : NULL,
+                    atac_het_available ? &atac_idx_to_site : NULL,
+                    het_method, min_het_sites, min_het_depth,
+                    dump_selection_audit)){
+                return 1;
+            }
         }
         
         // Write .runner_ups.gz
         {
             string fname = output_prefix + ".runner_ups.gz";
-            write_runner_ups_gz(fname, samples, assn, cell_runner_ups,
-                samples.size(), barcode_group, cellranger, seurat, underscore);
+            if (!write_runner_ups_gz(fname, samples, assn, cell_diagnostics,
+                    cell_runner_ups, samples.size(), barcode_group,
+                    cellranger, seurat, underscore)){
+                return 1;
+            }
         }
         
         fprintf(stderr, "Diagnostic output complete.\n");
         if (!het_vcf_available){
-            fprintf(stderr, "Note: het_balance_var columns contain -1 (no --het_vcf provided)\n");
+            fprintf(stderr, "Note: unavailable het/ploidy values are written as NA with an explicit state.\n");
         }
     }
     
@@ -3843,16 +4441,20 @@ int main(int argc, char *argv[]) {
         if (species_cell_counts_native.empty()){
             fprintf(stderr,
                 "ERROR: --species_assignment_output requested but native species counts are unavailable\n");
-            exit(1);
+            return 1;
         }
-        write_native_species_assignments(output_prefix, species_cell_counts_native,
-            species_samples_native, species_idfile,
-            species_doublet_rate, error_ref_posterior, error_alt_posterior,
-            n_threads, n_target, barcode_group, cellranger, seurat, underscore);
+        if (!write_native_species_assignments(output_prefix, species_cell_counts_native,
+                species_samples_native, species_idfile,
+                species_doublet_rate, error_ref_posterior, error_alt_posterior,
+                n_threads, n_target, barcode_group, cellranger, seurat, underscore)){
+            return 1;
+        }
     }
 
+    if (!publish_outputs(output_transaction, "demultiplexing")) return 1;
     print_elapsed(start_time, "Complete!");
-    fprintf(stderr, "Done!\n");
-    
+    fprintf(stderr, "Published complete output bundle at prefix %s\n",
+        final_output_prefix.c_str());
+
     return 0;
 }

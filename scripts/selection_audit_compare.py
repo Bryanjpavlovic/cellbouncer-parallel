@@ -1,84 +1,82 @@
 #!/usr/bin/env python3
-"""
-selection_audit_compare.py
-Created in conversation: https://claude.ai/chat/CURRENT_CONVERSATION
+"""Compare production maximin selection with the audit-only max-LLR comparator.
 
-Quantify how often the maximin winner-selection criterion (current
-demux_parallel: pick the identity with the highest min_margin) disagrees with
-the maxllr criterion (Nathan's original demux_vcf del(2) elimination survivor:
-pick the identity with the highest maxllr).
+The comparator reported by ``demux_parallel --dump_selection_audit`` is the
+non-mutating statistic ``argmax(maxllr)``. It is not the historical destructive
+process-of-elimination selector and this script makes no parity claim with that
+historical implementation.
 
-Input: one or more .diagnostics.gz files written by `demux_parallel` run with
---dump_selection_audit. That flag appends these columns:
-    maximin_winner   the actual assignment (highest min_margin)
-    maximin_score    that winner's min_margin
-    maxllr_winner    identity the maxllr criterion would pick
-    maxllr_score     that identity's maxllr
-    selection_agree  1 if the two criteria pick the same identity, else 0
+Required diagnostic columns:
+    maximin_winner
+    maximin_score
+    max_llr_comparator_winner
+    max_llr_comparator_score
+    selection_agree
 
-Reports the overall disagreement rate and breaks it down by confidence so you
-can see whether disagreements concentrate in low-confidence cells (expected and
-harmless) or reach confident calls (would warrant attention). Confidence is
-read from the `posterior` column when present, else from min_margin bands.
-
-Usage:
-    module purge
-    module load miniforge/3
-    module load genomics-base
-    python3 selection_audit_compare.py \
-        /path/to/libN_demuxed.diagnostics.gz [more.diagnostics.gz ...] \
-        --out-disagreements disagreements.tsv.gz
-
-    # Or point at a root and let it find audited diagnostics:
-    python3 selection_audit_compare.py --root /mnt/beegfs/.../mapping_output
-
-Revision history at bottom of file.
+``margin_softmax_score`` is used only as a descriptive confidence summary. It is
+not interpreted as a calibrated Bayesian posterior probability.
 """
 from __future__ import annotations
 
 import argparse
 import gzip
 import os
-import sys
 from collections import Counter
+from typing import IO, Dict, Iterable, List, Optional
 
 
-AUDIT_COLS = ["maximin_winner", "maximin_score",
-              "maxllr_winner", "maxllr_score", "selection_agree"]
+AUDIT_COLS = [
+    "maximin_winner",
+    "maximin_score",
+    "max_llr_comparator_winner",
+    "max_llr_comparator_score",
+    "selection_agree",
+]
 
 
-def _open(path):
+def _open(path: str) -> IO[str]:
     return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "r")
 
 
-def find_audited(root):
-    """Walk root for *.diagnostics.gz that carry the audit columns."""
-    hits = []
+def _parse_optional_float(value: str) -> Optional[float]:
+    if value in {"", ".", "NA", "nan", "NaN"}:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def find_audited(root: str) -> List[str]:
+    """Find diagnostics carrying the corrected audit schema under ``root``."""
+    hits: List[str] = []
     for dirpath, _dirs, files in os.walk(root):
-        for f in files:
-            if f.endswith(".diagnostics.gz"):
-                p = os.path.join(dirpath, f)
-                try:
-                    with _open(p) as fh:
-                        header = fh.readline().rstrip("\n").split("\t")
-                    if all(c in header for c in AUDIT_COLS):
-                        hits.append(p)
-                except OSError:
-                    continue
+        for filename in files:
+            if not filename.endswith(".diagnostics.gz"):
+                continue
+            path = os.path.join(dirpath, filename)
+            try:
+                with _open(path) as handle:
+                    header = handle.readline().rstrip("\n").split("\t")
+                if all(column in header for column in AUDIT_COLS):
+                    hits.append(path)
+            except OSError:
+                continue
     return sorted(hits)
 
 
-def _conf_band(posterior, min_margin):
-    """Coarse confidence band for breakdown. Prefer posterior if available."""
-    if posterior is not None:
-        if posterior >= 0.999:
-            return "posterior>=0.999"
-        if posterior >= 0.99:
-            return "0.99-0.999"
-        if posterior >= 0.9:
-            return "0.9-0.99"
-        return "<0.9"
-    # fall back to min_margin bands
+def _confidence_band(
+    margin_softmax_score: Optional[float], min_margin: Optional[float]
+) -> str:
+    """Return a descriptive band, preferring the margin-softmax summary."""
+    if margin_softmax_score is not None:
+        if margin_softmax_score >= 0.999:
+            return "margin_softmax>=0.999"
+        if margin_softmax_score >= 0.99:
+            return "margin_softmax 0.99-0.999"
+        if margin_softmax_score >= 0.9:
+            return "margin_softmax 0.9-0.99"
+        return "margin_softmax<0.9"
     if min_margin is None:
         return "unknown"
     if min_margin >= 100:
@@ -90,140 +88,175 @@ def _conf_band(posterior, min_margin):
     return "min_margin<1"
 
 
-def process_file(path, agg, disagree_writer=None, libname=None):
-    """Update aggregate counters from one audited diagnostics file."""
-    with _open(path) as fh:
-        header = fh.readline().rstrip("\n").split("\t")
-        idx = {c: i for i, c in enumerate(header)}
-        missing = [c for c in AUDIT_COLS if c not in idx]
+def process_file(
+    path: str,
+    aggregate: Dict[str, object],
+    disagreement_writer: Optional[IO[str]] = None,
+    source_name: Optional[str] = None,
+) -> None:
+    """Update counters from one corrected-schema diagnostics file."""
+    with _open(path) as handle:
+        header = handle.readline().rstrip("\n").split("\t")
+        index = {column: position for position, column in enumerate(header)}
+        missing = [column for column in AUDIT_COLS if column not in index]
         if missing:
             raise SystemExit(
-                f"ERROR: {path} lacks audit columns {missing}. "
-                "Re-run demux_parallel with --dump_selection_audit.")
-        i_assn = idx.get("assignment")
-        i_post = idx.get("posterior")
-        i_mm = idx.get("min_margin")
-        i_mxw = idx["maxllr_winner"]
-        i_agree = idx["selection_agree"]
+                f"ERROR: {path} lacks corrected audit columns {missing}. "
+                "Re-run demux_parallel with --dump_selection_audit."
+            )
 
-        for line in fh:
-            f = line.rstrip("\n").split("\t")
-            if len(f) <= i_agree:
+        assignment_index = index.get("assignment")
+        softmax_index = index.get("margin_softmax_score")
+        margin_index = index.get("min_margin")
+        comparator_index = index["max_llr_comparator_winner"]
+        agree_index = index["selection_agree"]
+
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) <= agree_index:
                 continue
-            agg["n_total"] += 1
-            try:
-                agree = int(f[i_agree])
-            except ValueError:
+            agree_text = fields[agree_index]
+            if agree_text not in {"0", "1"}:
+                # NA means one of the two statistics had no evaluable winner.
+                aggregate["n_not_comparable"] += 1
                 continue
-            post = None
-            if i_post is not None and i_post < len(f):
-                try:
-                    post = float(f[i_post])
-                except ValueError:
-                    post = None
-            mm = None
-            if i_mm is not None and i_mm < len(f):
-                try:
-                    mm = float(f[i_mm])
-                except ValueError:
-                    mm = None
-            band = _conf_band(post, mm)
-            agg["band_total"][band] += 1
+
+            agree = int(agree_text)
+            aggregate["n_comparable"] += 1
+            softmax = (
+                _parse_optional_float(fields[softmax_index])
+                if softmax_index is not None and softmax_index < len(fields)
+                else None
+            )
+            min_margin = (
+                _parse_optional_float(fields[margin_index])
+                if margin_index is not None and margin_index < len(fields)
+                else None
+            )
+            band = _confidence_band(softmax, min_margin)
+            aggregate["band_total"][band] += 1
+
             if agree == 0:
-                agg["n_disagree"] += 1
-                agg["band_disagree"][band] += 1
-                if disagree_writer is not None:
-                    assn = f[i_assn] if i_assn is not None and i_assn < len(f) else "?"
-                    mxw = f[i_mxw] if i_mxw < len(f) else "?"
-                    bc = f[0]
-                    disagree_writer.write(
-                        f"{libname or os.path.basename(path)}\t{bc}\t{assn}\t{mxw}\t"
-                        f"{'' if post is None else f'{post:.6f}'}\t"
-                        f"{'' if mm is None else f'{mm:.4f}'}\n")
+                aggregate["n_disagree"] += 1
+                aggregate["band_disagree"][band] += 1
+                if disagreement_writer is not None:
+                    assignment = (
+                        fields[assignment_index]
+                        if assignment_index is not None and assignment_index < len(fields)
+                        else "NA"
+                    )
+                    comparator = fields[comparator_index]
+                    disagreement_writer.write(
+                        f"{source_name or os.path.basename(path)}\t{fields[0]}\t"
+                        f"{assignment}\t{comparator}\t"
+                        f"{'' if softmax is None else f'{softmax:.6f}'}\t"
+                        f"{'' if min_margin is None else f'{min_margin:.6f}'}\n"
+                    )
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Count maximin-vs-maxllr selection disagreements from "
-                    "audited demux_parallel diagnostics.")
-    ap.add_argument("diagnostics", nargs="*",
-                    help="One or more *.diagnostics.gz files (run with "
-                         "--dump_selection_audit).")
-    ap.add_argument("--root",
-                    help="Recursively find audited *.diagnostics.gz under this "
-                         "directory instead of (or in addition to) listing them.")
-    ap.add_argument("--out-disagreements",
-                    help="Optional path to write the per-cell disagreement list "
-                         "(.tsv or .tsv.gz).")
-    args = ap.parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare maximin with the non-mutating max_llr_comparator from "
+            "audited demux_parallel diagnostics."
+        )
+    )
+    parser.add_argument(
+        "diagnostics",
+        nargs="*",
+        help="One or more *.diagnostics.gz files generated with --dump_selection_audit.",
+    )
+    parser.add_argument(
+        "--root",
+        help="Recursively discover corrected-schema audited diagnostics under this directory.",
+    )
+    parser.add_argument(
+        "--out-disagreements",
+        help="Optional .tsv or .tsv.gz path for per-cell disagreements.",
+    )
+    args = parser.parse_args()
 
     files = list(args.diagnostics)
     if args.root:
         found = find_audited(args.root)
-        print(f"Found {len(found)} audited diagnostics file(s) under {args.root}")
+        print(f"Found {len(found)} corrected audited diagnostics file(s) under {args.root}")
         files.extend(found)
     files = sorted(set(files))
     if not files:
         raise SystemExit("ERROR: no input files. Pass paths or --root.")
 
-    agg = {
-        "n_total": 0,
+    aggregate: Dict[str, object] = {
+        "n_comparable": 0,
+        "n_not_comparable": 0,
         "n_disagree": 0,
         "band_total": Counter(),
         "band_disagree": Counter(),
     }
 
-    dw = None
+    writer: Optional[IO[str]] = None
     if args.out_disagreements:
-        dw = (gzip.open(args.out_disagreements, "wt")
-              if args.out_disagreements.endswith(".gz")
-              else open(args.out_disagreements, "w"))
-        dw.write("source\tbarcode\tmaximin_winner\tmaxllr_winner\tposterior\tmin_margin\n")
+        writer = (
+            gzip.open(args.out_disagreements, "wt")
+            if args.out_disagreements.endswith(".gz")
+            else open(args.out_disagreements, "w")
+        )
+        writer.write(
+            "source\tbarcode\tmaximin_assignment\tmax_llr_comparator_winner\t"
+            "margin_softmax_score\tmin_margin\n"
+        )
 
     try:
-        for p in files:
-            n0, d0 = agg["n_total"], agg["n_disagree"]
-            process_file(p, agg, disagree_writer=dw,
-                         libname=os.path.basename(p).split(".")[0])
-            n = agg["n_total"] - n0
-            d = agg["n_disagree"] - d0
-            rate = (100.0 * d / n) if n else 0.0
-            print(f"  {os.path.basename(p)}: {n} cells, {d} disagreements ({rate:.3f}%)")
+        for path in files:
+            before_comparable = int(aggregate["n_comparable"])
+            before_disagree = int(aggregate["n_disagree"])
+            before_unavailable = int(aggregate["n_not_comparable"])
+            process_file(
+                path,
+                aggregate,
+                disagreement_writer=writer,
+                source_name=os.path.basename(path).split(".")[0],
+            )
+            comparable = int(aggregate["n_comparable"]) - before_comparable
+            disagree = int(aggregate["n_disagree"]) - before_disagree
+            unavailable = int(aggregate["n_not_comparable"]) - before_unavailable
+            rate = 100.0 * disagree / comparable if comparable else 0.0
+            print(
+                f"  {os.path.basename(path)}: {comparable} comparable cells, "
+                f"{disagree} disagreements ({rate:.3f}%), "
+                f"{unavailable} not comparable"
+            )
     finally:
-        if dw is not None:
-            dw.close()
+        if writer is not None:
+            writer.close()
 
-    total = agg["n_total"]
-    dis = agg["n_disagree"]
-    print("\n" + "=" * 60)
-    print(f"TOTAL cells:          {total}")
-    print(f"Selection disagreements: {dis} ({(100.0*dis/total) if total else 0:.4f}%)")
-    print("=" * 60)
-    print("\nBy confidence band (disagreements / cells in band):")
-    bands = sorted(agg["band_total"], key=lambda b: -agg["band_total"][b])
-    for b in bands:
-        bt = agg["band_total"][b]
-        bd = agg["band_disagree"][b]
-        rate = (100.0 * bd / bt) if bt else 0.0
-        print(f"  {b:24s} {bd:>8d} / {bt:<8d}  ({rate:.3f}%)")
+    comparable = int(aggregate["n_comparable"])
+    disagree = int(aggregate["n_disagree"])
+    unavailable = int(aggregate["n_not_comparable"])
+    print("\n" + "=" * 68)
+    print(f"Comparable cells:                    {comparable}")
+    print(f"Comparator unavailable/not comparable: {unavailable}")
+    print(
+        "Selection disagreements:             "
+        f"{disagree} ({(100.0 * disagree / comparable) if comparable else 0.0:.4f}%)"
+    )
+    print("=" * 68)
+    print("\nBy descriptive confidence band (disagreements / comparable cells):")
+    band_total: Counter = aggregate["band_total"]
+    band_disagree: Counter = aggregate["band_disagree"]
+    for band in sorted(band_total, key=lambda value: -band_total[value]):
+        total = band_total[band]
+        different = band_disagree[band]
+        rate = 100.0 * different / total if total else 0.0
+        print(f"  {band:32s} {different:>8d} / {total:<8d} ({rate:.3f}%)")
+
     if args.out_disagreements:
         print(f"\nPer-cell disagreement list written to: {args.out_disagreements}")
-    print("\nInterpretation: disagreements concentrated in low-confidence bands "
-          "(posterior<0.9 / small min_margin) indicate the two criteria only "
-          "differ on already-ambiguous cells. Disagreements in high-confidence "
-          "bands would warrant a closer look.")
+    print(
+        "\nInterpretation: this compares maximin with argmax(maxllr) only. "
+        "margin_softmax_score is a margin-derived descriptive score, not a "
+        "calibrated posterior probability."
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
-# =============================================================================
-# Revision History
-# =============================================================================
-#   V1_R1  Initial implementation. Reads .diagnostics.gz files written with
-#          demux_parallel --dump_selection_audit and reports the maximin-vs-
-#          maxllr winner disagreement rate overall and by confidence band.
-#          Optional per-cell disagreement dump. --root auto-discovers audited
-#          files by checking for the audit columns in the header.
-# =============================================================================

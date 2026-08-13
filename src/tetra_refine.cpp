@@ -1,17 +1,36 @@
-// tetra_refine v3.3
+// tetra_refine v3.4
 //
 // Revision history:
 //   V2_R1 - Complete rewrite separating ploidy from droplet contents (chat 543ca616)
-//   V3_R1 - Add DNLLR, margin_ratio, posterior/entropy carry-through,
+//   V3_R1 - Add depth-normalized runner-up contrast, margin_ratio,
+//           margin-softmax/entropy carry-through,
 //           demote het_var to annotation, add --contam_rate and --external_ploidy inputs,
-//           backward-compatible 11-col and 13-col diagnostics parsing
+//           backward-compatible legacy and versioned name-addressed diagnostics parsing
 //   V3_R3 - Add --scoring_only pass-through mode: emit scoring metrics only,
 //           no ploidy reclassification, no droplet flagging, no threshold computation.
 //           --external_ploidy is ignored in this mode (with warning).
+//   V3_R4 - Version bump to distinguish this name-addressed build from the
+//           position-parsed v3.3 build that shared the same version string.
+//           This build reads .diagnostics.gz and .runner_ups.gz by COLUMN NAME
+//           with alias tolerance: it accepts both the currently deployed demux
+//           names (llr, posterior, entropy) and the next-version demux names
+//           (llr_vs_runner_up, margin_softmax_score, margin_entropy), so it parses
+//           either schema without column-position assumptions. Unavailable fields
+//           are tokenized as NA rather than read as 0.0. Consumes the new
+//           runnerup/worst comparison_state fields and gates DNLLR and margin_ratio
+//           on comparisons that are actually present, so runner-ups with no
+//           shared-site support no longer distort the derived scores.
+//           Required to consume the next demux diagnostics schema
+//           (schema_version = demux_parallel_diagnostics_v3); do NOT pair the
+//           position-parsed v3.3 build with that schema, because its atof() parser
+//           reads the NA fields as 0.0. Ploidy classification, the --external_ploidy
+//           relabel gate (default 0.90), and --scoring_only are unchanged from v3.3.
 
 #include <getopt.h>
 #include <string>
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <vector>
 #include <iterator>
 #include <string.h>
@@ -30,6 +49,8 @@
 #include <zlib.h>
 #include <htswrapper/gzreader.h>
 #include <iomanip>
+#include <initializer_list>
+#include <limits>
 
 using std::cout;
 using std::endl;
@@ -57,8 +78,8 @@ using namespace std;
 //   1. Recognize that "D" assignments (A+B) are tetraploid SINGLETS, not doublets
 //   2. Flag candidate homotypic tetraploids among "S" assignments
 //   3. Detect actual doublets of tetraploids (quads) via runner-up patterns
-//   4. Compute cross-library confidence metrics (DNLLR, margin_ratio)
-//   5. Carry through posterior/entropy from demux_parallel and contam_rate
+//   4. Compute cross-library diagnostics from the direct winner/runner-up contrast
+//   5. Carry through margin_softmax_score/margin_entropy from demux_parallel and contam_rate
 //      from quant_contam
 // ============================================================================
 
@@ -76,26 +97,27 @@ struct Assignment {
 struct Diagnostics {
     string barcode;
     string assignment;
-    char singlet_doublet;
-    double llr;
-    double min_margin;
+    char singlet_doublet = 'U';
+    double llr_vs_runner_up = NAN;
+    string runnerup_comparison_state = "unavailable";
+    double min_margin = NAN;
     string worst_competitor;
-    int n_close;
-    double total_depth;
-    double het_balance_var;
-    int n_het_sites;
-    double het_total_depth;
-    // v3: optional columns from updated demux_parallel (13-col format)
-    double posterior;   // -1 if not available (11-col format)
-    double entropy;     // -1 if not available (11-col format)
+    int n_close = 0;
+    double total_depth = NAN;
+    double het_balance_var = NAN;
+    int n_het_sites = 0;
+    double het_total_depth = NAN;
+    double margin_softmax_score = NAN;
+    double margin_entropy = NAN;
 };
 
 struct RunnerUp {
     string barcode;
-    int rank;
+    int rank = 0;
     string identity;
-    double llr_vs_winner;
-    double min_margin;
+    double llr_vs_winner = NAN;
+    string comparison_state = "unavailable";
+    double min_margin = NAN;
 };
 
 struct RefinedCell {
@@ -104,7 +126,7 @@ struct RefinedCell {
     // Original demux output
     string original_assignment;
     char original_type;
-    double llr;
+    double assignment_score;
     
     // Refined assignment
     string refined_assignment;
@@ -119,11 +141,13 @@ struct RefinedCell {
     string droplet_flag;        // "NONE", "POSSIBLE_DOUBLET", "LIKELY_DOUBLET"
     string droplet_candidates;
     
-    // Confidence metrics (v3)
-    double dnllr;               // LLR / total_depth
+    // Confidence/diagnostic metrics (v3)
+    double llr_vs_runner_up;    // direct winner-versus-runner comparison
+    string runnerup_comparison_state;
+    double depth_normalized_llr_vs_runner_up;
     double margin_ratio;        // winner_min_margin / runner_up_rank1_min_margin
-    double posterior;            // from demux_parallel (-1 if unavailable)
-    double entropy;             // from demux_parallel (-1 if unavailable)
+    double margin_softmax_score; // descriptive score; not a calibrated posterior
+    double margin_entropy;
     
     // Contamination (v3)
     double contam_rate;         // from quant_contam (-1 if unavailable)
@@ -261,82 +285,325 @@ void parse_assignments_file(const string& filename, map<string, Assignment>& ass
     }
 }
 
-// Backward-compatible: handles both 11-col (v2) and 13-col (v3+) diagnostics
-void parse_diagnostics_file(const string& filename, map<string, Diagnostics>& diagnostics,
-                            bool& has_posterior_data) {
+static string trim_field(const string& raw) {
+    const size_t first = raw.find_first_not_of(" \t\r\n");
+    if (first == string::npos) return "";
+    const size_t last = raw.find_last_not_of(" \t\r\n");
+    return raw.substr(first, last - first + 1);
+}
+
+static string lowercase_field(string value) {
+    transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static vector<string> split_tsv_strict(const string& line) {
+    vector<string> fields;
+    size_t start = 0;
+    while (true) {
+        const size_t pos = line.find('\t', start);
+        if (pos == string::npos) {
+            fields.push_back(line.substr(start));
+            break;
+        }
+        fields.push_back(line.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return fields;
+}
+
+static void schema_error(const string& message) {
+    fprintf(stderr, "ERROR: %s\n", message.c_str());
+    exit(1);
+}
+
+static bool is_missing_diagnostic_token(const string& raw) {
+    const string token = lowercase_field(trim_field(raw));
+    return token.empty() || token == "." || token == "na" ||
+           token == "unavailable" || token == "partial_support" ||
+           token == "not_applicable";
+}
+
+static double parse_optional_diagnostic_number(
+    const string& raw, const string& context) {
+    if (is_missing_diagnostic_token(raw)) return NAN;
+    errno = 0;
+    char* end = NULL;
+    const double value = strtod(raw.c_str(), &end);
+    if (errno != 0 || end == raw.c_str() || *end != '\0' || !isfinite(value)) {
+        schema_error(context + ": expected a finite number or an explicit missing state, saw '" + raw + "'");
+    }
+    return value;
+}
+
+static long parse_required_integer(const string& raw, const string& context) {
+    errno = 0;
+    char* end = NULL;
+    const long value = strtol(raw.c_str(), &end, 10);
+    if (errno != 0 || end == raw.c_str() || *end != '\0') {
+        schema_error(context + ": expected an integer, saw '" + raw + "'");
+    }
+    return value;
+}
+
+static int parse_optional_integer(const string& raw, const string& context) {
+    if (is_missing_diagnostic_token(raw)) return 0;
+    const long value = parse_required_integer(raw, context);
+    if (value < numeric_limits<int>::min() || value > numeric_limits<int>::max()) {
+        schema_error(context + ": integer is out of range");
+    }
+    return static_cast<int>(value);
+}
+
+static map<string, int> make_header_index(
+    const vector<string>& header, const string& filename) {
+    map<string, int> index;
+    for (int i = 0; i < static_cast<int>(header.size()); ++i) {
+        if (header[i].empty()) schema_error(filename + ": empty column name");
+        if (index.count(header[i]) != 0) {
+            schema_error(filename + ": duplicate column name '" + header[i] + "'");
+        }
+        index[header[i]] = i;
+    }
+    return index;
+}
+
+static int optional_column(
+    const map<string, int>& index,
+    initializer_list<const char*> names) {
+    for (const char* name : names) {
+        const auto it = index.find(name);
+        if (it != index.end()) return it->second;
+    }
+    return -1;
+}
+
+static int required_column(
+    const map<string, int>& index,
+    initializer_list<const char*> names,
+    const string& filename) {
+    const int column = optional_column(index, names);
+    if (column >= 0) return column;
+    string wanted;
+    for (const char* name : names) {
+        if (!wanted.empty()) wanted += " or ";
+        wanted += name;
+    }
+    schema_error(filename + ": required column missing: " + wanted);
+    return -1;
+}
+
+static bool comparison_state_is_present(const string& state) {
+    return state == "present_nonzero" || state == "present_zero";
+}
+
+static string parse_comparison_state(
+    const string& raw_state,
+    double numeric_value,
+    bool explicit_state,
+    const string& context) {
+    if (!explicit_state) {
+        if (!isfinite(numeric_value)) return "unavailable";
+        return numeric_value == 0.0 ? "present_zero" : "present_nonzero";
+    }
+    const string state = lowercase_field(trim_field(raw_state));
+    static const set<string> supported = {
+        "present_nonzero", "present_zero", "unavailable",
+        "partial_support", "not_applicable"
+    };
+    if (supported.count(state) == 0) {
+        schema_error(context + ": unsupported comparison state '" + raw_state + "'");
+    }
+    if (comparison_state_is_present(state)) {
+        if (!isfinite(numeric_value)) {
+            schema_error(context + ": state " + state + " requires a numeric direct comparison");
+        }
+        if (state == "present_zero" && numeric_value != 0.0) {
+            schema_error(context + ": present_zero requires numeric zero");
+        }
+        if (state == "present_nonzero" && numeric_value == 0.0) {
+            schema_error(context + ": present_nonzero cannot carry numeric zero");
+        }
+    } else if (isfinite(numeric_value)) {
+        schema_error(context + ": missing comparison state " + state +
+                     " must not carry a numeric value");
+    }
+    return state;
+}
+
+static bool supported_schema(const string& schema, const string& prefix) {
+    return schema == prefix + "_v2" || schema == prefix + "_v3";
+}
+
+// Parse both legacy name-addressed diagnostics and the versioned corrected
+// schemas. Column order is never used as a contract.
+void parse_diagnostics_file(const string& filename,
+                            map<string, Diagnostics>& diagnostics,
+                            bool& has_margin_softmax_data) {
     gzreader reader(filename);
-    bool header_read = false;
-    has_posterior_data = false;
-    int n_cols_detected = 0;
-    
+    if (!reader.next()) schema_error(filename + ": empty diagnostics file");
+
+    const vector<string> header = split_tsv_strict(reader.line);
+    const map<string, int> index = make_header_index(header, filename);
+    const int barcode_col = required_column(index, {"barcode"}, filename);
+    const int assignment_col = required_column(index, {"assignment"}, filename);
+    const int sd_col = required_column(index, {"singlet_doublet"}, filename);
+    const int direct_col = required_column(index, {"llr_vs_runner_up", "llr"}, filename);
+    const int min_margin_col = required_column(index, {"min_margin"}, filename);
+    const int worst_col = required_column(index, {"worst_competitor"}, filename);
+    const int n_close_col = required_column(index, {"n_close"}, filename);
+    const int total_depth_col = required_column(index, {"total_depth"}, filename);
+    const int het_var_col = optional_column(index, {"het_balance_var"});
+    const int n_het_col = optional_column(index, {"n_het_sites"});
+    const int het_depth_col = optional_column(index, {"het_total_depth"});
+    const int state_col = optional_column(index,
+        {"runnerup_comparison_state", "runner_up_comparison_state"});
+    const int softmax_col = optional_column(index,
+        {"margin_softmax_score", "posterior"});
+    const int entropy_col = optional_column(index,
+        {"margin_entropy", "entropy"});
+    const int schema_col = optional_column(index, {"schema_version"});
+    const bool versioned = schema_col >= 0;
+
+    if (versioned) {
+        if (index.count("llr_vs_runner_up") == 0) {
+            schema_error(filename + ": versioned diagnostics require llr_vs_runner_up");
+        }
+        if (state_col < 0) {
+            schema_error(filename + ": versioned diagnostics require runnerup_comparison_state");
+        }
+        if (index.count("margin_softmax_score") == 0) {
+            schema_error(filename + ": versioned diagnostics require margin_softmax_score");
+        }
+        if (index.count("margin_entropy") == 0) {
+            schema_error(filename + ": versioned diagnostics require margin_entropy");
+        }
+    }
+    has_margin_softmax_data = softmax_col >= 0;
+
+    long line_no = 1;
     while (reader.next()) {
-        if (!header_read) {
-            // Count header columns to detect format
-            istringstream hdr(reader.line);
-            string tok;
-            while (getline(hdr, tok, '\t')) n_cols_detected++;
-            if (n_cols_detected >= 13) has_posterior_data = true;
-            header_read = true;
-            continue;
+        ++line_no;
+        if (reader.line == NULL || reader.line[0] == '\0') continue;
+        const vector<string> fields = split_tsv_strict(reader.line);
+        const string context = filename + ": line " + to_string(line_no);
+        if (fields.size() != header.size()) {
+            schema_error(context + ": malformed row has " +
+                to_string(fields.size()) + " fields; expected " +
+                to_string(header.size()));
         }
-        
-        istringstream splitter(reader.line);
-        string field;
+        if (versioned && !supported_schema(
+                fields[schema_col], "demux_parallel_diagnostics")) {
+            schema_error(context + ": unsupported diagnostics schema '" +
+                fields[schema_col] + "'");
+        }
+
         Diagnostics d;
-        d.posterior = -1.0;
-        d.entropy = -1.0;
-        int idx = 0;
-        
-        while (getline(splitter, field, '\t')) {
-            if (idx == 0) d.barcode = field;
-            else if (idx == 1) d.assignment = field;
-            else if (idx == 2 && field.length() > 0) d.singlet_doublet = field[0];
-            else if (idx == 3) d.llr = atof(field.c_str());
-            else if (idx == 4) d.min_margin = atof(field.c_str());
-            else if (idx == 5) d.worst_competitor = field;
-            else if (idx == 6) d.n_close = atoi(field.c_str());
-            else if (idx == 7) d.total_depth = atof(field.c_str());
-            else if (idx == 8) d.het_balance_var = atof(field.c_str());
-            else if (idx == 9) d.n_het_sites = atoi(field.c_str());
-            else if (idx == 10) d.het_total_depth = atof(field.c_str());
-            else if (idx == 11) d.posterior = atof(field.c_str());
-            else if (idx == 12) d.entropy = atof(field.c_str());
-            idx++;
+        d.barcode = fields[barcode_col];
+        d.assignment = fields[assignment_col];
+        if (fields[sd_col].empty()) {
+            schema_error(context + ": empty singlet_doublet value");
         }
-        
-        if (idx >= 8) {
-            diagnostics[d.barcode] = d;
+        d.singlet_doublet = fields[sd_col][0];
+        d.llr_vs_runner_up = parse_optional_diagnostic_number(
+            fields[direct_col], context + " llr_vs_runner_up");
+        d.runnerup_comparison_state = parse_comparison_state(
+            state_col >= 0 ? fields[state_col] : "",
+            d.llr_vs_runner_up, state_col >= 0,
+            context + " runner-up comparison");
+        d.min_margin = parse_optional_diagnostic_number(
+            fields[min_margin_col], context + " min_margin");
+        d.worst_competitor = fields[worst_col];
+        d.n_close = static_cast<int>(parse_required_integer(
+            fields[n_close_col], context + " n_close"));
+        d.total_depth = parse_optional_diagnostic_number(
+            fields[total_depth_col], context + " total_depth");
+        if (het_var_col >= 0) {
+            d.het_balance_var = parse_optional_diagnostic_number(
+                fields[het_var_col], context + " het_balance_var");
         }
+        if (n_het_col >= 0) {
+            d.n_het_sites = parse_optional_integer(
+                fields[n_het_col], context + " n_het_sites");
+        }
+        if (het_depth_col >= 0) {
+            d.het_total_depth = parse_optional_diagnostic_number(
+                fields[het_depth_col], context + " het_total_depth");
+        }
+        if (softmax_col >= 0) {
+            d.margin_softmax_score = parse_optional_diagnostic_number(
+                fields[softmax_col], context + " margin_softmax_score");
+        }
+        if (entropy_col >= 0) {
+            d.margin_entropy = parse_optional_diagnostic_number(
+                fields[entropy_col], context + " margin_entropy");
+        }
+        diagnostics[d.barcode] = d;
     }
 }
 
-void parse_runner_ups_file(const string& filename, map<string, vector<RunnerUp>>& runner_ups) {
+void parse_runner_ups_file(
+    const string& filename,
+    map<string, vector<RunnerUp>>& runner_ups) {
     gzreader reader(filename);
-    bool header_read = false;
-    
+    if (!reader.next()) schema_error(filename + ": empty runner-up file");
+
+    const vector<string> header = split_tsv_strict(reader.line);
+    const map<string, int> index = make_header_index(header, filename);
+    const int barcode_col = required_column(index, {"barcode"}, filename);
+    const int rank_col = required_column(index, {"rank"}, filename);
+    const int identity_col = required_column(index, {"identity"}, filename);
+    const int direct_col = required_column(index, {"llr_vs_winner"}, filename);
+    const int min_margin_col = required_column(index, {"min_margin"}, filename);
+    const int state_col = optional_column(index, {"comparison_state"});
+    const int schema_col = optional_column(index, {"schema_version"});
+    const bool versioned = schema_col >= 0;
+    if (versioned && state_col < 0) {
+        schema_error(filename + ": versioned runner-ups require comparison_state");
+    }
+
+    long line_no = 1;
     while (reader.next()) {
-        if (!header_read) {
-            header_read = true;
-            continue;
+        ++line_no;
+        if (reader.line == NULL || reader.line[0] == '\0') continue;
+        const vector<string> fields = split_tsv_strict(reader.line);
+        const string context = filename + ": line " + to_string(line_no);
+        if (fields.size() != header.size()) {
+            schema_error(context + ": malformed row has " +
+                to_string(fields.size()) + " fields; expected " +
+                to_string(header.size()));
         }
-        
-        istringstream splitter(reader.line);
-        string field;
+        if (versioned && !supported_schema(
+                fields[schema_col], "demux_parallel_runner_ups")) {
+            schema_error(context + ": unsupported runner-up schema '" +
+                fields[schema_col] + "'");
+        }
+
         RunnerUp ru;
-        int idx = 0;
-        
-        while (getline(splitter, field, '\t')) {
-            if (idx == 0) ru.barcode = field;
-            else if (idx == 1) ru.rank = atoi(field.c_str());
-            else if (idx == 2) ru.identity = field;
-            else if (idx == 3) ru.llr_vs_winner = atof(field.c_str());
-            else if (idx == 4) ru.min_margin = atof(field.c_str());
-            idx++;
-        }
-        
-        if (idx >= 5) {
-            runner_ups[ru.barcode].push_back(ru);
-        }
+        ru.barcode = fields[barcode_col];
+        ru.rank = static_cast<int>(parse_required_integer(
+            fields[rank_col], context + " rank"));
+        if (ru.rank <= 0) schema_error(context + ": runner-up rank must be positive");
+        ru.identity = fields[identity_col];
+        if (ru.identity.empty()) schema_error(context + ": empty runner-up identity");
+        ru.llr_vs_winner = parse_optional_diagnostic_number(
+            fields[direct_col], context + " llr_vs_winner");
+        ru.comparison_state = parse_comparison_state(
+            state_col >= 0 ? fields[state_col] : "",
+            ru.llr_vs_winner, state_col >= 0,
+            context + " runner-up comparison");
+        ru.min_margin = parse_optional_diagnostic_number(
+            fields[min_margin_col], context + " min_margin");
+        runner_ups[ru.barcode].push_back(ru);
+    }
+
+    for (auto& entry : runner_ups) {
+        sort(entry.second.begin(), entry.second.end(),
+             [](const RunnerUp& lhs, const RunnerUp& rhs) {
+                 if (lhs.rank != rhs.rank) return lhs.rank < rhs.rank;
+                 return lhs.identity < rhs.identity;
+             });
     }
 }
 
@@ -486,23 +753,35 @@ string make_homotypic(const string& singlet) {
 // Confidence Metric Computation
 // ============================================================================
 
-double compute_dnllr(double llr, double total_depth) {
-    if (total_depth <= 0) return -1.0;
-    return llr / total_depth;
+double compute_depth_normalized_llr_vs_runner_up(
+    double llr_vs_runner_up,
+    const string& comparison_state,
+    double total_depth) {
+    if (!comparison_state_is_present(comparison_state) ||
+        !isfinite(llr_vs_runner_up) || !isfinite(total_depth) || total_depth <= 0) {
+        return NAN;
+    }
+    return llr_vs_runner_up / total_depth;
 }
 
 double compute_margin_ratio(double winner_min_margin, const vector<RunnerUp>* runner_ups) {
-    if (runner_ups == NULL || runner_ups->empty()) return 1e6;
-    // rank 1 runner-up (first entry, should be sorted by rank)
-    double ru_margin = (*runner_ups)[0].min_margin;
-    // Both margins can be negative (LLR-based). Use absolute values.
-    // Winner min_margin is typically positive (winner beats everyone);
-    // runner-up min_margin is typically negative (runner-up loses its
-    // worst comparison). A ratio of absolute values captures relative
-    // dominance regardless of sign.
-    double abs_winner = fabs(winner_min_margin);
-    double abs_runner = fabs(ru_margin);
-    if (abs_runner < 1e-10) return 1e6;  // runner-up has no separation at all
+    if (!isfinite(winner_min_margin) || runner_ups == NULL || runner_ups->empty()) {
+        return NAN;
+    }
+    const RunnerUp* complete_runner = NULL;
+    for (const RunnerUp& runner : *runner_ups) {
+        if (comparison_state_is_present(runner.comparison_state) &&
+            isfinite(runner.min_margin)) {
+            complete_runner = &runner;
+            break;
+        }
+    }
+    if (complete_runner == NULL) return NAN;
+    // Both maximin margins can be negative. Use absolute values while keeping
+    // missing/partial direct comparisons out of the derived metric.
+    const double abs_winner = fabs(winner_min_margin);
+    const double abs_runner = fabs(complete_runner->min_margin);
+    if (abs_runner < 1e-10) return 1e6;  // genuine numeric zero support
     return abs_winner / abs_runner;
 }
 
@@ -511,7 +790,7 @@ double compute_margin_ratio(double winner_min_margin, const vector<RunnerUp>* ru
 // ============================================================================
 
 string compute_het_var_signal(double het_balance_var, const Thresholds& thresholds, bool has_het_data) {
-    if (het_balance_var < 0 || !has_het_data) return "no_data";
+    if (!isfinite(het_balance_var) || !has_het_data) return "no_data";
     if (thresholds.het_var_diploid <= 0 && thresholds.het_var_tetraploid <= 0) return "no_data";
     
     double threshold = (thresholds.het_var_diploid + thresholds.het_var_tetraploid) / 2.0;
@@ -565,6 +844,9 @@ string detect_droplet_doublet(const Diagnostics& diag,
     map<string, set<string>> runner_up_components;
     
     for (const auto& ru : runner_ups) {
+        // Unavailable/partial/not-applicable runner edges are missing evidence,
+        // not zero-strength biological support for a quad pattern.
+        if (!comparison_state_is_present(ru.comparison_state)) continue;
         string ru_id1, ru_id2;
         if (parse_doublet_identity(ru.identity, ru_id1, ru_id2)) {
             string key = make_doublet_key(ru_id1, ru_id2);
@@ -649,7 +931,7 @@ void classify_cell(const Assignment& assn,
     cell.barcode = assn.barcode;
     cell.original_assignment = assn.identity;
     cell.original_type = assn.type;
-    cell.llr = assn.llr;
+    cell.assignment_score = assn.llr;
     cell.refined_assignment = assn.identity;
     cell.changed = false;
     cell.cells_in_droplet = 1;
@@ -795,7 +1077,7 @@ void score_only_cell(const Assignment& assn,
     cell.barcode = assn.barcode;
     cell.original_assignment = assn.identity;
     cell.original_type = assn.type;
-    cell.llr = assn.llr;
+    cell.assignment_score = assn.llr;
 
     // Pass-through: no reclassification
     cell.refined_assignment = assn.identity;
@@ -832,13 +1114,23 @@ void score_only_cell(const Assignment& assn,
         }
     }
 
-    // overall_confidence from posterior alone
-    if (diag != NULL && diag->posterior >= 0) {
-        if (diag->posterior >= 0.9) cell.overall_confidence = "HIGH";
-        else if (diag->posterior >= 0.7) cell.overall_confidence = "MEDIUM";
-        else cell.overall_confidence = "LOW";
+    // The margin softmax is descriptive, not a calibrated posterior. In
+    // scoring-only mode report the state/sign of the direct winner-runner
+    // comparison instead of converting that score into confidence classes.
+    if (diag == NULL) {
+        cell.overall_confidence = "DIRECT_CONTRAST_UNAVAILABLE";
+    } else if (!comparison_state_is_present(diag->runnerup_comparison_state)) {
+        cell.overall_confidence = "DIRECT_CONTRAST_";
+        string state = diag->runnerup_comparison_state;
+        transform(state.begin(), state.end(), state.begin(),
+            [](unsigned char c){ return static_cast<char>(std::toupper(c)); });
+        cell.overall_confidence += state;
+    } else if (diag->llr_vs_runner_up > 0.0) {
+        cell.overall_confidence = "DIRECT_CONTRAST_POSITIVE";
+    } else if (diag->llr_vs_runner_up == 0.0) {
+        cell.overall_confidence = "DIRECT_CONTRAST_ZERO";
     } else {
-        cell.overall_confidence = "UNKNOWN";
+        cell.overall_confidence = "DIRECT_CONTRAST_NONPOSITIVE";
     }
 }
 
@@ -852,12 +1144,12 @@ void write_refined_assignments(const string& filename, const vector<RefinedCell>
         fprintf(stderr, "ERROR: Cannot open output file: %s\n", filename.c_str());
         exit(1);
     }
-    
+
     outf << "barcode\t"
          << "original_assignment\t"
          << "original_type\t"
          << "refined_assignment\t"
-         << "llr\t"
+         << "assignment_score\t"
          << "ploidy\t"
          << "ploidy_method\t"
          << "ploidy_confidence\t"
@@ -866,21 +1158,23 @@ void write_refined_assignments(const string& filename, const vector<RefinedCell>
          << "droplet_candidates\t"
          << "overall_confidence\t"
          << "changed\t"
-         << "dnllr\t"
+         << "llr_vs_runner_up\t"
+         << "runnerup_comparison_state\t"
+         << "depth_normalized_llr_vs_runner_up\t"
          << "margin_ratio\t"
-         << "posterior\t"
-         << "entropy\t"
+         << "margin_softmax_score\t"
+         << "margin_entropy\t"
          << "contam_rate\t"
          << "het_var_signal\t"
          << "het_balance_var\t"
          << "quad_pattern_score" << endl;
-    
+
     for (const auto& cell : cells) {
         outf << cell.barcode << "\t"
              << cell.original_assignment << "\t"
              << cell.original_type << "\t"
              << cell.refined_assignment << "\t"
-             << cell.llr << "\t"
+             << cell.assignment_score << "\t"
              << cell.ploidy << "\t"
              << cell.ploidy_method << "\t"
              << cell.ploidy_confidence << "\t"
@@ -889,44 +1183,66 @@ void write_refined_assignments(const string& filename, const vector<RefinedCell>
              << cell.droplet_candidates << "\t"
              << cell.overall_confidence << "\t"
              << (cell.changed ? "TRUE" : "FALSE") << "\t";
-        
-        // DNLLR
-        if (cell.dnllr >= 0) outf << fixed << setprecision(6) << cell.dnllr;
-        else outf << ".";
+
+        if (isfinite(cell.llr_vs_runner_up)) {
+            outf << fixed << setprecision(6) << cell.llr_vs_runner_up;
+        } else {
+            outf << "NA";
+        }
+        outf << "\t" << cell.runnerup_comparison_state << "\t";
+
+        if (isfinite(cell.depth_normalized_llr_vs_runner_up)) {
+            outf << fixed << setprecision(6)
+                 << cell.depth_normalized_llr_vs_runner_up;
+        } else {
+            outf << "NA";
+        }
         outf << "\t";
-        
-        // margin_ratio
-        if (cell.margin_ratio < 1e5) outf << fixed << setprecision(2) << cell.margin_ratio;
-        else outf << "INF";
+
+        if (isfinite(cell.margin_ratio)) {
+            if (cell.margin_ratio < 1e5) {
+                outf << fixed << setprecision(2) << cell.margin_ratio;
+            } else {
+                outf << "INF";
+            }
+        } else {
+            outf << "NA";
+        }
         outf << "\t";
-        
-        // posterior
-        if (cell.posterior >= 0) outf << fixed << setprecision(6) << cell.posterior;
-        else outf << ".";
+
+        if (isfinite(cell.margin_softmax_score)) {
+            outf << fixed << setprecision(6) << cell.margin_softmax_score;
+        } else {
+            outf << "NA";
+        }
         outf << "\t";
-        
-        // entropy
-        if (cell.entropy >= 0) outf << fixed << setprecision(4) << cell.entropy;
-        else outf << ".";
+
+        if (isfinite(cell.margin_entropy)) {
+            outf << fixed << setprecision(4) << cell.margin_entropy;
+        } else {
+            outf << "NA";
+        }
         outf << "\t";
-        
-        // contam_rate
-        if (cell.contam_rate >= 0) outf << fixed << setprecision(6) << cell.contam_rate;
-        else outf << ".";
+
+        if (cell.contam_rate >= 0) {
+            outf << fixed << setprecision(6) << cell.contam_rate;
+        } else {
+            outf << "NA";
+        }
+        outf << "\t" << cell.het_var_signal << "\t";
+
+        if (isfinite(cell.het_balance_var) && cell.het_balance_var >= 0) {
+            outf << fixed << setprecision(6) << cell.het_balance_var;
+        } else {
+            outf << "NA";
+        }
         outf << "\t";
-        
-        // het_var_signal
-        outf << cell.het_var_signal << "\t";
-        
-        // het_balance_var
-        if (cell.het_balance_var >= 0) outf << fixed << setprecision(6) << cell.het_balance_var;
-        else outf << ".";
-        outf << "\t";
-        
-        // quad_pattern_score
-        if (cell.quad_pattern_score >= 0) outf << fixed << setprecision(3) << cell.quad_pattern_score;
-        else outf << ".";
-        
+
+        if (cell.quad_pattern_score >= 0) {
+            outf << fixed << setprecision(3) << cell.quad_pattern_score;
+        } else {
+            outf << "NA";
+        }
         outf << endl;
     }
 }
@@ -945,7 +1261,7 @@ void write_simple_assignments(const string& filename, const vector<RefinedCell>&
         outf << cell.barcode << "\t"
              << cell.refined_assignment << "\t"
              << sd << "\t"
-             << cell.llr << endl;
+             << cell.assignment_score << endl;
     }
 }
 
@@ -960,7 +1276,7 @@ void write_summary(const string& filename,
                    const ExpectedLines& expected,
                    const Thresholds& thresholds,
                    bool has_het_data,
-                   bool has_posterior_data,
+                   bool has_margin_softmax_data,
                    double median_depth,
                    const SummaryStats& stats,
                    bool scoring_only) {
@@ -971,7 +1287,7 @@ void write_summary(const string& filename,
         exit(1);
     }
     
-    outf << "tetra_refine v3.3 summary" << endl;
+    outf << "tetra_refine v3.4 summary" << endl;
     outf << "=======================" << endl;
     if (scoring_only) {
         outf << "Mode: scoring-only (pass-through, no reclassification)" << endl;
@@ -1001,7 +1317,7 @@ void write_summary(const string& filename,
     
     outf << "Data availability:" << endl;
     outf << "  Het variance data: " << (has_het_data ? "YES" : "NO") << endl;
-    outf << "  Posterior/entropy data: " << (has_posterior_data ? "YES" : "NO") << endl;
+    outf << "  margin_softmax_score/margin_entropy data: " << (has_margin_softmax_data ? "YES" : "NO") << endl;
     outf << "  Contamination rate data: " << (!contam_rate_file.empty() ? "YES" : "NO") << endl;
     outf << "  External ploidy data: " << (!external_ploidy_file.empty() ? "YES" : "NO") << endl;
     outf << "  Median depth: " << median_depth << endl;
@@ -1053,15 +1369,15 @@ void write_summary(const string& filename,
 // ============================================================================
 
 void help(int code) {
-    fprintf(stderr, "tetra_refine v3.3 [OPTIONS]\n");
+    fprintf(stderr, "tetra_refine v3.4 [OPTIONS]\n");
     fprintf(stderr, "Refines demux_parallel assignments for tetraploid pools.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "This tool:\n");
     fprintf(stderr, "  1. Recognizes heterotypic tetraploids (A+B) as single cells, not doublets\n");
     fprintf(stderr, "  2. Reclassifies homotypic tetraploids (A+A) from expected_lines\n");
     fprintf(stderr, "  3. Flags potential doublets of tetraploids (quads)\n");
-    fprintf(stderr, "  4. Computes cross-library confidence metrics (DNLLR, margin_ratio)\n");
-    fprintf(stderr, "  5. Carries through posterior, entropy, and contamination rate\n");
+    fprintf(stderr, "  4. Computes direct winner/runner-up contrast diagnostics and margin_ratio\n");
+    fprintf(stderr, "  5. Carries through margin_softmax_score, margin_entropy, and contamination rate\n");
     fprintf(stderr, "  6. Accepts external ploidy classifications for ambiguous cells\n");
     fprintf(stderr, "\n===== REQUIRED =====\n");
     fprintf(stderr, "    --assignments -a FILE    .assignments file from demux_parallel\n");
@@ -1083,7 +1399,8 @@ void help(int code) {
     fprintf(stderr, "    --write_simple           Also write simple .assignments format file\n");
     fprintf(stderr, "\n===== OPTIONAL - Scoring-only mode =====\n");
     fprintf(stderr, "    --scoring_only           Pass through assignments unchanged; emit only scoring\n");
-    fprintf(stderr, "                             columns (DNLLR, margin_ratio, posterior, entropy,\n");
+    fprintf(stderr, "                             columns (llr_vs_runner_up, depth-normalized contrast,\n");
+    fprintf(stderr, "                             margin_ratio, margin_softmax_score, margin_entropy,\n");
     fprintf(stderr, "                             contam_rate, het_balance_var, quad_pattern_score).\n");
     fprintf(stderr, "                             No ploidy reclassification, no doublet flagging.\n");
     fprintf(stderr, "                             --external_ploidy is ignored in this mode.\n");
@@ -1187,7 +1504,7 @@ int main(int argc, char* argv[]) {
         external_ploidy_file = "";
     }
 
-    fprintf(stderr, "tetra_refine v3.3\n");
+    fprintf(stderr, "tetra_refine v3.4\n");
     fprintf(stderr, "===============\n");
     if (verbose && scoring_only) {
         fprintf(stderr, "Mode: scoring-only (no reclassification)\n");
@@ -1214,11 +1531,11 @@ int main(int argc, char* argv[]) {
     
     if (verbose) fprintf(stderr, "Loading diagnostics from %s...\n", diagnostics_file.c_str());
     map<string, Diagnostics> diagnostics;
-    bool has_posterior_data = false;
-    parse_diagnostics_file(diagnostics_file, diagnostics, has_posterior_data);
+    bool has_margin_softmax_data = false;
+    parse_diagnostics_file(diagnostics_file, diagnostics, has_margin_softmax_data);
     if (verbose) {
         fprintf(stderr, "  Loaded %lu diagnostics\n", diagnostics.size());
-        fprintf(stderr, "  Posterior/entropy columns: %s\n", has_posterior_data ? "YES" : "NO");
+        fprintf(stderr, "  margin_softmax_score/margin_entropy columns: %s\n", has_margin_softmax_data ? "YES" : "NO");
     }
     
     if (verbose) fprintf(stderr, "Loading runner-ups from %s...\n", runner_ups_file.c_str());
@@ -1250,13 +1567,16 @@ int main(int argc, char* argv[]) {
     bool has_het_data = false;
     
     for (const auto& dp : diagnostics) {
-        depths.push_back(dp.second.total_depth);
-        
-        if (dp.second.singlet_doublet == 'D') {
+        if (isfinite(dp.second.total_depth)) {
+            depths.push_back(dp.second.total_depth);
+        }
+
+        if (dp.second.singlet_doublet == 'D' && isfinite(dp.second.min_margin)) {
             min_margins_d.push_back(dp.second.min_margin);
         }
-        
-        if (dp.second.singlet_doublet == 'S' && dp.second.het_balance_var >= 0) {
+
+        if (dp.second.singlet_doublet == 'S' &&
+            isfinite(dp.second.het_balance_var) && dp.second.het_balance_var >= 0) {
             het_vars_singlet.push_back(dp.second.het_balance_var);
             has_het_data = true;
         }
@@ -1361,17 +1681,27 @@ int main(int argc, char* argv[]) {
                           median_depth, external_ploidy_min_prob, has_het_data, cell);
         }
         
-        // Compute confidence metrics
+        // Compute confidence/diagnostic metrics from the direct runner-up
+        // comparison. margin_softmax_score is carried through descriptively and
+        // is never treated as a calibrated posterior.
         if (diag_ptr != NULL) {
-            cell.dnllr = compute_dnllr(assn.llr, diag_ptr->total_depth);
+            cell.llr_vs_runner_up = diag_ptr->llr_vs_runner_up;
+            cell.runnerup_comparison_state = diag_ptr->runnerup_comparison_state;
+            cell.depth_normalized_llr_vs_runner_up =
+                compute_depth_normalized_llr_vs_runner_up(
+                    diag_ptr->llr_vs_runner_up,
+                    diag_ptr->runnerup_comparison_state,
+                    diag_ptr->total_depth);
             cell.margin_ratio = compute_margin_ratio(diag_ptr->min_margin, runner_ptr);
-            cell.posterior = diag_ptr->posterior;
-            cell.entropy = diag_ptr->entropy;
+            cell.margin_softmax_score = diag_ptr->margin_softmax_score;
+            cell.margin_entropy = diag_ptr->margin_entropy;
         } else {
-            cell.dnllr = -1.0;
-            cell.margin_ratio = 1e6;
-            cell.posterior = -1.0;
-            cell.entropy = -1.0;
+            cell.llr_vs_runner_up = NAN;
+            cell.runnerup_comparison_state = "unavailable";
+            cell.depth_normalized_llr_vs_runner_up = NAN;
+            cell.margin_ratio = NAN;
+            cell.margin_softmax_score = NAN;
+            cell.margin_entropy = NAN;
         }
         
         // Carry through contamination rate
@@ -1435,11 +1765,11 @@ int main(int argc, char* argv[]) {
     write_summary(summary_file, assignments_file, diagnostics_file, runner_ups_file,
                   expected_lines_file, contam_rate_file, external_ploidy_file,
                   external_ploidy_library,
-                  expected, thresholds, has_het_data, has_posterior_data, median_depth, stats,
+                  expected, thresholds, has_het_data, has_margin_softmax_data, median_depth, stats,
                   scoring_only);
     
     // Print summary to stderr
-    fprintf(stderr, "\ntetra_refine v3.3 complete\n");
+    fprintf(stderr, "\ntetra_refine v3.4 complete\n");
     fprintf(stderr, "========================\n");
     fprintf(stderr, "Total cells: %d\n", stats.total_cells);
     if (!scoring_only) {
@@ -1461,7 +1791,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "\nPass-through cells: %d\n", stats.passthrough_count);
     }
     fprintf(stderr, "\nData sources:\n");
-    fprintf(stderr, "  Posterior/entropy: %s\n", has_posterior_data ? "available" : "not in diagnostics");
+    fprintf(stderr, "  margin_softmax_score/margin_entropy: %s\n", has_margin_softmax_data ? "available" : "not in diagnostics");
     fprintf(stderr, "  Contamination rate: %s\n", !contam_rate_file.empty() ? "loaded" : "not provided");
     fprintf(stderr, "  External ploidy: %s\n", !external_ploidy_file.empty() ? "loaded" : "not provided");
     fprintf(stderr, "\nOutput files:\n");

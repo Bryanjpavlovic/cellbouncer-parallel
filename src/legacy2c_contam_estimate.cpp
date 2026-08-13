@@ -31,7 +31,7 @@ using namespace std;
 namespace {
 
 const char* TOOL_NAME = "legacy2c_contam_estimate";
-const char* TOOL_VERSION = "2.0";
+const char* TOOL_VERSION = "2.1";
 const char* RUN_CONTRACT_VERSION = "legacy2c_contam_estimate_run_contract_V1_R3";
 
 struct Options {
@@ -59,7 +59,11 @@ struct CoverageSummary {
 
 struct CandidateRoster {
     vector<string> lines;
-    set<int> active_sources;
+    // combined_sources is the bounded row domain needed to load receiver-keyed
+    // evidence. ambient_sources is the scientific mixture domain and must not
+    // be widened merely because receiver identities are present in the bundle.
+    set<int> combined_sources;
+    set<int> ambient_sources;
 };
 
 string trim(const string& input) {
@@ -201,9 +205,19 @@ CandidateRoster build_candidate_roster(
             if (found == sample_to_index.end()) {
                 throw runtime_error("identity " + *it + " references sample absent from .samples: " + *part);
             }
-            result.active_sources.insert(found->second);
+            result.combined_sources.insert(found->second);
         }
         if (seen.insert(*it).second) result.lines.push_back(*it);
+    }
+
+    for (vector<string>::const_iterator it = ambient.begin(); it != ambient.end(); ++it) {
+        const vector<string> parts = identity_components(*it);
+        for (vector<string>::const_iterator part = parts.begin(); part != parts.end(); ++part) {
+            result.ambient_sources.insert(sample_to_index.at(*part));
+        }
+    }
+    if (result.ambient_sources.empty()) {
+        throw runtime_error("ambient-candidates file contains no usable source components: " + ambient_path);
     }
 
     ostringstream content;
@@ -323,6 +337,37 @@ CoverageSummary audit_condf_coverage(
     return summary;
 }
 
+void normalize_singlet_null_keys(
+    robin_hood::unordered_map<unsigned long,
+        map<pair<int, int>, map<pair<int, int>, pair<float, float> > > >& counts
+) {
+    const pair<int, int> canonical_null = make_pair(-1, -1);
+    for (robin_hood::unordered_map<unsigned long,
+             map<pair<int, int>, map<pair<int, int>, pair<float, float> > > >::iterator cell = counts.begin();
+         cell != counts.end(); ++cell) {
+        for (map<pair<int, int>, map<pair<int, int>, pair<float, float> > >::iterator first = cell->second.begin();
+             first != cell->second.end(); ++first) {
+            vector<pair<int, int> > aliases;
+            pair<float, float> total(0.0f, 0.0f);
+            bool found = false;
+            for (map<pair<int, int>, pair<float, float> >::const_iterator second = first->second.begin();
+                 second != first->second.end(); ++second) {
+                if (second->first.first == -1) {
+                    aliases.push_back(second->first);
+                    total.first += second->second.first;
+                    total.second += second->second.second;
+                    found = true;
+                }
+            }
+            if (!found) continue;
+            for (vector<pair<int, int> >::const_iterator alias = aliases.begin(); alias != aliases.end(); ++alias) {
+                first->second.erase(*alias);
+            }
+            first->second[canonical_null] = total;
+        }
+    }
+}
+
 size_t assignment_changes(
     const robin_hood::unordered_map<unsigned long, int>& before,
     const robin_hood::unordered_map<unsigned long, int>& after
@@ -378,23 +423,58 @@ void write_model_outputs(
     const string profile_path = prefix + ".contam_prof";
     const string rate_path = prefix + ".contam_rate";
     const string assignments_path = prefix + ".decontam.assignments";
+    const string token = ".tmp.legacy2c." + std::to_string((long long)getpid());
+    const string profile_tmp = profile_path + token;
+    const string rate_tmp = rate_path + token;
+    const string assignments_tmp = assignments_path + token;
+    vector<string> installed;
 
-    FILE* profile = fopen(profile_path.c_str(), "w");
-    if (!profile) throw runtime_error("cannot open contamination-profile output: " + profile_path);
-    dump_contam_prof(profile, finder.contam_prof, empty_concentration, samples);
-    if (fclose(profile) != 0) throw runtime_error("failed closing contamination-profile output: " + profile_path);
+    auto cleanup_temporary = [&]() {
+        remove(profile_tmp.c_str());
+        remove(rate_tmp.c_str());
+        remove(assignments_tmp.c_str());
+    };
+    auto rollback_installed = [&]() {
+        for (vector<string>::const_iterator it = installed.begin(); it != installed.end(); ++it) {
+            remove(it->c_str());
+        }
+    };
+    auto publish_one = [&](const string& temporary, const string& final_path) {
+        if (!nonempty_file(temporary)) {
+            throw runtime_error("temporary model output missing or empty: " + temporary);
+        }
+        if (rename(temporary.c_str(), final_path.c_str()) != 0) {
+            throw runtime_error("cannot publish model output " + final_path + ": " + strerror(errno));
+        }
+        installed.push_back(final_path);
+    };
 
-    FILE* rate = fopen(rate_path.c_str(), "w");
-    if (!rate) throw runtime_error("cannot open contamination-rate output: " + rate_path);
-    dump_contam_rates(rate, finder.contam_rate, finder.contam_rate_se, samples,
-                      blank_libname, cellranger, seurat, underscore);
-    if (fclose(rate) != 0) throw runtime_error("failed closing contamination-rate output: " + rate_path);
+    try {
+        FILE* profile = fopen(profile_tmp.c_str(), "w");
+        if (!profile) throw runtime_error("cannot open temporary contamination-profile output: " + profile_tmp);
+        dump_contam_prof(profile, finder.contam_prof, empty_concentration, samples);
+        if (fclose(profile) != 0) throw runtime_error("failed closing temporary contamination-profile output: " + profile_tmp);
 
-    FILE* assignments = fopen(assignments_path.c_str(), "w");
-    if (!assignments) throw runtime_error("cannot open assignment-audit output: " + assignments_path);
-    dump_assignments(assignments, finder.assn, finder.assn_llr, samples,
-                     blank_libname, cellranger, seurat, underscore);
-    if (fclose(assignments) != 0) throw runtime_error("failed closing assignment-audit output: " + assignments_path);
+        FILE* rate = fopen(rate_tmp.c_str(), "w");
+        if (!rate) throw runtime_error("cannot open temporary contamination-rate output: " + rate_tmp);
+        dump_contam_rates(rate, finder.contam_rate, finder.contam_rate_se, samples,
+                          blank_libname, cellranger, seurat, underscore);
+        if (fclose(rate) != 0) throw runtime_error("failed closing temporary contamination-rate output: " + rate_tmp);
+
+        FILE* assignments = fopen(assignments_tmp.c_str(), "w");
+        if (!assignments) throw runtime_error("cannot open temporary assignment-audit output: " + assignments_tmp);
+        dump_assignments(assignments, finder.assn, finder.assn_llr, samples,
+                         blank_libname, cellranger, seurat, underscore);
+        if (fclose(assignments) != 0) throw runtime_error("failed closing temporary assignment-audit output: " + assignments_tmp);
+
+        publish_one(profile_tmp, profile_path);
+        publish_one(rate_tmp, rate_path);
+        publish_one(assignments_tmp, assignments_path);
+    } catch (...) {
+        cleanup_temporary();
+        rollback_installed();
+        throw;
+    }
 }
 
 string double_json(double value) {
@@ -662,9 +742,14 @@ int run(int argc, char** argv) {
     string counts_path_mut = counts_path;
     load_counts_from_file(allele_counts, samples, counts_path_mut, allowed_ids);
     if (allele_counts.empty()) throw runtime_error("count input contains no rows accepted by the candidate roster");
+    // Current count bundles encode the unused singlet second-component nalt as
+    // zero, while the retained two-component contamFinder uses (-1,-1) as its
+    // null sentinel.  Canonicalize only that representation; no source or row
+    // selection is changed.
+    normalize_singlet_null_keys(allele_counts);
 
     const CoverageSummary coverage = audit_condf_coverage(
-        allele_counts, exp_match_fracs, samples, roster.active_sources, coverage_path
+        allele_counts, exp_match_fracs, samples, roster.ambient_sources, coverage_path
     );
     if (coverage.missing_lookups > 0) {
         ostringstream message;
@@ -682,10 +767,17 @@ int run(int argc, char** argv) {
     if (assignments.empty()) throw runtime_error("assignments input contains no assignments");
     const robin_hood::unordered_map<unsigned long, int> original_assignments = assignments;
 
+    set<int> profile_ids = roster.ambient_sources;
     contamFinder finder(
         allele_counts, assignments, assignment_llr, exp_match_fracs,
-        static_cast<int>(samples.size()), allowed_ids, allowed_ids2
+        static_cast<int>(samples.size()), profile_ids, allowed_ids2
     );
+    map<int, double> initial_profile;
+    const double initial_mass = 1.0 / static_cast<double>(profile_ids.size());
+    for (set<int>::const_iterator it = profile_ids.begin(); it != profile_ids.end(); ++it) {
+        initial_profile[*it] = initial_mass;
+    }
+    finder.set_init_contam_prof(initial_profile);
     finder.set_doublet_rate(-1.0);
     finder.set_num_threads(opt.num_threads <= 1 ? 0 : opt.num_threads);
     finder.no_reassign();
@@ -731,7 +823,7 @@ int run(int argc, char** argv) {
     );
     write_legacy_diagnostics(
         legacy_diag_path, opt, original_assignments.size(), changed,
-        finder.contam_rate.size(), roster.lines.size(), roster.active_sources.size(),
+        finder.contam_rate.size(), roster.lines.size(), roster.ambient_sources.size(),
         finder.contam_prof.size(), profile_sum, coverage, selected_ll
     );
     write_run_contract(

@@ -23,6 +23,9 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <cmath>
+#include <exception>
+#include <limits>
 #include <omp.h>
 #include <htslib/sam.h>
 #include <htslib/vcf.h>
@@ -40,6 +43,133 @@ using namespace std;
 /**
  * ===== Contains functions relating to processing HTSlib-format files =====
  */
+
+namespace {
+
+class ParallelOperationStatus {
+  public:
+    ParallelOperationStatus() : ok_(true) {}
+
+    bool ok() const { return ok_.load(std::memory_order_acquire); }
+
+    void fail(const std::string& message) {
+        bool expected = true;
+        if (ok_.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(message_mutex_);
+            message_ = message;
+        }
+    }
+
+    std::string message() const {
+        std::lock_guard<std::mutex> lock(message_mutex_);
+        return message_;
+    }
+
+  private:
+    std::atomic<bool> ok_;
+    mutable std::mutex message_mutex_;
+    std::string message_;
+};
+
+static std::string format_worker_error(const char* operation, int thread_id, int tid = -1) {
+    std::ostringstream out;
+    out << operation << " failed in worker " << thread_id;
+    if (tid >= 0) out << " for BAM target id " << tid;
+    return out.str();
+}
+
+}  // namespace
+
+size_t estimate_cellcounts_bytes(int n_samples) {
+    if (n_samples <= 0) return 0;
+    const size_t state_count = (size_t)n_samples * (size_t)GENOTYPE_STATES;
+    if (state_count > std::numeric_limits<size_t>::max() / state_count) {
+        return std::numeric_limits<size_t>::max();
+    }
+    const size_t pair_slots = state_count * state_count;
+    if (pair_slots > (std::numeric_limits<size_t>::max() / sizeof(int64_t) - state_count) / 2) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return (2 * pair_slots + 2 * state_count) * sizeof(int64_t);
+}
+
+bool validate_identity_and_allocation_request(
+    int n_samples,
+    size_t* n_identity_states,
+    size_t* bytes_per_cell,
+    std::string* error_message) {
+
+    auto fail = [&](const std::string& message) {
+        if (error_message) *error_message = message;
+        return false;
+    };
+
+    if (n_samples <= 0) {
+        return fail("identity universe must contain at least one sample");
+    }
+    if (n_samples > MAX_INDIVIDUALS) {
+        std::ostringstream out;
+        out << "identity universe contains " << n_samples
+            << " samples, exceeding the bitset-backed limit of " << MAX_INDIVIDUALS;
+        return fail(out.str());
+    }
+
+    const size_t n = (size_t)n_samples;
+    if (n > 1 && (n - 1) > std::numeric_limits<size_t>::max() / n) {
+        return fail("identity-pair count overflows size_t");
+    }
+    const size_t pair_count = n * (n - 1) / 2;
+    if (pair_count > std::numeric_limits<size_t>::max() - n) {
+        return fail("identity-state count overflows size_t");
+    }
+    const size_t identity_states = n + pair_count;
+    if (identity_states > (size_t)std::numeric_limits<int>::max()) {
+        return fail("identity-state count exceeds the supported integer index range");
+    }
+    if (n_samples > MAX_COMBINATION_SAFE_INDIVIDUALS ||
+        identity_states - 1 > (size_t)std::numeric_limits<short>::max()) {
+        std::ostringstream out;
+        out << "identity universe contains " << n_samples
+            << " samples and " << identity_states
+            << " singlet/doublet states, exceeding the signed-short range used by "
+               "the shared haplotype-combination mapping; maximum supported sample count is "
+            << MAX_COMBINATION_SAFE_INDIVIDUALS;
+        return fail(out.str());
+    }
+
+    const size_t bytes = estimate_cellcounts_bytes(n_samples);
+    if (bytes == std::numeric_limits<size_t>::max()) {
+        return fail("dense CellCounts size overflows size_t");
+    }
+    if (bytes > MAX_CELLCOUNTS_BYTES_PER_CELL) {
+        std::ostringstream out;
+        out << "dense CellCounts request requires " << bytes
+            << " bytes per cell, exceeding the supported "
+            << MAX_CELLCOUNTS_BYTES_PER_CELL << "-byte safety limit";
+        return fail(out.str());
+    }
+
+    if (n_identity_states) *n_identity_states = identity_states;
+    if (bytes_per_cell) *bytes_per_cell = bytes;
+    if (error_message) error_message->clear();
+    return true;
+}
+
+const ReadFilterPolicy& default_production_read_filter() {
+    static const ReadFilterPolicy policy(
+        BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP,
+        SupplementaryReadHandling::INCLUDE);
+    return policy;
+}
+
+bool read_passes_filter(const bam1_t* record, const ReadFilterPolicy& policy) {
+    if (record == nullptr) return false;
+    uint16_t excluded = policy.excluded_flags;
+    if (policy.supplementary == SupplementaryReadHandling::EXCLUDE) {
+        excluded |= BAM_FSUPPLEMENTARY;
+    }
+    return (record->core.flag & excluded) == 0;
+}
 
 // ============================================================================
 // VCF READING FUNCTIONS
@@ -117,7 +247,8 @@ int read_vcf_chrom(string& vcf_file,
     int num_samples = bcf_hdr_nsamples(bcf_sr_get_header(sr, 0));
 
     long int nvar = 0;
-    float mingq = 30;
+    long int skipped_missing_gt = 0;
+    long int skipped_malformed_gt = 0;
     set<int> bl; 
     
     bcf_hdr_t* bcf_header = bcf_sr_get_header(sr, 0);
@@ -159,71 +290,54 @@ int read_vcf_chrom(string& vcf_file,
                     v.ref = bcf_record->d.allele[0][0];
                     v.alt = bcf_record->d.allele[1][0];
                     v.vq = bcf_record->qual;
-                    ++nvar;
 
                     int32_t* gts = NULL;
                     int n_gts = 0;
                     int nmiss = 0;
                     int num_loaded = bcf_get_genotypes(bcf_header, bcf_record, &gts, &n_gts);
                     if (num_loaded <= 0){
-                        fprintf(stderr, "ERROR loading genotypes at %s %ld\n", 
-                            chrom.c_str(), (long int) bcf_record->pos);
-                        exit(1);
+                        ++skipped_missing_gt;
+                        free(gts);
+                        continue;
                     }
-                    
-                    int ploidy = 2;
-                    
-                    float* gqs = NULL;
-                    int n_gqs = 0;
-                    int num_gq_loaded = bcf_get_format_float(bcf_header, bcf_record, "GQ",
-                        &gqs, &n_gqs);
-                    
+                    if (num_samples <= 0 || num_loaded % num_samples != 0 ||
+                        num_loaded / num_samples < 2){
+                        ++skipped_malformed_gt;
+                        free(gts);
+                        continue;
+                    }
+                    const int ploidy = num_loaded / num_samples;
+
+                    // GQ is intentionally ignored. Historical and current panels
+                    // use different GQ header types, and genotype quality is not
+                    // required by the demultiplexing model. GT alone determines
+                    // whether a donor genotype is available at this site.
                     for (int i = 0; i < num_samples; ++i){
                         int32_t* gtptr = gts + i*ploidy;
-                        
-                        bool gq_pass = false;
-                        
-                        if (num_gq_loaded < num_samples || !isnan(gqs[i]) || 
-                            gqs[i] == bcf_float_missing){
-                            gq_pass = true;
+                        const bool missing_gt =
+                            bcf_gt_is_missing(gtptr[0]) ||
+                            gtptr[0] == bcf_int32_vector_end ||
+                            bcf_gt_is_missing(gtptr[1]) ||
+                            gtptr[1] == bcf_int32_vector_end;
+                        if (missing_gt){
+                            ++nmiss;
+                            continue;
                         }
-                        else{
-                            if (gqs[i] >= mingq){
-                                v.gqs.push_back(pow(10, -(float)gqs[i] / 10.0));
-                            }
-                            else{
-                                gq_pass = false;
-                                v.gqs.push_back(-1);
-                            }
+                        const int allele0 = bcf_gt_allele(gtptr[0]);
+                        const int allele1 = bcf_gt_allele(gtptr[1]);
+                        if (allele0 < 0 || allele0 > 1 || allele1 < 0 || allele1 > 1){
+                            ++nmiss;
+                            continue;
                         }
-                        
-                        if (bcf_gt_is_missing(gtptr[0])){
-                            nmiss++;
-                        }
-                        else if (!gq_pass){
-                            nmiss++;
-                        }
-                        else{
-                            bool alt = false;   
-                            v.haps_covered.set(i);
-                            if (bcf_gt_allele(gtptr[0]) == 1){
-                                alt = true;
-                                v.haps1.set(i);
-                            }
-                            if (bcf_gt_allele(gtptr[1]) == 1){
-                                alt = true;
-                                v.haps2.set(i);
-                            }
-                        }    
-                    } 
-                    free(gqs);            
+                        v.haps_covered.set(i);
+                        if (allele0 == 1) v.haps1.set(i);
+                        if (allele1 == 1) v.haps2.set(i);
+                    }
                     free(gts);
-                    
+
                     if (allow_missing || nmiss == 0){
                         snps.insert(make_pair(pos, v));
-                    }
-                    else{
-                        --nvar;
+                        ++nvar;
                     }
                 }
             }
@@ -231,6 +345,11 @@ int read_vcf_chrom(string& vcf_file,
     }
     
     bcf_sr_destroy(sr);
+    if (skipped_missing_gt > 0 || skipped_malformed_gt > 0){
+        fprintf(stderr,
+            "WARNING: skipped %ld site(s) without usable GT and %ld site(s) with unsupported GT width on %s\n",
+            skipped_missing_gt, skipped_malformed_gt, chrom.c_str());
+    }
     return nvar;
 }
 
@@ -260,32 +379,34 @@ void get_bam_chroms(bam_reader& reader, set<string>& chroms){
     }
 }
 
-void get_bam_header_chroms_and_seq2tid(const string& bamfile,
+bool get_bam_header_chroms_and_seq2tid(const string& bamfile,
     set<string>& chroms,
-    map<string, int>& seq2tid){
+    map<string, int>& seq2tid,
+    string* error_message){
 
     chroms.clear();
     seq2tid.clear();
 
     htsFile* fp = hts_open(bamfile.c_str(), "r");
     if (!fp){
-        fprintf(stderr, "ERROR: Could not open BAM file for header read: %s\n",
-            bamfile.c_str());
-        exit(1);
+        if (error_message) *error_message = "could not open BAM file for header read: " + bamfile;
+        return false;
     }
 
     bam_hdr_t* hdr = sam_hdr_read(fp);
     if (!hdr){
-        fprintf(stderr, "ERROR: Could not read BAM header from: %s\n",
-            bamfile.c_str());
+        if (error_message) *error_message = "could not read BAM header from: " + bamfile;
         hts_close(fp);
-        exit(1);
+        return false;
     }
 
+    bool ok = true;
     for (int tid = 0; tid < hdr->n_targets; ++tid){
         const char* name = hdr->target_name[tid];
-        if (!name){
-            continue;
+        if (!name || name[0] == '\0'){
+            ok = false;
+            if (error_message) *error_message = "BAM header contains an invalid contig name";
+            break;
         }
         string chrom(name);
         chroms.insert(chrom);
@@ -294,6 +415,8 @@ void get_bam_header_chroms_and_seq2tid(const string& bamfile,
 
     bam_hdr_destroy(hdr);
     hts_close(fp);
+    if (ok && error_message) error_message->clear();
+    return ok;
 }
 
 long int count_vcf_snps(string& vcf_file, set<string>& chroms_to_include, int min_vq){
@@ -359,7 +482,8 @@ int read_vcf_chroms(string& vcf_file,
     int num_samples = bcf_hdr_nsamples(bcf_header);
     
     long int nvar = 0;
-    float mingq = 30;
+    long int skipped_missing_gt = 0;
+    long int skipped_malformed_gt = 0;
     set<pair<int, int> > bl;
     
     int progress = 1000000;
@@ -425,72 +549,54 @@ int read_vcf_chroms(string& vcf_file,
                 v.ref = bcf_record->d.allele[0][0];
                 v.alt = bcf_record->d.allele[1][0];
                 v.vq = bcf_record->qual;
-                ++nvar;
-                
+
                 int32_t* gts = NULL;
                 int n_gts = 0;
                 int nmiss = 0;
                 int num_loaded = bcf_get_genotypes(bcf_header, bcf_record, &gts, &n_gts);
                 if (num_loaded <= 0){
-                    fprintf(stderr, "ERROR loading genotypes at %s %ld\n", 
-                        chrom.c_str(), (long int) bcf_record->pos);
-                    exit(1);
+                    ++skipped_missing_gt;
+                    free(gts);
+                    continue;
                 }
-                
-                int ploidy = 2;
-                
-                float* gqs = NULL;
-                int n_gqs = 0;
-                int num_gq_loaded = bcf_get_format_float(bcf_header, bcf_record, "GQ",
-                    &gqs, &n_gqs);
-                
+                if (num_samples <= 0 || num_loaded % num_samples != 0 ||
+                    num_loaded / num_samples < 2){
+                    ++skipped_malformed_gt;
+                    free(gts);
+                    continue;
+                }
+                const int ploidy = num_loaded / num_samples;
+
+                // GQ is intentionally ignored. Historical and current panels
+                // use different GQ header types, and genotype quality is not
+                // required by the demultiplexing model. GT alone determines
+                // whether a donor genotype is available at this site.
                 for (int i = 0; i < num_samples; ++i){
                     int32_t* gtptr = gts + i*ploidy;
-                    
-                    bool gq_pass = false;
-                    
-                    if (num_gq_loaded < num_samples || !isnan(gqs[i]) || 
-                        gqs[i] == bcf_float_missing){
-                        gq_pass = true;
+                    const bool missing_gt =
+                        bcf_gt_is_missing(gtptr[0]) ||
+                        gtptr[0] == bcf_int32_vector_end ||
+                        bcf_gt_is_missing(gtptr[1]) ||
+                        gtptr[1] == bcf_int32_vector_end;
+                    if (missing_gt){
+                        ++nmiss;
+                        continue;
                     }
-                    else{
-                        if (gqs[i] >= mingq){
-                            v.gqs.push_back(pow(10, -(float)gqs[i] / 10.0));
-                        }
-                        else{
-                            gq_pass = false;
-                            v.gqs.push_back(-1);
-                        }
+                    const int allele0 = bcf_gt_allele(gtptr[0]);
+                    const int allele1 = bcf_gt_allele(gtptr[1]);
+                    if (allele0 < 0 || allele0 > 1 || allele1 < 0 || allele1 > 1){
+                        ++nmiss;
+                        continue;
                     }
-                    
-                    if (bcf_gt_is_missing(gtptr[0])){
-                        nmiss++;
-                    }
-                    else if (!gq_pass){
-                        nmiss++;
-                    }
-                    else{
-                        bool alt = false;   
-                        v.haps_covered.set(i);
-                        if (bcf_gt_allele(gtptr[0]) == 1){
-                            alt = true;
-                            v.haps1.set(i);
-                        }
-                        if (bcf_gt_allele(gtptr[1]) == 1){
-                            alt = true;
-                            v.haps2.set(i);
-                        }
-                    }
+                    v.haps_covered.set(i);
+                    if (allele0 == 1) v.haps1.set(i);
+                    if (allele1 == 1) v.haps2.set(i);
                 }
-                
-                free(gqs);
                 free(gts);
-                
+
                 if (allow_missing || nmiss == 0){
                     snps[tid].insert(make_pair(pos, v));
-                }
-                else{
-                    --nvar;
+                    ++nvar;
                 }
             }
         }
@@ -499,6 +605,11 @@ int read_vcf_chroms(string& vcf_file,
     bcf_destroy(bcf_record);
     bcf_hdr_destroy(bcf_header);
     hts_close(bcf_reader);
+    if (skipped_missing_gt > 0 || skipped_malformed_gt > 0){
+        fprintf(stderr,
+            "WARNING: skipped %ld site(s) without usable GT and %ld site(s) with unsupported GT width while loading %s\n",
+            skipped_missing_gt, skipped_malformed_gt, vcf_file.c_str());
+    }
     
     return nvar;
 }
@@ -519,6 +630,10 @@ int read_vcf_chroms_optimized(string& vcf_file,
     // First read into old format
     map<int, map<int, var> > snps_old;
     int nvar = read_vcf_chroms(vcf_file, chroms_to_include, seq2tid, snps_old, min_vq, allow_missing);
+    if (nvar < 0){
+        snpdat_optimized.clear();
+        return -1;
+    }
     
     auto t2 = std::chrono::steady_clock::now();
     auto read_secs = std::chrono::duration_cast<std::chrono::seconds>(t2 - t1).count();
@@ -1032,104 +1147,99 @@ void dump_vcs_counts(robin_hood::unordered_map<unsigned long, pair<float, float>
 // PARALLEL BAM PROCESSING FUNCTIONS
 // ============================================================================
 
-// Debug counters for base extraction
-static std::atomic<long> g_base_queries{0};
-static std::atomic<long> g_base_valid{0};
-static std::atomic<long> g_base_N{0};
-static std::atomic<long> g_base_dash{0};
-static std::atomic<long> g_base_other{0};  // non-ref, non-alt
-
-static std::atomic<long> g_debug_print_count{0};
-
 /**
- * Get base at position from BAM record, accounting for CIGAR operations.
- *
- * NOTE: BAM stores the sequence in reference orientation already (the aligner
- * reverse-complements reverse-strand reads before writing). So we do NOT need
- * to reverse complement here - just return bam_seqi() directly, matching 
- * htswrapper's get_base_at() behavior.
- *
- * pos is 0-based reference coordinate (same as bam1_t::core.pos and VCF bcf1_t::pos).
+ * Resolve one 0-based reference position against a BAM record using strict
+ * half-open intervals. Insertions and soft clips consume query only and can
+ * never satisfy a reference coordinate; hard clips and pads consume neither.
  */
-char get_base_at_pos(bam1_t* record, int pos){
-    g_base_queries++;
-    
-    // Debug: print first 20 queries
-    long count = g_debug_print_count.fetch_add(1);
-    if (count < 20){
-        fprintf(stderr, "DEBUG QUERY %ld: tid=%d read_pos=%ld-%ld snp_pos=%d\n",
-            count, record->core.tid, record->core.pos, (long)bam_endpos(record), pos);
+ReferenceCoordinateResult query_reference_coordinate(const bam1_t* record, int pos){
+    if (record == nullptr){
+        return ReferenceCoordinateResult(ReferenceCoordinateState::MALFORMED_CIGAR);
     }
-    
-    // Rewritten to exactly match V0's get_pos_in_read boundary behavior
-    // V0 uses 1-based positions internally; we use 0-based throughout
-    uint32_t* cigar = bam_get_cigar(record);
-    uint8_t* seq = bam_get_seq(record);
-    
-    int read_pos = 0;
-    int next_read_pos = 0;
-    int ref_pos = record->core.pos;
-    int next_ref_pos = 0;
-    
-    for (uint32_t i = 0; i < record->core.n_cigar; i++){
-        int op = bam_cigar_op(cigar[i]);
-        int len = bam_cigar_oplen(cigar[i]);
-        
-        // Compute next positions exactly like V0
-        // Read-consuming: M, I, S, =, X
-        if (op == BAM_CMATCH || op == BAM_CINS || op == BAM_CEQUAL || 
-            op == BAM_CSOFT_CLIP || op == BAM_CDIFF){
-            next_read_pos = read_pos + len;
+
+    const int64_t alignment_start = record->core.pos;
+    const int64_t alignment_end = bam_endpos(const_cast<bam1_t*>(record));
+    if (pos < alignment_start || pos >= alignment_end){
+        return ReferenceCoordinateResult(ReferenceCoordinateState::OUTSIDE_ALIGNMENT);
+    }
+
+    uint32_t* cigar = bam_get_cigar(const_cast<bam1_t*>(record));
+    uint8_t* seq = bam_get_seq(const_cast<bam1_t*>(record));
+    int64_t ref_pos = alignment_start;
+    int64_t query_pos = 0;
+
+    for (uint32_t i = 0; i < record->core.n_cigar; ++i){
+        const int op = bam_cigar_op(cigar[i]);
+        const int64_t len = bam_cigar_oplen(cigar[i]);
+        if (len < 0){
+            return ReferenceCoordinateResult(ReferenceCoordinateState::MALFORMED_CIGAR);
         }
-        else{
-            next_read_pos = read_pos;
-        }
-        
-        // Ref-consuming: M, D, N, =, X
-        if (op == BAM_CMATCH || op == BAM_CDEL || op == BAM_CREF_SKIP || 
-            op == BAM_CEQUAL || op == BAM_CDIFF){
-            next_ref_pos = ref_pos + len;
-        }
-        else{
-            next_ref_pos = ref_pos;
-        }
-        
-        // Check if position is strictly inside a deletion (returns '-')
-        if (op == BAM_CDEL || op == BAM_CREF_SKIP){
-            if (ref_pos < pos && next_ref_pos > pos){
-                g_base_dash++;
-                return '-';
+
+        switch (op){
+            case BAM_CMATCH:
+            case BAM_CEQUAL:
+            case BAM_CDIFF: {
+                const int64_t block_end = ref_pos + len;
+                if ((int64_t)pos >= ref_pos && (int64_t)pos < block_end){
+                    const int64_t query_index = query_pos + ((int64_t)pos - ref_pos);
+                    if (query_index < 0 || query_index >= record->core.l_qseq){
+                        return ReferenceCoordinateResult(
+                            ReferenceCoordinateState::NO_QUERY_BASE, 'N', -1);
+                    }
+                    const int base_code = bam_seqi(seq, (int)query_index);
+                    const char base = seq_nt16_str[base_code];
+                    if (base != 'A' && base != 'C' && base != 'G' && base != 'T'){
+                        return ReferenceCoordinateResult(
+                            ReferenceCoordinateState::NO_QUERY_BASE, 'N', (int)query_index);
+                    }
+                    return ReferenceCoordinateResult(
+                        ReferenceCoordinateState::BASE, base, (int)query_index);
+                }
+                ref_pos = block_end;
+                query_pos += len;
+                break;
             }
-        }
-        
-        // Range check - inclusive end boundary
-        if (pos >= ref_pos && pos <= next_ref_pos){
-            int increment = pos - ref_pos;
-            ref_pos += increment;
-            if (next_read_pos != read_pos){
-                read_pos += increment;
+            case BAM_CDEL: {
+                const int64_t block_end = ref_pos + len;
+                if ((int64_t)pos >= ref_pos && (int64_t)pos < block_end){
+                    return ReferenceCoordinateResult(ReferenceCoordinateState::DELETION, '-', -1);
+                }
+                ref_pos = block_end;
+                break;
             }
-            break;
+            case BAM_CREF_SKIP: {
+                const int64_t block_end = ref_pos + len;
+                if ((int64_t)pos >= ref_pos && (int64_t)pos < block_end){
+                    return ReferenceCoordinateResult(
+                        ReferenceCoordinateState::REFERENCE_SKIP, '-', -1);
+                }
+                ref_pos = block_end;
+                break;
+            }
+            case BAM_CINS:
+            case BAM_CSOFT_CLIP:
+                query_pos += len;
+                break;
+            case BAM_CHARD_CLIP:
+            case BAM_CPAD:
+                break;
+            default:
+                return ReferenceCoordinateResult(ReferenceCoordinateState::MALFORMED_CIGAR);
         }
-        
-        ref_pos = next_ref_pos;
-        read_pos = next_read_pos;
-    }
-    
-    // Check if we found the position
-    if (ref_pos == pos){
-        int base_code = bam_seqi(seq, read_pos);
-        char base = seq_nt16_str[base_code];
-        // Convert ANY non-ACGT base to N (match htswrapper behavior)
-        // seq_nt16_str can return IUPAC codes like M, R, Y, etc.
-        if (base != 'A' && base != 'C' && base != 'G' && base != 'T') {
-            g_base_N++;
-            return 'N';
+
+        if (query_pos < 0 || query_pos > record->core.l_qseq){
+            return ReferenceCoordinateResult(ReferenceCoordinateState::MALFORMED_CIGAR);
         }
-        return base;
     }
-    
-    g_base_N++;
+
+    return ReferenceCoordinateResult(ReferenceCoordinateState::NO_QUERY_BASE);
+}
+
+char get_base_at_pos(const bam1_t* record, int pos){
+    const ReferenceCoordinateResult result = query_reference_coordinate(record, pos);
+    if (result.state == ReferenceCoordinateState::BASE) return result.base;
+    if (result.state == ReferenceCoordinateState::DELETION ||
+        result.state == ReferenceCoordinateState::REFERENCE_SKIP) return '-';
     return 'N';
 }
 
@@ -1194,7 +1304,7 @@ static inline bool accumulate_species_native_targets(
     return true;
 }
 
-void count_alleles_parallel(
+bool count_alleles_parallel(
     const string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>& cell_counts,
@@ -1208,24 +1318,54 @@ void count_alleles_parallel(
     const NativeSpeciesTargetTable* species_native_targets,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts,
     int species_native_n_samples){
+    size_t n_identity_states = 0;
+    size_t bytes_per_cell = 0;
+    string request_error;
+    if (!validate_identity_and_allocation_request(
+            n_samples, &n_identity_states, &bytes_per_cell, &request_error)){
+        fprintf(stderr, "ERROR: invalid individual identity universe: %s\n", request_error.c_str());
+        return false;
+    }
+    if (species_native_n_samples > 0 && !validate_identity_and_allocation_request(
+            species_native_n_samples, nullptr, nullptr, &request_error)){
+        fprintf(stderr, "ERROR: invalid native-species identity universe: %s\n", request_error.c_str());
+        return false;
+    }
+    if (n_threads < 1 || htslib_threads < 1){
+        fprintf(stderr, "ERROR: thread counts must be positive\n");
+        return false;
+    }
     
     bool has_bc_list = !valid_barcodes.empty();
     const bool collect_species_native =
         species_native_targets != nullptr && species_native_counts != nullptr &&
         species_native_n_samples > 0;
     
-    // Pre-allocate count structure for known barcodes
+    // Pre-allocate count structure for known barcodes after validating the
+    // per-cell dense allocation and the total multiplication.
     if (has_bc_list){
-        fprintf(stderr, "Pre-allocating counts for %lu cells...\n", valid_barcodes.size());
-        for (unsigned long bc : valid_barcodes){
-            cell_counts.emplace(std::piecewise_construct,
-                std::forward_as_tuple(bc),
-                std::forward_as_tuple(n_samples));
-            if (collect_species_native){
-                species_native_counts->emplace(std::piecewise_construct,
+        if (bytes_per_cell > 0 && valid_barcodes.size() >
+            std::numeric_limits<size_t>::max() / bytes_per_cell){
+            fprintf(stderr, "ERROR: projected CellCounts allocation overflows size_t\n");
+            return false;
+        }
+        fprintf(stderr, "Pre-allocating counts for %lu cells (%lu bytes/cell)...\n",
+            valid_barcodes.size(), (unsigned long)bytes_per_cell);
+        try {
+            for (unsigned long bc : valid_barcodes){
+                cell_counts.emplace(std::piecewise_construct,
                     std::forward_as_tuple(bc),
-                    std::forward_as_tuple(species_native_n_samples));
+                    std::forward_as_tuple(n_samples));
+                if (collect_species_native){
+                    species_native_counts->emplace(std::piecewise_construct,
+                        std::forward_as_tuple(bc),
+                        std::forward_as_tuple(species_native_n_samples));
+                }
             }
+        }
+        catch (const std::exception& e){
+            fprintf(stderr, "ERROR: CellCounts pre-allocation failed: %s\n", e.what());
+            return false;
         }
     }
     
@@ -1233,12 +1373,32 @@ void count_alleles_parallel(
     // Also get read counts per chromosome from BAM index
     htsFile* bam_tmp = hts_open(bamfile.c_str(), "r");
     if (!bam_tmp){
-        fprintf(stderr, "ERROR: Could not open BAM file to get header\n");
-        return;
+        fprintf(stderr, "ERROR: Could not open BAM file to get header: %s\n", bamfile.c_str());
+        return false;
     }
     bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
+    if (!hdr_tmp){
+        fprintf(stderr, "ERROR: Could not read BAM header: %s\n", bamfile.c_str());
+        hts_close(bam_tmp);
+        return false;
+    }
     hts_idx_t* idx_tmp = sam_index_load(bam_tmp, bamfile.c_str());
+    if (!idx_tmp){
+        fprintf(stderr, "ERROR: Could not load required BAM index: %s\n", bamfile.c_str());
+        bam_hdr_destroy(hdr_tmp);
+        hts_close(bam_tmp);
+        return false;
+    }
     int n_chroms = hdr_tmp->n_targets;
+    for (const auto& kv : snpdat_all){
+        if (kv.first < 0 || kv.first >= n_chroms){
+            fprintf(stderr, "ERROR: SNP panel references invalid BAM target id %d\n", kv.first);
+            hts_idx_destroy(idx_tmp);
+            bam_hdr_destroy(hdr_tmp);
+            hts_close(bam_tmp);
+            return false;
+        }
+    }
 
     // --dump_pileup: emit the per-SNP genotype sidecar for the variant-consistency
     // metric (interindividual panel only).  geno[] is already populated by
@@ -1251,6 +1411,10 @@ void count_alleles_parallel(
         gzFile sf = gzopen(sites_path.c_str(), "w");
         if (!sf){
             fprintf(stderr, "ERROR: could not open %s for writing\n", sites_path.c_str());
+            hts_idx_destroy(idx_tmp);
+            bam_hdr_destroy(hdr_tmp);
+            hts_close(bam_tmp);
+            return false;
         } else {
             long n_sites_written = 0;
             for (auto& kv : snpdat_all){
@@ -1268,7 +1432,13 @@ void count_alleles_parallel(
                     n_sites_written++;
                 }
             }
-            gzclose(sf);
+            if (gzclose(sf) != Z_OK){
+                fprintf(stderr, "ERROR: failed while closing %s\n", sites_path.c_str());
+                hts_idx_destroy(idx_tmp);
+                bam_hdr_destroy(hdr_tmp);
+                hts_close(bam_tmp);
+                return false;
+            }
             fprintf(stderr, "Wrote %ld pileup sites to %s\n", n_sites_written, sites_path.c_str());
         }
     }
@@ -1281,20 +1451,43 @@ void count_alleles_parallel(
         chrom_names[i] = hdr_tmp->target_name[i] ? hdr_tmp->target_name[i] : std::to_string(i);
     }
     
-    if (idx_tmp){
-        for (int i = 0; i < n_chroms; i++){
-            uint64_t mapped, unmapped;
-            hts_idx_get_stat(idx_tmp, i, &mapped, &unmapped);
-            chrom_read_counts[i] = mapped;
-            chrom_lengths[i] = hdr_tmp->target_len[i];
-        }
+    const int n_index_targets = hts_idx_nseq(idx_tmp);
+    if (n_index_targets < 0){
+        fprintf(stderr, "ERROR: Could not determine BAM-index target count\n");
         hts_idx_destroy(idx_tmp);
-    } else {
-        fprintf(stderr, "WARNING: Could not load BAM index for read count estimation\n");
-        for (int i = 0; i < n_chroms; i++){
-            chrom_lengths[i] = hdr_tmp->target_len[i];
-        }
+        bam_hdr_destroy(hdr_tmp);
+        hts_close(bam_tmp);
+        return false;
     }
+    int n_missing_index_stats = 0;
+    int first_missing_index_stat = -1;
+    for (int i = 0; i < n_chroms; i++){
+        uint64_t mapped = 0, unmapped = 0;
+        if (i >= n_index_targets ||
+            hts_idx_get_stat(idx_tmp, i, &mapped, &unmapped) < 0){
+            // A valid BAI/CSI may omit the metadata bin for a target with no
+            // alignment records. These counts are used only to estimate work
+            // unit size and ordering; the iterator still queries the complete
+            // target below. Use an unchunked zero-read scheduling estimate.
+            mapped = 0;
+            unmapped = 0;
+            if (first_missing_index_stat < 0) first_missing_index_stat = i;
+            n_missing_index_stats++;
+        }
+        chrom_read_counts[i] = mapped;
+        chrom_lengths[i] = hdr_tmp->target_len[i];
+    }
+    if (n_missing_index_stats > 0){
+        const char* first_name =
+            (first_missing_index_stat >= 0 && first_missing_index_stat < n_chroms &&
+             hdr_tmp->target_name[first_missing_index_stat])
+                ? hdr_tmp->target_name[first_missing_index_stat] : ".";
+        fprintf(stderr,
+            "WARNING: BAM-index mapped/unmapped statistics unavailable for %d of %d header targets "
+            "(first target %d: %s); using zero only for work-unit scheduling estimates\n",
+            n_missing_index_stats, n_chroms, first_missing_index_stat, first_name);
+    }
+    hts_idx_destroy(idx_tmp);
     bam_hdr_destroy(hdr_tmp);
     hts_close(bam_tmp);
     
@@ -1322,7 +1515,7 @@ void count_alleles_parallel(
     
     // Thresholds for chunking
     const size_t CHUNK_SNP_THRESHOLD = 100000;       // Chunk if >100k SNPs
-    const uint64_t CHUNK_READ_THRESHOLD = 10000000;  // Chunk if >10M reads
+    const uint64_t CHUNK_READ_THRESHOLD = 10000000;  // Chunk if >10M iterator records
     
     for (int tid = 0; tid < n_chroms; tid++){
         auto it = snpdat_all.find(tid);
@@ -1330,26 +1523,10 @@ void count_alleles_parallel(
         uint64_t chrom_reads = chrom_read_counts[tid];
         
         if (it == snpdat_all.end() || it->second.empty()){
-            // No SNPs - check if high read density warrants chunking
-            if (chrom_reads > CHUNK_READ_THRESHOLD){
-                // High read count - split into chunks by position
-                size_t n_chunks = (chrom_reads + CHUNK_READ_THRESHOLD - 1) / CHUNK_READ_THRESHOLD;
-                // Cap at reasonable number of chunks
-                n_chunks = std::min(n_chunks, (size_t)20);
-                int64_t chunk_size = (chrom_len + n_chunks - 1) / n_chunks;
-                uint64_t reads_per_chunk = chrom_reads / n_chunks;
-                
-                for (size_t c = 0; c < n_chunks; c++){
-                    int start_pos = c * chunk_size;
-                    int end_pos = (c == n_chunks - 1) ? INT_MAX : (int)((c + 1) * chunk_size);
-                    work_units.push_back({tid, start_pos, end_pos, 0, 0, false, reads_per_chunk});
-                }
-                chroms_chunked_by_reads++;
-            }
-            else{
-                // Low read count - single unit
-                work_units.push_back({tid, 0, INT_MAX, 0, 0, false, chrom_reads});
-            }
+            // Targets with no active panel SNPs cannot contribute scientific
+            // evidence. Do not create iterators merely to count records for
+            // progress reporting; that adds unnecessary I/O and failure modes.
+            continue;
         }
         else{
             ChromSNPs& chrom_snps = it->second;
@@ -1398,6 +1575,7 @@ void count_alleles_parallel(
                         snp_idx++;
                     }
                     size_t snp_end = snp_idx;
+                    if (snp_start == snp_end) continue;
                     
                     work_units.push_back({tid, start_pos, end_pos, snp_start, snp_end, true, reads_per_chunk});
                 }
@@ -1416,13 +1594,13 @@ void count_alleles_parallel(
                   return a.est_reads > b.est_reads;
               });
     
-    fprintf(stderr, "Processing %d chromosomes (%d with SNPs, %ld total SNPs) using %d threads...\n",
+    fprintf(stderr, "BAM header has %d targets; processing %d SNP-bearing targets (%ld total SNPs) using %d threads...\n",
         n_chroms, chroms_with_snps, total_snps, n_threads);
     fprintf(stderr, "  Split into %lu work units (%d by SNP density, %d by read density)\n", 
         work_units.size(), chroms_chunked_by_snp, chroms_chunked_by_reads);
     if (work_units.size() > 0){
         const WorkUnit& largest = work_units[0];
-        fprintf(stderr, "  Largest work unit: %lu SNPs, ~%luM reads\n", 
+        fprintf(stderr, "  Largest work unit: %lu SNPs, ~%luM iterator records\n", 
             largest.snp_end - largest.snp_start, largest.est_reads / 1000000);
     }
     
@@ -1444,6 +1622,8 @@ void count_alleles_parallel(
     vector<robin_hood::unordered_map<unsigned long,
         robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights(n_threads);
+    ParallelOperationStatus operation_status;
+    std::atomic<bool> hts_thread_warning_emitted(false);
     
     #pragma omp parallel
     {
@@ -1453,31 +1633,54 @@ void count_alleles_parallel(
             collect_species_native ? &thread_species_native_counts[thread_id] : nullptr;
         auto& local_site_weights = thread_site_weights[thread_id];
         
-        // Each thread gets its own BAM reader
+        // Each thread gets its own BAM reader. All workers still encounter the
+        // same OpenMP work-sharing construct; a failed worker sets shared status.
         htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
+        bam_hdr_t* header = nullptr;
+        hts_idx_t* idx = nullptr;
+        bam1_t* record = nullptr;
         if (!bam_fp){
-            fprintf(stderr, "ERROR: Thread %d could not open BAM file\n", omp_get_thread_num());
+            operation_status.fail(format_worker_error("BAM open", thread_id));
         }
         else{
-            hts_set_threads(bam_fp, htslib_threads);
-            
-            bam_hdr_t* header = sam_hdr_read(bam_fp);
-            hts_idx_t* idx = sam_index_load(bam_fp, bamfile.c_str());
-            bam1_t* record = bam_init1();
-            
-            if (!idx){
-                fprintf(stderr, "ERROR: Could not load BAM index\n");
+            if (htslib_threads > 1 && hts_set_threads(bam_fp, htslib_threads) < 0){
+                bool expected = false;
+                if (hts_thread_warning_emitted.compare_exchange_strong(expected, true)){
+                    fprintf(stderr,
+                        "WARNING: HTSlib helper-thread setup failed; continuing with synchronous BAM I/O\n");
+                }
             }
-            else{
-                // Process work units with dynamic scheduling
-                #pragma omp for schedule(dynamic, 1)
-                for (size_t i = 0; i < work_units.size(); i++){
-                    WorkUnit& wu = work_units[i];
-                    int tid = wu.tid;
+            header = sam_hdr_read(bam_fp);
+            if (!header){
+                operation_status.fail(format_worker_error("BAM header read", thread_id));
+            }
+            idx = sam_index_load(bam_fp, bamfile.c_str());
+            if (!idx){
+                operation_status.fail(format_worker_error("BAM index load", thread_id));
+            }
+            record = bam_init1();
+            if (!record){
+                operation_status.fail(format_worker_error("BAM record allocation", thread_id));
+            }
+        }
+
+        // Process work units with dynamic scheduling.
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t i = 0; i < work_units.size(); i++){
+            if (!operation_status.ok() || !bam_fp || !header || !idx || !record) continue;
+            WorkUnit& wu = work_units[i];
+            int tid = wu.tid;
+            if (tid < 0 || tid >= header->n_targets){
+                operation_status.fail(format_worker_error("invalid contig", thread_id, tid));
+                continue;
+            }
                     
                     // Query BAM for this region
-                    hts_itr_t* iter = sam_itr_queryi(idx, tid, wu.start_pos, wu.end_pos);
-                    if (!iter) continue;
+            hts_itr_t* iter = sam_itr_queryi(idx, tid, wu.start_pos, wu.end_pos);
+            if (!iter){
+                operation_status.fail(format_worker_error("iterator creation", thread_id, tid));
+                continue;
+            }
                     
                     long local_snps = 0;
                     long local_reads = 0;
@@ -1485,18 +1688,22 @@ void count_alleles_parallel(
                     
                     if (!wu.has_snps){
                         // No SNPs on this chromosome - just count reads
-                        while (sam_itr_next(bam_fp, iter, record) >= 0){
-                            if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
+                        int iterator_result = 0;
+                        while ((iterator_result = sam_itr_next(bam_fp, iter, record)) >= 0){
+                            if (!read_passes_filter(record, default_production_read_filter())){
                                 continue;
                             }
                             local_all_reads++;
+                        }
+                        if (iterator_result < -1){
+                            operation_status.fail(format_worker_error("iterator read", thread_id, tid));
                         }
                         hts_itr_destroy(iter);
                         reads_processed += local_all_reads;
                         
                         int done = ++units_done;
                         if (done % 100 == 0 || done == (int)work_units.size()){
-                            fprintf(stderr, "\rProgress: %d/%lu units, %ld/%ld SNPs, %ld reads",
+                            fprintf(stderr, "\rProgress: %d/%lu units, %ld/%ld SNPs, %ld iterator records",
                                 done, work_units.size(), snps_processed.load(), total_snps,
                                 reads_processed.load());
                         }
@@ -1522,19 +1729,20 @@ void count_alleles_parallel(
                     const char* chrom_name = header->target_name[tid];
                     long chunk_snp_count = wu.snp_end - wu.snp_start;
                     
-                    while (sam_itr_next(bam_fp, iter, record) >= 0){
-                        // Skip filtered reads - match V1 behavior exactly
+                    int iterator_result = 0;
+                    while ((iterator_result = sam_itr_next(bam_fp, iter, record)) >= 0){
+                        // Apply the named production read-filter policy.
                         // V1 filters: unmapped, secondary, qcfail, dup
-                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
+                        if (!read_passes_filter(record, default_production_read_filter())){
                             continue;
                         }
                         
                         // Count ALL reads that pass flag filter (before CB check) - matches V1
                         local_all_reads++;
                         
-                        // Progress within large chunks (every 5M reads)
+                        // Progress within large chunks (every 5M iterator records)
                         if (local_all_reads % 5000000 == 0){
-                            fprintf(stderr, "\r  [%s:%d-%d] %ldM reads, %ld/%ld SNPs...          ",
+                            fprintf(stderr, "\r  [%s:%d-%d] %ldM iterator records, %ld/%ld SNPs...          ",
                                 chrom_name, wu.start_pos, wu.end_pos, 
                                 local_all_reads / 1000000, local_snps, chunk_snp_count);
                         }
@@ -1579,7 +1787,7 @@ void count_alleles_parallel(
                         
                         // Process all SNPs overlapping this read (within our chunk)
                         for (auto snp_check = snp_iter; 
-                             snp_check != snp_chunk_end && snp_check->pos <= read_end; 
+                             snp_check != snp_chunk_end && snp_check->pos < read_end; 
                              ++snp_check){
                             
                             char allele = get_base_at_pos(record, snp_check->pos);
@@ -1589,14 +1797,11 @@ void count_alleles_parallel(
                             
                             if (allele == snp_check->data.ref){
                                 ref_add = prob_scaled;
-                                g_base_valid++;  // Count ref matches
                             }
                             else if (allele == snp_check->data.alt){
                                 alt_add = prob_scaled;
-                                g_base_valid++;  // Count alt matches
                             }
                             else {
-                                g_base_other++;  // non-ref, non-alt base
                             }
                             
                             if (ref_add > 0 || alt_add > 0){
@@ -1657,6 +1862,10 @@ void count_alleles_parallel(
                         }
                     }
                     
+                    if (iterator_result < -1){
+                        operation_status.fail(format_worker_error("iterator read", thread_id, tid));
+                    }
+
                     // Count remaining SNPs in this chunk
                     while (snp_iter != snp_chunk_end){
                         ++snp_iter;
@@ -1668,21 +1877,24 @@ void count_alleles_parallel(
                     int done = ++units_done;
                     
                     if (done % 10 == 0 || done == (int)work_units.size()){
-                        fprintf(stderr, "\rProgress: %d/%lu units, %ld/%ld SNPs, %ld reads          ",
+                        fprintf(stderr, "\rProgress: %d/%lu units, %ld/%ld SNPs, %ld iterator records          ",
                             done, work_units.size(), snps_processed.load(), total_snps,
                             reads_processed.load());
                     }
                     
                     hts_itr_destroy(iter);
-                }
-                
-                hts_idx_destroy(idx);
-            }
-            
-            bam_destroy1(record);
-            bam_hdr_destroy(header);
-            hts_close(bam_fp);
         }
+
+        if (record) bam_destroy1(record);
+        if (idx) hts_idx_destroy(idx);
+        if (header) bam_hdr_destroy(header);
+        if (bam_fp) hts_close(bam_fp);
+    }
+
+    if (!operation_status.ok()){
+        fprintf(stderr, "ERROR: parallel allele counting failed: %s\n",
+            operation_status.message().c_str());
+        return false;
     }
     
     // Merge per-thread counts (order doesn't matter with fixed-point int64 arithmetic)
@@ -1759,6 +1971,7 @@ void count_alleles_parallel(
         gzFile pf = gzopen(obs_path.c_str(), "w");
         if (!pf){
             fprintf(stderr, "ERROR: could not open %s for writing\n", obs_path.c_str());
+            return false;
         } else {
             long n_obs_written = 0;
             for (int t = 0; t < n_threads; t++){
@@ -1775,26 +1988,20 @@ void count_alleles_parallel(
                 }
                 thread_pileup[t].clear();
             }
-            gzclose(pf);
+            if (gzclose(pf) != Z_OK){
+                fprintf(stderr, "ERROR: failed while closing %s\n", obs_path.c_str());
+                return false;
+            }
             fprintf(stderr, "Wrote %ld pileup observations to %s\n", n_obs_written, obs_path.c_str());
         }
     }
     thread_pileup.clear();
     thread_pileup.shrink_to_fit();
     
-    fprintf(stderr, "Completed: %d chromosomes (%lu work units), %ld SNPs, %ld reads, %lu cells\n",
+    fprintf(stderr, "Completed: %d chromosomes (%lu work units), %ld SNPs, %ld iterator records, %lu cells\n",
         n_chroms, work_units.size(), snps_processed.load(), reads_processed.load(), 
         cell_counts.size());
-    
-    // Debug: print base extraction stats
-    fprintf(stderr, "DEBUG base extraction stats:\n");
-    fprintf(stderr, "  reads processed: %ld\n", reads_processed.load());
-    fprintf(stderr, "  queries: %ld\n", g_base_queries.load());
-    fprintf(stderr, "  valid (ref/alt): %ld\n", g_base_valid.load());
-    fprintf(stderr, "  N:       %ld\n", g_base_N.load());
-    fprintf(stderr, "  dash:    %ld\n", g_base_dash.load());
-    fprintf(stderr, "  other:   %ld\n", g_base_other.load());
-    fprintf(stderr, "  queries per read: %.2f\n", (double)g_base_queries.load() / reads_processed.load());
+    return true;
 }
 
 // ============================================================================
@@ -2391,7 +2598,7 @@ static void write_source_reconciliation_summary(
 // DUAL-OUTPUT PARALLEL COUNTING (WP3: single BAM pass for two panels)
 // ============================================================================
 
-void count_alleles_parallel_dual(
+bool count_alleles_parallel_dual(
     const string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
@@ -2401,14 +2608,15 @@ void count_alleles_parallel_dual(
     int n_threads,
     int htslib_threads){
     const vector<string> no_sample_names;
-    count_alleles_parallel_dual(
+    return count_alleles_parallel_dual(
         bamfile, combined_snpdat, counts_panel0, counts_panel1, valid_barcodes,
         n_samples, no_sample_names, n_threads, htslib_threads,
         false, "", "YI", "YS", "", "", false, false, 256,
-        nullptr, nullptr, nullptr, nullptr, 0);
+        nullptr, nullptr, nullptr, nullptr, 0,
+        false, "");
 }
 
-void count_alleles_parallel_dual(
+bool count_alleles_parallel_dual(
     const string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
@@ -2431,67 +2639,182 @@ void count_alleles_parallel_dual(
     AcceptedSiteWeightMap* accepted_site_weights_panel1,
     const NativeSpeciesTargetTable* species_native_targets,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts,
-    int species_native_n_samples){
-    
-    bool has_bc_list = !valid_barcodes.empty();
+    int species_native_n_samples,
+    bool dump_pileup,
+    const string& pileup_prefix){
+
+    size_t bytes_per_cell = 0;
+    string request_error;
+    if (!validate_identity_and_allocation_request(
+            n_samples, nullptr, &bytes_per_cell, &request_error)){
+        fprintf(stderr, "ERROR: invalid dual-panel identity universe: %s\n",
+            request_error.c_str());
+        return false;
+    }
+    if (species_native_n_samples > 0 && !validate_identity_and_allocation_request(
+            species_native_n_samples, nullptr, nullptr, &request_error)){
+        fprintf(stderr, "ERROR: invalid native-species identity universe: %s\n",
+            request_error.c_str());
+        return false;
+    }
+    if (n_threads < 1 || htslib_threads < 1){
+        fprintf(stderr, "ERROR: thread counts must be positive\n");
+        return false;
+    }
+
+    const bool has_bc_list = !valid_barcodes.empty();
     const bool collect_species_native =
         species_native_targets != nullptr && species_native_counts != nullptr &&
         species_native_n_samples > 0;
-    
-    // Pre-allocate count structures for known barcodes
+
     if (has_bc_list){
-        fprintf(stderr, "Pre-allocating dual counts for %lu cells...\n", valid_barcodes.size());
-        for (unsigned long bc : valid_barcodes){
-            counts_panel0.emplace(std::piecewise_construct,
-                std::forward_as_tuple(bc),
-                std::forward_as_tuple(n_samples));
-            counts_panel1.emplace(std::piecewise_construct,
-                std::forward_as_tuple(bc),
-                std::forward_as_tuple(n_samples));
-            if (collect_species_native){
-                species_native_counts->emplace(std::piecewise_construct,
+        if (bytes_per_cell > 0 && valid_barcodes.size() >
+            std::numeric_limits<size_t>::max() / (2 * bytes_per_cell)){
+            fprintf(stderr, "ERROR: projected dual-panel CellCounts allocation overflows size_t\n");
+            return false;
+        }
+        fprintf(stderr, "Pre-allocating dual counts for %lu cells (%lu bytes/cell/panel)...\n",
+            valid_barcodes.size(), (unsigned long)bytes_per_cell);
+        try {
+            for (unsigned long bc : valid_barcodes){
+                counts_panel0.emplace(std::piecewise_construct,
                     std::forward_as_tuple(bc),
-                    std::forward_as_tuple(species_native_n_samples));
+                    std::forward_as_tuple(n_samples));
+                counts_panel1.emplace(std::piecewise_construct,
+                    std::forward_as_tuple(bc),
+                    std::forward_as_tuple(n_samples));
+                if (collect_species_native){
+                    species_native_counts->emplace(std::piecewise_construct,
+                        std::forward_as_tuple(bc),
+                        std::forward_as_tuple(species_native_n_samples));
+                }
             }
         }
+        catch (const std::exception& e){
+            fprintf(stderr, "ERROR: dual-panel pre-allocation failed: %s\n", e.what());
+            return false;
+        }
     }
-    
-    // Get chromosome info from BAM header
+
     htsFile* bam_tmp = hts_open(bamfile.c_str(), "r");
     if (!bam_tmp){
-        fprintf(stderr, "ERROR: Could not open BAM file to get header\n");
-        return;
+        fprintf(stderr, "ERROR: Could not open BAM file to get header: %s\n", bamfile.c_str());
+        return false;
     }
     bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
+    if (!hdr_tmp){
+        fprintf(stderr, "ERROR: Could not read BAM header: %s\n", bamfile.c_str());
+        hts_close(bam_tmp);
+        return false;
+    }
     hts_idx_t* idx_tmp = sam_index_load(bam_tmp, bamfile.c_str());
-    int n_chroms = hdr_tmp->n_targets;
-    
+    if (!idx_tmp){
+        fprintf(stderr, "ERROR: Could not load required BAM index: %s\n", bamfile.c_str());
+        bam_hdr_destroy(hdr_tmp);
+        hts_close(bam_tmp);
+        return false;
+    }
+    const int n_chroms = hdr_tmp->n_targets;
+    for (const auto& kv : combined_snpdat){
+        if (kv.first < 0 || kv.first >= n_chroms){
+            fprintf(stderr, "ERROR: combined SNP panel references invalid BAM target id %d\n", kv.first);
+            hts_idx_destroy(idx_tmp);
+            bam_hdr_destroy(hdr_tmp);
+            hts_close(bam_tmp);
+            return false;
+        }
+    }
+
+    // --dump_pileup: emit the per-SNP genotype sidecar for the variant-consistency
+    // metric (interindividual panel only; panel_id != 0 sites are skipped so the
+    // dual-panel sidecar is byte-compatible with the single-panel sidecar).
+    // geno[] is populated by precompute_all_genotypes() before this call, and
+    // hdr_tmp is still valid here (destroyed below).
+    // Columns: tid  chrom  pos  ref  alt  geno_0 .. geno_{n_samples-1}  (0/1/2/-1).
+    // The (tid,pos) pair is the producer's SNP join key; ref/alt are the allele
+    // bases (informational; the metric is allele-orientation based).
+    if (dump_pileup){
+        string sites_path = pileup_prefix + ".pileup_sites.tsv.gz";
+        gzFile sf = gzopen(sites_path.c_str(), "w");
+        if (!sf){
+            fprintf(stderr, "ERROR: could not open %s for writing\n", sites_path.c_str());
+            hts_idx_destroy(idx_tmp);
+            bam_hdr_destroy(hdr_tmp);
+            hts_close(bam_tmp);
+            return false;
+        } else {
+            long n_sites_written = 0;
+            for (auto& kv : combined_snpdat){
+                int tid_s = kv.first;
+                const char* cname = (tid_s >= 0 && tid_s < n_chroms) ?
+                    hdr_tmp->target_name[tid_s] : ".";
+                for (auto& snp : kv.second.snps){
+                    if (snp.panel_id != 0) continue;
+                    gzprintf(sf, "%d\t%s\t%d\t%c\t%c", tid_s, cname, snp.pos,
+                        snp.data.ref, snp.data.alt);
+                    for (int s = 0; s < n_samples; s++){
+                        gzprintf(sf, "\t%d", (int)snp.geno[s]);
+                    }
+                    gzprintf(sf, "\n");
+                    n_sites_written++;
+                }
+            }
+            if (gzclose(sf) != Z_OK){
+                fprintf(stderr, "ERROR: failed while closing %s\n", sites_path.c_str());
+                hts_idx_destroy(idx_tmp);
+                bam_hdr_destroy(hdr_tmp);
+                hts_close(bam_tmp);
+                return false;
+            }
+            fprintf(stderr, "Wrote %ld pileup sites to %s\n", n_sites_written, sites_path.c_str());
+        }
+    }
+
     vector<uint64_t> chrom_read_counts(n_chroms, 0);
     vector<int64_t> chrom_lengths(n_chroms);
     vector<string> chrom_names(n_chroms);
+    const int n_index_targets = hts_idx_nseq(idx_tmp);
+    if (n_index_targets < 0){
+        fprintf(stderr, "ERROR: Could not determine BAM-index target count\n");
+        hts_idx_destroy(idx_tmp);
+        bam_hdr_destroy(hdr_tmp);
+        hts_close(bam_tmp);
+        return false;
+    }
+    int n_missing_index_stats = 0;
+    int first_missing_index_stat = -1;
     for (int i = 0; i < n_chroms; ++i){
         chrom_names[i] = hdr_tmp->target_name[i]
-            ? hdr_tmp->target_name[i]
-            : std::to_string(i);
-    }
-    
-    if (idx_tmp){
-        for (int i = 0; i < n_chroms; i++){
-            uint64_t mapped, unmapped;
-            hts_idx_get_stat(idx_tmp, i, &mapped, &unmapped);
-            chrom_read_counts[i] = mapped;
-            chrom_lengths[i] = hdr_tmp->target_len[i];
+            ? hdr_tmp->target_name[i] : std::to_string(i);
+        uint64_t mapped = 0, unmapped = 0;
+        if (i >= n_index_targets ||
+            hts_idx_get_stat(idx_tmp, i, &mapped, &unmapped) < 0){
+            // A valid BAI/CSI may omit the metadata bin for a target with no
+            // alignment records. These counts are used only to estimate work
+            // unit size and ordering; the iterator still queries the complete
+            // target below. Use an unchunked zero-read scheduling estimate.
+            mapped = 0;
+            unmapped = 0;
+            if (first_missing_index_stat < 0) first_missing_index_stat = i;
+            n_missing_index_stats++;
         }
-        hts_idx_destroy(idx_tmp);
-    } else {
-        fprintf(stderr, "WARNING: Could not load BAM index for read count estimation\n");
-        for (int i = 0; i < n_chroms; i++){
-            chrom_lengths[i] = hdr_tmp->target_len[i];
-        }
+        chrom_read_counts[i] = mapped;
+        chrom_lengths[i] = hdr_tmp->target_len[i];
     }
+    if (n_missing_index_stats > 0){
+        const char* first_name =
+            (first_missing_index_stat >= 0 && first_missing_index_stat < n_chroms &&
+             hdr_tmp->target_name[first_missing_index_stat])
+                ? hdr_tmp->target_name[first_missing_index_stat] : ".";
+        fprintf(stderr,
+            "WARNING: BAM-index mapped/unmapped statistics unavailable for %d of %d header targets "
+            "(first target %d: %s); using zero only for work-unit scheduling estimates\n",
+            n_missing_index_stats, n_chroms, first_missing_index_stat, first_name);
+    }
+    hts_idx_destroy(idx_tmp);
     bam_hdr_destroy(hdr_tmp);
     hts_close(bam_tmp);
-    
+
     // Build bin index for read skipping (Change 3)
     robin_hood::unordered_map<int, ChromBinIndex> bin_indices;
     build_bin_indices(combined_snpdat, chrom_lengths, bin_indices);
@@ -2523,22 +2846,9 @@ void count_alleles_parallel_dual(
         uint64_t chrom_reads = chrom_read_counts[tid];
         
         if (it == combined_snpdat.end() || it->second.empty()){
-            if (chrom_reads > CHUNK_READ_THRESHOLD){
-                size_t n_chunks = (chrom_reads + CHUNK_READ_THRESHOLD - 1) / CHUNK_READ_THRESHOLD;
-                n_chunks = std::min(n_chunks, (size_t)20);
-                int64_t chunk_size = (chrom_len + n_chunks - 1) / n_chunks;
-                uint64_t reads_per_chunk = chrom_reads / n_chunks;
-                
-                for (size_t c = 0; c < n_chunks; c++){
-                    int start_pos = c * chunk_size;
-                    int end_pos = (c == n_chunks - 1) ? INT_MAX : (int)((c + 1) * chunk_size);
-                    work_units.push_back({tid, start_pos, end_pos, 0, 0, false, reads_per_chunk});
-                }
-                chroms_chunked_by_reads++;
-            }
-            else{
-                work_units.push_back({tid, 0, INT_MAX, 0, 0, false, chrom_reads});
-            }
+            // Neither active panel has a SNP on this target. Skip it entirely;
+            // record-count-only iterators do not affect either output panel.
+            continue;
         }
         else{
             ChromSNPs& chrom_snps = it->second;
@@ -2582,6 +2892,7 @@ void count_alleles_parallel_dual(
                         snp_idx++;
                     }
                     size_t snp_end = snp_idx;
+                    if (snp_start == snp_end) continue;
                     
                     work_units.push_back({tid, start_pos, end_pos, snp_start, snp_end, true, reads_per_chunk});
                 }
@@ -2599,7 +2910,7 @@ void count_alleles_parallel_dual(
                   return a.est_reads > b.est_reads;
               });
     
-    fprintf(stderr, "DUAL-PANEL: Processing %d chromosomes (%d with SNPs, %ld total combined SNPs) using %d threads...\n",
+    fprintf(stderr, "DUAL-PANEL: BAM header has %d targets; processing %d SNP-bearing targets (%ld total combined SNPs) using %d threads...\n",
         n_chroms, chroms_with_snps, total_snps, n_threads);
     fprintf(stderr, "  Split into %lu work units (%d by SNP density, %d by read density)\n", 
         work_units.size(), chroms_chunked_by_snp, chroms_chunked_by_reads);
@@ -2615,6 +2926,13 @@ void count_alleles_parallel_dual(
     vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts_p1(n_threads);
     vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_species_native_counts(
         collect_species_native ? n_threads : 0);
+
+    // --dump_pileup: per-thread per-(cell,SNP) allele evidence (interindividual
+    // only).  Inner key packs (tid<<32 | pos); value is (ref_scaled, alt_scaled).
+    // Empty and untouched unless dump_pileup is set.  Identical structure and
+    // downstream contract to the single-panel path.
+    vector<robin_hood::unordered_map<unsigned long,
+        robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights_p0(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights_p1(n_threads);
     vector<SourceObservationMap> thread_source_observations(n_threads);
@@ -2635,6 +2953,8 @@ void count_alleles_parallel_dual(
         load_source_receiver_map(source_receiver_map_path, source_sample_to_idx);
     std::atomic<uint64_t> source_observations_missing_receiver_map{0};
     std::atomic<uint64_t> source_observations_invalid_receiver_genotype{0};
+    ParallelOperationStatus operation_status;
+    std::atomic<bool> hts_thread_warning_emitted(false);
     
     #pragma omp parallel
     {
@@ -2651,45 +2971,71 @@ void count_alleles_parallel_dual(
         auto& local_donor_site_audit = thread_donor_site_audit[thread_id];
         
         htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
+        bam_hdr_t* header = nullptr;
+        hts_idx_t* idx = nullptr;
+        bam1_t* record = nullptr;
         if (!bam_fp){
-            fprintf(stderr, "ERROR: Thread %d could not open BAM file\n", omp_get_thread_num());
+            operation_status.fail(format_worker_error("BAM open", thread_id));
         }
         else{
-            hts_set_threads(bam_fp, htslib_threads);
-            
-            bam_hdr_t* header = sam_hdr_read(bam_fp);
-            hts_idx_t* idx = sam_index_load(bam_fp, bamfile.c_str());
-            bam1_t* record = bam_init1();
-            
-            if (!idx){
-                fprintf(stderr, "ERROR: Could not load BAM index\n");
+            if (htslib_threads > 1 && hts_set_threads(bam_fp, htslib_threads) < 0){
+                bool expected = false;
+                if (hts_thread_warning_emitted.compare_exchange_strong(expected, true)){
+                    fprintf(stderr,
+                        "WARNING: HTSlib helper-thread setup failed; continuing with synchronous BAM I/O\n");
+                }
             }
-            else{
-                #pragma omp for schedule(dynamic, 1)
-                for (size_t i = 0; i < work_units.size(); i++){
-                    WorkUnit& wu = work_units[i];
-                    int tid = wu.tid;
-                    
-                    hts_itr_t* iter = sam_itr_queryi(idx, tid, wu.start_pos, wu.end_pos);
-                    if (!iter) continue;
+            header = sam_hdr_read(bam_fp);
+            if (!header){
+                operation_status.fail(format_worker_error("BAM header read", thread_id));
+            }
+            idx = sam_index_load(bam_fp, bamfile.c_str());
+            if (!idx){
+                operation_status.fail(format_worker_error("BAM index load", thread_id));
+            }
+            record = bam_init1();
+            if (!record){
+                operation_status.fail(format_worker_error("BAM record allocation", thread_id));
+            }
+        }
+
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t i = 0; i < work_units.size(); i++){
+            if (!operation_status.ok() || !bam_fp || !header || !idx || !record) continue;
+            WorkUnit& wu = work_units[i];
+            int tid = wu.tid;
+            if (tid < 0 || tid >= header->n_targets){
+                operation_status.fail(format_worker_error("invalid contig", thread_id, tid));
+                continue;
+            }
+
+            hts_itr_t* iter = sam_itr_queryi(idx, tid, wu.start_pos, wu.end_pos);
+            if (!iter){
+                operation_status.fail(format_worker_error("iterator creation", thread_id, tid));
+                continue;
+            }
                     
                     long local_snps = 0;
                     long local_reads = 0;
                     long local_all_reads = 0;
                     
                     if (!wu.has_snps){
-                        while (sam_itr_next(bam_fp, iter, record) >= 0){
-                            if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
+                        int iterator_result = 0;
+                        while ((iterator_result = sam_itr_next(bam_fp, iter, record)) >= 0){
+                            if (!read_passes_filter(record, default_production_read_filter())){
                                 continue;
                             }
                             local_all_reads++;
+                        }
+                        if (iterator_result < -1){
+                            operation_status.fail(format_worker_error("iterator read", thread_id, tid));
                         }
                         hts_itr_destroy(iter);
                         reads_processed += local_all_reads;
                         
                         int done = ++units_done;
                         if (done % 100 == 0 || done == (int)work_units.size()){
-                            fprintf(stderr, "\rDUAL progress: %d/%lu units, %ld/%ld SNPs, %ld reads",
+                            fprintf(stderr, "\rDUAL progress: %d/%lu units, %ld/%ld SNPs, %ld iterator records",
                                 done, work_units.size(), snps_processed.load(), total_snps,
                                 reads_processed.load());
                         }
@@ -2709,8 +3055,9 @@ void count_alleles_parallel_dual(
                     auto snp_iter = chrom_snps.snps.begin() + wu.snp_start;
                     auto snp_chunk_end = chrom_snps.snps.begin() + wu.snp_end;
                     
-                    while (sam_itr_next(bam_fp, iter, record) >= 0){
-                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP)){
+                    int iterator_result = 0;
+                    while ((iterator_result = sam_itr_next(bam_fp, iter, record)) >= 0){
+                        if (!read_passes_filter(record, default_production_read_filter())){
                             continue;
                         }
                         
@@ -2845,7 +3192,7 @@ void count_alleles_parallel_dual(
                         int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
                         
                         for (auto snp_check = snp_iter; 
-                             snp_check != snp_chunk_end && snp_check->pos <= read_end; 
+                             snp_check != snp_chunk_end && snp_check->pos < read_end; 
                              ++snp_check){
                             
                             char allele = get_base_at_pos(record, snp_check->pos);
@@ -2855,14 +3202,11 @@ void count_alleles_parallel_dual(
                             
                             if (allele == snp_check->data.ref){
                                 ref_add = prob_scaled;
-                                g_base_valid++;
                             }
                             else if (allele == snp_check->data.alt){
                                 alt_add = prob_scaled;
-                                g_base_valid++;
                             }
                             else {
-                                g_base_other++;
                             }
                             
                             if (ref_add > 0 || alt_add > 0){
@@ -2999,6 +3343,17 @@ void count_alleles_parallel_dual(
                                     cc.alt_counts[p.pair_idx] += alt_add;
                                 }
 
+                                // --dump_pileup: record per-(cell,SNP) evidence for
+                                // interindividual SNPs.  Summed within a thread; the
+                                // producer sums any cross-thread duplicates.
+                                if (dump_pileup && snp_check->panel_id == 0){
+                                    int64_t pkey = ((int64_t)tid << 32) |
+                                        (int64_t)(uint32_t)snp_check->pos;
+                                    auto& slot = thread_pileup[thread_id][bc_key][pkey];
+                                    slot.first += ref_add;
+                                    slot.second += alt_add;
+                                }
+
                                 if (local_species_native != nullptr && snp_check->panel_id == 1 &&
                                     native_chrom_targets != nullptr){
                                     const size_t snp_index = (size_t)(
@@ -3025,6 +3380,10 @@ void count_alleles_parallel_dual(
                         }
                     }
                     
+                    if (iterator_result < -1){
+                        operation_status.fail(format_worker_error("iterator read", thread_id, tid));
+                    }
+
                     while (snp_iter != snp_chunk_end){
                         ++snp_iter;
                         ++local_snps;
@@ -3035,21 +3394,24 @@ void count_alleles_parallel_dual(
                     int done = ++units_done;
                     
                     if (done % 10 == 0 || done == (int)work_units.size()){
-                        fprintf(stderr, "\rDUAL progress: %d/%lu units, %ld/%ld SNPs, %ld reads          ",
+                        fprintf(stderr, "\rDUAL progress: %d/%lu units, %ld/%ld SNPs, %ld iterator records          ",
                             done, work_units.size(), snps_processed.load(), total_snps,
                             reads_processed.load());
                     }
                     
                     hts_itr_destroy(iter);
-                }
-                
-                hts_idx_destroy(idx);
-            }
-            
-            bam_destroy1(record);
-            bam_hdr_destroy(header);
-            hts_close(bam_fp);
         }
+
+        if (record) bam_destroy1(record);
+        if (idx) hts_idx_destroy(idx);
+        if (header) bam_hdr_destroy(header);
+        if (bam_fp) hts_close(bam_fp);
+    }
+
+    if (!operation_status.ok()){
+        fprintf(stderr, "ERROR: dual-panel allele counting failed: %s\n",
+            operation_status.message().c_str());
+        return false;
     }
     
     // Merge per-thread counts for panel 0
@@ -3113,6 +3475,42 @@ void count_alleles_parallel_dual(
     thread_counts_p1.clear();
     thread_counts_p1.shrink_to_fit();
 
+    // --dump_pileup: flush per-thread per-(cell,SNP) observations.  Per-thread
+    // rows are pre-summed; the same (bc,tid,pos) may still appear across threads
+    // and is summed downstream by the producer.  Columns: bc_hash tid pos ref alt
+    // (ref/alt are prob-scaled float evidence, matching the .counts units).
+    if (dump_pileup){
+        string obs_path = pileup_prefix + ".pileup_obs.tsv.gz";
+        gzFile pf = gzopen(obs_path.c_str(), "w");
+        if (!pf){
+            fprintf(stderr, "ERROR: could not open %s for writing\n", obs_path.c_str());
+            return false;
+        } else {
+            long n_obs_written = 0;
+            for (int t = 0; t < n_threads; t++){
+                for (auto& cell : thread_pileup[t]){
+                    unsigned long bc = cell.first;
+                    for (auto& kv : cell.second){
+                        int tid_o = (int)(kv.first >> 32);
+                        int pos_o = (int)(kv.first & 0xFFFFFFFF);
+                        gzprintf(pf, "%lu\t%d\t%d\t%f\t%f\n", bc, tid_o, pos_o,
+                            (double)kv.second.first / FIXED_POINT_SCALE,
+                            (double)kv.second.second / FIXED_POINT_SCALE);
+                        n_obs_written++;
+                    }
+                }
+                thread_pileup[t].clear();
+            }
+            if (gzclose(pf) != Z_OK){
+                fprintf(stderr, "ERROR: failed while closing %s\n", obs_path.c_str());
+                return false;
+            }
+            fprintf(stderr, "Wrote %ld pileup observations to %s\n", n_obs_written, obs_path.c_str());
+        }
+    }
+    thread_pileup.clear();
+    thread_pileup.shrink_to_fit();
+
     auto merge_site_weights = [n_threads](
         vector<AcceptedSiteWeightMap>& per_thread,
         AcceptedSiteWeightMap* destination,
@@ -3167,7 +3565,7 @@ void count_alleles_parallel_dual(
                 (unsigned long long)missing_sid, synthetic_id_tag.c_str(),
                 (unsigned long long)mismatched_sid, synthetic_id_tag.c_str(),
                 expected_synthetic_id.c_str());
-            exit(1);
+            return false;
         }
         if (!source_receiver_map_path.empty() &&
             (missing_receiver > 0 || invalid_receiver_genotype > 0)){
@@ -3175,7 +3573,7 @@ void count_alleles_parallel_dual(
                 "ERROR: category-resolved source provenance failed: %llu accepted individual-panel observations lacked a receiver-map entry and %llu had an invalid receiver genotype index.\n",
                 (unsigned long long)missing_receiver,
                 (unsigned long long)invalid_receiver_genotype);
-            exit(1);
+            return false;
         }
         if (!source_receiver_map_path.empty()){
             fprintf(stderr,
@@ -3229,7 +3627,7 @@ void count_alleles_parallel_dual(
     thread_donor_site_audit.clear();
     thread_donor_site_audit.shrink_to_fit();
     
-    fprintf(stderr, "DUAL completed: %d chromosomes (%lu work units), %ld SNPs, %ld reads\n",
+    fprintf(stderr, "DUAL completed: %d chromosomes (%lu work units), %ld SNPs, %ld iterator records\n",
         n_chroms, work_units.size(), snps_processed.load(), reads_processed.load());
     fprintf(stderr, "  Panel 0 (interindiv): %lu cells\n", counts_panel0.size());
     fprintf(stderr, "  Panel 1 (individual-shaped species evidence): %lu cells\n", counts_panel1.size());
@@ -3237,9 +3635,10 @@ void count_alleles_parallel_dual(
         fprintf(stderr, "  Panel 1 (native species evidence):            %lu cells\n",
             species_native_counts->size());
     }
+    return true;
 }
 
-void count_alleles_single_threaded(
+bool count_alleles_single_threaded(
     const string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
@@ -3251,157 +3650,30 @@ void count_alleles_single_threaded(
     const NativeSpeciesTargetTable* species_native_targets,
     robin_hood::unordered_map<unsigned long, CellCounts>* species_native_counts,
     int species_native_n_samples){
-    
-    bool has_bc_list = !valid_barcodes.empty();
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts> parallel_counts;
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts> parallel_species_counts;
     const bool collect_species_native =
         species_native_targets != nullptr && species_native_counts != nullptr &&
         species_native_n_samples > 0;
-    
-    string bamfile_copy = bamfile;  // bam_reader needs non-const
-    bam_reader reader;
-    reader.set_file(bamfile_copy);
-    reader.set_cb();
-    
-    long total_snps = 0;
-    for (auto& kv : snpdat_all){
-        total_snps += kv.second.size();
-    }
-    
-    fprintf(stderr, "Processing %ld SNPs single-threaded...\n", total_snps);
-    
-    int curtid = -1;
-    vector<SNPData>::iterator cursnp;
-    vector<SNPData>::iterator cursnp_end;
-    ChromSNPs* active_chrom = nullptr;
-    const NativeSpeciesChromTargets* active_native_targets = nullptr;
-    
-    long snps_processed = 0;
-    long reads_processed = 0;
-    int progress = 10000;
-    
-    while (reader.next()){
-        if (reader.unmapped() || reader.secondary() || reader.qcfail() || reader.dup()){
-            continue;
-        }
-        
-        // Count ALL reads after flag filter (like V1)
-        reads_processed++;
-        
-        if (curtid != reader.tid()){
-            // New chromosome
-            curtid = reader.tid();
-            
-            auto it = snpdat_all.find(curtid);
-            if (it != snpdat_all.end() && !it->second.empty()){
-                active_chrom = &(it->second);
-                active_native_targets = nullptr;
-                if (collect_species_native){
-                    auto native_it = species_native_targets->find(curtid);
-                    if (native_it != species_native_targets->end()){
-                        active_native_targets = &native_it->second;
-                    }
-                }
-                cursnp = active_chrom->snps.begin();
-                cursnp_end = active_chrom->snps.end();
-                
-                if (compute_conditional){
-                    get_conditional_match_fracs_chrom_optimized(*active_chrom,
-                        conditional_match_fracs, conditional_match_tots, n_samples);
-                }
-            }
-            else{
-                active_chrom = nullptr;
-                active_native_targets = nullptr;
-            }
-        }
-        
-        if (!active_chrom) continue;
-        
-        // Advance SNP iterator BEFORE CB check (match V1 behavior)
-        while (cursnp != cursnp_end && cursnp->pos < reader.reference_start){
-            ++cursnp;
-            ++snps_processed;
-        }
-        
-        if (!reader.has_cb_z) continue;
-        
-        bc cb_bits;
-        str2bc(reader.cb_z, cb_bits);
-        unsigned long bc_key = cb_bits.to_ulong();
-        
-        if (has_bc_list && valid_barcodes.find(bc_key) == valid_barcodes.end()){
-            continue;
-        }
-        
-        // Get mapping quality probability and scale to fixed-point
-        float prob_correct = 1.0f - powf(10.0f, -(float)reader.mapq / 10.0f);
-        int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
-        
-        // Process overlapping SNPs
-        for (auto snp_check = cursnp;
-             snp_check != cursnp_end && snp_check->pos <= reader.reference_end;
-             ++snp_check){
-            
-            char allele = reader.get_base_at(snp_check->pos + 1);
-            if (allele == 'N' || allele == '-') continue;
-            
-            int64_t ref_add = 0, alt_add = 0;
-            
-            if (allele == snp_check->data.ref){
-                ref_add = prob_scaled;
-            }
-            else if (allele == snp_check->data.alt){
-                alt_add = prob_scaled;
-            }
-            
-            if (ref_add > 0 || alt_add > 0){
-                // Get or create cell counts
-                auto it = cell_counts.find(bc_key);
-                if (it == cell_counts.end()){
-                    cell_counts.emplace(bc_key, CellCounts(n_samples));
-                    it = cell_counts.find(bc_key);
-                }
-                
-                // Precomputed targets: linear traversal, no branches
-                CellCounts& cc = it->second;
-                const auto& ttargets = snp_check->total_targets;
-                const auto& ptargets = snp_check->pair_targets;
-                
-                for (const auto& t : ttargets){
-                    cc.total_ref[t.total_idx] += ref_add;
-                    cc.total_alt[t.total_idx] += alt_add;
-                }
-                for (const auto& p : ptargets){
-                    cc.ref_counts[p.pair_idx] += ref_add;
-                    cc.alt_counts[p.pair_idx] += alt_add;
-                }
 
-                if (collect_species_native && active_native_targets != nullptr){
-                    const size_t snp_index = (size_t)(
-                        snp_check - active_chrom->snps.begin());
-                    if (snp_index < active_native_targets->site_offsets.size() &&
-                        active_native_targets->site_offsets[snp_index] != UINT64_MAX){
-                        auto native_it = species_native_counts->find(bc_key);
-                        if (native_it == species_native_counts->end()){
-                            species_native_counts->emplace(
-                                bc_key, CellCounts(species_native_n_samples));
-                            native_it = species_native_counts->find(bc_key);
-                        }
-                        accumulate_species_native_targets(
-                            native_it->second, *active_native_targets, snp_index,
-                            ref_add, alt_add);
-                    }
-                }
-            }
-        }
-        
-        if (reads_processed % progress == 0){
-            fprintf(stderr, "Processed %ld reads, %ld SNPs\r", reads_processed, snps_processed);
-        }
+    if (!count_alleles_parallel(
+            bamfile, snpdat_all, parallel_counts, valid_barcodes, n_samples,
+            1, 1, false, "", nullptr, species_native_targets,
+            collect_species_native ? &parallel_species_counts : nullptr,
+            species_native_n_samples)){
+        return false;
     }
-    
-    fprintf(stderr, "\nCompleted: %ld SNPs, %ld reads, %lu cells\n",
-        snps_processed, reads_processed, cell_counts.size());
+
+    finalize_parallel_counts(parallel_counts, cell_counts);
+    if (collect_species_native){
+        finalize_parallel_counts(parallel_species_counts, *species_native_counts);
+    }
+    if (compute_conditional){
+        conditional_match_tots.clear();
+        compute_conditional_match_fracs_parallel(
+            snpdat_all, conditional_match_fracs, n_samples, 1);
+    }
+    return true;
 }
 
 void finalize_parallel_counts(
@@ -3431,8 +3703,9 @@ bool create_shared_vcf(
     string vcf_file_copy = vcf_file;  // read_vcf_chroms_optimized needs non-const
     int nvar = read_vcf_chroms_optimized(vcf_file_copy, chroms_to_include, seq2tid, snpdat, min_vq);
     
-    if (nvar == 0){
-        fprintf(stderr, "ERROR: No variants loaded from VCF\n");
+    if (nvar <= 0){
+        fprintf(stderr, "ERROR: %s variants loaded from VCF\n",
+            nvar < 0 ? "failed to load" : "no usable");
         return false;
     }
     
@@ -3647,7 +3920,7 @@ int load_het_vcf(
     return read_vcf_chroms_optimized(vcf_file_copy, chroms_copy, seq2tid, het_snpdat, min_vq);
 }
 
-void count_het_alleles_parallel(
+bool count_het_alleles_parallel(
     const string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
     robin_hood::unordered_map<unsigned long, CellCounts>& het_counts,
@@ -3662,13 +3935,16 @@ void count_het_alleles_parallel(
     robin_hood::unordered_map<unsigned long, AlignedCellCounts> parallel_counts;
     
     // Use the same counting function - it works with any SNP set
-    count_alleles_parallel(bamfile, het_snpdat, parallel_counts,
-        valid_barcodes, n_samples, n_threads, htslib_threads);
+    if (!count_alleles_parallel(bamfile, het_snpdat, parallel_counts,
+            valid_barcodes, n_samples, n_threads, htslib_threads)){
+        return false;
+    }
     
     // Finalize into the output structure
     finalize_parallel_counts(parallel_counts, het_counts);
     
     fprintf(stderr, "Het allele counting complete: %lu cells\n", het_counts.size());
+    return true;
 }
 
 /**
@@ -3677,7 +3953,7 @@ void count_het_alleles_parallel(
  * Unlike count_het_alleles_parallel which aggregates by genotype pair (losing per-site info),
  * this preserves per-site information needed for accurate het balance variance.
  */
-void count_het_alleles_extended(
+bool count_het_alleles_extended(
     const string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
     robin_hood::unordered_map<unsigned long, CellHetData>& het_data,
@@ -3687,245 +3963,296 @@ void count_het_alleles_extended(
     int n_threads,
     int htslib_threads,
     HetBalanceMethod method) {
-    
-    bool collect_persite = (method == HetBalanceMethod::PERSITE);
-    bool collect_welford = (method == HetBalanceMethod::WELFORD);
-    bool has_bc_list = !valid_barcodes.empty();
-    
-    // Build global site index for persite method
+    size_t ignored_bytes = 0;
+    string request_error;
+    if (!validate_identity_and_allocation_request(
+            n_samples, nullptr, &ignored_bytes, &request_error)){
+        fprintf(stderr, "ERROR: invalid het/ploidy identity universe: %s\n",
+            request_error.c_str());
+        return false;
+    }
+    if (n_threads < 1 || htslib_threads < 1){
+        fprintf(stderr, "ERROR: thread counts must be positive\n");
+        return false;
+    }
+
+    const bool collect_persite = (method == HetBalanceMethod::PERSITE);
+    const bool collect_welford = (method == HetBalanceMethod::WELFORD);
+    const bool has_bc_list = !valid_barcodes.empty();
+    if (!collect_persite && !collect_welford){
+        fprintf(stderr, "ERROR: unsupported het-balance method\n");
+        return false;
+    }
+
     map<pair<int, int>, int32_t> site_to_idx;
     idx_to_site.clear();
-    int32_t global_idx = 0;
-    
-    for (auto& kv : het_snpdat) {
-        int tid = kv.first;
-        for (const auto& snp : kv.second.snps) {
-            site_to_idx[{tid, snp.pos}] = global_idx;
-            idx_to_site.push_back({tid, snp.pos});
-            global_idx++;
+    size_t global_idx = 0;
+    for (const auto& kv : het_snpdat){
+        const int tid = kv.first;
+        for (const auto& snp : kv.second.snps){
+            if (global_idx > (size_t)std::numeric_limits<int32_t>::max()){
+                fprintf(stderr, "ERROR: het site index exceeds int32_t representation\n");
+                return false;
+            }
+            site_to_idx[make_pair(tid, snp.pos)] = (int32_t)global_idx;
+            idx_to_site.push_back(make_pair(tid, snp.pos));
+            ++global_idx;
         }
     }
-    
-    long total_het_sites = global_idx;
+
     const char* method_name = collect_persite ? "per-site" : "Welford";
-    fprintf(stderr, "Processing %ld het sites with %s method\n", total_het_sites, method_name);
-    
-    // Pre-allocate for known barcodes
-    if (has_bc_list) {
+    fprintf(stderr, "Processing %lu het sites with %s method\n",
+        (unsigned long)global_idx, method_name);
+
+    if (has_bc_list){
         fprintf(stderr, "Pre-allocating het data for %lu cells...\n", valid_barcodes.size());
-        for (unsigned long bc : valid_barcodes) {
-            het_data.emplace(piecewise_construct,
-                forward_as_tuple(bc),
-                forward_as_tuple(n_samples));
+        try {
+            for (unsigned long bc : valid_barcodes){
+                het_data.emplace(piecewise_construct,
+                    forward_as_tuple(bc), forward_as_tuple(n_samples));
+            }
+        }
+        catch (const std::exception& e){
+            fprintf(stderr, "ERROR: het/ploidy pre-allocation failed: %s\n", e.what());
+            return false;
         }
     }
-    
-    // Get chromosome info from BAM header
+
     htsFile* bam_tmp = hts_open(bamfile.c_str(), "r");
-    if (!bam_tmp) {
-        fprintf(stderr, "ERROR: Could not open BAM file\n");
-        return;
+    if (!bam_tmp){
+        fprintf(stderr, "ERROR: Could not open BAM file: %s\n", bamfile.c_str());
+        return false;
     }
     bam_hdr_t* hdr_tmp = sam_hdr_read(bam_tmp);
-    int n_chroms = hdr_tmp->n_targets;
-    bam_hdr_destroy(hdr_tmp);
-    hts_close(bam_tmp);
-    
-    // Build work units by chromosome
-    vector<int> chrom_work;
-    for (int tid = 0; tid < n_chroms; tid++) {
-        if (het_snpdat.find(tid) != het_snpdat.end() && !het_snpdat[tid].empty()) {
-            chrom_work.push_back(tid);
+    if (!hdr_tmp){
+        fprintf(stderr, "ERROR: Could not read BAM header: %s\n", bamfile.c_str());
+        hts_close(bam_tmp);
+        return false;
+    }
+    hts_idx_t* idx_tmp = sam_index_load(bam_tmp, bamfile.c_str());
+    if (!idx_tmp){
+        fprintf(stderr, "ERROR: Could not load required BAM index: %s\n", bamfile.c_str());
+        bam_hdr_destroy(hdr_tmp);
+        hts_close(bam_tmp);
+        return false;
+    }
+    const int n_chroms = hdr_tmp->n_targets;
+    for (const auto& kv : het_snpdat){
+        if (kv.first < 0 || kv.first >= n_chroms){
+            fprintf(stderr, "ERROR: het panel references invalid BAM target id %d\n", kv.first);
+            hts_idx_destroy(idx_tmp);
+            bam_hdr_destroy(hdr_tmp);
+            hts_close(bam_tmp);
+            return false;
         }
     }
-    
-    fprintf(stderr, "Processing %lu chromosomes with %d threads...\n", chrom_work.size(), n_threads);
-    
-    mutex output_mutex;
+    hts_idx_destroy(idx_tmp);
+    bam_hdr_destroy(hdr_tmp);
+    hts_close(bam_tmp);
+
+    vector<int> chrom_work;
+    for (int tid = 0; tid < n_chroms; ++tid){
+        auto it = het_snpdat.find(tid);
+        if (it != het_snpdat.end() && !it->second.empty()) chrom_work.push_back(tid);
+    }
+    fprintf(stderr, "Processing %lu chromosomes with %d threads...\n",
+        chrom_work.size(), n_threads);
+
     atomic<int> chroms_done(0);
-    atomic<long> reads_processed(0);
+    atomic<long> records_processed(0);
     atomic<long> sites_hit(0);
-    
+    ParallelOperationStatus operation_status;
+    std::atomic<bool> hts_thread_warning_emitted(false);
+    vector<robin_hood::unordered_map<unsigned long, CellHetData> > thread_het_data(n_threads);
+
     #pragma omp parallel num_threads(n_threads)
     {
-        // Thread-local het data
-        robin_hood::unordered_map<unsigned long, CellHetData> local_het_data;
-        
-        if (has_bc_list) {
-            for (unsigned long bc : valid_barcodes) {
-                local_het_data.emplace(piecewise_construct,
-                    forward_as_tuple(bc),
-                    forward_as_tuple(n_samples));
+        const int thread_id = omp_get_thread_num();
+        auto& local_het_data = thread_het_data[thread_id];
+        if (has_bc_list){
+            try {
+                for (unsigned long bc : valid_barcodes){
+                    local_het_data.emplace(piecewise_construct,
+                        forward_as_tuple(bc), forward_as_tuple(n_samples));
+                }
+            }
+            catch (const std::exception& e){
+                operation_status.fail(std::string("het worker allocation failed: ") + e.what());
             }
         }
-        
-        // Open BAM for this thread
+
         htsFile* bam_fp = hts_open(bamfile.c_str(), "r");
-        if (!bam_fp) {
-            fprintf(stderr, "ERROR: Thread could not open BAM\n");
+        bam_hdr_t* header = nullptr;
+        hts_idx_t* idx = nullptr;
+        bam1_t* record = nullptr;
+        if (!bam_fp){
+            operation_status.fail(format_worker_error("BAM open", thread_id));
         }
-        else {
-            if (htslib_threads > 1) {
-                hts_set_threads(bam_fp, htslib_threads);
+        else{
+            if (htslib_threads > 1 && hts_set_threads(bam_fp, htslib_threads) < 0){
+                bool expected = false;
+                if (hts_thread_warning_emitted.compare_exchange_strong(expected, true)){
+                    fprintf(stderr,
+                        "WARNING: HTSlib helper-thread setup failed; continuing with synchronous BAM I/O\n");
+                }
             }
-            
-            bam_hdr_t* header = sam_hdr_read(bam_fp);
-            hts_idx_t* idx = sam_index_load(bam_fp, bamfile.c_str());
-            bam1_t* record = bam_init1();
-            
-            if (idx) {
-                #pragma omp for schedule(dynamic)
-                for (size_t wi = 0; wi < chrom_work.size(); wi++) {
-                    int tid = chrom_work[wi];
-                    ChromSNPs& chrom_snps = het_snpdat[tid];
-                    
-                    long local_reads = 0;
-                    long local_sites = 0;
-                    
-                    hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, INT_MAX);
-                    if (!iter) continue;
-                    
-                    auto snp_iter = chrom_snps.snps.begin();
-                    auto snp_end = chrom_snps.snps.end();
-                    
-                    while (sam_itr_next(bam_fp, iter, record) >= 0) {
-                        local_reads++;
-                        
-                        if (record->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY)) {
-                            continue;
+            header = sam_hdr_read(bam_fp);
+            if (!header) operation_status.fail(format_worker_error("BAM header read", thread_id));
+            idx = sam_index_load(bam_fp, bamfile.c_str());
+            if (!idx) operation_status.fail(format_worker_error("BAM index load", thread_id));
+            record = bam_init1();
+            if (!record) operation_status.fail(format_worker_error("BAM record allocation", thread_id));
+        }
+
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t wi = 0; wi < chrom_work.size(); ++wi){
+            if (!operation_status.ok() || !bam_fp || !header || !idx || !record) continue;
+            const int tid = chrom_work[wi];
+            if (tid < 0 || tid >= header->n_targets){
+                operation_status.fail(format_worker_error("invalid contig", thread_id, tid));
+                continue;
+            }
+            auto snp_map_it = het_snpdat.find(tid);
+            if (snp_map_it == het_snpdat.end()){
+                operation_status.fail(format_worker_error("missing het contig data", thread_id, tid));
+                continue;
+            }
+            ChromSNPs& chrom_snps = snp_map_it->second;
+            hts_itr_t* iter = sam_itr_queryi(idx, tid, 0, INT_MAX);
+            if (!iter){
+                operation_status.fail(format_worker_error("iterator creation", thread_id, tid));
+                continue;
+            }
+
+            long local_records = 0;
+            long local_sites = 0;
+            auto snp_iter = chrom_snps.snps.begin();
+            auto snp_end = chrom_snps.snps.end();
+            int iterator_result = 0;
+            while ((iterator_result = sam_itr_next(bam_fp, iter, record)) >= 0){
+                ++local_records;
+                if (!read_passes_filter(record, default_production_read_filter())) continue;
+
+                uint8_t* cb_ptr = bam_aux_get(record, "CB");
+                if (!cb_ptr) continue;
+                const char* cb_str = bam_aux2Z(cb_ptr);
+                if (!cb_str) continue;
+                const unsigned long bc_key = bc_ul((char*)cb_str);
+                if (has_bc_list && valid_barcodes.find(bc_key) == valid_barcodes.end()) continue;
+
+                const int read_start = record->core.pos;
+                const int read_end = bam_endpos(record);
+                while (snp_iter != snp_end && snp_iter->pos < read_start) ++snp_iter;
+
+                const float prob_correct =
+                    1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
+                for (auto snp_check = snp_iter;
+                     snp_check != snp_end && snp_check->pos < read_end;
+                     ++snp_check){
+                    const char allele = get_base_at_pos(record, snp_check->pos);
+                    if (allele == 'N' || allele == '-') continue;
+                    float ref_add = 0.0f;
+                    float alt_add = 0.0f;
+                    if (allele == snp_check->data.ref) ref_add = prob_correct;
+                    else if (allele == snp_check->data.alt) alt_add = prob_correct;
+                    else continue;
+                    ++local_sites;
+
+                    auto cell_it = local_het_data.find(bc_key);
+                    if (cell_it == local_het_data.end()){
+                        if (has_bc_list) continue;
+                        try {
+                            local_het_data.emplace(bc_key, CellHetData(n_samples));
                         }
-                        
-                        uint8_t* cb_ptr = bam_aux_get(record, "CB");
-                        if (!cb_ptr) continue;
-                        
-                        const char* cb_str = bam_aux2Z(cb_ptr);
-                        if (!cb_str) continue;
-                        
-                        unsigned long bc_key = bc_ul((char*)cb_str);
-                        
-                        if (has_bc_list && valid_barcodes.find(bc_key) == valid_barcodes.end()) {
-                            continue;
+                        catch (const std::exception& e){
+                            operation_status.fail(std::string("het worker allocation failed: ") + e.what());
+                            break;
                         }
-                        
-                        int read_start = record->core.pos;
-                        int read_end = bam_endpos(record);
-                        
-                        // Advance SNP iterator
-                        while (snp_iter != snp_end && snp_iter->pos < read_start) {
-                            ++snp_iter;
+                        cell_it = local_het_data.find(bc_key);
+                    }
+                    CellHetData& cell_data = cell_it->second;
+
+                    if (collect_persite){
+                        const auto site_it = site_to_idx.find(make_pair(tid, snp_check->pos));
+                        if (site_it == site_to_idx.end()){
+                            operation_status.fail(format_worker_error("het site lookup", thread_id, tid));
+                            break;
                         }
-                        
-                        float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
-                        
-                        // Process overlapping SNPs
-                        for (auto snp_check = snp_iter;
-                             snp_check != snp_end && snp_check->pos <= read_end;
-                             ++snp_check) {
-                            
-                            char allele = get_base_at_pos(record, snp_check->pos);
-                            if (allele == 'N' || allele == '-') continue;
-                            
-                            float ref_add = 0.0f, alt_add = 0.0f;
-                            
-                            if (allele == snp_check->data.ref) {
-                                ref_add = prob_correct;
-                            } else if (allele == snp_check->data.alt) {
-                                alt_add = prob_correct;
-                            } else {
-                                continue;
-                            }
-                            
-                            local_sites++;
-                            
-                            // Get or create cell's het data
-                            auto it = local_het_data.find(bc_key);
-                            if (it == local_het_data.end()) {
-                                if (has_bc_list) continue;
-                                local_het_data.emplace(bc_key, CellHetData(n_samples));
-                                it = local_het_data.find(bc_key);
-                            }
-                            CellHetData& cell_data = it->second;
-                            
-                            // Per-site method: store site counts
-                            if (collect_persite) {
-                                int32_t site_idx = site_to_idx[{tid, snp_check->pos}];
-                                cell_data.persite_data.add_site(site_idx, ref_add, alt_add);
-                            }
-                            
-                            // Welford method: update running stats for het individuals
-                            if (collect_welford) {
-                                float depth = ref_add + alt_add;
-                                if (depth > 0) {
-                                    float alt_frac = alt_add / depth;
-                                    
-                                    for (int indiv = 0; indiv < n_samples; ++indiv) {
-                                        if (snp_check->data.is_het(indiv)) {
-                                            cell_data.welford_stats.add(indiv, alt_frac, depth);
-                                        }
-                                    }
+                        cell_data.persite_data.add_site(site_it->second, ref_add, alt_add);
+                    }
+                    if (collect_welford){
+                        const float depth = ref_add + alt_add;
+                        if (depth > 0.0f){
+                            const float alt_frac = alt_add / depth;
+                            for (int indiv = 0; indiv < n_samples; ++indiv){
+                                if (snp_check->data.is_het(indiv)){
+                                    cell_data.welford_stats.add(indiv, alt_frac, depth);
                                 }
                             }
                         }
                     }
-                    
-                    hts_itr_destroy(iter);
-                    reads_processed += local_reads;
-                    sites_hit += local_sites;
-                    
-                    int done = ++chroms_done;
-                    if (done % 5 == 0 || done == (int)chrom_work.size()) {
-                        fprintf(stderr, "\rHet counting: %d/%lu chroms, %ld reads, %ld site hits    ",
-                                done, chrom_work.size(), reads_processed.load(), sites_hit.load());
-                    }
                 }
-                
-                hts_idx_destroy(idx);
+                if (!operation_status.ok()) break;
             }
-            
-            bam_destroy1(record);
-            bam_hdr_destroy(header);
-            hts_close(bam_fp);
-        }
-        
-        // Merge thread-local data
-        #pragma omp critical
-        {
-            for (auto& kv : local_het_data) {
-                auto it = het_data.find(kv.first);
-                if (it != het_data.end()) {
-                    it->second.merge(kv.second);
-                } else {
-                    het_data.emplace(kv.first, std::move(kv.second));
-                }
+            if (iterator_result < -1){
+                operation_status.fail(format_worker_error("iterator read", thread_id, tid));
+            }
+            hts_itr_destroy(iter);
+            records_processed += local_records;
+            sites_hit += local_sites;
+            const int done = ++chroms_done;
+            if (done % 5 == 0 || done == (int)chrom_work.size()){
+                fprintf(stderr,
+                    "\rHet counting: %d/%lu chroms, %ld iterator records, %ld site hits    ",
+                    done, chrom_work.size(), records_processed.load(), sites_hit.load());
             }
         }
+
+        if (record) bam_destroy1(record);
+        if (idx) hts_idx_destroy(idx);
+        if (header) bam_hdr_destroy(header);
+        if (bam_fp) hts_close(bam_fp);
     }
-    
-    fprintf(stderr, "\nHet counting complete: %lu cells, %ld reads, %ld site hits\n",
-            het_data.size(), reads_processed.load(), sites_hit.load());
-    
-    // Report stats
-    if (collect_persite) {
+
+    if (!operation_status.ok()){
+        fprintf(stderr, "ERROR: het/ploidy counting failed: %s\n",
+            operation_status.message().c_str());
+        return false;
+    }
+
+    for (int t = 0; t < n_threads; ++t){
+        for (auto& kv : thread_het_data[t]){
+            auto it = het_data.find(kv.first);
+            if (it != het_data.end()) it->second.merge(kv.second);
+            else het_data.emplace(kv.first, std::move(kv.second));
+        }
+        thread_het_data[t].clear();
+    }
+
+    fprintf(stderr,
+        "\nHet counting complete: %lu cells, %ld iterator records, %ld site hits\n",
+        het_data.size(), records_processed.load(), sites_hit.load());
+    if (collect_persite){
         long total_sites_stored = 0;
         long max_sites = 0;
-        for (const auto& kv : het_data) {
-            long n = kv.second.persite_data.size();
+        for (const auto& kv : het_data){
+            const long n = (long)kv.second.persite_data.size();
             total_sites_stored += n;
             if (n > max_sites) max_sites = n;
         }
         fprintf(stderr, "Per-site: %ld total entries, max %ld/cell, avg %.1f/cell\n",
-                total_sites_stored, max_sites, 
-                het_data.size() > 0 ? (double)total_sites_stored / het_data.size() : 0.0);
+            total_sites_stored, max_sites,
+            het_data.empty() ? 0.0 : (double)total_sites_stored / het_data.size());
     }
-    
-    if (collect_welford) {
+    if (collect_welford){
         long max_sites = 0;
-        for (const auto& kv : het_data) {
-            for (int i = 0; i < n_samples; ++i) {
-                long n = kv.second.welford_stats.get(i).n;
+        for (const auto& kv : het_data){
+            for (int i = 0; i < n_samples; ++i){
+                const long n = (long)kv.second.welford_stats.get(i).n;
                 if (n > max_sites) max_sites = n;
             }
         }
         fprintf(stderr, "Max het sites per individual per cell: %ld\n", max_sites);
     }
+    return true;
 }

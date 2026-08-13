@@ -54,7 +54,7 @@ using std::cout;
 using std::endl;
 using namespace std;
 
-const string TOOL_VERSION = "2.0";
+const string TOOL_VERSION = "2.1-exact-include";
 const string TOOL_NAME = "tet_ambient_profile";
 
 
@@ -76,9 +76,11 @@ struct PseudoBulkLoadStats {
     size_t empty_barcodes_kept;
     size_t cell_barcodes_kept;
     size_t categories_kept;
+    size_t informative_barcodes;
     PseudoBulkLoadStats() : rows_read(0), rows_kept(0),
         empty_barcodes_available(0), cell_barcodes_available(0),
-        empty_barcodes_kept(0), cell_barcodes_kept(0), categories_kept(0) {}
+        empty_barcodes_kept(0), cell_barcodes_kept(0), categories_kept(0),
+        informative_barcodes(0) {}
 };
 
 static bool parse_count_row(const string& line, CountRow& row){
@@ -189,6 +191,56 @@ static void load_filtered_barcodes_streaming(const string& filename,
     }
 }
 
+static void load_positive_barcodes_streaming(const string& filename,
+    vector<unsigned long>& requested,
+    robin_hood::unordered_set<unsigned long>& requested_set){
+
+    gzreader reader(filename);
+    size_t line_number = 0;
+    while (reader.next()){
+        line_number++;
+        string bc_line = reader.line;
+        if (bc_line.empty()) continue;
+        while (!bc_line.empty() && (bc_line.back() == '\r' || bc_line.back() == '\n' ||
+            bc_line.back() == ' ' || bc_line.back() == '\t')){
+            bc_line.pop_back();
+        }
+        if (bc_line.empty()) continue;
+        unsigned long ul = bc_ul(bc_line);
+        if (!requested_set.insert(ul).second){
+            fprintf(stderr, "ERROR: duplicate barcode in --include_barcodes at line %lu: %s\n",
+                line_number, bc_line.c_str());
+            exit(1);
+        }
+        requested.push_back(ul);
+    }
+    if (requested.empty()){
+        fprintf(stderr, "ERROR: --include_barcodes contains no barcodes: %s\n", filename.c_str());
+        exit(1);
+    }
+}
+
+static string file_signature_fnv1a64(const string& filename){
+    std::ifstream in(filename.c_str(), std::ios::binary);
+    if (!in){
+        fprintf(stderr, "ERROR: cannot open include-list for signature: %s\n", filename.c_str());
+        exit(1);
+    }
+    unsigned long long hash = 1469598103934665603ULL;
+    char buffer[8192];
+    while (in.good()){
+        in.read(buffer, sizeof(buffer));
+        std::streamsize n = in.gcount();
+        for (std::streamsize i = 0; i < n; ++i){
+            hash ^= static_cast<unsigned char>(buffer[i]);
+            hash *= 1099511628211ULL;
+        }
+    }
+    char out[64];
+    snprintf(out, sizeof(out), "fnv1a64:%016llx", hash);
+    return string(out);
+}
+
 static void discover_count_barcodes(const string& counts_name,
     const robin_hood::unordered_set<unsigned long>& cell_barcodes,
     vector<unsigned long>& empty_bc_list,
@@ -219,6 +271,7 @@ static void aggregate_selected_counts_streaming(const string& counts_name,
 
     gzreader reader(counts_name);
     CountRow row;
+    robin_hood::unordered_set<unsigned long> informative_barcodes;
     while (reader.next()){
         stats.rows_read++;
         if (!parse_count_row(reader.line, row)) continue;
@@ -232,8 +285,10 @@ static void aggregate_selected_counts_streaming(const string& counts_name,
         }
         bulk_agg[indv1key][indv2key].first += row.ref;
         bulk_agg[indv1key][indv2key].second += row.alt;
+        informative_barcodes.insert(row.cell);
         stats.rows_kept++;
     }
+    stats.informative_barcodes = informative_barcodes.size();
 }
 
 void help(int code){
@@ -247,6 +302,8 @@ void help(int code){
     fprintf(stderr, "                          interspecies mode finds .species_counts/.species_condf/.species_samples.\n");
     fprintf(stderr, "    --filtered_barcodes   Path to filtered barcode list (one per line,\n");
     fprintf(stderr, "                          cell-containing barcodes to EXCLUDE)\n");
+    fprintf(stderr, "    --include_barcodes    Experimental exact positive barcode list; requested\n");
+    fprintf(stderr, "                          barcodes must be present in counts and non-cell.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "SNP PANEL (exactly one required, mutually exclusive):\n");
     fprintf(stderr, "    --interindividual     Use .counts and .condf at the output prefix\n");
@@ -271,7 +328,9 @@ void help(int code){
     fprintf(stderr, "    --condf, -F           Pre-computed .condf file\n");
     fprintf(stderr, "                          (if absent, derived from output_prefix)\n");
     fprintf(stderr, "    --ids, -i             Filtered individual list (one name per line)\n");
-    fprintf(stderr, "    --output, -O          Override output file path\n");
+    fprintf(stderr, "    --output, -O          Override output profile file path\n");
+    fprintf(stderr, "    --diagnostics         Override diagnostics TSV path (recommended for exact lists)\n");
+    fprintf(stderr, "    --version             Display the tool version and exit\n");
     fprintf(stderr, "    --help, -h            Display this message and exit\n");
     exit(code);
 }
@@ -291,17 +350,21 @@ int main(int argc, char *argv[]){
         {"condf",             required_argument, 0, 'F'},
         {"panel_metadata",    required_argument, 0, 'P'},
         {"filtered_barcodes", required_argument, 0, 1003},
+        {"include_barcodes",  required_argument, 0, 1006},
+        {"diagnostics",       required_argument, 0, 1007},
         {"max_empty",         required_argument, 0, 'm'},
         {"cell_fraction",     required_argument, 0, 1004},
         {"seed",              required_argument, 0, 1005},
         {"interindividual",   no_argument,       0, 1001},
         {"interspecies",      no_argument,       0, 1002},
+        {"version",           no_argument,       0, 1008},
         {"help",              no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     string output_prefix = "";
     string output_file = "";
+    string diagnostics_file = "";
     int num_threads = 0;
     int n_bootstrap = 100;
     double error_ref = 0.001;
@@ -312,6 +375,7 @@ int main(int argc, char *argv[]){
     string condf_file = "";
     string panel_metadata_file = "";
     string filtered_barcodes_file = "";
+    string include_barcodes_file = "";
     int max_empty = 50000;
     double cell_fraction = 0.0;
     int seed = 42;
@@ -376,6 +440,15 @@ int main(int argc, char *argv[]){
             case 1005:
                 seed = atoi(optarg);
                 break;
+            case 1006:
+                include_barcodes_file = optarg;
+                break;
+            case 1007:
+                diagnostics_file = optarg;
+                break;
+            case 1008:
+                fprintf(stdout, "%s v%s\n", TOOL_NAME.c_str(), TOOL_VERSION.c_str());
+                return 0;
             case 'h':
                 help(0);
                 break;
@@ -421,8 +494,11 @@ int main(int argc, char *argv[]){
     fprintf(stderr, "  Output prefix: %s\n", output_prefix.c_str());
     fprintf(stderr, "  Output file: %s\n", output_file.c_str());
     fprintf(stderr, "  SNP panel: %s\n", use_interspecies ? "interspecies" : "interindividual");
-    fprintf(stderr, "  Max empty barcodes: %d%s\n", max_empty,
-        max_empty == 0 ? " (no subsampling)" : "");
+    fprintf(stderr, "  Selection mode: %s\n",
+        include_barcodes_file.empty() ? "legacy_complement" : "exact_include_list");
+    fprintf(stderr, "  Max empty barcodes: %d%s%s\n", max_empty,
+        max_empty == 0 ? " (no subsampling)" : "",
+        include_barcodes_file.empty() ? "" : " (disabled by exact include-list)");
     fprintf(stderr, "  Cell include fraction: %.3f\n", cell_fraction);
     fprintf(stderr, "  Seed: %d\n", seed);
 
@@ -511,9 +587,55 @@ int main(int argc, char *argv[]){
     fprintf(stderr, "  Barcodes in counts: %lu empty, %lu cell\n",
         n_empty_available, n_cell_available);
 
-    // ---- Subsample empties ----
+    size_t include_requested = 0;
+    size_t include_found = 0;
+    string include_signature = "not_applicable";
+    if (!include_barcodes_file.empty()){
+        if (cell_fraction != 0.0){
+            fprintf(stderr, "ERROR: --cell_fraction must be 0 when --include_barcodes is supplied\n");
+            exit(1);
+        }
+        vector<unsigned long> requested;
+        robin_hood::unordered_set<unsigned long> requested_set;
+        load_positive_barcodes_streaming(include_barcodes_file, requested, requested_set);
+        include_requested = requested.size();
+        include_signature = file_signature_fnv1a64(include_barcodes_file);
+        robin_hood::unordered_set<unsigned long> empty_available_set;
+        robin_hood::unordered_set<unsigned long> cell_available_set;
+        for (auto bc : empty_bc_list) empty_available_set.insert(bc);
+        for (auto bc : cell_bc_list) cell_available_set.insert(bc);
+        vector<unsigned long> exact;
+        vector<unsigned long> missing;
+        vector<unsigned long> filtered_overlap;
+        for (auto bc : requested){
+            if (cell_barcodes.count(bc) > 0 || cell_available_set.count(bc) > 0){
+                filtered_overlap.push_back(bc);
+            } else if (empty_available_set.count(bc) == 0){
+                missing.push_back(bc);
+            } else {
+                exact.push_back(bc);
+            }
+        }
+        if (!filtered_overlap.empty()){
+            fprintf(stderr, "ERROR: --include_barcodes contains %lu filtered-cell barcode(s); first encoded barcode=%lu\n",
+                filtered_overlap.size(), filtered_overlap.front());
+            exit(1);
+        }
+        if (!missing.empty()){
+            fprintf(stderr, "ERROR: %lu requested include-list barcode(s) are absent from counts; first encoded barcode=%lu\n",
+                missing.size(), missing.front());
+            exit(1);
+        }
+        empty_bc_list.swap(exact);
+        cell_bc_list.clear();
+        include_found = empty_bc_list.size();
+        fprintf(stderr, "  Exact include-list: requested=%lu found=%lu signature=%s\n",
+            include_requested, include_found, include_signature.c_str());
+    }
 
-    if (max_empty > 0 && (int)empty_bc_list.size() > max_empty){
+    // ---- Subsample empties (legacy complement mode only) ----
+
+    if (include_barcodes_file.empty() && max_empty > 0 && (int)empty_bc_list.size() > max_empty){
         std::mt19937 rng(seed);
         std::shuffle(empty_bc_list.begin(), empty_bc_list.end(), rng);
         empty_bc_list.resize(max_empty);
@@ -663,10 +785,31 @@ int main(int argc, char *argv[]){
     // ---- Write diagnostics ----
 
     {
-        string diag_name = output_prefix + ".empty_diagnostics.tsv";
+        string diag_name = diagnostics_file.empty()
+            ? output_prefix + ".empty_diagnostics.tsv"
+            : diagnostics_file;
         FILE* diagf = fopen(diag_name.c_str(), "w");
         if (diagf){
             fprintf(diagf, "metric\tvalue\n");
+            fprintf(diagf, "tool_name\t%s\n", TOOL_NAME.c_str());
+            fprintf(diagf, "tool_version\t%s\n", TOOL_VERSION.c_str());
+            fprintf(diagf, "selection_mode\t%s\n",
+                include_barcodes_file.empty() ? "legacy_complement" : "exact_include_list");
+            fprintf(diagf, "include_list_path\t%s\n",
+                include_barcodes_file.empty() ? "not_applicable" : include_barcodes_file.c_str());
+            fprintf(diagf, "include_list_signature\t%s\n", include_signature.c_str());
+            fprintf(diagf, "barcodes_requested\t%lu\n",
+                include_barcodes_file.empty() ? empty_bc_list.size() : include_requested);
+            fprintf(diagf, "barcodes_found_in_counts\t%lu\n",
+                include_barcodes_file.empty() ? empty_bc_list.size() : include_found);
+            fprintf(diagf, "barcodes_with_informative_individual_observations\t%lu\n",
+                use_interindividual ? pb_stats.informative_barcodes : 0UL);
+            fprintf(diagf, "barcodes_with_informative_species_observations\t%lu\n",
+                use_interspecies ? pb_stats.informative_barcodes : 0UL);
+            fprintf(diagf, "count_rows_used\t%lu\n", pb_stats.rows_kept);
+            fprintf(diagf, "labels_supported\t%d\n", (int)samples.size());
+            fprintf(diagf, "profile_identifiability_status\t%s\n",
+                (pb_stats.rows_kept > 0 && pb_stats.categories_kept > 0) ? "identifiable_input" : "non_identifiable");
             fprintf(diagf, "n_empty_available\t%lu\n", n_empty_available);
             fprintf(diagf, "n_empty_kept\t%lu\n", empty_bc_list.size());
             fprintf(diagf, "n_cell_available\t%lu\n", n_cell_available);

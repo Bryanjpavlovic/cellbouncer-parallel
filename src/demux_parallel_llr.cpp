@@ -41,237 +41,200 @@ bool g_debug = false;
 // LLR TABLE CLASS IMPLEMENTATION
 // ============================================================================
 
-llr_table::llr_table(int x){
-    n_indvs = 0;
-    int n_elt = x + (int)round(pow(2, binom_coef_log(x, 2)));
-    included.reserve(n_elt);
-    maxllr.reserve(n_elt);
+const char* comparison_state_name(ComparisonState state) {
+    switch (state) {
+        case ComparisonState::PRESENT_NONZERO: return "present_nonzero";
+        case ComparisonState::PRESENT_ZERO: return "present_zero";
+        case ComparisonState::UNAVAILABLE: return "unavailable";
+        case ComparisonState::PARTIAL_SUPPORT: return "partial_support";
+        case ComparisonState::NOT_APPLICABLE: return "not_applicable";
+    }
+    return "unavailable";
 }
 
-llr_table::~llr_table(){
+llr_table::llr_table(int x) : n_indvs(0) {
+    const int n_elt = std::max(0, x);
+    included.reserve(n_elt);
+    maxllr.reserve(n_elt);
+    minllr.reserve(n_elt);
+}
+
+llr_table::~llr_table() {
     lookup_llr.clear();
+    pairwise_llr.clear();
+    pairwise_partial_support.clear();
     included.clear();
     maxllr.clear();
     minllr.clear();
 }
 
-void llr_table::print(string& bc_str, vector<string>& samples){
-    for (map<double, vector<pair<short, short> > >::iterator x = lookup_llr.begin();
-        x != lookup_llr.end(); ++x){
-        for (int i = 0; i < x->second.size(); ++i){
-            if (included[x->second[i].first] && included[x->second[i].second]){
-                string n1 = idx2name(x->second[i].first, samples);
-                string n2 = idx2name(x->second[i].second, samples);
-                fprintf(stdout, "%s\t%s\t%s\t%f\n", bc_str.c_str(),
-                    n1.c_str(), n2.c_str(), -x->first);
-                fprintf(stdout, "%s\t%s\t%s\t%f\n", bc_str.c_str(),
-                    n2.c_str(), n1.c_str(), x->first);
+void llr_table::print(string& bc_str, vector<string>& samples) {
+    for (auto x = lookup_llr.begin(); x != lookup_llr.end(); ++x) {
+        for (size_t i = 0; i < x->second.size(); ++i) {
+            const int low = x->second[i].first;
+            const int high = x->second[i].second;
+            if (low < 0 || high < 0 || low >= (int)included.size() ||
+                high >= (int)included.size() || !included[low] || !included[high]) {
+                continue;
             }
+            const string n1 = idx2name(low, samples);
+            const string n2 = idx2name(high, samples);
+            fprintf(stdout, "%s\t%s\t%s\t%f\n", bc_str.c_str(), n1.c_str(), n2.c_str(), x->first);
+            fprintf(stdout, "%s\t%s\t%s\t%f\n", bc_str.c_str(), n2.c_str(), n1.c_str(), -x->first);
         }
     }
 }
 
-void llr_table::print_ranges(string& barcode, vector<string>& samples){
-    int n_samples = samples.size();
-    for (int i = 0; i < n_samples; ++i){
-        if (included[i]){
-            fprintf(stdout, "%s\t%s\t%f\t%f\n", barcode.c_str(), idx2name(i, samples).c_str(), 
-                minllr[i], maxllr[i]);
-        }
-        for (int j = i + 1; j < n_samples; ++j){
-            int k = hap_comb_to_idx(i, j, n_samples);
-            fprintf(stdout, "%s\t%s\t%f\t%f\n", barcode.c_str(), idx2name(k, samples).c_str(),
-                minllr[k], maxllr[k]);
-        }
+void llr_table::print_ranges(string& barcode, vector<string>& samples) {
+    for (size_t i = 0; i < included.size(); ++i) {
+        if (!included[i]) continue;
+        fprintf(stdout, "%s\t%s\t%f\t%f\n", barcode.c_str(),
+                idx2name((int)i, samples).c_str(), minllr[i], maxllr[i]);
     }
 }
 
-void llr_table::insert(short i1, short i2, double llr){
-    while(included.size() < i1+1){
+void llr_table::insert(int i1, int i2, double llr) {
+    if (i1 < 0 || i2 < 0 || i1 == i2 || !std::isfinite(llr)) {
+        return;
+    }
+
+    const int max_index = std::max(i1, i2);
+    while ((int)included.size() <= max_index) {
         included.push_back(false);
         maxllr.push_back(0.0);
         minllr.push_back(0.0);
     }
-    while(included.size() < i2+1){
-        included.push_back(false);
-        maxllr.push_back(0.0);
-        minllr.push_back(0.0);
-    }
-    if (!included[i1]){
-        ++n_indvs;
-    }
-    if (!included[i2]){
-        ++n_indvs;
-    }
-    if (!included[i1] || maxllr[i1] < llr){
-        maxllr[i1] = llr;
-    }
-    if (!included[i1] || minllr[i1] > llr){
-        minllr[i1] = llr;
-    }
-    if (!included[i2] || maxllr[i2] < -llr){
-        maxllr[i2] = -llr;
-    }
-    if (!included[i2] || minllr[i2] > -llr){
-        minllr[i2] = -llr;
-    }
+
+    if (!included[i1]) ++n_indvs;
+    if (!included[i2]) ++n_indvs;
+
+    if (!included[i1] || maxllr[i1] < llr) maxllr[i1] = llr;
+    if (!included[i1] || minllr[i1] > llr) minllr[i1] = llr;
+    if (!included[i2] || maxllr[i2] < -llr) maxllr[i2] = -llr;
+    if (!included[i2] || minllr[i2] > -llr) minllr[i2] = -llr;
     included[i1] = true;
     included[i2] = true;
-    
-    short low;
-    short high;
-    if (llr > 0){
+
+    const std::pair<int, int> key = (i1 < i2) ? std::make_pair(i1, i2)
+                                               : std::make_pair(i2, i1);
+    pairwise_partial_support.erase(key);
+    pairwise_llr[key] = (i1 < i2) ? llr : -llr;
+
+    int low = i1;
+    int high = i2;
+    double stored = llr;
+    if (llr > 0.0) {
         low = i2;
         high = i1;
-        llr = -llr;
+        stored = -llr;
     }
-    else{
-        low = i1;
-        high = i2;
-    }
-    if (lookup_llr.count(llr) == 0){
-        vector<pair<short, short> > v;
-        lookup_llr.emplace(llr, v);
-    }
-    lookup_llr[llr].push_back(make_pair(low, high));
+    lookup_llr[stored].push_back(std::make_pair(low, high));
 }
 
-void llr_table::disallow(short i){
-    if (i < included.size()){
-        if (included[i]){
-            maxllr[i] = 0.0;
-            minllr[i] = 0.0;
-            --n_indvs;
-        }
-        included[i] = false;
-    }
+void llr_table::mark_partial_support(int i1, int i2) {
+    if (i1 < 0 || i2 < 0 || i1 == i2) return;
+    const std::pair<int, int> key = (i1 < i2) ? std::make_pair(i1, i2)
+                                               : std::make_pair(i2, i1);
+    if (pairwise_llr.count(key) == 0) pairwise_partial_support.insert(key);
 }
 
-// Recalculate minllr/maxllr values considering only still-included identities
-// This is needed after disallowing identities, since minllr may reflect
-// comparisons against now-disallowed identities
-void llr_table::recalculate_minmax(){
-    // Reset all minllr/maxllr for included identities
-    for (int i = 0; i < included.size(); ++i){
-        if (included[i]){
-            minllr[i] = std::numeric_limits<double>::max();
-            maxllr[i] = std::numeric_limits<double>::lowest();
+void llr_table::disallow(int i) {
+    if (i < 0 || i >= (int)included.size()) return;
+    if (included[i]) {
+        maxllr[i] = 0.0;
+        minllr[i] = 0.0;
+        --n_indvs;
+    }
+    included[i] = false;
+}
+
+void llr_table::recalculate_minmax() {
+    const double inf = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < included.size(); ++i) {
+        if (included[i]) {
+            minllr[i] = inf;
+            maxllr[i] = -inf;
         }
     }
-    
-    // Recalculate from lookup_llr, considering only included pairs
-    for (auto& entry : lookup_llr){
-        double llr_neg = entry.first;  // Stored as negative
-        for (auto& p : entry.second){
-            short low = p.first;
-            short high = p.second;
-            
-            if (!included[low] || !included[high]){
-                continue;  // Skip pairs involving disallowed identities
-            }
-            
-            // low has negative LLR vs high, high has positive LLR vs low
-            // llr_neg is stored as negative, so:
-            // LLR(low vs high) = llr_neg (negative)
-            // LLR(high vs low) = -llr_neg (positive)
-            
-            if (llr_neg < minllr[low]){
-                minllr[low] = llr_neg;
-            }
-            if (llr_neg > maxllr[low]){
-                maxllr[low] = llr_neg;
-            }
-            if (-llr_neg < minllr[high]){
-                minllr[high] = -llr_neg;
-            }
-            if (-llr_neg > maxllr[high]){
-                maxllr[high] = -llr_neg;
-            }
+
+    for (const auto& entry : pairwise_llr) {
+        const int first = entry.first.first;
+        const int second = entry.first.second;
+        if (first < 0 || second < 0 || first >= (int)included.size() ||
+            second >= (int)included.size() || !included[first] || !included[second]) {
+            continue;
         }
+        const double first_vs_second = entry.second;
+        minllr[first] = std::min(minllr[first], first_vs_second);
+        maxllr[first] = std::max(maxllr[first], first_vs_second);
+        minllr[second] = std::min(minllr[second], -first_vs_second);
+        maxllr[second] = std::max(maxllr[second], -first_vs_second);
     }
-    
-    // Handle identities that have no remaining comparisons
-    for (int i = 0; i < included.size(); ++i){
-        if (included[i] && minllr[i] == std::numeric_limits<double>::max()){
-            minllr[i] = 0.0;
-            maxllr[i] = 0.0;
+
+    for (size_t i = 0; i < included.size(); ++i) {
+        if (included[i] && minllr[i] == inf) {
+            minllr[i] = -inf;
+            maxllr[i] = -inf;
         }
     }
 }
 
-bool llr_table::del(int n_keep){
-    if (n_indvs < n_keep){
-        return false;
-    }
-    
+bool llr_table::del(int n_keep) {
+    if (n_indvs < n_keep) return false;
+
     it = lookup_llr.begin();
-    while (n_indvs > n_keep && it != lookup_llr.end()){
-        bool del_all = it->second.size() <= (n_indvs - n_keep);
+    while (n_indvs > n_keep && it != lookup_llr.end()) {
+        bool del_all = it->second.size() <= static_cast<size_t>(n_indvs - n_keep);
         map<double, int> maxllr_counts;
         int indv_tot = 0;
-        for (vector<pair<short, short> >::iterator x = it->second.begin();
-            x != it->second.end();){
-            if (!included[x->first] || !included[x->second]){
+        for (auto x = it->second.begin(); x != it->second.end();) {
+            if (x->first < 0 || x->second < 0 ||
+                x->first >= (int)included.size() || x->second >= (int)included.size() ||
+                !included[x->first] || !included[x->second]) {
                 x = it->second.erase(x);
-            }
-            else if (del_all){
-                if (included[x->first]){
+            } else if (del_all) {
+                if (included[x->first]) {
                     --n_indvs;
                     included[x->first] = false;
                     minllr[x->first] = 0.0;
                     maxllr[x->first] = 0.0;
                 }
                 x = it->second.erase(x);
-            }
-            else{
-                double mllr = maxllr[x->first];
-                if (maxllr_counts.count(mllr) == 0){
-                    maxllr_counts.insert(make_pair(mllr, 1));
-                }
-                else{
-                    maxllr_counts[mllr]++;
-                }
-                indv_tot++;
+            } else {
+                ++maxllr_counts[maxllr[x->first]];
+                ++indv_tot;
                 ++x;
             }
         }
-        
-        if (indv_tot <= n_indvs - n_keep){
-            del_all = true;
-        }
 
-        if (!del_all){
+        if (indv_tot <= n_indvs - n_keep) del_all = true;
+
+        if (!del_all) {
             double cutoff = 0.0;
             int runtot = 0;
-            for (map<double, int>::iterator m = maxllr_counts.begin(); m != maxllr_counts.end();
-                ++m){
-                runtot += m->second;
-                cutoff = m->first;
-                if (runtot >= n_indvs - n_keep){
-                    break;
-                }
+            for (const auto& m : maxllr_counts) {
+                runtot += m.second;
+                cutoff = m.first;
+                if (runtot >= n_indvs - n_keep) break;
             }
-            for (vector<pair<short, short> >::iterator x = it->second.begin(); x != it->second.end(); ){
-                if (maxllr[x->first] <= cutoff){
-                    if (included[x->first]){
+            for (auto x = it->second.begin(); x != it->second.end();) {
+                if (maxllr[x->first] <= cutoff) {
+                    if (included[x->first]) {
                         included[x->first] = false;
                         maxllr[x->first] = 0.0;
                         minllr[x->first] = 0.0;
-                        n_indvs--;
+                        --n_indvs;
                     }
                     x = it->second.erase(x);
-                }
-                else{
+                } else {
                     ++x;
                 }
             }
-        }
-        else{
-            for (vector<pair<short, short> >::iterator x = it->second.begin(); x != 
-                it->second.end(); ){
-                if (included[x->first]){
+        } else {
+            for (auto x = it->second.begin(); x != it->second.end();) {
+                if (included[x->first]) {
                     included[x->first] = false;
-                    n_indvs--;
+                    --n_indvs;
                     maxllr[x->first] = 0.0;
                     minllr[x->first] = 0.0;
                 }
@@ -283,43 +246,71 @@ bool llr_table::del(int n_keep){
     return true;
 }
 
-void llr_table::get_max(int& best_idx, double& best_llr){
+void llr_table::get_max(int& best_idx, double& best_llr) const {
     best_idx = -1;
-    best_llr = 0.0;
-    
-    for (int i = 0; i < included.size(); ++i){
-        if (included[i]){
-            if (best_idx == -1 || minllr[i] > best_llr){
-                best_idx = i;
-                best_llr = minllr[i];
-            }
+    best_llr = -std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < included.size(); ++i) {
+        if (included[i] && (best_idx == -1 || minllr[i] > best_llr)) {
+            best_idx = static_cast<int>(i);
+            best_llr = minllr[i];
         }
     }
 }
 
-// NEW: Get min_margin for a specific identity
 double llr_table::get_min_margin(int identity) const {
-    if (identity < 0 || identity >= (int)minllr.size() || !included[identity]){
-        return 0.0;
+    if (identity < 0 || identity >= (int)minllr.size() || !included[identity]) {
+        return std::numeric_limits<double>::quiet_NaN();
     }
     return minllr[identity];
 }
 
-// Selection-audit: winner under the maxllr criterion. Nathan's del(2)
-// elimination removes identities with the lowest maxllr until two survive,
-// then returns the higher; that survivor is argmax(maxllr) over included
-// identities, which this computes directly without mutating the table.
-void llr_table::get_max_by_maxllr(int& best_idx, double& best_maxllr) const {
+void llr_table::get_max_by_max_llr_comparator(int& best_idx, double& best_maxllr) const {
     best_idx = -1;
-    best_maxllr = 0.0;
-    for (size_t i = 0; i < included.size(); ++i){
-        if (included[i]){
-            if (best_idx == -1 || maxllr[i] > best_maxllr){
-                best_idx = (int)i;
-                best_maxllr = maxllr[i];
-            }
+    best_maxllr = -std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < included.size(); ++i) {
+        if (included[i] && (best_idx == -1 || maxllr[i] > best_maxllr)) {
+            best_idx = static_cast<int>(i);
+            best_maxllr = maxllr[i];
         }
     }
+}
+
+PairwiseComparison llr_table::get_pairwise(int lhs, int rhs) const {
+    if (lhs < 0 || rhs < 0 || lhs == rhs) return PairwiseComparison();
+    const std::pair<int, int> key = (lhs < rhs) ? std::make_pair(lhs, rhs)
+                                                : std::make_pair(rhs, lhs);
+    const auto found = pairwise_llr.find(key);
+    if (found != pairwise_llr.end()) {
+        return PairwiseComparison(true, lhs < rhs ? found->second : -found->second);
+    }
+    if (pairwise_partial_support.count(key) > 0) {
+        return PairwiseComparison(false,
+            std::numeric_limits<double>::quiet_NaN(), true);
+    }
+    return PairwiseComparison();
+}
+
+vector<int> llr_table::retained_identities() const {
+    vector<int> result;
+    result.reserve(n_indvs > 0 ? static_cast<size_t>(n_indvs) : 0U);
+    for (size_t i = 0; i < included.size(); ++i) {
+        if (included[i]) result.push_back(static_cast<int>(i));
+    }
+    return result;
+}
+
+bool llr_table::winner_has_complete_comparisons(
+    int winner,
+    vector<int>& missing_alternatives) const {
+    missing_alternatives.clear();
+    if (winner < 0 || winner >= (int)included.size() || !included[winner]) return false;
+    for (size_t i = 0; i < included.size(); ++i) {
+        if (!included[i] || static_cast<int>(i) == winner) continue;
+        if (!get_pairwise(winner, static_cast<int>(i)).present) {
+            missing_alternatives.push_back(static_cast<int>(i));
+        }
+    }
+    return missing_alternatives.empty();
 }
 
 // ============================================================================
@@ -334,331 +325,241 @@ double adjust_p_err(double p, double e_r, double e_a){
 // DOUBLET COMPARISON COMPUTATION (from original demux_vcf_llr.cpp)
 // ============================================================================
 
-void get_kcomps_cond(map<int, map<int, double> >& kcomps,
-    map<int, map<int, double> >& llrs,
-    llr_table& tab,
-    int n_samples,
-    set<int>& allowed_assignments){
+namespace {
 
-    for (map<int, map<int, double> >::iterator llr = llrs.begin(); llr != llrs.end();
-        ++llr){
+bool get_directed_llr(
+    const map<int, map<int, double> >& llrs,
+    int lhs,
+    int rhs,
+    double& value) {
 
-        vector<int> js;
-        vector<int> comps;
-        for (map<int, double>::iterator llr2 = llr->second.begin(); llr2 != llr->second.end();
-            ++llr2){
-            if (llr2->first >= n_samples){
-                if (!tab.included[llr2->first]){
-                }
+    if (lhs == rhs) {
+        value = 0.0;
+        return true;
+    }
+    const int low = std::min(lhs, rhs);
+    const int high = std::max(lhs, rhs);
+    const auto low_it = llrs.find(low);
+    if (low_it == llrs.end()) return false;
+    const auto high_it = low_it->second.find(high);
+    if (high_it == low_it->second.end() || !std::isfinite(high_it->second)) return false;
+    value = lhs < rhs ? high_it->second : -high_it->second;
+    return true;
+}
 
-                if (true){
-                    pair<int, int> comb = idx_to_hap_comb(llr2->first, n_samples);
-                    int j = -1;
-                    if (comb.first == llr->first){
-                        j = comb.second;
-                    }
-                    else{
-                        j = comb.first;
-                    }
-                    js.push_back(j);
-                    comps.push_back(-llr2->second);
-                }
-            }
+bool get_conditional_llr(
+    const map<int, map<int, map<int, double> > >& conditional,
+    int anchor,
+    int lhs,
+    int rhs,
+    double& value) {
+
+    if (lhs == rhs) {
+        value = 0.0;
+        return true;
+    }
+    const auto anchor_it = conditional.find(anchor);
+    if (anchor_it == conditional.end()) return false;
+    const int low = std::min(lhs, rhs);
+    const int high = std::max(lhs, rhs);
+    const auto low_it = anchor_it->second.find(low);
+    if (low_it == anchor_it->second.end()) return false;
+    const auto high_it = low_it->second.find(high);
+    if (high_it == low_it->second.end() || !std::isfinite(high_it->second)) return false;
+    value = lhs < rhs ? high_it->second : -high_it->second;
+    return true;
+}
+
+}  // namespace
+
+void get_kcomps_cond(
+    map<int, map<int, double> >& kcomps,
+    const map<int, map<int, double> >& llrs,
+    int n_samples) {
+
+    for (const auto& llr : llrs) {
+        vector<int> component_ids;
+        vector<double> component_scores;
+        for (const auto& llr2 : llr.second) {
+            if (llr2.first < n_samples || !std::isfinite(llr2.second)) continue;
+            const pair<int, int> comb = idx_to_hap_comb(llr2.first, n_samples);
+            const int other = comb.first == llr.first ? comb.second : comb.first;
+            component_ids.push_back(other);
+            component_scores.push_back(-llr2.second);
         }
-        
-        if (comps.size() > 1){
-            for (int i = 0; i < comps.size()-1; ++i){
-                int idx1 = js[i];
-                for (int j = i +1; j < comps.size(); ++j){
-                    int idx2 = js[j];
-                    double llr = comps[i] - comps[j];
-                    if (idx1 < idx2){
-                        if (kcomps.count(idx1) == 0){
-                            map<int, double> m;
-                            kcomps.insert(make_pair(idx1, m));
-                        }
-                        if (kcomps[idx1].count(idx2) == 0){
-                            kcomps[idx1].insert(make_pair(idx2, 0.0));
-                        }
-                        kcomps[idx1][idx2] += llr;
-                    }
-                    else{
-                        if (kcomps.count(idx2) == 0){
-                            map<int, double> m;
-                            kcomps.insert(make_pair(idx2, m));
-                        }
-                        if (kcomps[idx2].count(idx1) == 0){
-                            kcomps[idx2].insert(make_pair(idx1, 0.0));
-                        }
-                        kcomps[idx2][idx1] += llr;
-                    }
-                }
+
+        for (size_t i = 0; i + 1 < component_scores.size(); ++i) {
+            for (size_t j = i + 1; j < component_scores.size(); ++j) {
+                const int first = component_ids[i];
+                const int second = component_ids[j];
+                if (first == second) continue;
+                const int low = std::min(first, second);
+                const int high = std::max(first, second);
+                const double directed = component_scores[i] - component_scores[j];
+                kcomps[low][high] += first < second ? directed : -directed;
             }
         }
     }
 }
 
-void compute_k_comps(map<int, map<int, double> >& llrs, 
+void compute_k_comps(
+    const map<int, map<int, double> >& llrs,
     llr_table& tab,
-    vector<int>& ks,
+    const vector<int>& ks,
     int n_samples,
     set<int>& allowed_assignments,
     double doublet_rate,
-    map<int, double>* prior_weights){
-    
-    // Get a table of LLRs between different combination members, conditional on a cell
-    // being half another member. In other words, keys/values here are
-    // ID1 -> ID2A -> ID2B -> LLR
-    // LLR is the log likelihood ratio of ID2A vs ID2B being included in a double model
-    // with ID1. 
+    map<int, double>* prior_weights) {
+
+    // Conditional comparisons are stored only when their supporting direct
+    // comparisons exist. Exact zero remains present; absent paths remain absent.
     map<int, map<int, map<int, double> > > kcomp_cond;
-    for (map<int, map<int, double> >::iterator samp = llrs.begin(); samp != llrs.end(); ++samp){
-        if (!tab.included[samp->first]){
+    for (const auto& sample : llrs) {
+        if (sample.first < 0 || sample.first >= (int)tab.included.size() ||
+            !tab.included[sample.first]) {
             continue;
         }
-        map<int, map<int, double> > llrstmp;
-        llrstmp.insert(make_pair(samp->first, samp->second));
-        map<int, map<int, double> > kcomp; 
-        get_kcomps_cond(kcomp, llrstmp, tab, n_samples, allowed_assignments);
-        kcomp_cond.insert(make_pair(samp->first, kcomp));
-    }
-    // compute all single vs double comparisons
-    for (int i = 0; i < n_samples; ++i){
-        if (allowed_assignments.size() != 0 && 
-            allowed_assignments.find(i) == allowed_assignments.end()){
-            continue;
-        }
-        else if (!tab.included[i]){
-            continue;
-        }
-
-        for (int ki = 0; ki < ks.size(); ++ki){
-            // NOTE: ks is already a filtered list (allowable)
-            int k = ks[ki];
-            pair<int, int> comb = idx_to_hap_comb(k, n_samples);
-            if (comb.first != i && comb.second != i){
-                double ll1 = llrs[comb.first][k];
-                double ll2 = llrs[comb.second][k];
-                if (comb.first < i){
-                    ll1 += -llrs[comb.first][i];
-                }
-                else{
-                    ll1 += llrs[i][comb.first];
-                }
-                if (comb.second < i){
-                    ll2 += -llrs[comb.second][i];
-                }
-                else{
-                    ll2 += llrs[i][comb.second];
-                }
-                double llr = 0.5*ll1 + 0.5*ll2;
-                if (prior_weights != NULL && 
-                    prior_weights->count(i) > 0 && prior_weights->count(k) > 0){
-                    llr += (*prior_weights)[i] - (*prior_weights)[k];
-                }
-                else if (doublet_rate != 0.5 && doublet_rate < 1.0){
-                    // i is singlet, k is doublet
-                    llr += log2(1.0 - doublet_rate) - log2(doublet_rate);
-                }
-                tab.insert(i, k, llr);
-            }
-            else{
-                // It's already been computed.
-                double llr = llrs[i][k];
-                if (prior_weights != NULL && 
-                    prior_weights->count(i) > 0 && prior_weights->count(k) > 0){
-                    llr += (*prior_weights)[i] - (*prior_weights)[k];
-                }
-                else if (doublet_rate != 0.5 && doublet_rate < 1.0){
-                    llr += log2(1.0 - doublet_rate) - log2(doublet_rate);
-                }
-                tab.insert(i, k, llr);
-            }
+        map<int, map<int, double> > conditional_for_anchor;
+        map<int, map<int, double> > one_anchor;
+        one_anchor.emplace(sample.first, sample.second);
+        get_kcomps_cond(conditional_for_anchor, one_anchor, n_samples);
+        if (!conditional_for_anchor.empty()) {
+            kcomp_cond.emplace(sample.first, std::move(conditional_for_anchor));
         }
     }
 
-    // compute all double vs double comparisons
-    for (int ki = 0; ki < ks.size()-1; ++ki){
-        int k1 = ks[ki];
-        
-        pair<int, int> comb1 = idx_to_hap_comb(k1, n_samples);
-        for (int kj = ki+1; kj < ks.size(); ++kj){
-            int k2 = ks[kj];
-            pair<int, int> comb2 = idx_to_hap_comb(k2, n_samples);
+    // Compute singlet-versus-doublet comparisons. The established complete-data
+    // equation is retained exactly: a related singlet uses its one direct path;
+    // an unrelated singlet uses the mean of both defined component paths. A
+    // proper nonempty subset is recorded as partial support and is never inserted
+    // as a production comparison.
+    for (int i = 0; i < n_samples; ++i) {
+        if ((!allowed_assignments.empty() && allowed_assignments.count(i) == 0) ||
+            i >= (int)tab.included.size() || !tab.included[i]) {
+            continue;
+        }
+
+        for (int k : ks) {
+            const pair<int, int> comb = idx_to_hap_comb(k, n_samples);
+            if (comb.first == i || comb.second == i) {
+                double direct = 0.0;
+                if (get_directed_llr(llrs, i, k, direct)) {
+                    if (prior_weights != NULL &&
+                        prior_weights->count(i) > 0 && prior_weights->count(k) > 0) {
+                        direct += (*prior_weights)[i] - (*prior_weights)[k];
+                    } else if (doublet_rate != 0.5 && doublet_rate < 1.0) {
+                        direct += log2(1.0 - doublet_rate) - log2(doublet_rate);
+                    }
+                    tab.insert(i, k, direct);
+                }
+                continue;
+            }
+
+            vector<double> complete_paths;
+            size_t atomic_support = 0;
+            const int components[2] = {comb.first, comb.second};
+            for (int component : components) {
+                double component_vs_doublet = 0.0;
+                double singlet_vs_component = 0.0;
+                const bool have_component_vs_doublet =
+                    get_directed_llr(llrs, component, k, component_vs_doublet);
+                const bool have_singlet_vs_component =
+                    get_directed_llr(llrs, i, component, singlet_vs_component);
+                atomic_support += have_component_vs_doublet ? 1U : 0U;
+                atomic_support += have_singlet_vs_component ? 1U : 0U;
+                if (have_component_vs_doublet && have_singlet_vs_component) {
+                    complete_paths.push_back(
+                        component_vs_doublet + singlet_vs_component);
+                }
+            }
+
+            if (complete_paths.size() != 2U) {
+                if (atomic_support > 0U) tab.mark_partial_support(i, k);
+                continue;
+            }
+
+            double llr = (complete_paths[0] + complete_paths[1]) / 2.0;
+            if (prior_weights != NULL &&
+                prior_weights->count(i) > 0 && prior_weights->count(k) > 0) {
+                llr += (*prior_weights)[i] - (*prior_weights)[k];
+            } else if (doublet_rate != 0.5 && doublet_rate < 1.0) {
+                llr += log2(1.0 - doublet_rate) - log2(doublet_rate);
+            }
+            tab.insert(i, k, llr);
+        }
+    }
+
+    // Compute doublet-versus-doublet comparisons. The existing complete-data
+    // equation uses one conditional path for pairs sharing a component and all
+    // eight two-anchor support paths for disjoint pairs. Every required path must
+    // be present. A proper subset is represented explicitly as partial support.
+    for (size_t ki = 0; ki + 1 < ks.size(); ++ki) {
+        const int k1 = ks[ki];
+        const pair<int, int> comb1 = idx_to_hap_comb(k1, n_samples);
+        for (size_t kj = ki + 1; kj < ks.size(); ++kj) {
+            const int k2 = ks[kj];
+            const pair<int, int> comb2 = idx_to_hap_comb(k2, n_samples);
+            const int a = comb1.first;
+            const int b = comb1.second;
+            const int c = comb2.first;
+            const int d = comb2.second;
+
+            int common = -1;
+            int other1 = -1;
+            int other2 = -1;
+            if (a == c) { common = a; other1 = b; other2 = d; }
+            else if (a == d) { common = a; other1 = b; other2 = c; }
+            else if (b == c) { common = b; other1 = a; other2 = d; }
+            else if (b == d) { common = b; other1 = a; other2 = c; }
+
+            if (common >= 0) {
+                double part = 0.0;
+                if (get_conditional_llr(kcomp_cond, common, other1, other2, part)) {
+                    if (prior_weights != NULL &&
+                        prior_weights->count(k1) > 0 && prior_weights->count(k2) > 0) {
+                        part += (*prior_weights)[k1] - (*prior_weights)[k2];
+                    }
+                    tab.insert(k1, k2, part);
+                }
+                continue;
+            }
+
             vector<double> llr_parts;
-            int a = comb1.first;
-            int b = comb1.second;
-            int c = comb2.first;
-            int d = comb2.second;
+            size_t atomic_support = 0;
+            auto append_two_path = [&](int anchor1, int lhs1, int rhs1,
+                                       int anchor2, int lhs2, int rhs2,
+                                       double multiplier) {
+                double first = 0.0;
+                double second = 0.0;
+                const bool have_first =
+                    get_conditional_llr(kcomp_cond, anchor1, lhs1, rhs1, first);
+                const bool have_second =
+                    get_conditional_llr(kcomp_cond, anchor2, lhs2, rhs2, second);
+                atomic_support += have_first ? 1U : 0U;
+                atomic_support += have_second ? 1U : 0U;
+                if (have_first && have_second) {
+                    llr_parts.push_back(multiplier * (first + second));
+                }
+            };
+            append_two_path(a, b, c, c, a, d, 1.0);
+            append_two_path(b, a, c, c, b, d, 1.0);
+            append_two_path(a, b, d, d, a, c, 1.0);
+            append_two_path(b, a, d, d, b, c, 1.0);
+            append_two_path(c, d, a, a, c, b, -1.0);
+            append_two_path(d, c, a, a, d, b, -1.0);
+            append_two_path(c, d, b, b, c, a, -1.0);
+            append_two_path(d, c, b, b, d, a, -1.0);
 
-            if (a == c){
-                if (b < d){
-                    llr_parts.push_back(kcomp_cond[a][b][d]);
-                }
-                else{
-                    llr_parts.push_back(-kcomp_cond[a][d][b]);
-                }
+            if (llr_parts.size() != 8U) {
+                if (atomic_support > 0U) tab.mark_partial_support(k1, k2);
+                continue;
             }
-            else if (a == d){
-                if (b < c){
-                    llr_parts.push_back(kcomp_cond[a][b][c]);
-                }
-                else{
-                    llr_parts.push_back(-kcomp_cond[a][c][b]);
-                }
-            }
-            else if (b == c){
-                if (a < d){
-                    llr_parts.push_back(kcomp_cond[b][a][d]);
-                }         
-                else{
-                    llr_parts.push_back(-kcomp_cond[b][d][a]);
-                }
-            }
-            else if (b == d){
-                if (a < c){
-                    llr_parts.push_back(kcomp_cond[b][a][c]);
-                }
-                else{
-                    llr_parts.push_back(-kcomp_cond[b][c][a]);
-                }
-            }
-            else{
-                double llr1 = 0;
-                double llr2 = 0;
-                double llr3 = 0;
-                double llr4 = 0;
-                double llr5 = 0;
-                double llr6 = 0;
-                double llr7 = 0;
-                double llr8 = 0;
-                // Calculate (A+B)/(C+D) 
-                if (b < c){
-                    llr1 += kcomp_cond[a][b][c];
-                }
-                else{
-                    llr1 += -kcomp_cond[a][c][b];
-                }
-                if (a < d){
-                    llr1 += kcomp_cond[c][a][d];
-                }
-                else{
-                    llr1 += -kcomp_cond[c][d][a];
-                }
-                
-                if (a < c){
-                    llr2 += kcomp_cond[b][a][c];
-                }
-                else{
-                    llr2 += -kcomp_cond[b][c][a];
-                }
-                if (b < d){
-                    llr2 += kcomp_cond[c][b][d];
-                }
-                else{
-                    llr2 += -kcomp_cond[c][d][b];
-                }
 
-                if (b < d){
-                    llr3 += kcomp_cond[a][b][d];
-                }
-                else{
-                    llr3 += -kcomp_cond[a][d][b];
-                }
-                if (a < c){
-                    llr3 += kcomp_cond[d][a][c];
-                }
-                else{
-                    llr3 += -kcomp_cond[d][c][a];
-                }
-
-                if (a < d){
-                    llr4 += kcomp_cond[b][a][d];
-                }
-                else{
-                    llr4 += -kcomp_cond[b][d][a];
-                }
-                if (b < c){
-                    llr4 += kcomp_cond[d][b][c];
-                }
-                else{
-                    llr4 += -kcomp_cond[d][c][b];
-                }
-
-                if (d < a){
-                    llr5 += kcomp_cond[c][d][a];
-                }
-                else{
-                    llr5 += -kcomp_cond[c][a][d];
-                }
-                if (c < b){
-                    llr5 += kcomp_cond[a][c][b];
-                }
-                else{
-                    llr5 += -kcomp_cond[a][b][c];
-                }
-                llr5 = -llr5;
-
-                if (c < a){
-                    llr6 += kcomp_cond[d][c][a];
-                }
-                else{
-                    llr6 += -kcomp_cond[d][a][c];
-                }
-                if (d < b){
-                    llr6 += kcomp_cond[a][d][b];
-                }
-                else{
-                    llr6 += -kcomp_cond[a][b][d];
-                }
-                llr6 = -llr6;
-
-                if (d < b){
-                    llr7 += kcomp_cond[c][d][b];
-                }
-                else{
-                    llr7 += -kcomp_cond[c][b][d];
-                }
-                if (c < a){
-                    llr7 += kcomp_cond[b][c][a];
-                }
-                else{
-                    llr7 += -kcomp_cond[b][a][c];
-                }
-                llr7 = -llr7;
-
-                if (c < b){
-                    llr8 += kcomp_cond[d][c][b];
-                }
-                else{
-                    llr8 += -kcomp_cond[d][b][c];
-                }
-                if (d < a){
-                    llr8 += kcomp_cond[b][d][a];
-                }
-                else{
-                    llr8 += -kcomp_cond[b][a][d];
-                }
-                llr8 = -llr8;
-                llr_parts.push_back(llr1);
-                llr_parts.push_back(llr2);
-                llr_parts.push_back(llr3);
-                llr_parts.push_back(llr4);
-                llr_parts.push_back(llr5);
-                llr_parts.push_back(llr6);
-                llr_parts.push_back(llr7);
-                llr_parts.push_back(llr8);
-            }
-            
-            float llrsum = 0.0;
-            float llrcount = 0;
-            for (int idx = 0; idx < llr_parts.size(); ++idx){
-                llrsum += llr_parts[idx];
-                llrcount++;
-            }
-            double llr = llrsum / llrcount;
-            if (prior_weights != NULL && 
-                prior_weights->count(k1) > 0 && prior_weights->count(k2) > 0){
+            double llr = 0.0;
+            for (double part : llr_parts) llr += part;
+            llr /= 8.0;
+            if (prior_weights != NULL &&
+                prior_weights->count(k1) > 0 && prior_weights->count(k2) > 0) {
                 llr += (*prior_weights)[k1] - (*prior_weights)[k2];
             }
             tab.insert(k1, k2, llr);
@@ -1145,118 +1046,97 @@ void get_diagnostics_from_llrs(
     int n_runner_ups,
     double close_threshold,
     CellDiagnostics& diag,
-    vector<RunnerUp>& runners){
-    
+    vector<RunnerUp>& runners) {
+
+    (void)llrs;
+    (void)n_samples;
     runners.clear();
-    
-    // Get min_margin for the winner (already computed in tab)
+
+    diag.maximin_candidate = winner;
+    diag.maximin_score = winner_llr;
     diag.min_margin = tab.get_min_margin(winner);
-    
-    // Find the worst competitor (identity that gave min_margin to winner)
-    // We need to look through all LLRs involving the winner
-    double min_llr_found = std::numeric_limits<double>::max();
-    int worst_comp = -1;
-    
-    // Check all pairwise comparisons involving the winner
-    if (llrs.count(winner) > 0){
-        for (const auto& kv : llrs.at(winner)){
-            int other = kv.first;
-            if (!tab.included[other]) continue;
-            
-            // LLR(winner vs other) = llrs[winner][other] if winner < other in storage
-            // Need to get the direct LLR from winner's perspective
-            double direct_llr = kv.second;
-            if (direct_llr < min_llr_found){
-                min_llr_found = direct_llr;
-                worst_comp = other;
-            }
-        }
-    }
-    
-    // Also check cases where winner is in the "other" position
-    for (const auto& outer : llrs){
-        if (outer.first == winner) continue;
-        if (!tab.included[outer.first]) continue;
-        
-        if (outer.second.count(winner) > 0){
-            // llrs[outer.first][winner] is from outer.first's perspective
-            // So from winner's perspective, it's -llrs[outer.first][winner]
-            double llr_from_winner = -outer.second.at(winner);
-            if (llr_from_winner < min_llr_found){
-                min_llr_found = llr_from_winner;
-                worst_comp = outer.first;
-            }
-        }
-    }
-    
-    diag.worst_competitor = worst_comp;
-    
-    // Count n_close: identities within close_threshold of winner
-    diag.n_close = 0;
-    
-    // Build list of all identity scores for runner-up extraction
-    vector<pair<double, int> > identity_scores;  // (min_margin, identity)
-    
+    tab.winner_has_complete_comparisons(
+        winner, diag.missing_comparison_alternatives);
+    diag.selection_resolved = winner >= 0 && winner_llr > 0.0 &&
+                              diag.missing_comparison_alternatives.empty();
+
+    const vector<int> retained = tab.retained_identities();
     const vector<double>& all_minllr = tab.get_minllr();
-    
-    for (size_t i = 0; i < tab.included.size(); ++i){
-        if (!tab.included[i]) continue;
-        if ((int)i == winner) continue;
-        
-        double score = all_minllr[i];
-        identity_scores.push_back(make_pair(score, (int)i));
-        
-        // Check if within close_threshold of winner
-        // A competitor is "close" if winner's margin over them is small
-        // winner_llr is the winner's min_margin
-        // If (winner_llr - score) < close_threshold, they're close
-        if ((diag.min_margin - score) < close_threshold){
-            diag.n_close++;
+    vector<pair<double, int> > identity_scores;
+    identity_scores.reserve(retained.size());
+
+    double worst_value = std::numeric_limits<double>::infinity();
+    bool saw_present_competitor = false;
+    bool saw_partial_competitor = false;
+    bool saw_any_competitor = false;
+
+    for (int other : retained) {
+        if (other == winner) continue;
+        saw_any_competitor = true;
+
+        const PairwiseComparison direct = tab.get_pairwise(winner, other);
+        if (direct.state() == ComparisonState::PARTIAL_SUPPORT) {
+            saw_partial_competitor = true;
         }
-    }
-    
-    // Sort by score descending to get best runner-ups
-    sort(identity_scores.begin(), identity_scores.end(), 
-         [](const pair<double, int>& a, const pair<double, int>& b){
-             return a.first > b.first;  // Descending
-         });
-    
-    // Extract top n_runner_ups
-    int n_to_extract = min((int)identity_scores.size(), n_runner_ups);
-    for (int i = 0; i < n_to_extract; ++i){
-        int runner_id = identity_scores[i].second;
-        double runner_margin = identity_scores[i].first;
-        
-        // Get direct LLR vs winner
-        double llr_vs_winner = 0.0;
-        
-        // Look up in llrs map
-        if (winner < runner_id){
-            if (llrs.count(winner) > 0 && llrs.at(winner).count(runner_id) > 0){
-                llr_vs_winner = -llrs.at(winner).at(runner_id);  // Negative because runner lost
-            }
+        if (direct.present && direct.value < worst_value) {
+            worst_value = direct.value;
+            diag.worst_competitor = other;
+            diag.worst_comparison_state = direct.state();
+            saw_present_competitor = true;
         }
-        else{
-            if (llrs.count(runner_id) > 0 && llrs.at(runner_id).count(winner) > 0){
-                llr_vs_winner = llrs.at(runner_id).at(winner);  // Already from runner's perspective
-            }
+
+        const double score = (other >= 0 && other < (int)all_minllr.size())
+            ? all_minllr[other]
+            : -std::numeric_limits<double>::infinity();
+        identity_scores.push_back(make_pair(score, other));
+        if (std::isfinite(diag.min_margin) && std::isfinite(score) &&
+            (diag.min_margin - score) < close_threshold) {
+            ++diag.n_close;
         }
-        
-        runners.push_back(RunnerUp(runner_id, llr_vs_winner, runner_margin));
     }
 
-    // Winner-vs-runner-up LLR (best vs second-best), mirroring the original
-    // demux_vcf elimination semantics. runners[0] is the rank-1 runner-up
-    // (highest min_margin among non-winners). Its llr_vs_winner is the direct
-    // pairwise LLR from the runner-up's perspective (negative because it lost),
-    // so the winner's margin over it is the magnitude. This is reported in the
-    // distinct `llr` output column; it does NOT affect winner selection.
-    if (!runners.empty()){
-        diag.llr_vs_runnerup = -runners[0].llr_vs_winner;
+    if (!saw_any_competitor) {
+        diag.worst_competitor = -1;
+        diag.worst_comparison_state = ComparisonState::NOT_APPLICABLE;
+    } else if (!saw_present_competitor) {
+        diag.worst_competitor = -1;
+        diag.worst_comparison_state = saw_partial_competitor
+            ? ComparisonState::PARTIAL_SUPPORT
+            : ComparisonState::UNAVAILABLE;
+    }
+
+    sort(identity_scores.begin(), identity_scores.end(),
+         [](const pair<double, int>& a, const pair<double, int>& b) {
+             if (a.first != b.first) return a.first > b.first;
+             return a.second < b.second;
+         });
+
+    const int requested = std::max(0, n_runner_ups);
+    const int n_to_extract = std::min((int)identity_scores.size(), requested);
+    for (int i = 0; i < n_to_extract; ++i) {
+        const int runner_id = identity_scores[i].second;
+        const double runner_margin = identity_scores[i].first;
+        const PairwiseComparison winner_vs_runner = tab.get_pairwise(winner, runner_id);
+        const double runner_vs_winner = winner_vs_runner.present
+            ? -winner_vs_runner.value
+            : std::numeric_limits<double>::quiet_NaN();
+        runners.push_back(RunnerUp(
+            runner_id,
+            runner_vs_winner,
+            winner_vs_runner.state(),
+            runner_margin));
+    }
+
+    if (runners.empty()) {
+        diag.llr_vs_runnerup = std::numeric_limits<double>::quiet_NaN();
+        diag.runnerup_comparison_state = ComparisonState::NOT_APPLICABLE;
     } else {
-        // No competitor (single included identity): fall back to the winner's
-        // own min_margin so the column is never empty.
-        diag.llr_vs_runnerup = diag.min_margin;
+        const PairwiseComparison winner_vs_runner =
+            tab.get_pairwise(winner, runners.front().identity);
+        diag.llr_vs_runnerup = winner_vs_runner.present
+            ? winner_vs_runner.value
+            : std::numeric_limits<double>::quiet_NaN();
+        diag.runnerup_comparison_state = winner_vs_runner.state();
     }
 }
 
@@ -1353,7 +1233,8 @@ void compute_het_balance_stats(
     const int MIN_HET_SITES = 10;
     
     if (alt_fracs.size() < MIN_HET_SITES){
-        diag.het_balance_var = -1.0;  // Insufficient data
+        diag.het_balance_var = std::numeric_limits<double>::quiet_NaN();
+        diag.het_diagnostic_available = false;
         return;
     }
     
@@ -1371,6 +1252,7 @@ void compute_het_balance_stats(
         var_sum += diff * diff;
     }
     diag.het_balance_var = var_sum / (alt_fracs.size() - 1);  // Sample variance
+    diag.het_diagnostic_available = true;
 }
 
 /**
@@ -1389,84 +1271,66 @@ double compute_total_depth(const CellCounts& counts, int n_samples){
 }
 
 // ============================================================================
-// POSTERIOR PROBABILITY AND ENTROPY COMPUTATION (v3)
+// MARGIN SOFTMAX SCORE AND ENTROPY COMPUTATION
 // ============================================================================
 
-void compute_posterior_entropy(
+void compute_margin_softmax_scores(
     const map<int, map<int, double> >& llrs,
     const llr_table& tab,
     int winner,
     int n_samples,
     CellDiagnostics& diag) {
-    
-    if (winner < 0) {
-        diag.posterior = -1.0;
-        diag.entropy = -1.0;
+
+    (void)llrs;
+    (void)n_samples;
+    if (winner < 0 || winner >= (int)tab.included.size() ||
+        !tab.included[winner]) {
+        diag.margin_softmax_score = std::numeric_limits<double>::quiet_NaN();
+        diag.margin_entropy = std::numeric_limits<double>::quiet_NaN();
         return;
     }
-    
-    // Use the tab's minllr vector for posterior computation.
-    // minllr[i] = identity i's worst pairwise LLR (the "min margin").
-    // The winner has the highest minllr. All others have lower values.
-    // Relative LL: identity_ll[i] = minllr[i] - minllr[winner], always <= 0.
-    //
-    // Previous implementation reconstructed per-identity LLs from the raw
-    // pairwise llrs map, but this produced positive values for non-winners
-    // when a singlet beat the winning combo in their direct pairwise comparison
-    // despite losing overall. This caused exp(large_positive) = inf,
-    // sum_exp = inf, posterior = 0.
-    
-    const vector<double>& minllr = tab.get_minllr();
-    const vector<bool>& included = tab.included;
-    
-    double winner_ll = minllr[winner];
-    
-    // Collect all included identities and their relative LLs
-    map<int, double> identity_ll;
-    identity_ll[winner] = 0.0;
-    
-    int n_included = 0;
-    for (int i = 0; i < (int)included.size(); i++) {
-        if (!included[i]) continue;
-        if (i == winner) {
-            n_included++;
-            continue;
-        }
-        identity_ll[i] = minllr[i] - winner_ll;  // always <= 0
-        n_included++;
-    }
-    
-    if (n_included <= 1) {
-        diag.posterior = 1.0;
-        diag.entropy = 0.0;
+
+    const vector<double>& margins = tab.get_minllr();
+    const double winner_margin = margins[winner];
+    if (!std::isfinite(winner_margin)) {
+        diag.margin_softmax_score = std::numeric_limits<double>::quiet_NaN();
+        diag.margin_entropy = std::numeric_limits<double>::quiet_NaN();
         return;
     }
-    
-    // Softmax: posterior = exp(0) / sum(exp(identity_ll[i]))
-    // Since winner's LL is 0 and all others are <= 0, exp(0) = 1.0
-    // and sum_exp >= 1.0. No overflow possible.
+
+    vector<double> relative_margins;
+    relative_margins.reserve(tab.n_indvs > 0 ? (size_t)tab.n_indvs : 0U);
+    for (size_t i = 0; i < tab.included.size(); ++i) {
+        if (!tab.included[i] || !std::isfinite(margins[i])) continue;
+        relative_margins.push_back(margins[i] - winner_margin);
+    }
+
+    if (relative_margins.empty()) {
+        diag.margin_softmax_score = std::numeric_limits<double>::quiet_NaN();
+        diag.margin_entropy = std::numeric_limits<double>::quiet_NaN();
+        return;
+    }
+    if (relative_margins.size() == 1U) {
+        diag.margin_softmax_score = 1.0;
+        diag.margin_entropy = 0.0;
+        return;
+    }
+
     double sum_exp = 0.0;
-    for (const auto& kv : identity_ll) {
-        sum_exp += exp(kv.second);
-    }
-    
-    if (sum_exp <= 0.0) {
-        diag.posterior = 1.0;
-        diag.entropy = 0.0;
+    for (double value : relative_margins) sum_exp += exp(value);
+    if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) {
+        diag.margin_softmax_score = std::numeric_limits<double>::quiet_NaN();
+        diag.margin_entropy = std::numeric_limits<double>::quiet_NaN();
         return;
     }
-    
-    diag.posterior = 1.0 / sum_exp;
-    
-    // Shannon entropy (bits)
+
+    diag.margin_softmax_score = 1.0 / sum_exp;
     double entropy = 0.0;
-    for (const auto& kv : identity_ll) {
-        double p = exp(kv.second) / sum_exp;
-        if (p > 0.0) {
-            entropy -= p * log2(p);
-        }
+    for (double value : relative_margins) {
+        const double p = exp(value) / sum_exp;
+        if (p > 0.0) entropy -= p * log2(p);
     }
-    diag.entropy = entropy;
+    diag.margin_entropy = entropy;
 }
 
 /**
@@ -1535,7 +1399,8 @@ void compute_het_balance_persite(
     diag.het_method = HetBalanceMethod::PERSITE;
     
     if ((int)alt_fracs.size() < min_sites) {
-        diag.het_balance_var = -1.0;
+        diag.het_balance_var = std::numeric_limits<double>::quiet_NaN();
+        diag.het_diagnostic_available = false;
         return;
     }
     
@@ -1549,6 +1414,7 @@ void compute_het_balance_persite(
         var_sum += diff * diff;
     }
     diag.het_balance_var = var_sum / (alt_fracs.size() - 1);
+    diag.het_diagnostic_available = true;
 }
 
 /**
@@ -1560,48 +1426,52 @@ void compute_het_balance_welford(
     int n_samples,
     int min_sites,
     CellDiagnostics& diag) {
-    
+
     diag.het_method = HetBalanceMethod::WELFORD;
-    
-    bool is_doublet = (assigned_id >= n_samples);
-    
+    diag.het_balance_var = std::numeric_limits<double>::quiet_NaN();
+    diag.het_diagnostic_available = false;
+
+    const bool is_doublet = assigned_id >= n_samples;
     if (is_doublet) {
-        auto combo = idx_to_hap_comb(assigned_id, n_samples);
-        int indv1 = combo.first;
-        int indv2 = combo.second;
-        
-        const WelfordStats& ws1 = welford_stats.get(indv1);
-        const WelfordStats& ws2 = welford_stats.get(indv2);
-        
-        double var1 = ws1.variance(min_sites);
-        double var2 = ws2.variance(min_sites);
-        
-        if (var1 < 0 && var2 < 0) {
-            diag.het_balance_var = -1.0;
+        const pair<int, int> combo = idx_to_hap_comb(assigned_id, n_samples);
+        const WelfordStats& ws1 = welford_stats.get(combo.first);
+        const WelfordStats& ws2 = welford_stats.get(combo.second);
+        const double var1 = ws1.variance(min_sites);
+        const double var2 = ws2.variance(min_sites);
+        const bool valid1 = std::isfinite(var1) && var1 >= 0.0;
+        const bool valid2 = std::isfinite(var2) && var2 >= 0.0;
+
+        if (!valid1 && !valid2) {
             diag.n_het_sites = 0;
-            diag.het_total_depth = 0;
+            diag.het_total_depth = 0.0;
             return;
         }
-        
-        if (var1 < 0) {
+        if (!valid1) {
             diag.het_balance_var = var2;
-            diag.n_het_sites = (int)ws2.n;
+            diag.n_het_sites = static_cast<int>(ws2.n);
             diag.het_total_depth = ws2.total_depth;
-        } else if (var2 < 0) {
+        } else if (!valid2) {
             diag.het_balance_var = var1;
-            diag.n_het_sites = (int)ws1.n;
+            diag.n_het_sites = static_cast<int>(ws1.n);
             diag.het_total_depth = ws1.total_depth;
         } else {
-            double n_total = ws1.n + ws2.n;
+            const double n_total = ws1.n + ws2.n;
+            if (!(n_total > 0.0)) return;
             diag.het_balance_var = (var1 * ws1.n + var2 * ws2.n) / n_total;
-            diag.n_het_sites = (int)n_total;
+            diag.n_het_sites = static_cast<int>(n_total);
             diag.het_total_depth = ws1.total_depth + ws2.total_depth;
         }
-    } else {
-        const WelfordStats& ws = welford_stats.get(assigned_id);
-        diag.het_balance_var = ws.variance(min_sites);
-        diag.n_het_sites = (int)ws.n;
-        diag.het_total_depth = ws.total_depth;
+        diag.het_diagnostic_available = true;
+        return;
+    }
+
+    const WelfordStats& ws = welford_stats.get(assigned_id);
+    const double variance = ws.variance(min_sites);
+    diag.n_het_sites = static_cast<int>(ws.n);
+    diag.het_total_depth = ws.total_depth;
+    if (std::isfinite(variance) && variance >= 0.0) {
+        diag.het_balance_var = variance;
+        diag.het_diagnostic_available = true;
     }
 }
 
@@ -1609,7 +1479,50 @@ void compute_het_balance_welford(
 // PARALLEL IDENTITY ASSIGNMENT
 // ============================================================================
 
-void assign_ids_parallel(
+static bool accepted_maximin_candidate(
+    const llr_table& tab,
+    int candidate,
+    double score,
+    vector<int>& missing_alternatives) {
+    if (candidate < 0 || !(score > 0.0) || !std::isfinite(score)) {
+        missing_alternatives.clear();
+        return false;
+    }
+    return tab.winner_has_complete_comparisons(candidate, missing_alternatives);
+}
+
+static bool validate_assignment_dimensions(int n_samples) {
+    string error;
+    if (!validate_identity_and_allocation_request(n_samples, NULL, NULL, &error)) {
+        fprintf(stderr, "ERROR: cannot score requested identity universe: %s\n", error.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool reject_unsupported_identity_prior(const map<int, double>* identity_prior) {
+    if (identity_prior == nullptr) return false;
+    fprintf(stderr,
+        "ERROR: --identity_prior is NOT IMPLEMENTED / NOT USED IN IDENTITY SCORING. "
+        "Refusing to continue rather than silently ignoring it.\n");
+    return true;
+}
+
+static void report_auxiliary_evidence_scope(
+    const robin_hood::unordered_map<unsigned long, CellCounts>* atac_cell_counts,
+    const robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_rna,
+    const robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac) {
+    if (atac_cell_counts != nullptr) {
+        fprintf(stderr,
+            "STATUS: ATAC counts are diagnostic/count-only and do not affect individual identity scoring.\n");
+    }
+    if (species_counts_rna != nullptr || species_counts_atac != nullptr) {
+        fprintf(stderr,
+            "STATUS: species counts are diagnostic/count-only and do not affect individual identity scoring.\n");
+    }
+}
+
+bool assign_ids_parallel(
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
     vector<string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
@@ -1622,105 +1535,90 @@ void assign_ids_parallel(
     bool use_prior_weights,
     map<int, double>& prior_weights,
     int n_threads,
-    int n_target){
-    
+    int n_target) {
+
     assignments.clear();
     assignments_llr.clear();
-    
-    if (g_verbose){
-        fprintf(stderr, "[VERBOSE] assign_ids_parallel: n_samples=%d, n_target=%d, doublet_rate=%.3f\n",
-            (int)samples.size(), n_target, doublet_rate);
+    const int n_samples = static_cast<int>(samples.size());
+    if (!validate_assignment_dimensions(n_samples)) return false;
+
+    if (g_verbose) {
+        fprintf(stderr,
+            "[VERBOSE] assign_ids_parallel: n_samples=%d, n_target=%d, doublet_rate=%.3f\n",
+            n_samples, n_target, doublet_rate);
         fprintf(stderr, "[VERBOSE]   allowed_assignments: %lu, allowed_assignments2: %lu\n",
             allowed_assignments.size(), allowed_assignments2.size());
     }
-    
-    // Collect barcodes into vector for parallel processing
+
     vector<unsigned long> barcodes;
     barcodes.reserve(cell_counts.size());
-    for (auto& kv : cell_counts){
-        barcodes.push_back(kv.first);
-    }
-    
-    // Pre-allocate results
+    for (const auto& kv : cell_counts) barcodes.push_back(kv.first);
+
     vector<int> result_assn(barcodes.size(), -1);
-    vector<double> result_llr(barcodes.size(), 0.0);
-    
+    vector<double> result_llr(barcodes.size(), std::numeric_limits<double>::quiet_NaN());
+
     fprintf(stderr, "Assigning identities to %lu cells using %d threads...\n",
         barcodes.size(), n_threads);
-    
-    int n_samples = samples.size();
-    
+
     #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 100)
-    for (size_t idx = 0; idx < barcodes.size(); ++idx){
-        unsigned long bc = barcodes[idx];
+    for (size_t idx = 0; idx < barcodes.size(); ++idx) {
+        const unsigned long bc = barcodes[idx];
         const CellCounts& counts = cell_counts[bc];
-        
-        // Skip empty cells
         if (counts.is_empty()) continue;
-        
+
         map<int, map<int, double> > llrs;
         llr_table tab(n_samples);
-        
         map<int, double>* pw_ptr = use_prior_weights ? &prior_weights : NULL;
-        
-        bool success = populate_llr_table_optimized(
+        const bool success = populate_llr_table_optimized(
             counts, llrs, tab, n_samples,
             allowed_assignments, allowed_assignments2,
             doublet_rate, error_rate_ref, error_rate_alt,
             pw_ptr, false, 0.0, 0.0, NULL, n_target);
-        
-        if (success){
-            int assn = -1;
-            double llr_final = 0.0;
-            tab.get_max(assn, llr_final);
-            
-            if (llr_final > 0.0){
-                result_assn[idx] = assn;
-                result_llr[idx] = llr_final;
-            }
+        if (!success) continue;
+
+        int candidate = -1;
+        double score = -std::numeric_limits<double>::infinity();
+        tab.get_max(candidate, score);
+        vector<int> missing;
+        if (accepted_maximin_candidate(tab, candidate, score, missing)) {
+            result_assn[idx] = candidate;
+            result_llr[idx] = score;
         }
     }
-    
-    // Collect results
-    for (size_t idx = 0; idx < barcodes.size(); ++idx){
-        if (result_assn[idx] >= 0){
-            assignments.emplace(barcodes[idx], result_assn[idx]);
-            assignments_llr.emplace(barcodes[idx], result_llr[idx]);
-        }
+
+    for (size_t idx = 0; idx < barcodes.size(); ++idx) {
+        if (result_assn[idx] < 0) continue;
+        assignments.emplace(barcodes[idx], result_assn[idx]);
+        assignments_llr.emplace(barcodes[idx], result_llr[idx]);
     }
-    
+
     fprintf(stderr, "Assigned %lu cells\n", assignments.size());
-    
-    if (g_verbose){
-        // Count singlets vs doublets
-        int n_samples = samples.size();
-        int n_singlets = 0, n_doublets = 0;
+    if (g_verbose) {
+        int n_singlets = 0;
+        int n_doublets = 0;
         map<int, int> assignment_counts;
-        for (auto& a : assignments){
-            assignment_counts[a.second]++;
-            if (a.second < n_samples) n_singlets++;
-            else n_doublets++;
+        for (const auto& assignment : assignments) {
+            ++assignment_counts[assignment.second];
+            if (assignment.second < n_samples) ++n_singlets;
+            else ++n_doublets;
         }
-        fprintf(stderr, "[VERBOSE] Assignment summary: %d singlets, %d doublets\n", 
+        fprintf(stderr, "[VERBOSE] Assignment summary: %d singlets, %d doublets\n",
             n_singlets, n_doublets);
-        for (auto& ac : assignment_counts){
-            if (ac.first < n_samples){
-                fprintf(stderr, "[VERBOSE]   %s: %d cells\n", samples[ac.first].c_str(), ac.second);
-            }
-            else{
-                pair<int, int> combo = idx_to_hap_comb(ac.first, n_samples);
-                fprintf(stderr, "[VERBOSE]   %s+%s: %d cells\n", 
-                    samples[combo.first].c_str(), samples[combo.second].c_str(), ac.second);
+        for (const auto& entry : assignment_counts) {
+            if (entry.first < n_samples) {
+                fprintf(stderr, "[VERBOSE]   %s: %d cells\n",
+                    samples[entry.first].c_str(), entry.second);
+            } else {
+                const pair<int, int> combo = idx_to_hap_comb(entry.first, n_samples);
+                fprintf(stderr, "[VERBOSE]   %s+%s: %d cells\n",
+                    samples[combo.first].c_str(), samples[combo.second].c_str(), entry.second);
             }
         }
     }
+    return true;
 }
 
-// ============================================================================
-// NEW: PARALLEL IDENTITY ASSIGNMENT WITH DIAGNOSTICS
-// ============================================================================
-
-void assign_ids_parallel_with_diagnostics(
+bool assign_ids_parallel_with_diagnostics(
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
     vector<string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
@@ -1734,138 +1632,112 @@ void assign_ids_parallel_with_diagnostics(
     map<int, double>& prior_weights,
     int n_threads,
     int n_target,
-    // Diagnostic options
     bool compute_diagnostics,
     int n_runner_ups,
     double close_threshold,
     robin_hood::unordered_map<unsigned long, CellCounts>* het_counts,
-    // Diagnostic outputs
     robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
     robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups,
-    // Extended evidence (2A/2B/2C) - accepted for call-site compatibility
     robin_hood::unordered_map<unsigned long, CellCounts>* atac_cell_counts,
     const map<int, double>* identity_prior,
     double z_doublet,
     robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_rna,
-    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac){
-    
+    robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac) {
+
+    (void)z_doublet;
     assignments.clear();
     assignments_llr.clear();
     diagnostics.clear();
     runner_ups.clear();
-    
-    if (g_verbose){
-        fprintf(stderr, "[VERBOSE] assign_ids_parallel_with_diagnostics: n_samples=%d, n_target=%d\n",
-            (int)samples.size(), n_target);
-        fprintf(stderr, "[VERBOSE]   compute_diagnostics=%d, n_runner_ups=%d, close_threshold=%.1f\n",
-            compute_diagnostics, n_runner_ups, close_threshold);
-        fprintf(stderr, "[VERBOSE]   het_counts provided: %s\n", het_counts ? "yes" : "no");
-    }
-    
-    // Collect barcodes into vector for parallel processing
+
+    const int n_samples = static_cast<int>(samples.size());
+    if (!validate_assignment_dimensions(n_samples) ||
+        reject_unsupported_identity_prior(identity_prior)) return false;
+    report_auxiliary_evidence_scope(atac_cell_counts, species_counts_rna, species_counts_atac);
+
     vector<unsigned long> barcodes;
     barcodes.reserve(cell_counts.size());
-    for (auto& kv : cell_counts){
-        barcodes.push_back(kv.first);
-    }
-    
-    // Pre-allocate results
+    for (const auto& kv : cell_counts) barcodes.push_back(kv.first);
+
     vector<int> result_assn(barcodes.size(), -1);
-    vector<double> result_llr(barcodes.size(), 0.0);
+    vector<double> result_llr(barcodes.size(), std::numeric_limits<double>::quiet_NaN());
+    vector<bool> result_has_diag(barcodes.size(), false);
     vector<CellDiagnostics> result_diag(barcodes.size());
     vector<vector<RunnerUp> > result_runners(barcodes.size());
-    
+
     fprintf(stderr, "Assigning identities to %lu cells using %d threads%s...\n",
-        barcodes.size(), n_threads, 
-        compute_diagnostics ? " (with diagnostics)" : "");
-    
-    int n_samples = samples.size();
-    
+        barcodes.size(), n_threads, compute_diagnostics ? " (with diagnostics)" : "");
+
     #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 100)
-    for (size_t idx = 0; idx < barcodes.size(); ++idx){
-        unsigned long bc = barcodes[idx];
+    for (size_t idx = 0; idx < barcodes.size(); ++idx) {
+        const unsigned long bc = barcodes[idx];
         const CellCounts& counts = cell_counts[bc];
-        
-        // Skip empty cells
         if (counts.is_empty()) continue;
-        
+
         map<int, map<int, double> > llrs;
         llr_table tab(n_samples);
-        
         map<int, double>* pw_ptr = use_prior_weights ? &prior_weights : NULL;
-        
-        bool success = populate_llr_table_optimized(
+        const bool success = populate_llr_table_optimized(
             counts, llrs, tab, n_samples,
             allowed_assignments, allowed_assignments2,
             doublet_rate, error_rate_ref, error_rate_alt,
             pw_ptr, false, 0.0, 0.0, NULL, n_target);
-        
-        if (success){
-            int assn = -1;
-            double llr_final = 0.0;
-            tab.get_max(assn, llr_final);
-            
-            if (llr_final > 0.0){
-                result_assn[idx] = assn;
-                result_llr[idx] = llr_final;
-                
-                // Extract diagnostics BEFORE table destruction
-                if (compute_diagnostics){
-                    CellDiagnostics diag;
-                    vector<RunnerUp> runners;
-                    
-                    get_diagnostics_from_llrs(llrs, tab, assn, llr_final, n_samples,
-                        n_runner_ups, close_threshold, diag, runners);
-                    
-                    // Compute posterior probability and entropy from llrs
-                    compute_posterior_entropy(llrs, tab, assn, n_samples, diag);
+        if (!success) continue;
 
-                    // Selection audit: record the maxllr-criterion winner so an
-                    // offline script can compare against the maximin assignment.
-                    tab.get_max_by_maxllr(diag.maxllr_winner, diag.maxllr_winner_score);
+        int candidate = -1;
+        double score = -std::numeric_limits<double>::infinity();
+        tab.get_max(candidate, score);
+        vector<int> missing;
+        const bool accepted = accepted_maximin_candidate(tab, candidate, score, missing);
+        if (accepted) {
+            result_assn[idx] = candidate;
+            result_llr[idx] = score;
+        }
 
-                    // Compute total depth from main counts
-                    diag.total_depth = compute_total_depth(counts, n_samples);
-                    
-                    // Compute het balance stats if het counts provided
-                    if (het_counts != NULL){
-                        auto het_it = het_counts->find(bc);
-                        if (het_it != het_counts->end()){
-                            compute_het_balance_stats(het_it->second, assn, n_samples, diag);
-                        }
-                    }
-                    
-                    result_diag[idx] = diag;
-                    result_runners[idx] = runners;
+        if (compute_diagnostics && candidate >= 0) {
+            CellDiagnostics diag;
+            vector<RunnerUp> runners;
+            get_diagnostics_from_llrs(llrs, tab, candidate, score, n_samples,
+                n_runner_ups, close_threshold, diag, runners);
+            compute_margin_softmax_scores(llrs, tab, candidate, n_samples, diag);
+            tab.get_max_by_max_llr_comparator(
+                diag.max_llr_comparator_winner,
+                diag.max_llr_comparator_score);
+            diag.total_depth = compute_total_depth(counts, n_samples);
+
+            // Het/ploidy is read-only with respect to the frozen accepted identity.
+            if (accepted && het_counts != NULL) {
+                const auto het_it = het_counts->find(bc);
+                if (het_it != het_counts->end()) {
+                    compute_het_balance_stats(het_it->second, candidate, n_samples, diag);
                 }
             }
+            result_has_diag[idx] = true;
+            result_diag[idx] = diag;
+            result_runners[idx] = runners;
         }
     }
-    
-    // Collect results
-    for (size_t idx = 0; idx < barcodes.size(); ++idx){
-        if (result_assn[idx] >= 0){
-            unsigned long bc = barcodes[idx];
+
+    for (size_t idx = 0; idx < barcodes.size(); ++idx) {
+        const unsigned long bc = barcodes[idx];
+        if (result_assn[idx] >= 0) {
             assignments.emplace(bc, result_assn[idx]);
             assignments_llr.emplace(bc, result_llr[idx]);
-            
-            if (compute_diagnostics){
-                diagnostics.emplace(bc, result_diag[idx]);
-                runner_ups.emplace(bc, result_runners[idx]);
-            }
+        }
+        if (compute_diagnostics && result_has_diag[idx]) {
+            diagnostics.emplace(bc, result_diag[idx]);
+            runner_ups.emplace(bc, result_runners[idx]);
         }
     }
-    
+
     fprintf(stderr, "Assigned %lu cells\n", assignments.size());
-    if (compute_diagnostics){
-        fprintf(stderr, "Collected diagnostics for %lu cells\n", diagnostics.size());
+    if (compute_diagnostics) {
+        fprintf(stderr, "Collected diagnostics for %lu evaluated cells\n", diagnostics.size());
     }
+    return true;
 }
 
-/**
- * Extended assignment with Welford het balance method
- */
-void assign_ids_parallel_with_diagnostics_extended(
+bool assign_ids_parallel_with_diagnostics_extended(
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
     vector<string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
@@ -1884,145 +1756,127 @@ void assign_ids_parallel_with_diagnostics_extended(
     double close_threshold,
     robin_hood::unordered_map<unsigned long, CellHetData>* het_data,
     const robin_hood::unordered_map<int, ChromSNPs>* het_snpdat,
-    const vector<pair<int, int>>* idx_to_site,
+    const vector<pair<int, int> >* idx_to_site,
     HetBalanceMethod het_method,
     int min_het_sites,
     double min_het_depth,
     robin_hood::unordered_map<unsigned long, CellDiagnostics>& diagnostics,
     robin_hood::unordered_map<unsigned long, vector<RunnerUp> >& runner_ups,
-    // Extended evidence (2A/2B/2C)
     robin_hood::unordered_map<unsigned long, CellCounts>* atac_cell_counts,
     const map<int, double>* identity_prior,
     double z_doublet,
     robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_rna,
     robin_hood::unordered_map<unsigned long, CellCounts>* species_counts_atac) {
-    
-    int n_samples = samples.size();
-    const char* method_name = (het_method == HetBalanceMethod::PERSITE) ? "per-site" : "Welford";
-    
-    if (g_verbose) {
-        fprintf(stderr, "[VERBOSE] assign_ids_parallel_with_diagnostics_extended:\n");
-        fprintf(stderr, "[VERBOSE]   cells: %lu, method: %s, min_het_sites: %d\n", 
-                cell_counts.size(), method_name, min_het_sites);
-    }
-    
-    // Convert to vector for parallel processing
+
+    (void)z_doublet;
+    assignments.clear();
+    assignments_llr.clear();
+    diagnostics.clear();
+    runner_ups.clear();
+
+    const int n_samples = static_cast<int>(samples.size());
+    if (!validate_assignment_dimensions(n_samples) ||
+        reject_unsupported_identity_prior(identity_prior)) return false;
+    report_auxiliary_evidence_scope(atac_cell_counts, species_counts_rna, species_counts_atac);
+
+    const char* method_name = het_method == HetBalanceMethod::PERSITE ? "per-site" : "Welford";
     vector<unsigned long> barcodes;
     barcodes.reserve(cell_counts.size());
-    for (const auto& kv : cell_counts) {
-        barcodes.push_back(kv.first);
-    }
-    
-    // Results storage
+    for (const auto& kv : cell_counts) barcodes.push_back(kv.first);
+
     vector<int> result_assn(barcodes.size(), -1);
-    vector<double> result_llr(barcodes.size(), 0.0);
+    vector<double> result_llr(barcodes.size(), std::numeric_limits<double>::quiet_NaN());
+    vector<bool> result_has_diag(barcodes.size(), false);
     vector<CellDiagnostics> result_diag(barcodes.size());
     vector<vector<RunnerUp> > result_runners(barcodes.size());
-    
     atomic<int> cells_done(0);
-    int total_cells = barcodes.size();
-    
+    const int total_cells = static_cast<int>(barcodes.size());
+
     #pragma omp parallel num_threads(n_threads)
     {
         map<int, map<int, double> > llrs;
-        
         #pragma omp for schedule(dynamic, 100)
-        for (size_t idx = 0; idx < barcodes.size(); idx++) {
-            unsigned long bc = barcodes[idx];
+        for (size_t idx = 0; idx < barcodes.size(); ++idx) {
+            const unsigned long bc = barcodes[idx];
             const CellCounts& counts = cell_counts[bc];
-            
             if (counts.is_empty()) continue;
-            
-            int n_identities = n_samples + n_samples * (n_samples - 1) / 2;
-            llr_table tab(n_identities);
+
+            llr_table tab(n_samples);
             llrs.clear();
-            
-            bool success = populate_llr_table_optimized(
+            const bool success = populate_llr_table_optimized(
                 counts, llrs, tab, n_samples,
                 allowed_assignments, allowed_assignments2,
                 doublet_rate, error_rate_ref, error_rate_alt,
                 use_prior_weights ? &prior_weights : NULL,
                 false, 0.0, 0.0, NULL, n_target);
-            
             if (!success) continue;
-            
-            int best_idx;
-            double best_llr;
-            tab.get_max(best_idx, best_llr);
-            
-            result_assn[idx] = best_idx;
-            result_llr[idx] = best_llr;
-            
-            if (compute_diagnostics) {
+
+            int candidate = -1;
+            double score = -std::numeric_limits<double>::infinity();
+            tab.get_max(candidate, score);
+            vector<int> missing;
+            const bool accepted = accepted_maximin_candidate(tab, candidate, score, missing);
+            if (accepted) {
+                result_assn[idx] = candidate;
+                result_llr[idx] = score;
+            }
+
+            if (compute_diagnostics && candidate >= 0) {
                 CellDiagnostics diag;
                 vector<RunnerUp> runners;
-                
-                get_diagnostics_from_llrs(llrs, tab, best_idx, best_llr,
+                get_diagnostics_from_llrs(llrs, tab, candidate, score,
                     n_samples, n_runner_ups, close_threshold, diag, runners);
-                
-                // Compute posterior probability and entropy from llrs
-                compute_posterior_entropy(llrs, tab, best_idx, n_samples, diag);
-
-                // Selection audit: record the maxllr-criterion winner.
-                tab.get_max_by_maxllr(diag.maxllr_winner, diag.maxllr_winner_score);
-
+                compute_margin_softmax_scores(llrs, tab, candidate, n_samples, diag);
+                tab.get_max_by_max_llr_comparator(
+                    diag.max_llr_comparator_winner,
+                    diag.max_llr_comparator_score);
                 diag.total_depth = compute_total_depth(counts, n_samples);
-                
-                // Compute het balance using selected method
-                if (het_data != NULL) {
-                    auto het_it = het_data->find(bc);
+
+                // Freeze the accepted identity before optional het/ploidy diagnostics.
+                if (accepted && het_data != NULL) {
+                    const auto het_it = het_data->find(bc);
                     if (het_it != het_data->end()) {
                         const CellHetData& cell_het = het_it->second;
-                        
-                        if (het_method == HetBalanceMethod::PERSITE && 
+                        if (het_method == HetBalanceMethod::PERSITE &&
                             het_snpdat != NULL && idx_to_site != NULL) {
                             compute_het_balance_persite(
-                                cell_het.persite_data,
-                                *het_snpdat,
-                                *idx_to_site,
-                                best_idx,
-                                n_samples,
-                                min_het_depth,
-                                min_het_sites,
-                                diag);
+                                cell_het.persite_data, *het_snpdat, *idx_to_site,
+                                candidate, n_samples, min_het_depth, min_het_sites, diag);
                         } else {
                             compute_het_balance_welford(
-                                cell_het.welford_stats,
-                                best_idx,
-                                n_samples,
-                                min_het_sites,
-                                diag);
+                                cell_het.welford_stats, candidate, n_samples,
+                                min_het_sites, diag);
                         }
                     }
                 }
-                
+                result_has_diag[idx] = true;
                 result_diag[idx] = diag;
                 result_runners[idx] = runners;
             }
-            
-            int done = ++cells_done;
+
+            const int done = ++cells_done;
             if (done % 1000 == 0 || done == total_cells) {
                 fprintf(stderr, "\rAssigning: %d/%d cells    ", done, total_cells);
             }
         }
     }
-    
-    // Collect results
+
     for (size_t idx = 0; idx < barcodes.size(); ++idx) {
+        const unsigned long bc = barcodes[idx];
         if (result_assn[idx] >= 0) {
-            unsigned long bc = barcodes[idx];
             assignments.emplace(bc, result_assn[idx]);
             assignments_llr.emplace(bc, result_llr[idx]);
-            
-            if (compute_diagnostics) {
-                diagnostics.emplace(bc, result_diag[idx]);
-                runner_ups.emplace(bc, result_runners[idx]);
-            }
+        }
+        if (compute_diagnostics && result_has_diag[idx]) {
+            diagnostics.emplace(bc, result_diag[idx]);
+            runner_ups.emplace(bc, result_runners[idx]);
         }
     }
-    
-    fprintf(stderr, "\nAssigned %lu cells (%s het method)\n", assignments.size(), method_name);
+
+    fprintf(stderr, "\nAssigned %lu cells (%s het method)\n",
+        assignments.size(), method_name);
     if (compute_diagnostics) {
-        fprintf(stderr, "Collected diagnostics for %lu cells\n", diagnostics.size());
+        fprintf(stderr, "Collected diagnostics for %lu evaluated cells\n", diagnostics.size());
     }
+    return true;
 }

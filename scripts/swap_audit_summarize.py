@@ -8,6 +8,7 @@ import gzip
 import json
 import math
 import os
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple
@@ -34,7 +35,7 @@ from swap_audit_lib import (
 )
 
 DEFAULT_THRESHOLDS = {
-    "threshold_min_signal_llr": 10.0,
+    "threshold_min_runner_up_llr": 10.0,
     "threshold_max_ambiguous_frac": 0.30,
     "threshold_min_cells": 100.0,
     "threshold_clean_overlap_frac": 0.90,
@@ -60,6 +61,7 @@ REPORT_FIELDS = [
     "missing_optional_features", "warnings", "thresholds_source", "n_cells", "expected_identity",
     "audit_best_identity_unconstrained", "audit_best_identity_constrained", "audit_best_fraction",
     "expected_rank_median", "expected_rank_p90", "delta_ll_best_vs_expected_median",
+    "median_llr_vs_runner_up", "frac_cells_runner_up_comparison_complete", "frac_cells_high_n_close",
     "frac_cells_component_overlap_2", "frac_cells_component_overlap_1", "frac_cells_component_overlap_0",
     "median_dosage_concordance_assigned", "median_dosage_concordance_unconstrained",
     "median_dosage_gap_constrained", "median_dosage_gap_unconstrained",
@@ -130,7 +132,13 @@ def load_thresholds(path: str | None) -> Tuple[Dict[str, float], str, bool]:
             if len(parts) < 2 or parts[0] == "threshold_name":
                 continue
             try:
-                t[parts[0]] = float(parts[1])
+                name = parts[0]
+                value = float(parts[1])
+                if name == "threshold_min_signal_llr":
+                    # Backward-compatible threshold-file alias. The active
+                    # statistic is the direct winner-versus-runner contrast.
+                    name = "threshold_min_runner_up_llr"
+                t[name] = value
             except ValueError:
                 pass
     return t, "calibrated", True
@@ -153,37 +161,199 @@ def load_assignments(path: str) -> Dict[str, Dict[str, object]]:
     return out
 
 
-def load_diagnostics(path: str) -> Dict[str, Dict[str, str]]:
+MISSING_DIAGNOSTIC_TOKENS = {
+    "", ".", "na", "unavailable", "partial_support", "not_applicable"
+}
+PRESENT_COMPARISON_STATES = {"present_nonzero", "present_zero"}
+SUPPORTED_COMPARISON_STATES = PRESENT_COMPARISON_STATES | {
+    "unavailable", "partial_support", "not_applicable"
+}
+
+
+def _is_missing_diagnostic_token(value: object) -> bool:
+    return str(value if value is not None else "").strip().lower() in MISSING_DIAGNOSTIC_TOKENS
+
+
+def _strict_optional_float(value: object, context: str) -> float:
+    if _is_missing_diagnostic_token(value):
+        return math.nan
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context}: expected a finite number or explicit missing state, saw {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{context}: expected a finite number, saw {value!r}")
+    return parsed
+
+
+def _strict_int(value: object, context: str) -> int:
+    text = str(value).strip()
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise ValueError(f"{context}: expected an integer, saw {value!r}") from exc
+    return parsed
+
+
+def _parse_comparison_state(
+    raw_state: object,
+    numeric_value: float,
+    explicit_state: bool,
+    context: str,
+) -> str:
+    if not explicit_state:
+        if math.isnan(numeric_value):
+            return "unavailable"
+        return "present_zero" if numeric_value == 0.0 else "present_nonzero"
+    state = str(raw_state).strip().lower()
+    if state not in SUPPORTED_COMPARISON_STATES:
+        raise ValueError(f"{context}: unsupported comparison state {raw_state!r}")
+    if state in PRESENT_COMPARISON_STATES:
+        if math.isnan(numeric_value):
+            raise ValueError(f"{context}: state {state} requires a numeric direct comparison")
+        if state == "present_zero" and numeric_value != 0.0:
+            raise ValueError(f"{context}: present_zero requires numeric zero")
+        if state == "present_nonzero" and numeric_value == 0.0:
+            raise ValueError(f"{context}: present_nonzero cannot carry numeric zero")
+    elif not math.isnan(numeric_value):
+        raise ValueError(f"{context}: missing state {state} must not carry a numeric value")
+    return state
+
+
+def _read_strict_tsv(path: str) -> tuple[list[str], list[tuple[int, dict[str, str]]]]:
     opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt") as fh:
-        return {r["barcode"]: r for r in csv.DictReader(fh, delimiter="\t")}
+    with opener(path, "rt", newline="") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        try:
+            header = next(reader)
+        except StopIteration as exc:
+            raise ValueError(f"{path}: empty TSV") from exc
+        if not header or any(not name for name in header):
+            raise ValueError(f"{path}: empty column name")
+        duplicates = sorted(name for name, count in Counter(header).items() if count > 1)
+        if duplicates:
+            raise ValueError(f"{path}: duplicate columns: {','.join(duplicates)}")
+        rows: list[tuple[int, dict[str, str]]] = []
+        for line_no, fields in enumerate(reader, start=2):
+            if not fields or (len(fields) == 1 and fields[0] == ""):
+                continue
+            if len(fields) != len(header):
+                raise ValueError(
+                    f"{path}: line {line_no}: malformed row has {len(fields)} fields; expected {len(header)}"
+                )
+            rows.append((line_no, dict(zip(header, fields))))
+    return header, rows
+
+
+def _require_any_column(header: list[str], path: str, *names: str) -> str:
+    for name in names:
+        if name in header:
+            return name
+    raise ValueError(f"{path}: required column missing: {' or '.join(names)}")
+
+
+def load_diagnostics(path: str) -> Dict[str, Dict[str, object]]:
+    header, rows = _read_strict_tsv(path)
+    barcode_col = _require_any_column(header, path, "barcode")
+    direct_col = _require_any_column(header, path, "llr_vs_runner_up", "llr")
+    n_close_col = _require_any_column(header, path, "n_close")
+    state_col = next((x for x in ("runnerup_comparison_state", "runner_up_comparison_state") if x in header), None)
+    schema_col = "schema_version" if "schema_version" in header else None
+    versioned = schema_col is not None
+    if versioned and "llr_vs_runner_up" not in header:
+        raise ValueError(f"{path}: versioned diagnostics require llr_vs_runner_up")
+    if versioned and state_col is None:
+        raise ValueError(f"{path}: versioned diagnostics require runnerup_comparison_state")
+    if versioned and "margin_softmax_score" not in header:
+        raise ValueError(f"{path}: versioned diagnostics require margin_softmax_score")
+    if versioned and "margin_entropy" not in header:
+        raise ValueError(f"{path}: versioned diagnostics require margin_entropy")
+
+    softmax_col = next((x for x in ("margin_softmax_score", "posterior") if x in header), None)
+    entropy_col = next((x for x in ("margin_entropy", "entropy") if x in header), None)
+    total_depth_col = "total_depth" if "total_depth" in header else None
+    out: Dict[str, Dict[str, object]] = {}
+    for line_no, row in rows:
+        context = f"{path}: line {line_no}"
+        if versioned:
+            schema = row[schema_col]
+            if schema not in {"demux_parallel_diagnostics_v2", "demux_parallel_diagnostics_v3"}:
+                raise ValueError(f"{context}: unsupported diagnostics schema {schema!r}")
+        direct = _strict_optional_float(row[direct_col], f"{context} llr_vs_runner_up")
+        state = _parse_comparison_state(
+            row[state_col] if state_col else "",
+            direct,
+            state_col is not None,
+            f"{context} runner-up comparison",
+        )
+        barcode = row[barcode_col]
+        if not barcode:
+            raise ValueError(f"{context}: empty barcode")
+        if barcode in out:
+            raise ValueError(f"{context}: duplicate barcode {barcode!r}")
+        out[barcode] = {
+            "barcode": barcode,
+            "llr_vs_runner_up": direct,
+            "runnerup_comparison_state": state,
+            "n_close": _strict_int(row[n_close_col], f"{context} n_close"),
+            "total_depth": _strict_optional_float(row[total_depth_col], f"{context} total_depth") if total_depth_col else math.nan,
+            "margin_softmax_score": _strict_optional_float(row[softmax_col], f"{context} margin_softmax_score") if softmax_col else math.nan,
+            "margin_entropy": _strict_optional_float(row[entropy_col], f"{context} margin_entropy") if entropy_col else math.nan,
+            "schema_version": row[schema_col] if schema_col else "legacy_name_addressed",
+        }
+    return out
 
 
 def load_runner_ups(path: str) -> Dict[str, List[Dict[str, object]]]:
+    header, rows = _read_strict_tsv(path)
+    barcode_col = _require_any_column(header, path, "barcode")
+    rank_col = _require_any_column(header, path, "rank")
+    identity_col = _require_any_column(header, path, "identity")
+    direct_col = _require_any_column(header, path, "llr_vs_winner")
+    min_margin_col = _require_any_column(header, path, "min_margin")
+    state_col = "comparison_state" if "comparison_state" in header else None
+    schema_col = "schema_version" if "schema_version" in header else None
+    versioned = schema_col is not None
+    if versioned and state_col is None:
+        raise ValueError(f"{path}: versioned runner-ups require comparison_state")
+
     out: Dict[str, List[Dict[str, object]]] = defaultdict(list)
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        for r in reader:
-            bc = r.get("barcode", "")
-            if not bc:
-                continue
-            ident = r.get("identity", "")
-            if not ident:
-                continue
-            try:
-                ident = canonical_identity(ident, None)
-            except ValueError:
-                continue
-            rank = int(float(r.get("rank", "0") or 0))
-            margin = r.get("min_margin", r.get("llr_vs_winner", "NA"))
-            try:
-                margin_f = float(margin)
-            except ValueError:
-                margin_f = math.nan
-            out[bc].append({"rank": rank, "identity": ident, "min_margin": margin_f})
+    for line_no, row in rows:
+        context = f"{path}: line {line_no}"
+        if versioned:
+            schema = row[schema_col]
+            if schema not in {"demux_parallel_runner_ups_v2", "demux_parallel_runner_ups_v3"}:
+                raise ValueError(f"{context}: unsupported runner-up schema {schema!r}")
+        bc = row[barcode_col]
+        if not bc:
+            raise ValueError(f"{context}: empty barcode")
+        ident_raw = row[identity_col]
+        if not ident_raw:
+            raise ValueError(f"{context}: empty identity")
+        try:
+            ident = canonical_identity(ident_raw, None)
+        except ValueError as exc:
+            raise ValueError(f"{context}: invalid identity {ident_raw!r}: {exc}") from exc
+        rank = _strict_int(row[rank_col], f"{context} rank")
+        if rank <= 0:
+            raise ValueError(f"{context}: runner-up rank must be positive")
+        direct = _strict_optional_float(row[direct_col], f"{context} llr_vs_winner")
+        state = _parse_comparison_state(
+            row[state_col] if state_col else "",
+            direct,
+            state_col is not None,
+            f"{context} runner-up comparison",
+        )
+        out[bc].append({
+            "rank": rank,
+            "identity": ident,
+            "llr_vs_winner": direct,
+            "comparison_state": state,
+            "min_margin": _strict_optional_float(row[min_margin_col], f"{context} min_margin"),
+            "schema_version": row[schema_col] if schema_col else "legacy_name_addressed",
+        })
     for bc in out:
-        out[bc].sort(key=lambda x: int(x["rank"]))
+        out[bc].sort(key=lambda x: (int(x["rank"]), str(x["identity"])))
     return out
 
 
@@ -222,9 +392,10 @@ def runtime_feature_mode(has_call_qc: bool, has_species_qc: bool, has_atac_qc: b
 
 def safe_float(x, default=math.nan):
     try:
-        if x in (None, "", ".", "NA"):
+        if _is_missing_diagnostic_token(x):
             return default
-        return float(x)
+        value = float(x)
+        return value if math.isfinite(value) else default
     except (TypeError, ValueError):
         return default
 
@@ -242,14 +413,20 @@ def components_csv(ident: str) -> str:
 
 
 def runner_expected_rank(runners: List[Mapping[str, object]], expected: str) -> Tuple[float, float]:
+    """Return rank and direct winner-vs-expected contrast for a complete edge."""
     expected_snp = snp_resolvable_identity(expected, None)
     for r in runners:
+        if str(r.get("comparison_state", "unavailable")) not in PRESENT_COMPARISON_STATES:
+            continue
         try:
             runner_snp = snp_resolvable_identity(str(r["identity"]), None)
         except ValueError:
             continue
         if runner_snp == expected_snp:
-            return float(r["rank"]), float(r.get("min_margin", math.nan))
+            runner_vs_winner = safe_float(r.get("llr_vs_winner"))
+            if math.isnan(runner_vs_winner):
+                return math.nan, math.nan
+            return float(r["rank"]), -runner_vs_winner
     return math.nan, math.nan
 
 
@@ -293,8 +470,9 @@ def verdict_logic(row: Dict[str, object], t: Mapping[str, float]) -> Tuple[str, 
     n_cells = float(row.get("n_cells", 0) or 0)
     if n_cells < t["threshold_min_cells"]:
         flags.append("LOW_CELL_COUNT")
-    if float(row.get("median_original_llr", math.nan)) < t["threshold_min_signal_llr"]:
-        flags.append("LOW_SIGNAL_LLR")
+    runner_contrast = safe_float(row.get("median_llr_vs_runner_up"))
+    if not math.isnan(runner_contrast) and runner_contrast < t["threshold_min_runner_up_llr"]:
+        flags.append("LOW_RUNNER_UP_CONTRAST")
     if float(row.get("frac_cells_high_n_close", 0.0) or 0.0) > t["threshold_max_ambiguous_frac"]:
         flags.append("HIGH_AMBIGUOUS_N_CLOSE")
     frac_species_disjoint = float(row.get("frac_cells_species_disjoint_wrong", 0.0) or 0.0)
@@ -324,7 +502,7 @@ def verdict_logic(row: Dict[str, object], t: Mapping[str, float]) -> Tuple[str, 
     if float(row.get("missing_expected_identity_fraction", 0.0) or 0.0) > 0.05:
         flags.append("EXPECTED_IDENTITY_MISSING")
 
-    if "LOW_CELL_COUNT" in flags or "LOW_SIGNAL_LLR" in flags or "HIGH_AMBIGUOUS_N_CLOSE" in flags:
+    if "LOW_CELL_COUNT" in flags or "LOW_RUNNER_UP_CONTRAST" in flags or "HIGH_AMBIGUOUS_N_CLOSE" in flags:
         verdict = "LOW_SIGNAL"
     elif "WRONG_SPECIES_SIGNAL" in flags:
         verdict = "WRONG_SPECIES_SIGNAL"
@@ -545,14 +723,23 @@ def main() -> int:
     n = len(barcodes)
     top_u, top_u_frac = top_identity({bc: au[bc] for bc in barcodes if bc in au})
     top_c, _ = top_identity({bc: ac[bc] for bc in barcodes if bc in ac})
-    llrs = []
+    runner_up_contrasts = []
     n_close_vals = []
+    n_complete_runner_up_comparisons = 0
+    n_diagnostic_rows = 0
     for bc in barcodes:
         d = diag.get(bc, {})
-        try: llrs.append(float(d.get("llr", math.nan)))
-        except ValueError: pass
-        try: n_close_vals.append(float(d.get("n_close", 0)))
-        except ValueError: pass
+        if not d:
+            continue
+        n_diagnostic_rows += 1
+        state = str(d.get("runnerup_comparison_state", "unavailable"))
+        value = safe_float(d.get("llr_vs_runner_up"))
+        if state in PRESENT_COMPARISON_STATES and not math.isnan(value):
+            runner_up_contrasts.append(value)
+            n_complete_runner_up_comparisons += 1
+        n_close = safe_float(d.get("n_close"))
+        if not math.isnan(n_close):
+            n_close_vals.append(n_close)
     comp = composition_distances(expected_ids, orig)
     refined_counts = refined_assignment_counts(refined_for_scored) if refined_for_scored else Counter()
     refined_top_identity, refined_top_fraction = (NA, math.nan)
@@ -669,8 +856,15 @@ def main() -> int:
         "rna_atac_same_identity_fraction": NA,
         "rna_atac_same_species_fraction": NA,
         "frac_cells_rna_atac_discordant": NA,
-        "median_original_llr": median(llrs),
-        "frac_cells_high_n_close": sum(1 for v in n_close_vals if v > 0) / len(n_close_vals) if n_close_vals else 0.0,
+        "median_llr_vs_runner_up": median(runner_up_contrasts),
+        "frac_cells_runner_up_comparison_complete": (
+            n_complete_runner_up_comparisons / n_diagnostic_rows
+            if n_diagnostic_rows else math.nan
+        ),
+        "frac_cells_high_n_close": (
+            sum(1 for v in n_close_vals if v > 0) / len(n_close_vals)
+            if n_close_vals else math.nan
+        ),
     })
     row.update(comp)
     if has_call_qc:
@@ -706,4 +900,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError, KeyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

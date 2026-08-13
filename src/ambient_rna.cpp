@@ -1042,6 +1042,13 @@ void contamFinder::est_contam_cells_global(){
             p_c.push_back(amb_mu[type1_all[*i]][type2_all[*i]]);
         }
     }
+    if (n.empty() || k.size() != n.size() || p_e.size() != n.size() || p_c.size() != n.size()){
+        std::ostringstream message;
+        message << "global contamination input mismatch: n=" << n.size()
+                << ", k=" << k.size() << ", p_e=" << p_e.size()
+                << ", p_c=" << p_c.size();
+        throw std::runtime_error(message.str());
+    }
     optimML::brent_solver c_global(ll_c, dll_dc, d2ll_dc2);
     if (num_threads > 1){
         c_global.set_threads(num_threads);
@@ -1516,9 +1523,19 @@ double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, b
         startprops.push_back(contam_prof[-1]);
     }
     
-    // Set up ML solver 
-    solver.add_mixcomp(mixfracs);
-    solver.add_mixcomp_fracs(startprops);
+    // Set up ML solver.  Reject malformed component geometry before optimML
+    // can dereference an incomplete parameter vector.
+    const size_t mixture_width = mixfracs.empty() ? 0 : mixfracs.front().size();
+    if (mixfracs.empty() || mixture_width == 0 || startprops.size() != mixture_width){
+        std::ostringstream message;
+        message << "ambient mixture initialization mismatch: rows=" << mixfracs.size()
+                << ", components=" << mixture_width
+                << ", start_proportions=" << startprops.size();
+        throw std::runtime_error(message.str());
+    }
+    if (!solver.add_mixcomp(mixfracs) || !solver.add_mixcomp_fracs(startprops)){
+        throw std::runtime_error("failed to initialize ambient mixture solver");
+    }
     solver.add_data("n", n);
     solver.add_data("k", k);
     solver.add_data("p_e", p_e);
@@ -2414,10 +2431,20 @@ double contamFinder::compute_ll(){
  */
 void contamFinder::fit(){
     // Begin with minimum estimate of c (global contamination rate)
-    // if not provided from a previous run
+    // if not provided from a previous run.  est_min_c() also constructs its
+    // own profile guess; preserve an explicitly supplied profile so
+    // set_init_contam_prof() remains an actual contract rather than being
+    // silently discarded on the first fit.
+    map<int, double> supplied_profile;
+    if (contam_prof_initialized){
+        supplied_profile = contam_prof;
+    }
     if (c_init <= 0){
         // Get (estimated/averaged) min bound on c
         c_init = this->est_min_c();
+    }
+    if (contam_prof_initialized){
+        contam_prof = supplied_profile;
     }
     double ll_init = init_params(c_init);
     fprintf(stderr, "Initial global contamination rate = %f\n", c_init);

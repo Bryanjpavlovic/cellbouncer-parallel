@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <utility>
 #include <tuple>
+#include <limits>
+#include <stdexcept>
 #include <zlib.h>
 #include <mutex>
 #include <atomic>
@@ -36,12 +38,74 @@ using namespace std;
 // CONSTANTS FOR OPTIMIZED DATA STRUCTURES
 // ============================================================================
 
-// Maximum number of individuals supported (increase if needed)
-constexpr int MAX_INDIVIDUALS = 64;
+// The VCF representation below uses bitset<500>, but the repository-shared
+// haplotype-combination helpers still use signed short indices.  Reject any
+// identity universe that would overflow either representation.
+constexpr int MAX_INDIVIDUALS = 500;
+constexpr int MAX_COMBINATION_SAFE_INDIVIDUALS = 255;
 // Number of genotype states (0, 1, 2 alt alleles)
 constexpr int GENOTYPE_STATES = 3;
 // Total number of (individual, genotype) state combinations
 constexpr int STATE_COUNT = MAX_INDIVIDUALS * GENOTYPE_STATES;
+
+// Maximum dense CellCounts allocation for one cell.  This is deliberately a
+// safety guard, not a redesign of the existing dense representation.
+constexpr size_t MAX_CELLCOUNTS_BYTES_PER_CELL = (size_t)1 << 30;  // 1 GiB
+
+/** Validate the declared identity universe and dense per-cell allocation. */
+bool validate_identity_and_allocation_request(
+    int n_samples,
+    size_t* n_identity_states,
+    size_t* bytes_per_cell,
+    std::string* error_message);
+
+size_t estimate_cellcounts_bytes(int n_samples);
+
+// ============================================================================
+// SHARED BAM READ FILTER AND REFERENCE-COORDINATE POLICY
+// ============================================================================
+
+/**
+ * The production default excludes unmapped, secondary, QC-fail and duplicate
+ * records. Supplementary records are intentionally retained to preserve the
+ * established main-path behavior. Any future deviation must use a named policy.
+ */
+enum class SupplementaryReadHandling { INCLUDE, EXCLUDE };
+
+struct ReadFilterPolicy {
+    uint16_t excluded_flags;
+    SupplementaryReadHandling supplementary;
+
+    ReadFilterPolicy(uint16_t flags = 0,
+                     SupplementaryReadHandling supp = SupplementaryReadHandling::INCLUDE)
+        : excluded_flags(flags), supplementary(supp) {}
+};
+
+const ReadFilterPolicy& default_production_read_filter();
+bool read_passes_filter(const bam1_t* record, const ReadFilterPolicy& policy);
+
+enum class ReferenceCoordinateState {
+    BASE,
+    DELETION,
+    REFERENCE_SKIP,
+    OUTSIDE_ALIGNMENT,
+    NO_QUERY_BASE,
+    MALFORMED_CIGAR
+};
+
+struct ReferenceCoordinateResult {
+    ReferenceCoordinateState state;
+    char base;
+    int query_index;
+
+    ReferenceCoordinateResult(
+        ReferenceCoordinateState s = ReferenceCoordinateState::OUTSIDE_ALIGNMENT,
+        char b = 'N',
+        int q = -1)
+        : state(s), base(b), query_index(q) {}
+};
+
+ReferenceCoordinateResult query_reference_coordinate(const bam1_t* record, int pos);
 
 // ============================================================================
 // HET BALANCE COMPUTATION OPTIONS
@@ -408,9 +472,11 @@ struct ChromBinIndex {
     // Returns true if the read MIGHT overlap a SNP.
     // Returns false only if the read is entirely within cold bins.
     inline bool might_overlap(int read_start, int read_end) const {
+        if (read_end <= read_start) return false;
         int bin_start = read_start / BIN_SIZE;
-        int bin_end = read_end / BIN_SIZE;
+        int bin_end = (read_end - 1) / BIN_SIZE;
         // Clamp to valid range
+        if (bin_start < 0) bin_start = 0;
         if (bin_start >= n_bins) return false;
         if (bin_end >= n_bins) bin_end = n_bins - 1;
         // Check all bins the read spans
@@ -468,8 +534,16 @@ struct CellCounts {
     
     CellCounts() : n_samples(0), state_count(0) {}
     
-    CellCounts(int n_samp) : n_samples(n_samp), state_count(n_samp * GENOTYPE_STATES) {
-        size_t total_size = (size_t)state_count * state_count;
+    CellCounts(int n_samp) : n_samples(n_samp), state_count(0) {
+        size_t n_identity_states = 0;
+        size_t bytes_per_cell = 0;
+        std::string error_message;
+        if (!validate_identity_and_allocation_request(
+                n_samp, &n_identity_states, &bytes_per_cell, &error_message)) {
+            throw std::length_error(error_message);
+        }
+        state_count = n_samp * GENOTYPE_STATES;
+        size_t total_size = (size_t)state_count * (size_t)state_count;
         ref_counts.resize(total_size, 0);
         alt_counts.resize(total_size, 0);
         total_ref.resize(state_count, 0);
@@ -625,9 +699,10 @@ void get_bam_chroms(bam_reader& reader,
  * operations before any reads are consumed. Exits with an explicit error on
  * unreadable BAM/header instead of allowing a null header dereference.
  */
-void get_bam_header_chroms_and_seq2tid(const std::string& bamfile,
+bool get_bam_header_chroms_and_seq2tid(const std::string& bamfile,
     std::set<std::string>& chroms,
-    std::map<std::string, int>& seq2tid);
+    std::map<std::string, int>& seq2tid,
+    std::string* error_message = nullptr);
 
 long int count_vcf_snps(std::string& vcf_file,
     std::set<std::string>& chroms_to_include,
@@ -792,7 +867,7 @@ void dump_vcs_counts(robin_hood::unordered_map<unsigned long,
 /**
  * Get base at a specific position from a BAM record, accounting for CIGAR
  */
-char get_base_at_pos(bam1_t* record, int pos);
+char get_base_at_pos(const bam1_t* record, int pos);
 
 /**
  * Main parallel counting function - processes BAM file using multiple threads
@@ -805,7 +880,7 @@ char get_base_at_pos(bam1_t* record, int pos);
  * @param n_threads Number of OpenMP threads to use
  * @param htslib_threads Number of decompression threads per BAM reader
  */
-void count_alleles_parallel(
+bool count_alleles_parallel(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>& cell_counts,
@@ -828,7 +903,7 @@ void count_alleles_parallel(
 // Backward-compatible overload for callers compiled against the historical
 // interface. Source-provenance output is disabled because no sample-name
 // mapping was supplied.
-void count_alleles_parallel_dual(
+bool count_alleles_parallel_dual(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
@@ -838,7 +913,7 @@ void count_alleles_parallel_dual(
     int n_threads,
     int htslib_threads);
 
-void count_alleles_parallel_dual(
+bool count_alleles_parallel_dual(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& combined_snpdat,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>& counts_panel0,
@@ -861,13 +936,15 @@ void count_alleles_parallel_dual(
     AcceptedSiteWeightMap* accepted_site_weights_panel1 = nullptr,
     const NativeSpeciesTargetTable* species_native_targets = nullptr,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts = nullptr,
-    int species_native_n_samples = 0);
+    int species_native_n_samples = 0,
+    bool dump_pileup = false,
+    const std::string& pileup_prefix = "");
 
 /**
  * Single-threaded counting using optimized data structures
  * Fallback for --threads 1 or when parallel processing is disabled
  */
-void count_alleles_single_threaded(
+bool count_alleles_single_threaded(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
@@ -952,7 +1029,7 @@ int load_het_vcf(
  * @param n_threads Number of OpenMP threads
  * @param htslib_threads Number of decompression threads per reader
  */
-void count_het_alleles_parallel(
+bool count_het_alleles_parallel(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
     robin_hood::unordered_map<unsigned long, CellCounts>& het_counts,
@@ -968,7 +1045,7 @@ void count_het_alleles_parallel(
  * @param idx_to_site Output: site index to (tid, pos) mapping (only for PERSITE)
  * @param method Which method to use (WELFORD or PERSITE)
  */
-void count_het_alleles_extended(
+bool count_het_alleles_extended(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& het_snpdat,
     robin_hood::unordered_map<unsigned long, CellHetData>& het_data,

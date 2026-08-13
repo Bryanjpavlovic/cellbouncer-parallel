@@ -15,6 +15,7 @@
 #include <set>
 #include <cstdlib>
 #include <utility>
+#include <limits>
 #include "common.h"
 #include "demux_parallel_hts.h"  // For CellCounts
 
@@ -25,63 +26,112 @@ extern bool g_verbose;
 extern bool g_debug;
 
 // ============================================================================
-// DIAGNOSTIC STRUCTURES (NEW)
+// DIAGNOSTIC STRUCTURES
 // ============================================================================
 
-/**
- * Per-cell diagnostic information for downstream refinement
- */
-struct CellDiagnostics {
-    // Margin diagnostics (always computed)
-    double min_margin;          // Winner's worst pairwise LLR
-    double llr_vs_runnerup;     // Winner's LLR against the rank-1 runner-up
-                                // (best vs second-best). Distinct from min_margin:
-                                // min_margin is the worst pairwise margin over ALL
-                                // competitors; this is the margin over the single
-                                // second-most-likely identity.
-    int worst_competitor;       // Identity that gave min_margin
-    int n_close;               // Count of identities within close_threshold of winner
-    double total_depth;        // Total allele counts from main demux VCF
-    
-    // Ploidy diagnostics (only if --het_vcf provided)
-    double het_balance_var;    // Variance of alt_frac at het sites (-1 if not computed)
-    int n_het_sites;           // Number of het sites used (0 if not computed)
-    double het_total_depth;    // Total depth at het sites (0 if not computed)
-    
-    // Method used for het_balance computation
-    HetBalanceMethod het_method;
-    
-    // Posterior probability and entropy (v3)
-    double posterior;           // P(winner | data) via softmax over all identities
-    double entropy;             // Shannon entropy of posterior distribution (bits)
-
-    // Selection audit (only populated under --dump_selection_audit).
-    // maxllr_winner is the identity that the maxllr criterion (Nathan's del(2)
-    // elimination survivor) would select; the normal assignment uses the
-    // maximin (highest min_margin) winner. These let an offline script count
-    // how often the two criteria disagree. -1 / 0 when not computed.
-    int maxllr_winner;          // argmax(maxllr) identity index
-    double maxllr_winner_score; // that identity's maxllr
-    
-    CellDiagnostics() 
-        : min_margin(0.0), llr_vs_runnerup(0.0), worst_competitor(-1), n_close(0), total_depth(0.0),
-          het_balance_var(-1.0), n_het_sites(0), het_total_depth(0.0),
-          het_method(HetBalanceMethod::WELFORD),
-          posterior(-1.0), entropy(-1.0),
-          maxllr_winner(-1), maxllr_winner_score(0.0) {}
+/** Explicit state for a direct pairwise comparison in corrected diagnostics. */
+enum class ComparisonState {
+    PRESENT_NONZERO = 0,
+    PRESENT_ZERO = 1,
+    UNAVAILABLE = 2,
+    PARTIAL_SUPPORT = 3,
+    NOT_APPLICABLE = 4
 };
 
-/**
- * Runner-up identity information for quad detection
- */
+const char* comparison_state_name(ComparisonState state);
+
+struct PairwiseComparison {
+    bool present;
+    bool partial_support;
+    double value;  // LLR(lhs versus rhs) when present
+
+    PairwiseComparison()
+        : present(false), partial_support(false),
+          value(std::numeric_limits<double>::quiet_NaN()) {}
+    PairwiseComparison(bool is_present, double comparison_value,
+                       bool has_partial_support = false)
+        : present(is_present), partial_support(has_partial_support),
+          value(comparison_value) {}
+
+    ComparisonState state() const {
+        if (present) {
+            return value == 0.0 ? ComparisonState::PRESENT_ZERO
+                                : ComparisonState::PRESENT_NONZERO;
+        }
+        return partial_support ? ComparisonState::PARTIAL_SUPPORT
+                               : ComparisonState::UNAVAILABLE;
+    }
+};
+
+/** Per-cell diagnostic information for downstream refinement. */
+struct CellDiagnostics {
+    // Margin diagnostics. Missing numeric values are NaN and accompanied by an
+    // explicit state; exact numeric zero remains a valid observed comparison.
+    double min_margin;                    // Winner's maximin score
+    double llr_vs_runnerup;               // Direct LLR(winner versus rank-1 runner)
+    ComparisonState runnerup_comparison_state;
+    int worst_competitor;                 // Identity that gave the worst present edge
+    ComparisonState worst_comparison_state;
+    int n_close;
+    double total_depth;
+    bool selection_resolved;
+    int maximin_candidate;
+    double maximin_score;
+    std::vector<int> missing_comparison_alternatives;
+
+    // Read-only ploidy diagnostics for the frozen accepted identity.
+    double het_balance_var;
+    int n_het_sites;
+    double het_total_depth;
+    bool het_diagnostic_available;
+    HetBalanceMethod het_method;
+
+    // Softmax summary of maximin margins. These are not calibrated Bayesian
+    // posterior probabilities.
+    double margin_softmax_score;
+    double margin_entropy;
+
+    // Non-mutating selection audit comparator: argmax(maxllr). It is not the
+    // historical destructive elimination selector.
+    int max_llr_comparator_winner;
+    double max_llr_comparator_score;
+
+    CellDiagnostics()
+        : min_margin(std::numeric_limits<double>::quiet_NaN()),
+          llr_vs_runnerup(std::numeric_limits<double>::quiet_NaN()),
+          runnerup_comparison_state(ComparisonState::NOT_APPLICABLE),
+          worst_competitor(-1),
+          worst_comparison_state(ComparisonState::NOT_APPLICABLE),
+          n_close(0),
+          total_depth(0.0),
+          selection_resolved(false),
+          maximin_candidate(-1),
+          maximin_score(std::numeric_limits<double>::quiet_NaN()),
+          het_balance_var(std::numeric_limits<double>::quiet_NaN()),
+          n_het_sites(0),
+          het_total_depth(0.0),
+          het_diagnostic_available(false),
+          het_method(HetBalanceMethod::WELFORD),
+          margin_softmax_score(std::numeric_limits<double>::quiet_NaN()),
+          margin_entropy(std::numeric_limits<double>::quiet_NaN()),
+          max_llr_comparator_winner(-1),
+          max_llr_comparator_score(std::numeric_limits<double>::quiet_NaN()) {}
+};
+
+/** Runner-up identity information for quad detection. */
 struct RunnerUp {
-    int identity;              // Runner-up identity index
-    double llr_vs_winner;      // Direct LLR vs winner (negative = winner wins)
-    double min_margin;         // Runner-up's own worst comparison
-    
-    RunnerUp() : identity(-1), llr_vs_winner(0.0), min_margin(0.0) {}
-    RunnerUp(int id, double llr, double margin) 
-        : identity(id), llr_vs_winner(llr), min_margin(margin) {}
+    int identity;
+    double llr_vs_winner;  // LLR(runner versus winner) when comparison is present
+    ComparisonState comparison_state;
+    double min_margin;
+
+    RunnerUp()
+        : identity(-1),
+          llr_vs_winner(std::numeric_limits<double>::quiet_NaN()),
+          comparison_state(ComparisonState::NOT_APPLICABLE),
+          min_margin(std::numeric_limits<double>::quiet_NaN()) {}
+    RunnerUp(int id, double llr, ComparisonState state, double margin)
+        : identity(id), llr_vs_winner(llr), comparison_state(state), min_margin(margin) {}
 };
 
 // ============================================================================
@@ -89,48 +139,47 @@ struct RunnerUp {
 // ============================================================================
 
 /**
- * Log likelihood ratio table for cell identity assignment.
- * 
- * Stores pairwise LLRs between all possible identities and provides
- * methods to iteratively eliminate unlikely identities.
+ * Pairwise log-likelihood-ratio table for identity assignment.
+ *
+ * Production selection is maximin: choose the retained identity with the
+ * highest minimum present pairwise LLR. The table also retains an authoritative
+ * signed pairwise map so diagnostic lookup can distinguish absence from zero.
  */
-class llr_table{
+class llr_table {
     private:
-        std::map<double, std::vector<std::pair<short, short> > > lookup_llr;
-        std::map<double, std::vector<std::pair<short, short> > >::iterator it;
+        std::map<double, std::vector<std::pair<int, int> > > lookup_llr;
+        std::map<double, std::vector<std::pair<int, int> > >::iterator it;
+        std::map<std::pair<int, int>, double> pairwise_llr;
+        std::set<std::pair<int, int> > pairwise_partial_support;
         std::vector<double> maxllr;
         std::vector<double> minllr;
 
     public:
         std::vector<bool> included;
         int n_indvs;
-        
-        llr_table(int x);
+
+        explicit llr_table(int x);
         ~llr_table();
-        
+
         void print(std::string& bc_str, std::vector<std::string>& samples);
         void print_ranges(std::string& barcode, std::vector<std::string>& samples);
-        void insert(short i1, short i2, double llr);
-        void disallow(short i);
+        void insert(int i1, int i2, double llr);
+        void mark_partial_support(int i1, int i2);
+        void disallow(int i);
         void recalculate_minmax();
         bool del(int n_keep);
-        void get_max(int& best_idx, double& best_llr);
+        void get_max(int& best_idx, double& best_llr) const;
 
-        // Selection-audit helper: winner under the maxllr criterion (the
-        // identity with the highest best-pairwise margin). This is the exact
-        // survivor of Nathan's del(2) elimination, which removes identities by
-        // lowest maxllr until two remain; reported here without the destructive
-        // lookup_llr mutation so the table stays intact. Used only by
-        // --dump_selection_audit; does not affect normal assignment.
-        void get_max_by_maxllr(int& best_idx, double& best_maxllr) const;
-        
-        // NEW: Get min_margin for a specific identity
+        // Audit-only non-mutating argmax(maxllr) comparator.
+        void get_max_by_max_llr_comparator(int& best_idx, double& best_maxllr) const;
+
         double get_min_margin(int identity) const;
-        
-        // NEW: Get the lookup_llr map for diagnostic extraction
-        const std::map<double, std::vector<std::pair<short, short> > >& get_lookup_llr() const { 
-            return lookup_llr; 
-        }
+        PairwiseComparison get_pairwise(int lhs, int rhs) const;
+        std::vector<int> retained_identities() const;
+        bool winner_has_complete_comparisons(
+            int winner,
+            std::vector<int>& missing_alternatives) const;
+
         const std::vector<double>& get_minllr() const { return minllr; }
         const std::vector<double>& get_maxllr() const { return maxllr; }
 };
@@ -191,7 +240,7 @@ bool populate_llr_table_optimized(
  * 
  * @param n_target Singlet pruning control (see populate_llr_table_optimized)
  */
-void assign_ids_parallel(
+bool assign_ids_parallel(
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
     std::vector<std::string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
@@ -216,7 +265,7 @@ void assign_ids_parallel(
  * @param diagnostics Output: per-cell diagnostics
  * @param runner_ups Output: per-cell runner-up lists
  */
-void assign_ids_parallel_with_diagnostics(
+bool assign_ids_parallel_with_diagnostics(
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
     std::vector<std::string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
@@ -248,7 +297,7 @@ void assign_ids_parallel_with_diagnostics(
 /**
  * Batch process with Welford or per-site het balance method
  */
-void assign_ids_parallel_with_diagnostics_extended(
+bool assign_ids_parallel_with_diagnostics_extended(
     robin_hood::unordered_map<unsigned long, CellCounts>& cell_counts,
     std::vector<std::string>& samples,
     robin_hood::unordered_map<unsigned long, int>& assignments,
@@ -349,18 +398,16 @@ void compute_het_balance_welford(
 double compute_total_depth(const CellCounts& counts, int n_samples);
 
 /**
- * Compute posterior probability and entropy from the pairwise LLR map.
- * Must be called while llrs is still populated (before table destruction).
- * 
- * Reconstructs per-identity log-likelihoods relative to the winner,
- * applies softmax to get posteriors, then computes Shannon entropy.
- * 
- * @param llrs The pairwise LLR map (llrs[i][j] = LL(i) - LL(j))
+ * Compute a softmax score and entropy from retained maximin margins.
+ * These summaries are descriptive margin transforms, not calibrated Bayesian
+ * posterior probabilities.
+ *
+ * @param llrs Retained for call-site compatibility; authoritative margins come from tab.
  * @param winner The winning identity index
  * @param n_samples Number of samples
- * @param diag Output: posterior and entropy fields populated
+ * @param diag Output: margin_softmax_score and margin_entropy populated
  */
-void compute_posterior_entropy(
+void compute_margin_softmax_scores(
     const std::map<int, std::map<int, double> >& llrs,
     const llr_table& tab,
     int winner,
@@ -374,9 +421,9 @@ void compute_posterior_entropy(
 double adjust_p_err(double p, double e_r, double e_a);
 
 void compute_k_comps(
-    std::map<int, std::map<int, double> >& llrs, 
+    const std::map<int, std::map<int, double> >& llrs, 
     llr_table& tab,
-    std::vector<int>& ks,
+    const std::vector<int>& ks,
     int n_samples,
     std::set<int>& allowed_assignments,
     double doublet_rate,

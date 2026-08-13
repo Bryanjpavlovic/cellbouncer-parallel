@@ -112,9 +112,75 @@ static bool one_hot_source_mapping_test(){
     return true;
 }
 
+
+static bool source_exclusion_profile_tests(){
+    bool ok=true;
+    const map<int,double> global{{0,0.50},{1,0.30},{2,0.20}};
+    const set<int> excluded{0,2};
+
+    const auto zero=apply_source_exclusion_profile(global,excluded,0.0);
+    if(zero.status!="global_profile_no_exclusion" || zero.scoring_profile!=global ||
+       !close_enough(zero.scoring_profile_mass_sum,1.0) ||
+       !close_enough(zero.effective_removed_source_mass_total,0.0)){
+        cerr << "lambda=0 source-exclusion endpoint failed\n";
+        ok=false;
+    }
+
+    const auto hard=apply_source_exclusion_profile(global,excluded,1.0);
+    if(hard.status!="hard_source_exclusion" ||
+       !close_enough(hard.scoring_profile.at(0),0.0) ||
+       !close_enough(hard.scoring_profile.at(1),1.0) ||
+       !close_enough(hard.scoring_profile.at(2),0.0) ||
+       !close_enough(hard.scoring_profile_mass_sum,1.0) ||
+       !close_enough(hard.excluded_source_mass_raw_total,0.70) ||
+       !close_enough(hard.effective_removed_source_mass_total,0.70)){
+        cerr << "lambda=1 hard source-exclusion endpoint failed\n";
+        ok=false;
+    }
+
+    for(double lambda: {0.25,0.50,0.75}){
+        const auto partial=apply_source_exclusion_profile(global,excluded,lambda);
+        double sum=0.0;
+        bool finite=true;
+        for(const auto& kv: partial.scoring_profile){
+            finite = finite && std::isfinite(kv.second) && kv.second >= 0.0;
+            sum += kv.second;
+        }
+        const double expected_removed=lambda*0.70;
+        if(partial.status!="partial_source_exclusion" || !finite ||
+           !close_enough(sum,1.0) ||
+           !close_enough(partial.scoring_profile_mass_sum,1.0) ||
+           !close_enough(partial.effective_removed_source_mass_total,expected_removed) ||
+           !close_enough(partial.scoring_profile_renormalization_denominator,1.0-expected_removed)){
+            cerr << "interior source exclusion failed at lambda=" << lambda << "\n";
+            ok=false;
+        }
+    }
+
+    const auto fallback=apply_source_exclusion_profile(global,{0,1,2},1.0);
+    if(fallback.status!="degenerate_all_mass_excluded_fallback_global" ||
+       fallback.scoring_profile!=global ||
+       !close_enough(fallback.scoring_profile_mass_sum,1.0) ||
+       !close_enough(fallback.effective_removed_source_mass_total,0.0)){
+        cerr << "all-mass-excluded fallback failed\n";
+        ok=false;
+    }
+
+    for(double invalid: {-0.01,1.01,std::numeric_limits<double>::quiet_NaN()}){
+        const auto assessment=apply_source_exclusion_profile(global,excluded,invalid);
+        if(assessment.status!="invalid_source_exclusion_strength" ||
+           assessment.scoring_profile!=global){
+            cerr << "invalid source exclusion strength was not rejected\n";
+            ok=false;
+        }
+    }
+    return ok;
+}
+
 int main(){
     bool ok=randomized_gradient_tests();
     ok &= one_hot_source_mapping_test();
+    ok &= source_exclusion_profile_tests();
     if(!ok) return 1;
     cout << "ambient mathematical tests passed\n";
     return 0;
