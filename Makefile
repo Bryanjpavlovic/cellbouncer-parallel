@@ -2,6 +2,7 @@ SHELL = bash
 COMP = g++
 CCOMP = gcc
 PREFIX ?= /usr/local
+SOURCE_REVISION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo archive)
 
 # -----------------------------------------------------------------------------
 # Cluster HTSlib location
@@ -37,6 +38,7 @@ CXXFLAGS_STD = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2)
 # $(ARCHFLAGS) for a cluster-portable CPU target; default is znver3.
 # -fopenmp for parallelism
 CXXFLAGS_PARALLEL = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -DNBITS=$(NBITS) \
+                    -DCELLBOUNCER_SOURCE_REVISION=\"$(SOURCE_REVISION)\" \
                     -O3 $(ARCHFLAGS) -fopenmp
 
 CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 $(ARCHFLAGS)
@@ -87,6 +89,8 @@ KX2 = 16
 DEPS = lib/libmixturedist.a lib/libhtswrapper.a lib/liboptimml.a
 DEPS2 = -lz -lhts -lpthread
 DEPS2_PARALLEL = -lz -lhts -lpthread -lrt
+BUILD_DIR_STAMP = build/.directory_ready
+HTSWRAPPER_HEADER_STAMP = include/htswrapper/.headers_installed
 
 # optimML is an external dependency, but CellBouncer needs two STLBFGS
 # assertions converted into catchable exceptions.  Never patch the vendored
@@ -102,9 +106,49 @@ OPTIMML_SOURCE_FILES = $(shell find dependencies/optimML -type f \
 # MAIN TARGETS
 # ============================================================================
 
-all: dependencies original_tools parallel_tools tet_tools qc_tools mitochondrial_tools
+# The integrated release is a self-contained source package, but the attached
+# CellBouncer update archives intentionally did not include four historical
+# source units (demux_vcf, demux_tags, serial downsample_vcf) or the FASTK
+# submodule required by get_unique_kmers.  The default target therefore builds
+# every executable whose complete source is actually bundled.  An explicit
+# full_upstream_tools target remains available after those optional sources are
+# restored from a full upstream checkout.
+BUNDLED_ROOT_BINS = demux_mt demux_species quant_contam doublet_dragon bulkprops \
+                    demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam tetra_refine \
+                    tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate \
+                    tetra_score_calls snps_per_read mt_fusion_ratio \
+                    quant3_contam quant3_contam_ap quant3_contam_empty_drops
+BUNDLED_UTIL_BINS = utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs \
+                    utils/bam_cb_cache_extract utils/split_read_files \
+                    utils/atac_fq_preprocess utils/combine_species_counts \
+                    utils/composite_bam2counts utils/downsample_vcf_parallel
+OPTIONAL_UPSTREAM_SOURCES = src/demux_vcf.cpp src/demux_tags.cpp \
+                            src/downsample_vcf.cpp src/downsample_vcf.h \
+                            src/FASTK/libfastk.c src/FASTK/libfastk.h
 
-original_tools: demux_vcf demux_mt demux_tags demux_species quant_contam doublet_dragon bulkprops utils
+# ``make all`` must work in both deployment layouts:
+#   1. the self-contained portable package, which intentionally lacks a few
+#      historical upstream source units; and
+#   2. the user's complete ~/cellbouncer-parallel checkout used by the compcb
+#      alias, where clean_build removes those executables and all must rebuild
+#      them before the alias copies them into the module installation.
+# Select the complete upstream target only when every required source is present;
+# otherwise retain the portable bundled build instead of failing on absent files.
+OPTIONAL_UPSTREAM_SOURCE_COUNT := $(words $(OPTIONAL_UPSTREAM_SOURCES))
+PRESENT_OPTIONAL_UPSTREAM_SOURCE_COUNT := $(words $(wildcard $(OPTIONAL_UPSTREAM_SOURCES)))
+ifeq ($(PRESENT_OPTIONAL_UPSTREAM_SOURCE_COUNT),$(OPTIONAL_UPSTREAM_SOURCE_COUNT))
+DEFAULT_ALL_TARGET = full_upstream_tools
+DEFAULT_ALL_MODE = full_upstream
+else
+DEFAULT_ALL_TARGET = bundled_all
+DEFAULT_ALL_MODE = bundled_portable
+endif
+
+all: $(DEFAULT_ALL_TARGET)
+
+bundled_all: dependencies bundled_original_tools parallel_tools tet_tools qc_tools mitochondrial_tools legacy_comparison_tools bundled_utils
+
+bundled_original_tools: demux_mt demux_species quant_contam doublet_dragon bulkprops
 
 parallel_tools: demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam utils/downsample_vcf_parallel tetra_refine
 
@@ -114,7 +158,35 @@ qc_tools: tetra_score_calls snps_per_read
 
 mitochondrial_tools: mt_fusion_ratio
 
+legacy_comparison_tools: quant3_contam quant3_contam_ap quant3_contam_empty_drops
+
+bundled_utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts
+
+# Compatibility aliases for a complete upstream CellBouncer checkout.
+original_tools: demux_vcf demux_mt demux_tags demux_species quant_contam doublet_dragon bulkprops utils
+
 utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/get_unique_kmers utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts utils/downsample_vcf
+
+check_optional_upstream_sources:
+	@missing=0; \
+	for f in $(OPTIONAL_UPSTREAM_SOURCES); do \
+	    if [ ! -f "$$f" ]; then echo "MISSING optional upstream source: $$f" >&2; missing=1; fi; \
+	done; \
+	if [ "$$missing" -ne 0 ]; then \
+	    echo "Restore the listed files/submodule from a complete CellBouncer checkout before using full_upstream_tools." >&2; \
+	    exit 2; \
+	fi
+
+full_upstream_tools: check_optional_upstream_sources
+	$(MAKE) dependencies original_tools parallel_tools tet_tools qc_tools mitochondrial_tools legacy_comparison_tools
+
+source_inventory:
+	@echo "Bundled build targets:"; \
+	for f in $(BUNDLED_ROOT_BINS) $(BUNDLED_UTIL_BINS); do echo "  $$f"; done; \
+	echo; echo "Optional upstream-only sources:"; \
+	for f in $(OPTIONAL_UPSTREAM_SOURCES); do \
+	    if [ -f "$$f" ]; then echo "  PRESENT $$f"; else echo "  ABSENT  $$f"; fi; \
+	done
 
 dependencies: lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a
 
@@ -123,9 +195,12 @@ print_flags:
 	@echo "HTSLIB_INCLUDE=$(HTSLIB_INCLUDE)"
 	@echo "HTSLIB_LIB=$(HTSLIB_LIB)"
 	@echo "HTSLIB_RPATH_FLAG=$(HTSLIB_RPATH_FLAG)"
+	@echo "DEFAULT_ALL_MODE=$(DEFAULT_ALL_MODE)"
+	@echo "OPTIONAL_UPSTREAM_SOURCES=$(PRESENT_OPTIONAL_UPSTREAM_SOURCE_COUNT)/$(OPTIONAL_UPSTREAM_SOURCE_COUNT) present"
 	@echo "CPU_ARCH=$(CPU_ARCH)"
 	@echo "CPU_TUNE=$(CPU_TUNE)"
 	@echo "ARCHFLAGS=$(ARCHFLAGS)"
+	@echo "SOURCE_REVISION=$(SOURCE_REVISION)"
 	@echo "CXXFLAGS_PARALLEL=$(CXXFLAGS_PARALLEL)"
 	@echo "CXXFLAGS_TET=$(CXXFLAGS_TET)"
 	@echo "CXXFLAGS_CACHE=$(CXXFLAGS_CACHE)"
@@ -168,7 +243,7 @@ bulkprops: src/bulkprops.cpp src/common.h build/common.o src/demux_vcf_hts.h bui
 # PARALLEL TOOLS
 # ============================================================================
 
-demux_parallel: src/demux_parallel.cpp build/common_parallel.o build/demux_vcf_io_parallel.o build/demux_parallel_hts.o build/demux_parallel_llr.o $(DEPS)
+demux_parallel: src/demux_parallel.cpp src/demux_parallel_hts.h src/demux_parallel_llr.h build/common_parallel.o build/demux_vcf_io_parallel.o build/demux_parallel_hts.o build/demux_parallel_llr.o $(DEPS) $(HTSWRAPPER_HEADER_STAMP)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o build/demux_vcf_io_parallel.o build/demux_parallel_hts.o build/demux_parallel_llr.o src/demux_parallel.cpp -o demux_parallel $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
 vcf_loader_daemon: src/vcf_loader_daemon.cpp build/common_parallel.o build/demux_parallel_hts.o $(DEPS)
@@ -184,7 +259,8 @@ bam_ram_host_daemon: src/bam_ram_host_daemon.cpp
 
 # Two-pass, per-cell dosage-projection scrubber for synthetic benchmark BAMs.
 # Standalone executable: htslib + zlib + pthread only. Build through an object
-# so the existing `make clean_build` workflow always forces a fresh rebuild.
+# so make clean_build invalidates the compiled source and the compcb target list
+# necessarily recompiles and relinks genotype_scrub_bam.
 build/genotype_scrub_bam.o: src/genotype_scrub_bam.cpp Makefile
 	mkdir -p build
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_SCRUB) -c src/genotype_scrub_bam.cpp \
@@ -343,16 +419,20 @@ build/gene_core.o: src/FASTK/gene_core.c src/FASTK/gene_core.h
 # OBJECT FILES - PARALLEL (optimized flags with OpenMP)
 # ============================================================================
 
-build/common_parallel.o: src/common.cpp src/common.h lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a
+$(BUILD_DIR_STAMP):
+	mkdir -p build
+	touch $@
+
+build/common_parallel.o: src/common.cpp src/common.h lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/common.cpp -c -o build/common_parallel.o
 
-build/demux_vcf_io_parallel.o: src/demux_vcf_io.cpp src/demux_vcf_io.h src/common.h
+build/demux_vcf_io_parallel.o: src/demux_vcf_io.cpp src/demux_vcf_io.h src/common.h $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/demux_vcf_io.cpp -c -o build/demux_vcf_io_parallel.o
 
-build/demux_parallel_hts.o: src/demux_parallel_hts.cpp src/demux_parallel_hts.h src/common.h lib/libhtswrapper.a
+build/demux_parallel_hts.o: src/demux_parallel_hts.cpp src/demux_parallel_hts.h src/common.h lib/libhtswrapper.a $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/demux_parallel_hts.cpp -c -o build/demux_parallel_hts.o
 
-build/demux_parallel_llr.o: src/demux_parallel_llr.cpp src/demux_parallel_llr.h src/common.h
+build/demux_parallel_llr.o: src/demux_parallel_llr.cpp src/demux_parallel_llr.h src/demux_parallel_hts.h src/common.h $(DEPS) $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/demux_parallel_llr.cpp -c -o build/demux_parallel_llr.o
 
 # ============================================================================
@@ -368,6 +448,15 @@ lib/libhtswrapper.a:
 	mkdir -p dependencies/htswrapper/build dependencies/htswrapper/lib
 	cd dependencies/htswrapper && $(MAKE) PREFIX=../.. BC_LENX2=$(BC_LENX2) KX2=$(KX2)
 	cd dependencies/htswrapper && $(MAKE) install PREFIX=../..
+
+$(HTSWRAPPER_HEADER_STAMP): lib/libhtswrapper.a
+	mkdir -p include/htswrapper
+	cd dependencies/htswrapper && $(MAKE) install PREFIX=../..
+	test -s include/htswrapper/bc.h
+	test -s include/htswrapper/bam.h
+	test -s include/htswrapper/gzreader.h
+	test -s include/htswrapper/robin_hood/robin_hood.h
+	touch $@
 
 lib/libmixturedist.a:
 	mkdir -p dependencies/mixtureDist/build dependencies/mixtureDist/lib
@@ -418,7 +507,9 @@ lib/liboptimml.a: $(OPTIMML_PATCH_STAMP)
 # ============================================================================
 
 # Stage only the headers required by the isolated math-test build without
-# compiling or modifying the htswrapper dependency.
+# compiling or modifying the htswrapper dependency. Both ambient math-test
+# source files are authoritative under src/.
+
 include/htswrapper/robin_hood/robin_hood.h: dependencies/htswrapper/src/robin_hood/robin_hood.h
 	mkdir -p include/htswrapper/robin_hood
 	cp $< $@
@@ -431,6 +522,7 @@ build/ambient_rna_three_ap_test.o: src/ambient_rna_three_ap.cpp src/ambient_rna_
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap_test.o
 
 build/test_ambient_support.o: src/test_ambient_support.cpp
+	mkdir -p build
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/test_ambient_support.cpp -c -o build/test_ambient_support.o
 
 test_ambient_math: src/test_ambient_gradients.cpp build/ambient_rna_three_ap_test.o build/test_ambient_support.o lib/liboptimml.a lib/libmixturedist.a
@@ -444,7 +536,10 @@ test_ambient_math: src/test_ambient_gradients.cpp build/ambient_rna_three_ap_tes
 clean: clean_build clean_binaries
 
 clean_build:
-	rm -f build/*.o
+	rm -f build/*.o $(BUILD_DIR_STAMP) $(HTSWRAPPER_HEADER_STAMP)
+	# Removing the scrubber object forces compile+relink; removing the binary too
+	# prevents an interrupted build from leaving a stale executable for manual use.
+	rm -f genotype_scrub_bam
 	rm -rf $(OPTIMML_PATCH_DIR)
 	rm -f lib/liboptimml.a
 	rm -rf include/optimML
@@ -470,20 +565,17 @@ clean_all: clean clean_deps
 # INSTALL
 # ============================================================================
 
-install: all quant3_contam quant3_contam_ap quant3_contam_empty_drops install_scripts
+install: all install_scripts
 	mkdir -p $(PREFIX)/bin
-	cp demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops $(PREFIX)/bin/
-	cp demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam tetra_refine $(PREFIX)/bin/
-	cp quant3_contam quant3_contam_ap quant3_contam_empty_drops $(PREFIX)/bin/
-	cp tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate tetra_score_calls snps_per_read mt_fusion_ratio $(PREFIX)/bin/
-	cp utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/get_unique_kmers $(PREFIX)/bin/
-	cp utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts $(PREFIX)/bin/
-	cp utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel $(PREFIX)/bin/
+	cp $(BUNDLED_ROOT_BINS) $(BUNDLED_UTIL_BINS) $(PREFIX)/bin/
 
+install_full_upstream: full_upstream_tools install_scripts
+	mkdir -p $(PREFIX)/bin
+	cp $(BUNDLED_ROOT_BINS) $(BUNDLED_UTIL_BINS) demux_vcf demux_tags utils/get_unique_kmers utils/downsample_vcf $(PREFIX)/bin/
 
 install_scripts:
 	mkdir -p $(PREFIX)/bin
 	cp scripts/*.py $(PREFIX)/bin/
 	chmod +x $(PREFIX)/bin/*.py
 
-.PHONY: all original_tools parallel_tools tet_tools qc_tools mitochondrial_tools utils dependencies print_flags test_ambient_math clean clean_build clean_binaries clean_deps clean_all install install_scripts
+.PHONY: all bundled_all bundled_original_tools parallel_tools tet_tools qc_tools mitochondrial_tools legacy_comparison_tools bundled_utils original_tools utils check_optional_upstream_sources full_upstream_tools source_inventory dependencies print_flags test_ambient_math clean clean_build clean_binaries clean_deps clean_all install install_full_upstream install_scripts
