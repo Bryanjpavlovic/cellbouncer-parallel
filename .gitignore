@@ -22,5 +22,8 @@
 !utils/
 !sbatch/
 !sbatch/*
+!scripts/
+!scripts/*.py
+
 qc_variants/
 quant3_contam
