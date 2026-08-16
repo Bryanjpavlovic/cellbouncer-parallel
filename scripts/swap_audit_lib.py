@@ -525,8 +525,26 @@ def discover_demux_prefixes(demux_root: os.PathLike | str) -> Dict[str, str]:
             out[lib] = str(preferred)[:-len(".counts")]
             continue
 
-        # 2) Recursive preferred filtered demux prefix.
-        demuxed = sorted(p for p in candidates if p.name == f"{lib}_demuxed.counts")
+        # 2) Recursive preferred filtered demux prefix. When searching a broad
+        # mapping_output root, prefer the current demux_nomito tree and do not
+        # silently select historical Archived_Demux_With_Mito or lib13
+        # demuxing_tests copies. If the caller explicitly points demux_root at
+        # one of those historical/test trees, honor that explicit root.
+        root_parts = set(root.parts)
+        explicit_historical_root = (
+            "Archived_Demux_With_Mito" in root_parts or "demuxing_tests" in root_parts
+        )
+        demuxed = [p for p in candidates if p.name == f"{lib}_demuxed.counts"]
+        if not explicit_historical_root:
+            demuxed = [
+                p for p in demuxed
+                if "Archived_Demux_With_Mito" not in p.parts
+                and "demuxing_tests" not in p.parts
+            ]
+        demuxed = sorted(
+            demuxed,
+            key=lambda p: (0 if "demux_nomito" in p.parts else 1, str(p)),
+        )
         if demuxed:
             out[lib] = str(demuxed[0])[:-len(".counts")]
             continue
@@ -537,6 +555,13 @@ def discover_demux_prefixes(demux_root: os.PathLike | str) -> Dict[str, str]:
             p for p in candidates
             if not is_rejected_counts_name(p.name)
             and p.name.endswith("_demuxed.counts")
+            and (
+                explicit_historical_root
+                or (
+                    "Archived_Demux_With_Mito" not in p.parts
+                    and "demuxing_tests" not in p.parts
+                )
+            )
         )
         if usable:
             out[lib] = str(usable[0])[:-len(".counts")]

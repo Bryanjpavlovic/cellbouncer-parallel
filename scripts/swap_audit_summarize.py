@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Summarize one library's post-hoc CellBouncer swap audit."""
+"""Summarize one library's post-hoc CellBouncer swap audit.
+
+2026-08-15 production flag refinement:
+- SNP-equivalent A and A+A are full matches for swap-audit purposes.
+- Missing declared identities are diagnostic only, never an alert by themselves.
+- Unconstrained alternative *combinations* made entirely from expected pool
+  components are diagnostic only. A swap alert requires a coherent supported
+  genotype component that is not expected anywhere in the library.
+- Missing expected species components are diagnostic only; unexpected/disjoint
+  species evidence remains alerting.
+"""
 from __future__ import annotations
 
 import argparse
@@ -49,6 +59,7 @@ DEFAULT_THRESHOLDS = {
     "threshold_species_unexpected_frac": 0.20,
     "threshold_species_disjoint_frac": 0.02,
     "threshold_species_component_missing_frac": 0.20,
+    "threshold_unexpected_component_frac": 0.05,
     "threshold_min_dosage_concordance": 0.70,
     "threshold_max_low_evidence_frac": 0.30,
     "threshold_ambiguous_gap": 0.0,
@@ -68,6 +79,12 @@ REPORT_FIELDS = [
     "frac_cells_neg_gap_constrained", "frac_cells_neg_gap_unconstrained",
     "expected_vs_observed_l1", "expected_vs_observed_cosine", "jensen_shannon_distance",
     "unexpected_identity_fraction", "missing_expected_identity_fraction",
+    "frac_cells_unconstrained_unexpected_identity",
+    "frac_cells_unconstrained_unexpected_identity_supported",
+    "frac_cells_unconstrained_unexpected_component",
+    "frac_cells_unconstrained_unexpected_component_supported",
+    "top_unexpected_component_supported",
+    "top_unexpected_component_fraction_supported",
     "refined_n_cells", "refined_n_total_available", "refined_n_overlap_with_audit", "refined_overlap_fraction",
     "refined_n_changed", "refined_n_singlet", "refined_n_heterotypic",
     "refined_n_homotypic", "refined_n_plus_identity", "refined_n_biological_fusion",
@@ -90,7 +107,7 @@ SCORE_FIELDS = [
     "refined_assignment_confidence", "droplet_doublet_flag", "quad_pattern_score",
     "original_assignment", "audit_unconstrained_best", "audit_constrained_best",
     "expected_components", "audit_best_components", "shared_components", "missing_expected_components",
-    "unexpected_components", "component_overlap", "expected_rank_unconstrained", "expected_rank_constrained",
+    "unexpected_components", "unexpected_pool_components", "component_overlap", "expected_rank_unconstrained", "expected_rank_constrained",
     "delta_ll_best_vs_expected", "dosage_concordance_assigned", "dosage_concordance_unconstrained",
     "dosage_gap_constrained", "dosage_gap_unconstrained", "species_support_expected",
     "species_relation", "species_missing_expected_component",
@@ -482,8 +499,11 @@ def verdict_logic(row: Dict[str, object], t: Mapping[str, float]) -> Tuple[str, 
         flags.append("WRONG_SPECIES_SIGNAL")
     elif frac_species_unexpected >= t.get("threshold_species_unexpected_frac", t["threshold_species_conflict_frac"]):
         flags.append("UNEXPECTED_SPECIES_SIGNAL")
-    if frac_species_component_missing >= t.get("threshold_species_component_missing_frac", t["threshold_species_conflict_frac"]):
-        flags.append("SPECIES_COMPONENT_IMBALANCE")
+    # Missing an expected species component by itself is not evidence of a
+    # sample swap.  Pools need not realize every theoretically expected
+    # component, and unexpected/disjoint species evidence is already handled
+    # by the two alerting gates above.  Keep the component-missing fraction in
+    # the report as diagnostic information, but do not turn it into an alert.
     if float(row.get("frac_cells_component_overlap_2", 0.0) or 0.0) >= t["threshold_clean_overlap_frac"] and float(row.get("audit_best_fraction", 0.0) or 0.0) >= t["threshold_clean_best_frac"]:
         clean = True
     else:
@@ -499,8 +519,16 @@ def verdict_logic(row: Dict[str, object], t: Mapping[str, float]) -> Tuple[str, 
         flags.append("UNRESOLVED_HOMOTYPIC_OR_SINGLET")
     if float(row.get("unexpected_identity_fraction", 0.0) or 0.0) > 0.05:
         flags.append("UNEXPECTED_EXTRA_IDENTITY")
-    if float(row.get("missing_expected_identity_fraction", 0.0) or 0.0) > 0.05:
-        flags.append("EXPECTED_IDENTITY_MISSING")
+    # Missing a theoretically possible identity is not evidence of a swap.
+    # Likewise, an unconstrained best *combination* is not contradictory if all
+    # of its genotype components already belong to this library's expected pool.
+    # Alert only when supported unconstrained calls coherently introduce an
+    # individual/genotype component that is not expected anywhere in the library.
+    coherent_unexpected_component = float(
+        row.get("top_unexpected_component_fraction_supported", 0.0) or 0.0
+    )
+    if coherent_unexpected_component >= t.get("threshold_unexpected_component_frac", 0.05):
+        flags.append("UNEXPECTED_COMPONENT_SIGNAL")
 
     if "LOW_CELL_COUNT" in flags or "LOW_RUNNER_UP_CONTRAST" in flags or "HIGH_AMBIGUOUS_N_CLOSE" in flags:
         verdict = "LOW_SIGNAL"
@@ -508,8 +536,8 @@ def verdict_logic(row: Dict[str, object], t: Mapping[str, float]) -> Tuple[str, 
         verdict = "WRONG_SPECIES_SIGNAL"
     elif "UNEXPECTED_SPECIES_SIGNAL" in flags:
         verdict = "UNEXPECTED_SPECIES_SIGNAL"
-    elif "SPECIES_COMPONENT_IMBALANCE" in flags:
-        verdict = "SPECIES_COMPONENT_IMBALANCE"
+    elif "UNEXPECTED_COMPONENT_SIGNAL" in flags:
+        verdict = "UNEXPECTED_COMPONENT_SIGNAL"
     elif clean and not {"LIKELY_FULL_FUSION_SWAP", "LIKELY_ONE_COMPONENT_SWAP"}.intersection(flags):
         verdict = "OK"
     elif "LIKELY_FULL_FUSION_SWAP" in flags:
@@ -522,8 +550,6 @@ def verdict_logic(row: Dict[str, object], t: Mapping[str, float]) -> Tuple[str, 
         verdict = "UNRESOLVED_HOMOTYPIC_OR_SINGLET"
     elif "UNEXPECTED_EXTRA_IDENTITY" in flags:
         verdict = "UNEXPECTED_EXTRA_IDENTITY"
-    elif "EXPECTED_IDENTITY_MISSING" in flags:
-        verdict = "EXPECTED_IDENTITY_MISSING"
     else:
         verdict = "OK"
     return verdict, ",".join(sorted(set(flags)))
@@ -638,6 +664,15 @@ def main() -> int:
     unresolved_homotypic = 0
     species_conflicts = 0
     species_relation_counts = Counter()
+    expected_snp_identities = {snp_resolvable_identity(x, None) for x in expected_ids}
+    expected_pool_components = set()
+    for expected_identity in expected_snp_identities:
+        expected_pool_components.update(identity_components(expected_identity))
+    unconstrained_unexpected_identity = 0
+    unconstrained_unexpected_identity_supported = 0
+    unconstrained_unexpected_component = 0
+    unconstrained_unexpected_component_supported = 0
+    unexpected_component_supported_counts = Counter()
 
     for bc in barcodes:
         o = str(orig[bc]["assignment"])
@@ -652,10 +687,23 @@ def main() -> int:
         cb = str(ac.get(bc, {}).get("assignment", NA))
         ocomp = set(identity_components(o))
         ucomp = set(identity_components(ub)) if ub != NA else set()
-        shared = sorted(ocomp & ucomp)
-        missing_exp = sorted(ocomp - ucomp)
-        unexpected = sorted(ucomp - ocomp)
-        overlap = len(shared)
+        snp_ub = snp_resolvable_identity(ub, None) if ub != NA else NA
+
+        # The swap audit is genotype based.  A singlet A and a homotypic A+A
+        # are the same SNP-resolvable genotype and must count as a full identity
+        # match, not as a one-component overlap.  This is especially important
+        # when tetra_refine/NN has supplied the biological A+A interpretation:
+        # the SNP audit cannot overrule that ploidy call by rediscovering A.
+        if snp_ub != NA and snp_o == snp_ub:
+            shared = sorted(ocomp & ucomp)
+            missing_exp = []
+            unexpected = []
+            overlap = 2
+        else:
+            shared = sorted(ocomp & ucomp)
+            missing_exp = sorted(ocomp - ucomp)
+            unexpected = sorted(ucomp - ocomp)
+            overlap = len(shared)
         overlap_counts[overlap] += 1
         if identity_type(o) == "homotypic" or identity_type(ub) == "homotypic":
             unresolved_homotypic += 1
@@ -665,6 +713,22 @@ def main() -> int:
         if not math.isnan(rank_c): ranks_c.append(rank_c)
         if not math.isnan(delta_u): deltas.append(abs(delta_u))
         qc = call_qc.get(bc, {})
+        qc_flags = {x for x in str(qc.get("call_qc_flags", "")).split(",") if x}
+        if snp_ub != NA and snp_ub not in expected_snp_identities:
+            unconstrained_unexpected_identity += 1
+            if qc and "LOW_EVIDENCE" not in qc_flags:
+                unconstrained_unexpected_identity_supported += 1
+
+        unexpected_pool_components = []
+        if snp_ub != NA:
+            unexpected_pool_components = sorted(
+                set(identity_components(snp_ub)) - expected_pool_components
+            )
+        if unexpected_pool_components:
+            unconstrained_unexpected_component += 1
+            if qc and "LOW_EVIDENCE" not in qc_flags:
+                unconstrained_unexpected_component_supported += 1
+                unexpected_component_supported_counts.update(unexpected_pool_components)
         sp_exp = species_set(o, panel)
         sp_best = species_set(ub, panel) if ub != NA else NA
         sp_rel = species_relation(sp_exp, sp_best)
@@ -793,6 +857,17 @@ def main() -> int:
     disjoint_wrong_frac = safe_float(species_qc.get("frac_cells_species_disjoint_wrong")) if has_species_qc and species_qc.get("frac_cells_species_disjoint_wrong") not in (None, "", NA) else (rel_counts.get("disjoint_wrong_species", 0) / rel_denom if rel_denom else math.nan)
     unexpected_or_disjoint_frac = safe_float(species_qc.get("frac_cells_species_unexpected_or_disjoint")) if has_species_qc and species_qc.get("frac_cells_species_unexpected_or_disjoint") not in (None, "", NA) else (sum(rel_counts.get(k, 0) for k in ("expected_superset_with_extra_species", "partial_overlap_with_extra_and_missing", "disjoint_wrong_species")) / rel_denom if rel_denom else math.nan)
 
+    if unexpected_component_supported_counts:
+        top_unexpected_component_supported, top_unexpected_component_supported_n = (
+            unexpected_component_supported_counts.most_common(1)[0]
+        )
+        top_unexpected_component_fraction_supported = (
+            top_unexpected_component_supported_n / n if n else math.nan
+        )
+    else:
+        top_unexpected_component_supported = NA
+        top_unexpected_component_fraction_supported = 0.0 if n else math.nan
+
     row = {f: NA for f in REPORT_FIELDS}
     row.update({
         "library": lib,
@@ -823,6 +898,20 @@ def main() -> int:
         "median_dosage_gap_unconstrained": NA,
         "frac_cells_neg_gap_constrained": sum(1 for v in qcgap if v < 0) / len(qcgap) if qcgap else math.nan,
         "frac_cells_neg_gap_unconstrained": NA,
+        "frac_cells_unconstrained_unexpected_identity": (
+            unconstrained_unexpected_identity / n if n else math.nan
+        ),
+        "frac_cells_unconstrained_unexpected_identity_supported": (
+            unconstrained_unexpected_identity_supported / n if n else math.nan
+        ),
+        "frac_cells_unconstrained_unexpected_component": (
+            unconstrained_unexpected_component / n if n else math.nan
+        ),
+        "frac_cells_unconstrained_unexpected_component_supported": (
+            unconstrained_unexpected_component_supported / n if n else math.nan
+        ),
+        "top_unexpected_component_supported": top_unexpected_component_supported,
+        "top_unexpected_component_fraction_supported": top_unexpected_component_fraction_supported,
         "refined_n_cells": refined_counts.get("total", NA) if refined_for_scored else NA,
         "refined_n_total_available": refined_total_available if has_refined_assignments else NA,
         "refined_n_overlap_with_audit": refined_overlap_n if has_refined_assignments else NA,
