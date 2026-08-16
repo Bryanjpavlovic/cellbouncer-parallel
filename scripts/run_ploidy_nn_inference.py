@@ -7,6 +7,8 @@ Cluster CPU inference wrapper for the trained ploidy NN. Runs the model
 (ploidy_nn_weights.pt + _scaler.npz) on a cluster h5ad and writes per-library
 TSVs in the format consumed by `tetra_refine --external_ploidy`.
 
+V1_R5 vs V1_R4: usage examples updated for the current NoMito retrained model.
+
 V1_R3 vs V1_R2: doc/path touch-ups only (V1_R4 of generate_h5ad now produces
 both filtered and unfiltered h5ads in /h5a5_outs/, so the example commands
 reference real paths).
@@ -30,16 +32,16 @@ Usage:
     # Filtered cells only (matches training distribution)
     python run_ploidy_nn_inference.py \\
         --h5ad /mnt/beegfs/tetmultiome_rna_mapped/mapping_output/h5a5_outs/filtered_normed_tetmultiome_rna.h5ad \\
-        --weights /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/ploidy_nn_weights.pt \\
-        --output_dir /mnt/beegfs/tetmultiome_rna_mapped/mapping_output/ploidy_calls_filtered \\
+        --weights /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814/model/ploidy_nn_weights.pt \\
+        --output_dir /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814/ploidy_calls_filtered \\
         --lib_range 1-40 \\
         --qc_only
 
     # All cells from unfiltered h5ad (Option C; preserves coverage)
     python run_ploidy_nn_inference.py \\
         --h5ad /mnt/beegfs/tetmultiome_rna_mapped/mapping_output/h5a5_outs/unfiltered_normed_tetmultiome_rna.h5ad \\
-        --weights /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/ploidy_nn_weights.pt \\
-        --output_dir /mnt/beegfs/tetmultiome_rna_mapped/mapping_output/ploidy_calls_unfiltered \\
+        --weights /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814/model/ploidy_nn_weights.pt \\
+        --output_dir /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814/ploidy_calls_unfiltered \\
         --lib_range 1-40
 
 Revision History:
@@ -425,7 +427,7 @@ def main():
 
     libs = parse_lib_range(args.lib_range)
     print("=" * 70)
-    print("  ploidy NN inference V1_R4 (CPU)")
+    print("  ploidy NN inference V1_R5 (CPU)")
     print("=" * 70)
     print(f"  Started: {datetime.now()}")
     print(f"  Libraries: {libs}")

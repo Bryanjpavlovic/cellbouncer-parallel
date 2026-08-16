@@ -7,7 +7,7 @@ passes optional evidence layers only when available unless --require-* flags are
 set.
 
 Default output:
-  /mnt/beegfs/tetmultiome_rna_mapped/QUANT3_CONTAM_V2/tetra_refine/lib<N>/lib<N>.refined_assignments
+  /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814/tetra_refine/lib<N>/lib<N>.refined_assignments
 
 The output root is shaped to match swap_audit_prepare.py's existing
 --refined_assignments_root search pattern:
@@ -25,10 +25,11 @@ from typing import List, Optional
 
 BEEGFS_ROOT = Path("/mnt/beegfs/tetmultiome_rna_mapped/mapping_output")
 QUANT_ROOT = Path("/mnt/beegfs/tetmultiome_rna_mapped/QUANT3_CONTAM_V2")
+RETRAIN_ROOT = Path("/mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814")
 EXPECTED_LINES_DIR = Path("/mnt/beegfs/tetmultiome_rna_mapped/Misc_Metadata")
 SOFTWARE_BIN = Path("/nvme/software/packages/cellbouncer/dev/bin")
 LIB_PREFIX = "Tet_2025_Multiome-RNA_"
-DEMUX_SUBDIR = "demux_het_v2_test"
+DEMUX_SUBDIR = "demux_nomito"
 
 
 def positive_int(text: str) -> int:
@@ -147,15 +148,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tetra_refine_bin", default=str(SOFTWARE_BIN / "tetra_refine"))
     p.add_argument("--demux_prefix", default=None, help="Override full demux prefix without suffix")
     p.add_argument("--expected", default=None, help="Override expected lines file")
-    p.add_argument("--output_root", default=str(QUANT_ROOT / "tetra_refine"))
-    p.add_argument("--ploidy_calls_root", default=str(Path("/mnt/beegfs/tetmultiome_rna_mapped/mapping_output/ploidy_calls_unfiltered")),
+    p.add_argument("--output_root", default=str(RETRAIN_ROOT / "tetra_refine"))
+    p.add_argument("--ploidy_calls_root", default=str(RETRAIN_ROOT / "ploidy_calls_unfiltered"),
                    help="Root containing lib<N>.ploidy_calls_nn.tsv")
     p.add_argument("--external_ploidy", default=None, help="Override external ploidy file path")
     p.add_argument("--external_ploidy_min_prob", type=float, default=0.90,
                    help="Minimum external ploidy confidence required to relabel A -> A+A")
     p.add_argument("--require_external_ploidy", action="store_true", help="Fail instead of warning if NN ploidy calls are missing")
     p.add_argument("--quant_root", default=str(QUANT_ROOT))
-    p.add_argument("--contam_condition", default="IND_WS_RA_LOO", help="Condition used to auto-locate optional contam_rate; empty string disables")
+    p.add_argument("--contam_condition", default="IND_CK_RF_SX0_GATED_RFREE_PFIT", help="Condition used to auto-locate optional contam_rate; empty string disables")
     p.add_argument("--contam_rate", default=None, help="Override contam_rate path")
     p.add_argument("--require_contam_rate", action="store_true", help="Fail instead of warning if contam_rate is missing")
     p.add_argument("--scoring_only", action="store_true", help="Pass through assignments and only emit scoring columns")
