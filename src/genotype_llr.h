@@ -1,5 +1,5 @@
-#ifndef _CELLBOUNCER_DEMUX_PARALLEL_LLR_H
-#define _CELLBOUNCER_DEMUX_PARALLEL_LLR_H
+#ifndef _CELLBOUNCER_GENOTYPE_LLR_H
+#define _CELLBOUNCER_GENOTYPE_LLR_H
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -17,7 +17,7 @@
 #include <utility>
 #include <limits>
 #include "common.h"
-#include "demux_parallel_hts.h"  // For CellCounts
+#include "vcf_hts.h"  // For CellCounts
 
 // Global verbose flag (set from main)
 extern bool g_verbose;
@@ -172,6 +172,7 @@ class llr_table {
 
         // Audit-only non-mutating argmax(maxllr) comparator.
         void get_max_by_max_llr_comparator(int& best_idx, double& best_maxllr) const;
+        void get_max_by_maxllr(int& best_idx, double& best_maxllr) const;
 
         double get_min_margin(int identity) const;
         PairwiseComparison get_pairwise(int lhs, int rhs) const;
@@ -205,6 +206,43 @@ bool populate_llr_table(std::map<std::pair<int, int>,
     double contam_rate_var=0.0,
     std::map<std::pair<int, int>, std::map<std::pair<int, int>, double> >* amb_fracs=NULL,
     int n_target=-1);
+
+
+// Explicit serial ambient-model variants retained for the shared production
+// ambient implementation. The per-identity entry point is the historical
+// populate_llr_table model; the pairwise entry point uses the shared-soup term.
+bool populate_llr_table_peridentity(
+    std::map<std::pair<int, int>, std::map<std::pair<int, int>, std::pair<float, float> > >& counts,
+    std::map<int, std::map<int, double> >& llrs,
+    llr_table& tab,
+    int n_samples,
+    std::set<int>& allowed_assignments,
+    std::set<int>& allowed_assignments2,
+    double doublet_rate,
+    double error_rate_ref,
+    double error_rate_alt,
+    std::map<int, double>* prior_weights=NULL,
+    bool incl_contam=false,
+    double contam_rate=0.0,
+    double contam_rate_var=0.0,
+    std::map<std::pair<int, int>, std::map<std::pair<int, int>, double> >* amb_fracs=NULL,
+    int n_target=-1);
+
+bool populate_llr_table_pairwise(
+    std::map<std::pair<int, int>, std::map<std::pair<int, int>, std::pair<float, float> > >& counts,
+    std::map<int, std::map<int, double> >& llrs,
+    llr_table& tab,
+    int n_samples,
+    std::set<int>& allowed_assignments,
+    std::set<int>& allowed_assignments2,
+    double doublet_rate,
+    double error_rate_ref,
+    double error_rate_alt,
+    std::map<int, double>* prior_weights,
+    bool incl_contam,
+    double contam_rate,
+    double contam_rate_var,
+    std::map<std::pair<int, int>, std::map<std::pair<int, int>, double> >* amb_fracs);
 
 // ============================================================================
 // NEW LLR FUNCTIONS (for optimized CellCounts structure)

@@ -1,5 +1,5 @@
-#ifndef _CELLBOUNCER_DEMUX_PARALLEL_HTS_H
-#define _CELLBOUNCER_DEMUX_PARALLEL_HTS_H
+#ifndef _CELLBOUNCER_VCF_HTS_H
+#define _CELLBOUNCER_VCF_HTS_H
 #include <string>
 #include <algorithm>
 #include <vector>

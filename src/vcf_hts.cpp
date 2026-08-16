@@ -1,3 +1,8 @@
+// =============================================================================
+// vcf_hts.cpp
+// Unified VCF/BCF, shared-memory panel, BAM counting, and HTS helpers.
+// =============================================================================
+
 #include <string>
 #include <climits>
 #include <algorithm>
@@ -34,7 +39,7 @@
 #include <htswrapper/bam.h>
 #include <htswrapper/robin_hood/robin_hood.h>
 #include "common.h"
-#include "demux_parallel_hts.h"
+#include "vcf_hts.h"
 
 using std::cout;
 using std::endl;
@@ -4255,4 +4260,121 @@ bool count_het_alleles_extended(
         fprintf(stderr, "Max het sites per individual per cell: %ld\n", max_sites);
     }
     return true;
+}
+
+
+// Serial compatibility helper retained in the unified HTS module.
+void process_bam_record_bulk(bam_reader& reader,
+    int snppos,
+    var& vardat,
+    map<int, pair<float, float> >& snp_ref_alt,
+    map<int, float>& snp_err,
+    bool genes,
+    map<pair<int, int>, set<string> >& gene_ids,
+    map<string, string>& gene_id2name){
+
+    if (!reader.unmapped() && !reader.secondary() && 
+        !reader.dup() && reader.has_cb_z){
+         
+        int tid = reader.tid();
+
+        // Instead of storing actual read counts, store the probability
+        // that the mapping was correct.
+        float prob_corr = 1.0 - pow(10, -(float)reader.mapq/10.0);
+        
+        if (snp_ref_alt.count(snppos) == 0){
+            snp_ref_alt.insert(make_pair(snppos, make_pair(0.0, 0.0)));
+            snp_err.insert(make_pair(snppos, 0.0));
+        }
+
+        // Note: this function expects positions to be 1-based, but 
+        // BCF/BAM functions store as 0-based
+        char allele = reader.get_base_at(snppos + 1);
+        
+        if (allele != 'N' && allele != '-'){
+            if (allele == vardat.ref){
+                snp_ref_alt[snppos].first += prob_corr;
+            }
+            else if (allele == vardat.alt){
+                snp_ref_alt[snppos].second += prob_corr;
+            }
+            else{
+                snp_err[snppos] += prob_corr;
+            }
+        }
+
+        if (genes){
+            pair<int, int> key = make_pair(tid, snppos);
+            if (gene_ids.count(key) == 0){
+                set<string> s;
+                gene_ids.insert(make_pair(key, s));
+            }
+            if (reader.gene_names.size() > 0 && reader.gene_ids.size() < reader.gene_names.size()){
+                // Use names as IDs
+                for (int i = 0; i < reader.gene_names.size(); ++i){
+                    gene_ids[key].insert(reader.gene_names[i]);
+                }
+            }
+            else if (reader.gene_ids.size() > 0 && reader.gene_names.size() < reader.gene_ids.size()){
+                // Ignore gene names (can't map from IDs -> names)
+                for (int i = 0; i < reader.gene_ids.size(); ++i){
+                    gene_ids[key].insert(reader.gene_ids[i]);
+                }
+            }
+            else if (reader.gene_ids.size() == reader.gene_names.size()){
+                // Store gene IDs and map to names
+                for (int i = 0; i < reader.gene_ids.size(); ++i){
+                    gene_ids[key].insert(reader.gene_ids[i]);
+                    if (gene_id2name.count(reader.gene_ids[i]) == 0){
+                        gene_id2name.insert(make_pair(reader.gene_ids[i], reader.gene_names[i]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// Serial compatibility helper retained in the unified HTS module.
+void process_bam_record_bysnp(bam_reader& reader,
+    int snppos,
+    var& vardat,
+    robin_hood::unordered_map<unsigned long, int>& assignments,
+    map<int, pair<float, float> >& snp_var_counts){
+
+    if (!reader.unmapped() && !reader.secondary() && 
+        !reader.dup() && reader.has_cb_z){
+                        
+        // Get BC key
+        bc bc_bits;
+        str2bc(reader.cb_z, bc_bits);
+        unsigned long bc_key = bc_bits.to_ulong();
+        
+        if (assignments.count(bc_key) > 0){
+            
+            // Instead of storing actual read counts, store the probability
+            // that the mapping was correct.
+            float prob_corr = 1.0 - pow(10, -(float)reader.mapq/10.0);
+            
+            if (prob_corr > 0.001){
+                int a = assignments[bc_key];
+                if (snp_var_counts.count(a) == 0){
+                    snp_var_counts.insert(make_pair(a, make_pair(0,0)));
+                }
+                
+                // Note: this function expects positions to be 1-based, but 
+                // BCF/BAM functions store as 0-based
+                char allele = reader.get_base_at(snppos + 1);
+                
+                if (allele != 'N' && allele != '-'){
+                    if (allele == vardat.ref){
+                        snp_var_counts[a].first += prob_corr;
+                    }
+                    else if (allele == vardat.alt){
+                        snp_var_counts[a].second += prob_corr;
+                    }
+                }
+            }
+        }
+    }
 }

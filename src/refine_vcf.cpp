@@ -29,8 +29,8 @@
 #include <htswrapper/robin_hood/robin_hood.h>
 #include <iomanip>
 #include "common.h"
-#include "demux_vcf_io.h"
-#include "demux_vcf_hts.h"
+#include "io.h"
+#include "vcf_hts.h"
 #include "refine_vcf.h"
 
 using std::cout;

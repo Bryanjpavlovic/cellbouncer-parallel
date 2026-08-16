@@ -1,3 +1,9 @@
+// =============================================================================
+// legacy2c_model.cpp
+// Historical two-component contamination model, isolated for the explicit
+// legacy2c_contam_estimate compatibility executable only.
+// =============================================================================
+
 #include <algorithm>
 #include <vector>
 #include <iterator>
@@ -20,8 +26,8 @@
 #include <optimML/multivar_ml.h>
 #include <htswrapper/robin_hood/robin_hood.h>
 #include "common.h"
-#include "demux_vcf_llr.h"
-#include "ambient_rna.h"
+#include "genotype_llr.h"
+#include "legacy2c_model.h"
 
 using std::cout;
 using std::endl;

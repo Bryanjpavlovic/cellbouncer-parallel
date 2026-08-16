@@ -81,9 +81,9 @@
 #include <optimML/multivar_ml.h>
 #include <htswrapper/robin_hood/robin_hood.h>
 #include "common.h"
-#include "demux_vcf_io.h"
-#include "demux_parallel_hts.h"
-#include "demux_parallel_llr.h"
+#include "io.h"
+#include "vcf_hts.h"
+#include "genotype_llr.h"
 
 using std::cout;
 using std::endl;

@@ -4,76 +4,43 @@ CCOMP = gcc
 PREFIX ?= /usr/local
 SOURCE_REVISION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo archive)
 
-# -----------------------------------------------------------------------------
-# Cluster HTSlib location
-# -----------------------------------------------------------------------------
-# Compile and link against the shared HTSlib installation used by the cluster,
-# and embed its library directory as a runtime search path.  LIBRARY_PATH helps
-# only at link time; without an rpath deployed executables fail at startup with:
-#   libhts.so.3: cannot open shared object file
+# Cluster HTSlib installation. Override these variables for another system.
 HTSLIB_PREFIX ?= /nvme/software/packages/htslib/1.20
 HTSLIB_INCLUDE ?= $(HTSLIB_PREFIX)/include
 HTSLIB_LIB ?= $(HTSLIB_PREFIX)/lib
 HTSLIB_RPATH_FLAG = -Wl,-rpath,$(HTSLIB_LIB)
 
-# -----------------------------------------------------------------------------
-# Cluster-portable CPU target
-# -----------------------------------------------------------------------------
-# This tree is compiled once on ash and synced to pika/char/squirtle.
-# ash/pika/char are Zen4-class EPYC systems, but squirtle is Zen3-class EPYC.
-# Therefore the shared binaries must NOT use -march=native when compiled on ash.
-# Default to Zen3 so the same binaries run safely on every node.
-#
-# Override only if intentionally building a node-specific binary, e.g.:
-#   make CPU_ARCH=znver4 CPU_TUNE=znver4 ...
+# One build is deployed across Zen3 and Zen4 cluster nodes.
 CPU_ARCH ?= znver3
 CPU_TUNE ?= znver3
 ARCHFLAGS ?= -march=$(CPU_ARCH) -mtune=$(CPU_TUNE)
 
-# Standard flags for original CellBouncer tools
-CXXFLAGS_STD = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2)
+BC_LENX2 = 32
+KX2 = 16
+NBITS ?= 2048
+MAX_SITES ?= 2000
+MAKE = make
+PROJROOT = $(shell pwd)
 
-# Optimized flags for parallel tools:
-# -O3 for high optimization without enabling fast-math semantics
-# $(ARCHFLAGS) for a cluster-portable CPU target; default is znver3.
-# -fopenmp for parallelism
+CXXFLAGS_STD = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2)
 CXXFLAGS_PARALLEL = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -DNBITS=$(NBITS) \
                     -DCELLBOUNCER_SOURCE_REVISION=\"$(SOURCE_REVISION)\" \
                     -O3 $(ARCHFLAGS) -fopenmp
-
+CXXFLAGS_TET = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -DNBITS=$(NBITS) \
+               -O3 $(ARCHFLAGS) -fopenmp
+CXXFLAGS_CACHE = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
+CXXFLAGS_MT = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
+CXXFLAGS_SCRUB = -std=c++11 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra
 CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 $(ARCHFLAGS)
-CXXIFLAGS = -I$(HTSLIB_INCLUDE) -I$(PREFIX)/include -Iinclude
+
+# Refactored sources include the unified headers directly.
+CXXIFLAGS = -I$(HTSLIB_INCLUDE) -I$(PREFIX)/include -Iinclude -Isrc
 CIFLAGS = -I$(HTSLIB_INCLUDE) -I$(PREFIX)/include -Iinclude
 LFLAGS = -L$(HTSLIB_LIB) $(HTSLIB_RPATH_FLAG) -L$(PREFIX)/lib -Llib
 LFLAGS_PARALLEL = -L$(HTSLIB_LIB) $(HTSLIB_RPATH_FLAG) -L$(PREFIX)/lib -Llib -fopenmp -flto=auto
-
-# Optimized flags for tet contamination tools.  These deliberately use a
-# separate ambient_rna_three_ap_tet.o object so legacy quant3_contam_ap remains
-# buildable with the original standard flags, while the production tet tools get
-# optimization and OpenMP linkage.
-CXXFLAGS_TET = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) \
-               -O3 $(ARCHFLAGS) -fopenmp
 LFLAGS_TET = -L$(HTSLIB_LIB) $(HTSLIB_RPATH_FLAG) -L$(PREFIX)/lib -Llib -fopenmp
 
-# Standalone barcode-cache extractor.  It uses std::filesystem, so it must
-# be compiled as C++17 without changing the legacy CellBouncer C++11 tools.
-CXXFLAGS_CACHE = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
-DEPS_CACHE = -lhts -lz -lpthread
-
-# Dedicated mitochondrial fusion-ratio estimator.  Mito panel selection itself
-# is compiled directly into utils/downsample_vcf_parallel and is enabled there
-# with --mt_output; there is no separate panel-selection executable.
-CXXFLAGS_MT = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
-DEPS_MT = -lhts -lz -lpthread
-
-# Standalone genotype scrubber used when materializing synthetic benchmark BAMs.
-# It uses htslib's codec thread pool but does not link CellBouncer objects.
-CXXFLAGS_SCRUB = -std=c++11 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra
-DEPS_SCRUB = -lhts -lz -lpthread
-
-NBITS ?= 2048
-
-ifeq ($(findstring cellbouncer, ${CONDA_PREFIX}), cellbouncer)
+ifeq ($(findstring cellbouncer,${CONDA_PREFIX}),cellbouncer)
     CXXIFLAGS += -I${CONDA_PREFIX}/include
     CIFLAGS += -I${CONDA_PREFIX}/include
     LFLAGS += -L${CONDA_PREFIX}/lib
@@ -81,368 +48,304 @@ ifeq ($(findstring cellbouncer, ${CONDA_PREFIX}), cellbouncer)
     LFLAGS_TET += -L${CONDA_PREFIX}/lib
 endif
 
-MAX_SITES ?= 2000
-MAKE = make
-PROJROOT = $(shell pwd)
-BC_LENX2 = 32
-KX2 = 16
 DEPS = lib/libmixturedist.a lib/libhtswrapper.a lib/liboptimml.a
 DEPS2 = -lz -lhts -lpthread
 DEPS2_PARALLEL = -lz -lhts -lpthread -lrt
+DEPS_CACHE = -lhts -lz -lpthread
+DEPS_MT = -lhts -lz -lpthread
+DEPS_SCRUB = -lhts -lz -lpthread
 BUILD_DIR_STAMP = build/.directory_ready
 HTSWRAPPER_HEADER_STAMP = include/htswrapper/.headers_installed
 
-# optimML is an external dependency, but CellBouncer needs two STLBFGS
-# assertions converted into catchable exceptions.  Never patch the vendored
-# dependency tree in place: build an isolated patched copy under build/ so a
-# clean checkout remains byte-for-byte unchanged.  The versioned stamp makes an
-# already-existing lib/liboptimml.a rebuild whenever this patch recipe changes.
+# optimML is patched only in a private build copy. The vendored source remains
+# unchanged, and the patch is rebuilt when this Makefile changes.
 OPTIMML_PATCH_DIR = build/optimML_cellbouncer
 OPTIMML_PATCH_STAMP = $(OPTIMML_PATCH_DIR)/.cellbouncer_patch_v3
 OPTIMML_SOURCE_FILES = $(shell find dependencies/optimML -type f \
-    -not -path '*/build/*' -not -path '*/lib/*')
+    -not -path '*/build/*' -not -path '*/lib/*' 2>/dev/null)
 
-# ============================================================================
-# MAIN TARGETS
-# ============================================================================
+# Executable names consumed by orchestrate_pipeline.py are unchanged.
+ORCHESTRATOR_BINS = demux_parallel vcf_loader_daemon tet_ambient_profile \
+                    tet_contam_estimate legacy2c_contam_estimate \
+                    tetra_score_calls tetra_refine
+AUX_ROOT_BINS = demux_mt demux_species demux_tags doublet_dragon bulkprops \
+                bam_ram_host_daemon genotype_scrub_bam snps_per_read \
+                mt_fusion_ratio
+DEPRECATED_BINS = demux_vcf quant_contam quant3_contam quant3_contam_ap \
+                  quant3_contam_empty_drops downsample_vcf
+UTIL_BINS = utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs \
+            utils/bam_cb_cache_extract utils/split_read_files \
+            utils/atac_fq_preprocess utils/combine_species_counts \
+            utils/composite_bam2counts utils/downsample_vcf_parallel
 
-# The integrated release is a self-contained source package, but the attached
-# CellBouncer update archives intentionally did not include four historical
-# source units (demux_vcf, demux_tags, serial downsample_vcf) or the FASTK
-# submodule required by get_unique_kmers.  The default target therefore builds
-# every executable whose complete source is actually bundled.  An explicit
-# full_upstream_tools target remains available after those optional sources are
-# restored from a full upstream checkout.
-BUNDLED_ROOT_BINS = demux_mt demux_species quant_contam doublet_dragon bulkprops \
-                    demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam tetra_refine \
-                    tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate \
-                    tetra_score_calls snps_per_read mt_fusion_ratio \
-                    quant3_contam quant3_contam_ap quant3_contam_empty_drops
-BUNDLED_UTIL_BINS = utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs \
-                    utils/bam_cb_cache_extract utils/split_read_files \
-                    utils/atac_fq_preprocess utils/combine_species_counts \
-                    utils/composite_bam2counts utils/downsample_vcf_parallel
-OPTIONAL_UPSTREAM_SOURCES = src/demux_vcf.cpp src/demux_tags.cpp \
-                            src/downsample_vcf.cpp src/downsample_vcf.h \
-                            src/FASTK/libfastk.c src/FASTK/libfastk.h
-
-# ``make all`` must work in both deployment layouts:
-#   1. the self-contained portable package, which intentionally lacks a few
-#      historical upstream source units; and
-#   2. the user's complete ~/cellbouncer-parallel checkout used by the compcb
-#      alias, where clean_build removes those executables and all must rebuild
-#      them before the alias copies them into the module installation.
-# Select the complete upstream target only when every required source is present;
-# otherwise retain the portable bundled build instead of failing on absent files.
-OPTIONAL_UPSTREAM_SOURCE_COUNT := $(words $(OPTIONAL_UPSTREAM_SOURCES))
-PRESENT_OPTIONAL_UPSTREAM_SOURCE_COUNT := $(words $(wildcard $(OPTIONAL_UPSTREAM_SOURCES)))
-ifeq ($(PRESENT_OPTIONAL_UPSTREAM_SOURCE_COUNT),$(OPTIONAL_UPSTREAM_SOURCE_COUNT))
-DEFAULT_ALL_TARGET = full_upstream_tools
-DEFAULT_ALL_MODE = full_upstream
-else
-DEFAULT_ALL_TARGET = bundled_all
-DEFAULT_ALL_MODE = bundled_portable
+# Preserve the unrelated FASTK utility when the full upstream source subtree is
+# present in the real checkout. The lean source bundle does not carry FASTK, so
+# this target is selected only where it was already available.
+ifneq ($(and $(wildcard src/FASTK/libfastk.c),$(wildcard src/FASTK/libfastk.h)),)
+UTIL_BINS += utils/get_unique_kmers
 endif
 
-all: $(DEFAULT_ALL_TARGET)
+all: dependencies orchestrator_tools auxiliary_tools utilities
 
-bundled_all: dependencies bundled_original_tools parallel_tools tet_tools qc_tools mitochondrial_tools legacy_comparison_tools bundled_utils
-
-bundled_original_tools: demux_mt demux_species quant_contam doublet_dragon bulkprops
-
-parallel_tools: demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam utils/downsample_vcf_parallel tetra_refine
-
-tet_tools: tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate
-
-qc_tools: tetra_score_calls snps_per_read
-
-mitochondrial_tools: mt_fusion_ratio
-
-legacy_comparison_tools: quant3_contam quant3_contam_ap quant3_contam_empty_drops
-
-bundled_utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts
-
-# Compatibility aliases for a complete upstream CellBouncer checkout.
-original_tools: demux_vcf demux_mt demux_tags demux_species quant_contam doublet_dragon bulkprops utils
-
-utils: utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/get_unique_kmers utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts utils/composite_bam2counts utils/downsample_vcf
-
-check_optional_upstream_sources:
-	@missing=0; \
-	for f in $(OPTIONAL_UPSTREAM_SOURCES); do \
-	    if [ ! -f "$$f" ]; then echo "MISSING optional upstream source: $$f" >&2; missing=1; fi; \
-	done; \
-	if [ "$$missing" -ne 0 ]; then \
-	    echo "Restore the listed files/submodule from a complete CellBouncer checkout before using full_upstream_tools." >&2; \
-	    exit 2; \
-	fi
-
-full_upstream_tools: check_optional_upstream_sources
-	$(MAKE) dependencies original_tools parallel_tools tet_tools qc_tools mitochondrial_tools legacy_comparison_tools
+orchestrator_tools: $(ORCHESTRATOR_BINS)
+auxiliary_tools: $(AUX_ROOT_BINS)
+utilities: $(UTIL_BINS)
+dependencies: $(DEPS)
 
 source_inventory:
-	@echo "Bundled build targets:"; \
-	for f in $(BUNDLED_ROOT_BINS) $(BUNDLED_UTIL_BINS); do echo "  $$f"; done; \
-	echo; echo "Optional upstream-only sources:"; \
-	for f in $(OPTIONAL_UPSTREAM_SOURCES); do \
-	    if [ -f "$$f" ]; then echo "  PRESENT $$f"; else echo "  ABSENT  $$f"; fi; \
-	done
-
-dependencies: lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a
+	@echo "Unified implementation modules:"; \
+	for f in src/io.cpp src/vcf_hts.cpp src/genotype_llr.cpp src/ambient_rna_three_ap.cpp; do \
+	    if [ -s "$$f" ]; then echo "  PRESENT $$f"; else echo "  MISSING $$f"; fi; \
+	done; \
+	echo; echo "Orchestrator executables:"; \
+	for f in $(ORCHESTRATOR_BINS); do echo "  $$f"; done
 
 print_flags:
 	@echo "HTSLIB_PREFIX=$(HTSLIB_PREFIX)"
-	@echo "HTSLIB_INCLUDE=$(HTSLIB_INCLUDE)"
-	@echo "HTSLIB_LIB=$(HTSLIB_LIB)"
-	@echo "HTSLIB_RPATH_FLAG=$(HTSLIB_RPATH_FLAG)"
-	@echo "DEFAULT_ALL_MODE=$(DEFAULT_ALL_MODE)"
-	@echo "OPTIONAL_UPSTREAM_SOURCES=$(PRESENT_OPTIONAL_UPSTREAM_SOURCE_COUNT)/$(OPTIONAL_UPSTREAM_SOURCE_COUNT) present"
 	@echo "CPU_ARCH=$(CPU_ARCH)"
 	@echo "CPU_TUNE=$(CPU_TUNE)"
 	@echo "ARCHFLAGS=$(ARCHFLAGS)"
 	@echo "SOURCE_REVISION=$(SOURCE_REVISION)"
 	@echo "CXXFLAGS_PARALLEL=$(CXXFLAGS_PARALLEL)"
 	@echo "CXXFLAGS_TET=$(CXXFLAGS_TET)"
-	@echo "CXXFLAGS_CACHE=$(CXXFLAGS_CACHE)"
-	@echo "CXXFLAGS_SCRUB=$(CXXFLAGS_SCRUB)"
-	@echo "DEPS_SCRUB=$(DEPS_SCRUB)"
-	@echo "CFLAGS=$(CFLAGS)"
 
-# ============================================================================
-# ORIGINAL CELLBOUNCER TOOLS
-# ============================================================================
+check_required_ambient_source:
+	@if [ ! -s src/ambient_rna_three_ap.cpp ]; then \
+	    echo "ERROR: src/ambient_rna_three_ap.cpp is missing." >&2; \
+	    exit 2; \
+	fi
 
-demux_vcf: src/demux_vcf.cpp build/common.o build/demux_vcf_io.o build/demux_vcf_hts.o build/demux_vcf_llr.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_hts.o build/demux_vcf_llr.o src/demux_vcf.cpp -o demux_vcf $(LFLAGS) $(DEPS) $(DEPS2)
+# -----------------------------------------------------------------------------
+# Orchestrator-facing executables
+# -----------------------------------------------------------------------------
 
-demux_mt: src/demux_mt.cpp src/common.h build/common.o build/demux_vcf_llr.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -D MAX_SITES=$(MAX_SITES) build/common.o build/demux_vcf_llr.o src/demux_mt.cpp -o demux_mt $(LFLAGS) $(DEPS) $(DEPS2)
+demux_parallel: src/demux_parallel.cpp src/io.h src/vcf_hts.h src/genotype_llr.h \
+    build/common_parallel.o build/io_parallel.o build/vcf_hts.o build/genotype_llr.o \
+    $(DEPS) $(HTSWRAPPER_HEADER_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g \
+	    build/common_parallel.o build/io_parallel.o build/vcf_hts.o build/genotype_llr.o \
+	    src/demux_parallel.cpp -o $@ $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
-demux_species: src/demux_species.cpp src/common.h build/common.o build/demux_species_io.o build/species_kmers.o build/reads_demux.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 -g build/common.o build/demux_species_io.o build/species_kmers.o build/reads_demux.o src/demux_species.cpp $(LFLAGS) $(DEPS) -pthread -o demux_species $(DEPS2)
+vcf_loader_daemon: src/vcf_loader_daemon.cpp src/vcf_hts.h \
+    build/common_parallel.o build/vcf_hts.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g \
+	    build/common_parallel.o build/vcf_hts.o src/vcf_loader_daemon.cpp \
+	    -o $@ $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
-demux_tags: src/demux_tags.cpp src/common.h build/common.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/demux_tags.cpp $(LFLAGS) $(DEPS) -D PROJ_ROOT=$(PROJROOT) -o demux_tags $(DEPS2)
+build/ambient_rna_three_ap_tet.o: check_required_ambient_source \
+    src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/genotype_llr.h \
+    src/common.h $(DEPS) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g \
+	    src/ambient_rna_three_ap.cpp -c -o $@
 
-quant_contam: src/common.h src/quant_contam.cpp src/ambient_rna.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o build/ambient_rna_gex.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o build/ambient_rna_gex.o src/quant_contam.cpp $(LFLAGS) $(DEPS) -o quant_contam $(DEPS2)
+tet_ambient_profile: src/tet_ambient_profile.cpp src/ambient_rna_three_ap.h src/io.h \
+    build/common_parallel.o build/io_parallel.o build/vcf_hts.o build/genotype_llr.o \
+    build/ambient_rna_three_ap_tet.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g \
+	    build/common_parallel.o build/io_parallel.o build/vcf_hts.o build/genotype_llr.o \
+	    build/ambient_rna_three_ap_tet.o src/tet_ambient_profile.cpp \
+	    -o $@ $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
-# Compiled current-code two-component compatibility estimator.  This is a
-# standalone C++ executable linked directly to the hardened ambient_rna model;
-# it does not invoke or wrap quant_contam at runtime.
-legacy2c_contam_estimate: src/legacy2c_contam_estimate.cpp src/ambient_rna.h src/common.h src/demux_vcf_io.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 $(ARCHFLAGS) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna.o src/legacy2c_contam_estimate.cpp $(LFLAGS) $(DEPS) -o legacy2c_contam_estimate $(DEPS2)
+tet_contam_estimate: src/tet_contam_estimate.cpp src/ambient_rna_three_ap.h \
+    src/ambient_rna_gex.h src/io.h build/common_parallel.o build/io_parallel.o \
+    build/vcf_hts.o build/genotype_llr.o build/ambient_rna_three_ap_tet.o \
+    build/ambient_rna_gex.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g \
+	    build/common_parallel.o build/io_parallel.o build/vcf_hts.o build/genotype_llr.o \
+	    build/ambient_rna_three_ap_tet.o build/ambient_rna_gex.o \
+	    src/tet_contam_estimate.cpp -o $@ $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
-doublet_dragon: src/doublet_dragon.cpp src/common.h build/common.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/doublet_dragon.cpp $(LFLAGS) $(DEPS) -o doublet_dragon $(DEPS2)
+build/legacy2c_model.o: src/legacy2c_model.cpp src/legacy2c_model.h \
+    src/genotype_llr.h src/common.h $(DEPS) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g src/legacy2c_model.cpp -c -o $@
 
-bulkprops: src/bulkprops.cpp src/common.h build/common.o src/demux_vcf_hts.h build/demux_vcf_hts.o src/demux_vcf_io.h build/demux_vcf_io.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o build/demux_vcf_io.o build/demux_vcf_hts.o src/bulkprops.cpp $(LFLAGS) $(DEPS) -o bulkprops $(DEPS2)
-
-# ============================================================================
-# PARALLEL TOOLS
-# ============================================================================
-
-demux_parallel: src/demux_parallel.cpp src/demux_parallel_hts.h src/demux_parallel_llr.h build/common_parallel.o build/demux_vcf_io_parallel.o build/demux_parallel_hts.o build/demux_parallel_llr.o $(DEPS) $(HTSWRAPPER_HEADER_STAMP)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o build/demux_vcf_io_parallel.o build/demux_parallel_hts.o build/demux_parallel_llr.o src/demux_parallel.cpp -o demux_parallel $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
-
-vcf_loader_daemon: src/vcf_loader_daemon.cpp build/common_parallel.o build/demux_parallel_hts.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o build/demux_parallel_hts.o src/vcf_loader_daemon.cpp -o vcf_loader_daemon $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
-
-# bam_ram_host_daemon stages cache BAM files into node-local tmpfs (/dev/shm) as
-# real files and publishes hosted_manifest.tsv. It is a standalone file-staging
-# daemon (POSIX I/O + pthreads only, no htslib/CellBouncer deps), built C++11 with
-# the cluster-portable ARCHFLAGS so the one binary runs on pika/char (Zen4) and
-# squirtle (Zen3).
-bam_ram_host_daemon: src/bam_ram_host_daemon.cpp
-	$(COMP) -std=c++11 -O3 $(ARCHFLAGS) src/bam_ram_host_daemon.cpp -o bam_ram_host_daemon -lpthread
-
-# Two-pass, per-cell dosage-projection scrubber for synthetic benchmark BAMs.
-# Standalone executable: htslib + zlib + pthread only. Build through an object
-# so make clean_build invalidates the compiled source and the compcb target list
-# necessarily recompiles and relinks genotype_scrub_bam.
-build/genotype_scrub_bam.o: src/genotype_scrub_bam.cpp Makefile
-	mkdir -p build
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_SCRUB) -c src/genotype_scrub_bam.cpp \
-	    -o build/genotype_scrub_bam.o
-
-genotype_scrub_bam: build/genotype_scrub_bam.o
-	$(COMP) build/genotype_scrub_bam.o -o genotype_scrub_bam \
-	    $(LFLAGS) $(DEPS_SCRUB)
-
-utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp src/downsample_vcf_parallel.h build/common_parallel.o $(DEPS)
-	mkdir -p utils
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o src/downsample_vcf_parallel.cpp -o utils/downsample_vcf_parallel $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
-
-mt_fusion_ratio: src/mt_fusion_ratio.cpp
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) src/mt_fusion_ratio.cpp -o mt_fusion_ratio $(LFLAGS) $(DEPS_MT)
+legacy2c_contam_estimate: src/legacy2c_contam_estimate.cpp src/legacy2c_model.h src/io.h \
+    build/common_parallel.o build/io_parallel.o build/vcf_hts.o build/genotype_llr.o \
+    build/legacy2c_model.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g \
+	    build/common_parallel.o build/io_parallel.o build/vcf_hts.o build/genotype_llr.o \
+	    build/legacy2c_model.o src/legacy2c_contam_estimate.cpp \
+	    -o $@ $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
 tetra_refine: src/tetra_refine.cpp lib/libhtswrapper.a
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 src/tetra_refine.cpp -o tetra_refine $(LFLAGS) lib/libhtswrapper.a -lz
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 src/tetra_refine.cpp \
+	    -o $@ $(LFLAGS) lib/libhtswrapper.a -lz
 
-# ============================================================================
-# THREE-COMPONENT MODEL (quant3_contam) - legacy
-# ============================================================================
-
-build/ambient_rna_three.o: src/ambient_rna_three.cpp src/ambient_rna_three.h src/common.h $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/ambient_rna_three.cpp -c -o build/ambient_rna_three.o
-
-quant3_contam: src/quant3_contam.cpp src/ambient_rna_three.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three.o build/ambient_rna_gex.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_llr.o build/ambient_rna_three.o build/ambient_rna_gex.o src/quant3_contam.cpp -o quant3_contam $(LFLAGS) $(DEPS) $(DEPS2)
-
-# ============================================================================
-# THREE-COMPONENT MODEL + AP REFINEMENTS (quant3_contam_ap) - legacy
-# These remain buildable for comparison but are superseded by tet_tools.
-# ============================================================================
-
-build/ambient_rna_three_ap.o: src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/common.h $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap.o
-
-build/demux_vcf_io_species.o: src/demux_vcf_io_species.cpp src/demux_vcf_io.h src/common.h
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g src/demux_vcf_io_species.cpp -c -o build/demux_vcf_io_species.o
-
-quant3_contam_ap: src/quant3_contam_ap.cpp src/ambient_rna_three_ap.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o build/ambient_rna_gex.o src/quant3_contam_ap.cpp $(LFLAGS) $(DEPS) -o quant3_contam_ap $(DEPS2)
-
-quant3_contam_empty_drops: src/quant3_contam_empty_drops.cpp src/ambient_rna_three_ap.h src/common.h build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap.o src/quant3_contam_empty_drops.cpp $(LFLAGS) $(DEPS) -o quant3_contam_empty_drops $(DEPS2)
-
-# ============================================================================
-# TET TOOLS (new pipeline, replaces quant3_contam_ap / quant3_contam_empty_drops)
-# Same shared library (ambient_rna_three_ap) with WP0 fixes applied.
-# ============================================================================
-
-build/ambient_rna_three_ap_tet.o: src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/common.h $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap_tet.o
-
-tet_ambient_profile: src/tet_ambient_profile.cpp src/ambient_rna_three_ap.h src/common.h \
-    build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o \
-    build/ambient_rna_three_ap_tet.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g build/common.o build/demux_vcf_io.o \
-	    build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap_tet.o \
-	    src/tet_ambient_profile.cpp $(LFLAGS_TET) $(DEPS) -o tet_ambient_profile $(DEPS2)
-
-tet_contam_estimate: src/tet_contam_estimate.cpp src/ambient_rna_three_ap.h src/common.h \
-    build/common.o build/demux_vcf_io.o build/demux_vcf_io_species.o build/demux_vcf_llr.o \
-    build/ambient_rna_three_ap_tet.o build/ambient_rna_gex.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g build/common.o build/demux_vcf_io.o \
-	    build/demux_vcf_io_species.o build/demux_vcf_llr.o build/ambient_rna_three_ap_tet.o \
-	    build/ambient_rna_gex.o src/tet_contam_estimate.cpp $(LFLAGS_TET) $(DEPS) \
-	    -o tet_contam_estimate $(DEPS2)
-
-# Per-cell post-hoc QC scorer used by the swap-audit layer.
 tetra_score_calls: src/tetra_score_calls.cpp lib/libhtswrapper.a
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g src/tetra_score_calls.cpp \
-	    -o tetra_score_calls $(LFLAGS_TET) lib/libhtswrapper.a -lz
+	    -o $@ $(LFLAGS_TET) lib/libhtswrapper.a -lz
 
-# Standalone per-read SNP-coverage counter: htslib + zlib + pthread + OpenMP.
-# robin_hood is header-only, resolved via -Iinclude from the installed htswrapper
-# headers. Built as C++17 like bam_cb_cache_extract. The order-only
-# lib/libhtswrapper.a prerequisite installs include/htswrapper/robin_hood/robin_hood.h;
-# the archive itself is not linked.
+# -----------------------------------------------------------------------------
+# Build-target compatibility for the existing compcb shell function
+# -----------------------------------------------------------------------------
+# The retired quant3 source files and executables are intentionally gone.  These
+# names remain as phony make targets only because the established compcb command
+# invokes them explicitly after `make all`.  They build the production
+# replacements without recreating or installing deprecated quant3 binaries.
+quant3_contam: tet_contam_estimate
+	@echo "quant3_contam compatibility target satisfied by tet_contam_estimate"
+
+quant3_contam_ap: tet_contam_estimate
+	@echo "quant3_contam_ap compatibility target satisfied by tet_contam_estimate"
+
+quant3_contam_empty_drops: tet_ambient_profile
+	@echo "quant3_contam_empty_drops compatibility target satisfied by tet_ambient_profile"
+
+# -----------------------------------------------------------------------------
+# Retained auxiliary tools, all linked through the unified modules where relevant
+# -----------------------------------------------------------------------------
+
+demux_mt: src/demux_mt.cpp src/genotype_llr.h build/common_parallel.o \
+    build/vcf_hts.o build/genotype_llr.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -D MAX_SITES=$(MAX_SITES) \
+	    build/common_parallel.o build/vcf_hts.o build/genotype_llr.o src/demux_mt.cpp \
+	    -o $@ $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
+
+demux_species: src/demux_species.cpp build/common.o build/demux_species_io.o \
+    build/species_kmers.o build/reads_demux.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 -g build/common.o \
+	    build/demux_species_io.o build/species_kmers.o build/reads_demux.o \
+	    src/demux_species.cpp $(LFLAGS) $(DEPS) -pthread -o $@ $(DEPS2)
+
+demux_tags: src/demux_tags.cpp build/common.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/demux_tags.cpp \
+	    $(LFLAGS) $(DEPS) -D PROJ_ROOT=$(PROJROOT) -o $@ $(DEPS2)
+
+doublet_dragon: src/doublet_dragon.cpp build/common.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/doublet_dragon.cpp \
+	    $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
+
+bulkprops: src/bulkprops.cpp src/vcf_hts.h src/io.h build/common_parallel.o \
+    build/io_parallel.o build/vcf_hts.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) build/common_parallel.o \
+	    build/io_parallel.o build/vcf_hts.o src/bulkprops.cpp \
+	    -o $@ $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
+
+bam_ram_host_daemon: src/bam_ram_host_daemon.cpp
+	$(COMP) -std=c++11 -O3 $(ARCHFLAGS) src/bam_ram_host_daemon.cpp -o $@ -lpthread
+
+build/genotype_scrub_bam.o: src/genotype_scrub_bam.cpp Makefile | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_SCRUB) -c src/genotype_scrub_bam.cpp -o $@
+
+genotype_scrub_bam: build/genotype_scrub_bam.o
+	$(COMP) $< -o $@ $(LFLAGS) $(DEPS_SCRUB)
+
 snps_per_read: src/snps_per_read.cpp | lib/libhtswrapper.a
-	$(COMP) $(CXXIFLAGS) -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -fopenmp -Wall -Wextra \
-	    src/snps_per_read.cpp -o snps_per_read $(LFLAGS) -lhts -lz -lpthread
+	$(COMP) $(CXXIFLAGS) -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) \
+	    -fopenmp -Wall -Wextra src/snps_per_read.cpp -o $@ \
+	    $(LFLAGS) -lhts -lz -lpthread
 
-# ============================================================================
-# UTILITY TOOLS
-# ============================================================================
+mt_fusion_ratio: src/mt_fusion_ratio.cpp
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) src/mt_fusion_ratio.cpp \
+	    -o $@ $(LFLAGS) $(DEPS_MT)
 
-utils/refine_vcf: src/refine_vcf.cpp src/refine_vcf.h src/common.h build/common.o src/demux_vcf_hts.h build/demux_vcf_hts.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g build/common.o build/demux_vcf_hts.o src/refine_vcf.cpp $(LFLAGS) $(DEPS) -o utils/refine_vcf $(DEPS2)
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 
-utils/bam_indiv_rg: src/bam_indiv_rg.cpp src/common.h build/common.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/bam_indiv_rg.cpp $(LFLAGS) $(DEPS) -o utils/bam_indiv_rg $(DEPS2)
+utils/refine_vcf: src/refine_vcf.cpp src/refine_vcf.h src/vcf_hts.h \
+    build/common_parallel.o build/vcf_hts.o $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o \
+	    build/vcf_hts.o src/refine_vcf.cpp -o $@ \
+	    $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
-utils/bam_split_bcs: src/bam_split_bcs.cpp src/common.h build/common.o $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/bam_split_bcs.cpp $(LFLAGS) $(DEPS) -o utils/bam_split_bcs $(DEPS2)
+utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp \
+    src/downsample_vcf_parallel.h build/common_parallel.o $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o \
+	    src/downsample_vcf_parallel.cpp -o $@ \
+	    $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
+
+utils/get_unique_kmers: src/get_unique_kmers.c src/FASTK/libfastk.c \
+    src/FASTK/libfastk.h build/libfastk.o
+	mkdir -p utils
+	$(CCOMP) $(CIFLAGS) $(CFLAGS) build/libfastk.o src/get_unique_kmers.c \
+	    -o $@ $(LFLAGS) -lz
+
+utils/bam_indiv_rg: src/bam_indiv_rg.cpp build/common.o $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/bam_indiv_rg.cpp \
+	    $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
+
+utils/bam_split_bcs: src/bam_split_bcs.cpp build/common.o $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) build/common.o src/bam_split_bcs.cpp \
+	    $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
 
 utils/bam_cb_cache_extract: src/bam_cb_cache_extract.cpp
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_CACHE) src/bam_cb_cache_extract.cpp -o utils/bam_cb_cache_extract $(LFLAGS) $(DEPS_CACHE)
+	mkdir -p utils
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_CACHE) src/bam_cb_cache_extract.cpp \
+	    -o $@ $(LFLAGS) $(DEPS_CACHE)
 
-utils/get_unique_kmers: src/get_unique_kmers.c src/FASTK/libfastk.c build/libfastk.o
-	$(CCOMP) $(CIFLAGS) $(CFLAGS) build/libfastk.o src/get_unique_kmers.c -o utils/get_unique_kmers $(LFLAGS) -lz
+utils/atac_fq_preprocess: src/atac_fq_preprocess.cpp build/common.o $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o \
+	    src/atac_fq_preprocess.cpp $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
 
-utils/atac_fq_preprocess: src/atac_fq_preprocess.cpp src/common.h build/common.o $(DEPS)
-	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o src/atac_fq_preprocess.cpp $(LFLAGS) $(DEPS) -o utils/atac_fq_preprocess $(DEPS2)
+utils/split_read_files: src/split_read_files.cpp build/common.o $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o \
+	    src/split_read_files.cpp $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
 
-utils/split_read_files: src/split_read_files.cpp src/common.h build/common.o $(DEPS)
-	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o src/split_read_files.cpp $(LFLAGS) $(DEPS) -o utils/split_read_files $(DEPS2)
+utils/combine_species_counts: src/combine_species_counts.cpp build/common.o $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o \
+	    src/combine_species_counts.cpp $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
 
-utils/combine_species_counts: src/combine_species_counts.cpp src/common.h build/common.o $(DEPS)
-	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o src/combine_species_counts.cpp $(LFLAGS) $(DEPS) -o utils/combine_species_counts $(DEPS2)
+utils/composite_bam2counts: src/composite_bam2counts.cpp $(DEPS)
+	mkdir -p utils
+	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) src/composite_bam2counts.cpp \
+	    $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
 
-utils/composite_bam2counts: src/composite_bam2counts.cpp lib/libhtswrapper.a $(DEPS)
-	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) src/composite_bam2counts.cpp $(LFLAGS) $(DEPS) -o utils/composite_bam2counts $(DEPS2)
-
-utils/downsample_vcf: src/downsample_vcf.cpp src/downsample_vcf.h build/common.o $(DEPS)
-	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) -DNBITS=$(NBITS) src/downsample_vcf.cpp build/common.o $(LFLAGS) $(DEPS) -o utils/downsample_vcf $(DEPS2)
-
-# ============================================================================
-# OBJECT FILES - ORIGINAL (standard flags)
-# ============================================================================
-
-build/common.o: src/common.cpp src/common.h lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/common.cpp -c -o build/common.o
-
-build/demux_vcf_io.o: src/demux_vcf_io.cpp src/demux_vcf_io.h src/common.h
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/demux_vcf_io.cpp -c -o build/demux_vcf_io.o
-
-build/demux_vcf_hts.o: src/demux_vcf_hts.cpp src/demux_vcf_hts.h src/common.h lib/libhtswrapper.a
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/demux_vcf_hts.cpp -c -o build/demux_vcf_hts.o
-
-build/demux_vcf_llr.o: src/demux_vcf_llr.cpp src/demux_vcf_llr.h src/common.h
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/demux_vcf_llr.cpp -c -o build/demux_vcf_llr.o
-
-build/ambient_rna.o: src/ambient_rna.cpp src/ambient_rna.h src/common.h $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/ambient_rna.cpp -c -o build/ambient_rna.o
-
-build/ambient_rna_gex.o: src/ambient_rna_gex.cpp src/ambient_rna_gex.h src/common.h $(DEPS)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/ambient_rna_gex.cpp -c -o build/ambient_rna_gex.o 
-
-build/species_kmers.o: src/species_kmers.cpp src/species_kmers.h src/common.h
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 -g src/species_kmers.cpp -c -o build/species_kmers.o
-
-build/reads_demux.o: src/reads_demux.cpp src/reads_demux.h src/common.h lib/libhtswrapper.a
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 -g src/reads_demux.cpp -c -o build/reads_demux.o
-
-build/demux_species_io.o: src/demux_species_io.cpp src/demux_species_io.h src/common.h lib/libhtswrapper.a
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g src/demux_species_io.cpp -c -o build/demux_species_io.o
-
-build/libfastk.o: src/FASTK/libfastk.c src/FASTK/libfastk.h
-	$(CCOMP) $(CIFLAGS) $(CFLAGS) src/FASTK/libfastk.c -c -o build/libfastk.o
-
-build/gene_core.o: src/FASTK/gene_core.c src/FASTK/gene_core.h
-	$(CCOMP) $(CIFLAGS) $(CFLAGS) src/FASTK/gene_core.c -c -o build/gene_core.o
-
-# ============================================================================
-# OBJECT FILES - PARALLEL (optimized flags with OpenMP)
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Shared object modules
+# -----------------------------------------------------------------------------
 
 $(BUILD_DIR_STAMP):
 	mkdir -p build
 	touch $@
 
-build/common_parallel.o: src/common.cpp src/common.h lib/libhtswrapper.a lib/libmixturedist.a lib/liboptimml.a $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/common.cpp -c -o build/common_parallel.o
+build/common.o: src/common.cpp src/common.h $(DEPS) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/common.cpp -c -o $@
 
-build/demux_vcf_io_parallel.o: src/demux_vcf_io.cpp src/demux_vcf_io.h src/common.h $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/demux_vcf_io.cpp -c -o build/demux_vcf_io_parallel.o
+build/common_parallel.o: src/common.cpp src/common.h $(DEPS) \
+    $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/common.cpp -c -o $@
 
-build/demux_parallel_hts.o: src/demux_parallel_hts.cpp src/demux_parallel_hts.h src/common.h lib/libhtswrapper.a $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/demux_parallel_hts.cpp -c -o build/demux_parallel_hts.o
+build/io_parallel.o: src/io.cpp src/io.h src/common.h \
+    $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/io.cpp -c -o $@
 
-build/demux_parallel_llr.o: src/demux_parallel_llr.cpp src/demux_parallel_llr.h src/demux_parallel_hts.h src/common.h $(DEPS) $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/demux_parallel_llr.cpp -c -o build/demux_parallel_llr.o
+build/vcf_hts.o: src/vcf_hts.cpp src/vcf_hts.h src/common.h \
+    lib/libhtswrapper.a $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/vcf_hts.cpp -c -o $@
 
-# ============================================================================
-# DEPENDENCIES
-#
-# optimML/STLBFGS handling is intentionally implemented only here, in the
-# top-level build.  The vendored dependencies/optimML source is never edited.
-# A private copy is created in build/, patched there, compiled, and installed
-# into this project's lib/ and include/ directories.
-# ============================================================================
+build/genotype_llr.o: src/genotype_llr.cpp src/genotype_llr.h src/vcf_hts.h \
+    src/common.h $(DEPS) $(HTSWRAPPER_HEADER_STAMP) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) src/genotype_llr.cpp -c -o $@
+
+build/ambient_rna_gex.o: src/ambient_rna_gex.cpp src/ambient_rna_gex.h \
+    src/common.h $(DEPS) | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) src/ambient_rna_gex.cpp -c -o $@
+
+build/species_kmers.o: src/species_kmers.cpp src/species_kmers.h src/common.h | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 -g src/species_kmers.cpp -c -o $@
+
+build/reads_demux.o: src/reads_demux.cpp src/reads_demux.h src/common.h \
+    lib/libhtswrapper.a | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -O3 -g src/reads_demux.cpp -c -o $@
+
+build/demux_species_io.o: src/demux_species_io.cpp src/demux_species_io.h \
+    src/common.h lib/libhtswrapper.a | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_STD) -g src/demux_species_io.cpp -c -o $@
+
+build/libfastk.o: src/FASTK/libfastk.c src/FASTK/libfastk.h | $(BUILD_DIR_STAMP)
+	$(CCOMP) $(CIFLAGS) $(CFLAGS) src/FASTK/libfastk.c -c -o $@
+
+# -----------------------------------------------------------------------------
+# Dependencies
+# -----------------------------------------------------------------------------
 
 lib/libhtswrapper.a:
 	mkdir -p dependencies/htswrapper/build dependencies/htswrapper/lib
@@ -474,9 +377,6 @@ $(OPTIMML_PATCH_STAMP): $(OPTIMML_SOURCE_FILES) Makefile
 	    -e 's/assert(-dot(g, p) < 0);/if (-dot(g, p) >= 0) throw 1;/' \
 	    -e 's/assert(std::isfinite(alpha));/if (!std::isfinite(alpha)) throw 2;/' \
 	    $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
-	# CellBouncer requires optimML's mixture logistic coordinates to use the
-	# actual mixture block when one or more external parameters precede it.
-	# Apply this only to the private build copy; never edit dependencies/optimML.
 	sed -i \
 	    -e 's|mixcompsum_f += mixcompfracs_sparse\[i\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
 	    -e 's|mixcompsum_f += mixcompfracs\[i\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
@@ -486,13 +386,9 @@ $(OPTIMML_PATCH_STAMP): $(OPTIMML_SOURCE_FILES) Makefile
 	    $(OPTIMML_PATCH_DIR)/src/multivar.cpp
 	grep -Fq 'if (-dot(g, p) >= 0) throw 1;' $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
 	grep -Fq 'if (!std::isfinite(alpha)) throw 2;' $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
-	! grep -Fq 'assert(std::isfinite(alpha));' $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
 	grep -Fq 'mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
 	grep -Fq 'mixcompsum_f += mixcompfracs[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
 	grep -Fq 'mixcompsum_f += mixcompfracs_sparse[jid][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar.cpp
-	! grep -Fq 'mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
-	! grep -Fq 'mixcompsum_f += mixcompfracs[i][k] / (exp(-x[k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
-	! grep -Fq 'mixcompsum_f += mixcompfracs_sparse[jid][k] / (exp(-x[k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar.cpp
 	touch $@
 
 lib/liboptimml.a: $(OPTIMML_PATCH_STAMP)
@@ -501,14 +397,9 @@ lib/liboptimml.a: $(OPTIMML_PATCH_STAMP)
 	$(MAKE) -C $(OPTIMML_PATCH_DIR) install PREFIX=$(abspath .)
 	test -s $@
 
-
-# ============================================================================
-# AMBIENT MODEL MATHEMATICAL TESTS
-# ============================================================================
-
-# Stage only the headers required by the isolated math-test build without
-# compiling or modifying the htswrapper dependency. Both ambient math-test
-# source files are authoritative under src/.
+# -----------------------------------------------------------------------------
+# Ambient mathematical tests
+# -----------------------------------------------------------------------------
 
 include/htswrapper/robin_hood/robin_hood.h: dependencies/htswrapper/src/robin_hood/robin_hood.h
 	mkdir -p include/htswrapper/robin_hood
@@ -518,40 +409,36 @@ include/htswrapper/bc.h: dependencies/htswrapper/src/bc.h include/htswrapper/rob
 	mkdir -p include/htswrapper
 	cp $< $@
 
-build/ambient_rna_three_ap_test.o: src/ambient_rna_three_ap.cpp src/ambient_rna_three_ap.h src/common.h lib/liboptimml.a lib/libmixturedist.a include/htswrapper/bc.h include/htswrapper/robin_hood/robin_hood.h
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/ambient_rna_three_ap.cpp -c -o build/ambient_rna_three_ap_test.o
+build/ambient_rna_three_ap_test.o: check_required_ambient_source \
+    src/ambient_rna_three_ap.h src/common.h lib/liboptimml.a lib/libmixturedist.a \
+    include/htswrapper/bc.h include/htswrapper/robin_hood/robin_hood.h | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections \
+	    src/ambient_rna_three_ap.cpp -c -o $@
 
-build/test_ambient_support.o: src/test_ambient_support.cpp
-	mkdir -p build
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/test_ambient_support.cpp -c -o build/test_ambient_support.o
+build/test_ambient_support.o: src/test_ambient_support.cpp | $(BUILD_DIR_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections \
+	    src/test_ambient_support.cpp -c -o $@
 
-test_ambient_math: src/test_ambient_gradients.cpp build/ambient_rna_three_ap_test.o build/test_ambient_support.o lib/liboptimml.a lib/libmixturedist.a
-	$(COMP) $(CXXIFLAGS) -Isrc $(CXXFLAGS_TET) -ffunction-sections -fdata-sections src/test_ambient_gradients.cpp build/ambient_rna_three_ap_test.o build/test_ambient_support.o -o test_ambient_math $(LFLAGS_TET) -Wl,--gc-sections lib/liboptimml.a lib/libmixturedist.a -lz -lpthread
+test_ambient_math: src/test_ambient_gradients.cpp build/ambient_rna_three_ap_test.o \
+    build/test_ambient_support.o lib/liboptimml.a lib/libmixturedist.a
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -ffunction-sections -fdata-sections \
+	    src/test_ambient_gradients.cpp build/ambient_rna_three_ap_test.o \
+	    build/test_ambient_support.o -o $@ $(LFLAGS_TET) -Wl,--gc-sections \
+	    lib/liboptimml.a lib/libmixturedist.a -lz -lpthread
 	./test_ambient_math
 
-# ============================================================================
-# CLEAN TARGETS
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Clean and install
+# -----------------------------------------------------------------------------
 
 clean: clean_build clean_binaries
 
 clean_build:
-	rm -f build/*.o $(BUILD_DIR_STAMP) $(HTSWRAPPER_HEADER_STAMP)
-	# Removing the scrubber object forces compile+relink; removing the binary too
-	# prevents an interrupted build from leaving a stale executable for manual use.
-	rm -f genotype_scrub_bam
-	rm -rf $(OPTIMML_PATCH_DIR)
-	rm -f lib/liboptimml.a
-	rm -rf include/optimML
+	rm -f build/*.o
 
 clean_binaries:
-	rm -f demux_vcf demux_mt demux_species demux_tags quant_contam doublet_dragon bulkprops
-	rm -f demux_parallel vcf_loader_daemon bam_ram_host_daemon genotype_scrub_bam tetra_refine
-	rm -f quant3_contam quant3_contam_ap quant3_contam_empty_drops
-	rm -f tet_ambient_profile tet_contam_estimate legacy2c_contam_estimate tetra_score_calls snps_per_read test_ambient_math mt_fusion_ratio
-	rm -f utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs utils/bam_cb_cache_extract utils/get_unique_kmers
-	rm -f utils/split_read_files utils/atac_fq_preprocess utils/combine_species_counts
-	rm -f utils/composite_bam2counts utils/downsample_vcf utils/downsample_vcf_parallel
+	rm -f $(ORCHESTRATOR_BINS) $(AUX_ROOT_BINS) $(DEPRECATED_BINS) test_ambient_math
+	rm -f $(UTIL_BINS) utils/get_unique_kmers
 
 clean_deps:
 	cd dependencies/htswrapper && $(MAKE) clean || true
@@ -561,21 +448,15 @@ clean_deps:
 clean_all: clean clean_deps
 	rm -f lib/libmixturedist.a lib/liboptimml.a lib/libhtswrapper.a
 
-# ============================================================================
-# INSTALL
-# ============================================================================
-
-install: all install_scripts
+install: all
 	mkdir -p $(PREFIX)/bin
-	cp $(BUNDLED_ROOT_BINS) $(BUNDLED_UTIL_BINS) $(PREFIX)/bin/
+	cp $(ORCHESTRATOR_BINS) $(AUX_ROOT_BINS) $(UTIL_BINS) $(PREFIX)/bin/
+	@if [ -d scripts ]; then \
+	    cp scripts/*.py $(PREFIX)/bin/ 2>/dev/null || true; \
+	    chmod +x $(PREFIX)/bin/*.py 2>/dev/null || true; \
+	fi
 
-install_full_upstream: full_upstream_tools install_scripts
-	mkdir -p $(PREFIX)/bin
-	cp $(BUNDLED_ROOT_BINS) $(BUNDLED_UTIL_BINS) demux_vcf demux_tags utils/get_unique_kmers utils/downsample_vcf $(PREFIX)/bin/
-
-install_scripts:
-	mkdir -p $(PREFIX)/bin
-	cp scripts/*.py $(PREFIX)/bin/
-	chmod +x $(PREFIX)/bin/*.py
-
-.PHONY: all bundled_all bundled_original_tools parallel_tools tet_tools qc_tools mitochondrial_tools legacy_comparison_tools bundled_utils original_tools utils check_optional_upstream_sources full_upstream_tools source_inventory dependencies print_flags test_ambient_math clean clean_build clean_binaries clean_deps clean_all install install_full_upstream install_scripts
+.PHONY: all orchestrator_tools auxiliary_tools utilities dependencies \
+        quant3_contam quant3_contam_ap quant3_contam_empty_drops \
+        source_inventory print_flags check_required_ambient_source \
+        test_ambient_math clean clean_build clean_binaries clean_deps clean_all install

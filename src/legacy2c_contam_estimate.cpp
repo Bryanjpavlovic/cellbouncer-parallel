@@ -22,9 +22,9 @@
 
 #include <htswrapper/robin_hood/robin_hood.h>
 
-#include "ambient_rna.h"
+#include "legacy2c_model.h"
 #include "common.h"
-#include "demux_vcf_io.h"
+#include "io.h"
 
 using namespace std;
 

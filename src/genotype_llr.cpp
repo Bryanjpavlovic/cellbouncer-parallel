@@ -1,3 +1,8 @@
+// =============================================================================
+// genotype_llr.cpp
+// Unified genotype likelihood, assignment, and comparison implementation.
+// =============================================================================
+
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -20,7 +25,7 @@
 #include <mixtureDist/functions.h>
 #include <htswrapper/robin_hood/robin_hood.h>
 #include "common.h"
-#include "demux_parallel_llr.h"
+#include "genotype_llr.h"
 
 using std::cout;
 using std::endl;
@@ -1878,5 +1883,381 @@ bool assign_ids_parallel_with_diagnostics_extended(
     if (compute_diagnostics) {
         fprintf(stderr, "Collected diagnostics for %lu evaluated cells\n", diagnostics.size());
     }
+    return true;
+}
+
+
+// Historical spelling retained as a source-compatibility wrapper only.
+void llr_table::get_max_by_maxllr(int& best_idx, double& best_maxllr) const {
+    get_max_by_max_llr_comparator(best_idx, best_maxllr);
+}
+
+
+bool populate_llr_table_peridentity(
+    map<pair<int, int>, map<pair<int, int>, pair<float, float> > >& counts,
+    map<int, map<int, double> >& llrs,
+    llr_table& tab,
+    int n_samples,
+    set<int>& allowed_assignments,
+    set<int>& allowed_assignments2,
+    double doublet_rate,
+    double error_rate_ref,
+    double error_rate_alt,
+    map<int, double>* prior_weights,
+    bool incl_contam,
+    double contam_rate,
+    double contam_rate_var,
+    map<pair<int, int>, map<pair<int, int>, double> >* amb_fracs,
+    int n_target) {
+    return populate_llr_table(counts, llrs, tab, n_samples,
+        allowed_assignments, allowed_assignments2, doublet_rate,
+        error_rate_ref, error_rate_alt, prior_weights, incl_contam,
+        contam_rate, contam_rate_var, amb_fracs, n_target);
+}
+
+
+// Pairwise ambient likelihood compatibility helpers.
+double lbinom_antider_c(double n, double k, double c, double p_0, double p_c){
+    double x = p_c;
+    double y = p_0;
+
+    double term1 = -c*(x-y)*(n-binom_coef_log(n,k));
+    double term2 = -(-k-n)*(c*(x-y) + y - 1)*log2(-c*x + c*y - y + 1);
+    double term3 = k*(c*(x-y) + y)*log2(c*(x-y) + y);
+    return (1.0/(x-y))*(term1 + term2 + term3);
+}
+
+double lbinom_antider_c2(double n, 
+    double k, 
+    double c, 
+    double p_0, 
+    double p_c, 
+    double e_r, 
+    double e_a){
+    
+    double x = p_c;
+    double y = p_0;
+    double r = e_r;
+    double a = e_a;
+
+    double term1 = (k*(a-1)*y + r*(y-1))*log2(-c*(a+r-1)*(x-y) - a*y + r*(-y) + r + y);
+    term1 /= ((a+r-1)*(x-y));
+    double term2 = -k*(a*(y-1) + (r-1)*y+1)*log2(a*(c*(x-y) + y - 1) + c*(r-1)*(x-y) + r*y - y + 1);
+    term2 /= ((a+r-1)*(x-y));
+    double term3 = -c*k*log2((a+r-1)*(c*(x-y) + y - 1) + r);
+    double term4 = c*k*log2(r - (a+r-1)*(c*(x-y) + y));
+    double term5 = n*(a*(y-1) + (r-1)*y + 1)*log2(a*(c*(x-y) + y - 1) + c*(r-1)*(x-y) + r*y - y + 1);
+    term5 /= ((a+r-1)*(x-y));
+    double term6 = c*n*log2((a+r-1)*(c*(x-y) + y - 1) + r);
+    double term7 = c*binom_coef_log(n,k) - c*n;
+    return term1+term2+term3+term4+term5+term6+term7;
+}
+
+bool populate_llr_table_pairwise(map<pair<int, int>, 
+    map<pair<int, int>, pair<float, float> > >& counts,
+    map<int, map<int, double> >& llrs,
+    llr_table& tab,
+    int n_samples,
+    set<int>& allowed_assignments,
+    set<int>& allowed_assignments2,
+    double doublet_rate,
+    double error_rate_ref,
+    double error_rate_alt,
+    map<int, double>* prior_weights,
+    bool incl_contam,
+    double contam_rate,
+    double contam_rate_var,
+    map<pair<int, int>, map<pair<int, int>, double> >* amb_fracs){
+    
+    for (map<pair<int, int>, map<pair<int, int>, pair<float, float> > >::iterator y = 
+        counts.begin(); y != counts.end(); ++y){
+        
+        if (allowed_assignments.size() > 0 && allowed_assignments.find(y->first.first) == 
+            allowed_assignments.end()){
+            continue;
+        }
+        
+        // Set default expectation for indv1
+        // 0 = homozygous ref (~0% alt allele)
+        // 1 = heterozygous (~50% alt allele)
+        // 2 = homozygous alt (~100% alt allele)
+        double exp1 = adjust_p_err((double)y->first.second / 2.0, error_rate_ref, error_rate_alt);
+        double var1; 
+        double exp1b = (double)y->first.second / 2.0;
+        /*
+        float exp1 = error_rate_ref;
+        if (y->first.second == 1){
+            //exp1 = 0.5;
+            exp1 = 0.5*(1.0 - error_rate_alt + error_rate_ref);
+        }
+        else if (y->first.second == 2){
+            exp1 = 1.0-error_rate_alt;
+        }
+        */
+
+        for (map<pair<int, int>, pair<float, float> >::iterator z = 
+            y->second.begin(); z != y->second.end(); ++z){
+            
+            if (allowed_assignments.size() > 0 && allowed_assignments.find(z->first.first) ==
+                allowed_assignments.end()){
+                continue;
+            } 
+
+            // If same site type, we can't distinguish between the
+            // two individuals from this piece of information
+            if (z->first.first != -1 && y->first.second != z->first.second){
+
+                if (incl_contam){
+                    exp1 = (1.0-contam_rate)*((double)y->first.second/2.0) + 
+                        contam_rate*((*amb_fracs)[y->first][z->first]);
+                    exp1 = adjust_p_err(exp1, error_rate_ref, error_rate_alt);
+                    var1 = ((*amb_fracs)[y->first][z->first] - (double)y->first.second/2.0);
+                }
+
+                // Set default expectation for indv2
+                double exp2 = adjust_p_err((double)z->first.second/2.0, error_rate_ref, error_rate_alt);
+                double var2;
+                double exp2b = (double)z->first.second/2.0;
+                /*
+                float exp2 = error_rate_ref;
+                if (z->first.second == 1){
+                    //exp2 = 0.5;
+                    exp2 = 0.5*(1.0 - error_rate_alt + error_rate_ref);
+                }
+                else if (z->first.second == 2){
+                    exp2 = 1.0-error_rate_alt;
+                }
+                */
+                if (incl_contam){
+                    exp2 = (1.0-contam_rate)*((double)z->first.second/2.0) + 
+                        contam_rate*((*amb_fracs)[y->first][z->first]);
+                    exp2 = adjust_p_err(exp2, error_rate_ref, error_rate_alt);
+                    var2 = ((*amb_fracs)[y->first][z->first] - (double)z->first.second/2.0);
+                }
+                
+                double exp3 = adjust_p_err((double)(y->first.second + z->first.second)/4.0, 
+                    error_rate_ref, error_rate_alt);
+                double var3;
+                double exp3b = (double)(y->first.second + z->first.second)/4.0;
+                /*
+                float exp3;
+                if (y->first.second == 0 && z->first.second == 0){
+                    exp3 = error_rate_ref;
+                }
+                else if (y->first.second == 2 && z->first.second == 2){
+                    exp3 = 1.0 - error_rate_alt;
+                }
+                else if ((y->first.second == 1 && z->first.second == 1) ||
+                        (y->first.second == 0 && z->first.second == 2) ||
+                        (y->first.second == 2 && z->first.second == 0)){
+                    exp3 = 0.5*( 1.0 - error_rate_alt + error_rate_ref);
+                }
+                else if ((y->first.second == 0 && z->first.second == 1) ||
+                    (y->first.second == 1 && z->first.second == 0)){
+                    exp3 = 0.25*(1 - error_rate_alt + 3*error_rate_ref);
+                }
+                else if ((y->first.second == 1 && z->first.second == 2) ||
+                    (y->first.second == 2 && z->first.second == 1)){
+                    exp3 = 0.25*(3.0 - 3*error_rate_alt + error_rate_ref);
+                }
+                */
+                if (incl_contam){
+                    exp3 = (1.0-contam_rate)*(double)(y->first.second + z->first.second)/4.0 + 
+                        contam_rate*((*amb_fracs)[y->first][z->first]);
+                    exp3 = adjust_p_err(exp3, error_rate_ref, error_rate_alt);
+                    var3 = ((*amb_fracs)[y->first][z->first] - (double)(y->first.second + z->first.second)/4.0);
+                }
+
+                int i = y->first.first;
+                int j = z->first.first;
+                int k = hap_comb_to_idx(i, j, n_samples);
+
+                int ref = (int)round(z->second.first);
+                int alt = (int)round(z->second.second);
+                
+                double ll1 = dbinom(ref+alt, alt, exp1);   
+                double ll2 = dbinom(ref+alt, alt, exp2);
+                double ll3 = dbinom(ref+alt, alt, exp3);
+                
+                if (incl_contam && contam_rate_var > 0){
+                    /*
+                    double p_c = (*amb_fracs)[y->first][z->first];
+                    double delta = 0.05; 
+                    ll1 = lbinom_antider_c(alt, ref+alt, contam_rate+delta,
+                        exp1b, p_c) - 
+                        lbinom_antider_c(alt, ref+alt, contam_rate,
+                        exp1b, p_c);
+                    ll2 = lbinom_antider_c(alt, ref+alt, contam_rate+delta,
+                        exp2b, p_c) - 
+                        lbinom_antider_c(alt, ref+alt, contam_rate,
+                        exp2b, p_c);
+                    ll3 = lbinom_antider_c(alt, ref+alt, contam_rate+delta,
+                        exp3b, p_c) - 
+                        lbinom_antider_c(alt, ref+alt, contam_rate,
+                        exp3b, p_c);
+                    */
+                    /* 
+                    ll1 = lbinom_antider_c2(alt, ref+alt, contam_rate+0.001,
+                        exp1b, p_c, error_rate_ref, error_rate_alt) - 
+                        lbinom_antider_c2(alt, ref+alt, contam_rate-0.001,
+                            exp1b, p_c, error_rate_ref, error_rate_alt);
+                    ll2 = lbinom_antider_c2(alt, ref+alt, contam_rate+0.001,
+                        exp2b, p_c, error_rate_ref, error_rate_alt) - 
+                        lbinom_antider_c2(alt, ref+alt, contam_rate-0.001,
+                            exp2b, p_c, error_rate_ref, error_rate_alt);
+                    ll3 = lbinom_antider_c2(alt, ref+alt, contam_rate+0.001,
+                        exp3b, p_c, error_rate_ref, error_rate_alt) - 
+                        lbinom_antider_c2(alt, ref+alt, contam_rate-0.001,
+                            exp3b, p_c, error_rate_ref, error_rate_alt);
+                    */
+
+                    
+                    var1 *= (1.0 - error_rate_ref - error_rate_alt);
+                    var2 *= (1.0 - error_rate_ref - error_rate_alt);
+                    var3 *= (1.0 - error_rate_ref - error_rate_alt);
+                    var1 = var1*var1;
+                    var2 = var2*var2;
+                    var3 = var3*var3;
+                    var1 *= contam_rate_var;
+                    var2 *= contam_rate_var;
+                    var3 *= contam_rate_var;
+                    //var1 = var2 = var3 = contam_rate_var;
+                    
+                    //double varmu = (var1+ var2+var3)/3.0;
+                    //var1 = var2 = var3 = varmu;
+
+                    double fac1 = (exp1*(1.0-exp1))/var1 - 1.0;
+                    double fac2 = (exp2*(1.0-exp2))/var2 - 1.0;
+                    double fac3 = (exp3*(1.0-exp3))/var3 - 1.0;
+                    double a1 = fac1*exp1;
+                    double b1 = fac1*(1.0-exp1);
+                    double a2 = fac2*exp2;
+                    double b2 = fac2*(1.0-exp2);
+                    double a3 = fac3*exp3;
+                    double b3 = fac3*(1.0-exp3);
+                    ll1 = dbetabin(alt, ref+alt, a1, b1);
+                    ll2 = dbetabin(alt, ref+alt, a2, b2);
+                    ll3 = dbetabin(alt, ref+alt, a3, b3);
+                    
+                }
+
+                map<int, double> m;
+                if (llrs.count(i) == 0){
+                    llrs.insert(make_pair(i, m));
+                }
+                if (llrs.count(j) == 0){
+                    llrs.insert(make_pair(j, m));
+                }
+                if (llrs[i].count(j) == 0){
+                    llrs[i].insert(make_pair(j, 0.0));
+                }
+                llrs[i][j] += (ll1-ll2);
+                if (doublet_rate > 0.0){
+                    // Store comparisons between i and (i,j) combo and 
+                    // between j and (i,j) combo
+                    if (llrs[i].count(k) == 0){
+                        llrs[i].insert(make_pair(k, 0.0));
+                    }
+                    if (llrs[j].count(k) == 0){
+                        llrs[j].insert(make_pair(k, 0.0));
+                    }
+                    
+                    llrs[i][k] += (ll1-ll3);
+                    llrs[j][k] += (ll2-ll3);
+                }
+            }
+        }
+    }
+    // Populate LLR table with singlet/singlet comparisons
+    for (map<int, map<int, double> >::iterator x = llrs.begin(); x != llrs.end(); ++x){
+        for (map<int, double>::iterator y = x->second.begin(); y != x->second.end(); ++y){
+            if (y->first < n_samples){
+                if (allowed_assignments.size() == 0 || 
+                    (allowed_assignments.find(x->first) != allowed_assignments.end() &&
+                     allowed_assignments.find(y->first) != allowed_assignments.end())){
+                     
+                     if (prior_weights != NULL && 
+                        prior_weights->count(x->first) > 0 && prior_weights->count(y->first) > 0){
+                        //y->second += log2((*prior_weights)[x->first]) - log2((*prior_weights)[y->first]);
+                        y->second += (*prior_weights)[x->first] - (*prior_weights)[y->first];
+                     }
+                     tab.insert(x->first, y->first, y->second);
+                }
+            }
+        }
+    }
+    if (doublet_rate > 0.0){ 
+        
+        // Toss out unlikely individuals (based on losing end of largest LLR
+        // in the table, iteratively), until we are left with 10 individuals
+        int n_target = 10;
+        if (tab.n_indvs > n_target){
+            bool success = tab.del(n_target);
+            if (!success){
+                //return false;
+            }
+        }
+        
+        // If we started with more than 3 individuals and threw out enough to get down
+        // below 3, give up trying to make an assignment. This will only happen if there
+        // are lots of ties, which would be the result of very sparse data.
+
+        if (tab.n_indvs < 2 && tab.n_indvs < n_samples){
+            return false;
+        }
+        
+        // Get a list of all possible double identities to consider.
+        vector<int> ks;
+        for (int i = 0; i < n_samples-1; ++i){
+            if (allowed_assignments.size() != 0 && 
+                allowed_assignments.find(i) == allowed_assignments.end()){
+                continue;
+            }
+            else if (!tab.included[i]){
+                continue;
+            }
+
+            for (int j = i + 1; j < n_samples; ++j){
+                if (allowed_assignments.size() != 0 && 
+                    allowed_assignments.find(j) == allowed_assignments.end()){
+                    continue;
+                }
+                else if (!tab.included[j]){
+                    continue;
+                }
+                int k = hap_comb_to_idx(i, j, n_samples);
+                if (allowed_assignments.size() == 0 || allowed_assignments.find(k) != 
+                    allowed_assignments.end()){
+                    
+                    ks.push_back(k);
+                }
+            }
+        }
+        
+        if (ks.size() > 0){
+            // put k indices in increasing order so we know what order to store comparisons
+            // in the data structure
+            
+            sort(ks.begin(), ks.end());
+            // With all possible values of k to consider, we already have all member component vs 
+            // double model comparisons computed. We now need to compute all other possible
+            // single vs double model comparisons, as well as double model vs double model comparisons.
+            
+            compute_k_comps(llrs, tab, ks, n_samples, allowed_assignments, doublet_rate, prior_weights);
+            
+        }
+    }
+    
+    // Disallow impossible combinations. We should already have excluded disallowed k combinations
+    // so only need to exclude single individuals.
+    if (allowed_assignments.size() > 0 || doublet_rate == 1.0){
+        for (int i = 0; i < n_samples; ++i){
+            if (doublet_rate == 1 || (allowed_assignments2.size() > 0 && 
+                allowed_assignments2.find(i) == allowed_assignments2.end())){
+                tab.disallow(i);
+            }
+        }
+    }
+
     return true;
 }

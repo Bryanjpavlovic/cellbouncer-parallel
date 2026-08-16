@@ -48,7 +48,7 @@
 #include <htswrapper/gzreader.h>
 #include "common.h"
 #include "ambient_rna_three_ap.h"
-#include "demux_vcf_io.h"
+#include "io.h"
 
 using std::cout;
 using std::endl;

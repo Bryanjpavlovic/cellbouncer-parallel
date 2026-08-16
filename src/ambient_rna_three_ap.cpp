@@ -63,7 +63,7 @@
 #include <omp.h>
 #endif
 #include "common.h"
-#include "demux_vcf_llr.h"
+#include "genotype_llr.h"
 #include "ambient_rna_three_ap.h"
 
 using std::cout;

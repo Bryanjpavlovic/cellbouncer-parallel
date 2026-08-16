@@ -1,7 +1,7 @@
-// tetra_refine v3.4
+// tetra_refine v3.5
 //
 // Revision history:
-//   V2_R1 - Complete rewrite separating ploidy from droplet contents (chat 543ca616)
+//   V2_R1 - Complete rewrite separating ploidy from droplet contents
 //   V3_R1 - Add depth-normalized runner-up contrast, margin_ratio,
 //           margin-softmax/entropy carry-through,
 //           demote het_var to annotation, add --contam_rate and --external_ploidy inputs,
@@ -25,6 +25,14 @@
 //           position-parsed v3.3 build with that schema, because its atof() parser
 //           reads the NA fields as 0.0. Ploidy classification, the --external_ploidy
 //           relabel gate (default 0.90), and --scoring_only are unchanged from v3.3.
+//   V3_R5 - Homotypic entries in expected_lines are eligibility/candidate information
+//           only. A demux singlet A is never converted to A+A from line expectation
+//           alone. Relabeling A -> A+A now requires cell-specific external ploidy
+//           evidence calling tetraploid at --external_ploidy_min_prob (default 0.90),
+//           while A+A must still be expected for that identity. het_balance_var remains
+//           carried through as orthogonal annotation for evaluation rather than an
+//           unvalidated hard gate. Also retains the finite-subnormal diagnostics parser
+//           fix: finite strtod() results are accepted even when underflow sets ERANGE.
 
 #include <getopt.h>
 #include <string>
@@ -331,7 +339,7 @@ static double parse_optional_diagnostic_number(
     errno = 0;
     char* end = NULL;
     const double value = strtod(raw.c_str(), &end);
-    if (errno != 0 || end == raw.c_str() || *end != '\0' || !isfinite(value)) {
+    if (end == raw.c_str() || *end != '\0' || !isfinite(value)) {
         schema_error(context + ": expected a finite number or an explicit missing state, saw '" + raw + "'");
     }
     return value;
@@ -991,18 +999,13 @@ void classify_cell(const Assignment& assn,
                                   expected.singlet_has_homotypic.at(indv);
     
     // -------------------------------------------------------------------------
-    // CASE 2a: Only homotypic tetraploid in pool - CHANGE ASSIGNMENT
+    // CASE 2a: Homotypic tetraploid is expected - candidate only.
+    //
+    // expected_lines establishes biological eligibility (A+A is possible), but
+    // it is not cell-level evidence that this particular demux singlet is
+    // tetraploid. Do not relabel here. If external ploidy evidence is available,
+    // the shared external-evidence branch below decides whether A -> A+A.
     // -------------------------------------------------------------------------
-    if (has_homotypic_in_pool && !has_diploid_in_pool) {
-        cell.refined_assignment = make_homotypic(indv);
-        cell.ploidy = "tetraploid";
-        cell.ploidy_method = "expected_lines";
-        cell.ploidy_confidence = "HIGH";
-        cell.cells_in_droplet = 1;
-        cell.overall_confidence = "HIGH";
-        cell.changed = true;
-        return;
-    }
     
     // -------------------------------------------------------------------------
     // CASE 2b: Only diploid in pool - confirm as diploid
@@ -1017,7 +1020,7 @@ void classify_cell(const Assignment& assn,
     }
     
     // -------------------------------------------------------------------------
-    // CASE 2c: Both or neither in pool - use external ploidy if available
+    // CASE 2c: Use cell-specific external ploidy when available
     // -------------------------------------------------------------------------
     if (ext_ploidy != NULL) {
         cell.ploidy = ext_ploidy->ploidy_call;
@@ -1287,7 +1290,7 @@ void write_summary(const string& filename,
         exit(1);
     }
     
-    outf << "tetra_refine v3.4 summary" << endl;
+    outf << "tetra_refine v3.5 summary" << endl;
     outf << "=======================" << endl;
     if (scoring_only) {
         outf << "Mode: scoring-only (pass-through, no reclassification)" << endl;
@@ -1369,7 +1372,7 @@ void write_summary(const string& filename,
 // ============================================================================
 
 void help(int code) {
-    fprintf(stderr, "tetra_refine v3.4 [OPTIONS]\n");
+    fprintf(stderr, "tetra_refine v3.5 [OPTIONS]\n");
     fprintf(stderr, "Refines demux_parallel assignments for tetraploid pools.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "This tool:\n");
@@ -1504,7 +1507,7 @@ int main(int argc, char* argv[]) {
         external_ploidy_file = "";
     }
 
-    fprintf(stderr, "tetra_refine v3.4\n");
+    fprintf(stderr, "tetra_refine v3.5\n");
     fprintf(stderr, "===============\n");
     if (verbose && scoring_only) {
         fprintf(stderr, "Mode: scoring-only (no reclassification)\n");
@@ -1769,7 +1772,7 @@ int main(int argc, char* argv[]) {
                   scoring_only);
     
     // Print summary to stderr
-    fprintf(stderr, "\ntetra_refine v3.4 complete\n");
+    fprintf(stderr, "\ntetra_refine v3.5 complete\n");
     fprintf(stderr, "========================\n");
     fprintf(stderr, "Total cells: %d\n", stats.total_cells);
     if (!scoring_only) {

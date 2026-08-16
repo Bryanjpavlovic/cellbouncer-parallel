@@ -28,7 +28,7 @@
 #include <mixtureDist/mixtureModel.h>
 #include <optimML/brent.h>
 #include "common.h"
-#include "demux_vcf_llr.h"
+#include "genotype_llr.h"
 
 /**
  * Given a BAM file of mapped single-cell sequencing data (ATAC or 

@@ -26,8 +26,8 @@
 #include <optimML/multivar_ml.h>
 #include <mixtureDist/functions.h>
 #include "common.h"
-#include "demux_vcf_hts.h"
-#include "demux_vcf_io.h"
+#include "vcf_hts.h"
+#include "io.h"
 
 using std::cout;
 using std::endl;

@@ -12,7 +12,7 @@
 #include <htswrapper/bam.h>
 #include <htswrapper/robin_hood/robin_hood.h>
 #include "common.h"
-#include "demux_parallel_hts.h"
+#include "vcf_hts.h"
 
 using namespace std;
 

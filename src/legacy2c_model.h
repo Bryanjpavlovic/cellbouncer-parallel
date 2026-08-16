@@ -1,5 +1,5 @@
-#ifndef _CELLBOUNCER_AMBIENT_RNA_H
-#define _CELLBOUNCER_AMBIENT_RNA_H
+#ifndef _CELLBOUNCER_LEGACY2C_MODEL_H
+#define _CELLBOUNCER_LEGACY2C_MODEL_H
 #include <algorithm>
 #include <vector>
 #include <iterator>
