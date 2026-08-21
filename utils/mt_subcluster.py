@@ -3,6 +3,7 @@ import sys
 import os
 import subprocess
 import argparse
+import shutil
 from collections import defaultdict
 """
 If a data set contains very divergent groups of individuals (i.e. multiple species),
@@ -30,27 +31,37 @@ def parse_args():
 
 def main(args):
     options = parse_args()
-    # Resolve companion programs in both supported layouts:
-    #   source tree:  utils/mt_subcluster.py + utils/mt_merge_hierarchical.py,
-    #                 with demux_mt in the repository root
-    #   installed:    all three live together in .../cellbouncer/dev/bin/
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    parent_dir = os.path.dirname(script_dir)
+    # Resolve companion programs relative to this script so the utility works
+    # both from the source tree and from a synced installed bin directory.
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    repo_dir = os.path.dirname(script_dir)
 
-    demux_mt = os.path.join(script_dir, 'demux_mt')
-    if not (os.path.isfile(demux_mt) and os.access(demux_mt, os.X_OK)):
-        demux_mt = os.path.join(parent_dir, 'demux_mt')
-    if not (os.path.isfile(demux_mt) and os.access(demux_mt, os.X_OK)):
-        print("ERROR: could not locate executable demux_mt next to mt_subcluster.py "
-              "or in its parent directory", file=sys.stderr)
+    # Installed layout: demux_mt lives beside mt_subcluster.py.
+    # Source layout: compiled binaries are collected under ../bin/.
+    # Final fallback: resolve from PATH.
+    demux_mt = None
+    for candidate in (
+        os.path.join(script_dir, "demux_mt"),
+        os.path.join(repo_dir, "bin", "demux_mt"),
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            demux_mt = candidate
+            break
+    if demux_mt is None:
+        demux_mt = shutil.which("demux_mt")
+    if demux_mt is None:
+        print("ERROR: could not locate executable demux_mt beside mt_subcluster.py, "
+              "under ../bin/, or in PATH", file=sys.stderr)
         exit(1)
 
-    merge_hierarchical = os.path.join(script_dir, 'mt_merge_hierarchical.py')
+    # mt_merge_hierarchical.py lives beside mt_subcluster.py in both the
+    # source utils directory and the installed bin directory.
+    merge_hierarchical = os.path.join(script_dir, "mt_merge_hierarchical.py")
     if not (os.path.isfile(merge_hierarchical) and os.access(merge_hierarchical, os.X_OK)):
-        merge_hierarchical = os.path.join(parent_dir, 'utils', 'mt_merge_hierarchical.py')
-    if not (os.path.isfile(merge_hierarchical) and os.access(merge_hierarchical, os.X_OK)):
-        print("ERROR: could not locate executable mt_merge_hierarchical.py next to "
-              "mt_subcluster.py or under the repository utils directory", file=sys.stderr)
+        merge_hierarchical = shutil.which("mt_merge_hierarchical.py")
+    if not merge_hierarchical:
+        print("ERROR: could not locate executable mt_merge_hierarchical.py beside "
+              "mt_subcluster.py or in PATH", file=sys.stderr)
         exit(1)
     
     if not os.path.isfile(options.bam):
