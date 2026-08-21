@@ -880,6 +880,15 @@ char get_base_at_pos(const bam1_t* record, int pos);
  * @param n_threads Number of OpenMP threads to use
  * @param htslib_threads Number of decompression threads per BAM reader
  */
+using BarcodeRemap = robin_hood::unordered_map<unsigned long, unsigned long>;
+
+struct BarcodeRemapStats {
+    size_t observed_raw_barcodes = 0;
+    size_t direct_target_barcodes = 0;
+    size_t mapped_target_barcodes = 0;
+    size_t map_entries_used = 0;
+};
+
 bool count_alleles_parallel(
     const std::string& bamfile,
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
@@ -893,7 +902,9 @@ bool count_alleles_parallel(
     AcceptedSiteWeightMap* accepted_site_weights = nullptr,
     const NativeSpeciesTargetTable* species_native_targets = nullptr,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts = nullptr,
-    int species_native_n_samples = 0);
+    int species_native_n_samples = 0,
+    const BarcodeRemap* barcode_remap = nullptr,
+    BarcodeRemapStats* barcode_remap_stats = nullptr);
 
 /**
  * Dual-output parallel counting: routes allele counts to panel0 or panel1

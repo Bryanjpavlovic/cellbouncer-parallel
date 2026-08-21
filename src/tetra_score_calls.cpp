@@ -787,6 +787,235 @@ static double median(vector<double> vals){
     return 0.5 * (v[n/2 - 1] + v[n/2]);
 }
 
+
+
+struct CandidateHypothesis {
+    string library;
+    string barcode;
+    string hypothesis_id;
+    string state_notation;
+    string donor_genotype;
+    string current_donor_genotype;
+    Identity identity;
+    bool scoreable = false;
+    ScoreAccum accum;
+    double log_likelihood = 0.0;
+};
+
+static double binom_log_kernel(double ref, double alt, double expected_alt){
+    const double eps = 1e-12;
+    double q = expected_alt;
+    if (q < eps) q = eps;
+    if (q > 1.0 - eps) q = 1.0 - eps;
+    return alt * log(q) + ref * log(1.0 - q);
+}
+
+static map<string,int> header_index_simple(const vector<string>& header){
+    map<string,int> out;
+    for (int i=0; i<(int)header.size(); ++i) out[header[i]] = i;
+    return out;
+}
+
+static int required_simple_col(const map<string,int>& idx, const string& name, const string& path){
+    auto it = idx.find(name);
+    if (it == idx.end()) die(path + ": required column missing: " + name);
+    return it->second;
+}
+
+static vector<CandidateHypothesis> load_candidate_manifest(
+    const string& path,
+    const unordered_map<string,int>& sample2idx,
+    unordered_map<unsigned long, vector<size_t>>& by_cell){
+    gzFile gz = gzopen(path.c_str(), "rb");
+    if (!gz) die("could not open candidate manifest: " + path);
+    char buf[1<<20];
+    if (!gzgets(gz, buf, sizeof(buf))){ gzclose(gz); die(path + ": empty candidate manifest"); }
+    string hline(buf); hline.erase(remove(hline.begin(), hline.end(), '\n'), hline.end()); hline.erase(remove(hline.begin(), hline.end(), '\r'), hline.end());
+    vector<string> header = split_tsv_strict(hline);
+    map<string,int> idx = header_index_simple(header);
+    const int lib_i = required_simple_col(idx, "library", path);
+    const int bc_i = required_simple_col(idx, "barcode", path);
+    const int hyp_i = required_simple_col(idx, "hypothesis_id", path);
+    const int state_i = required_simple_col(idx, "state_notation", path);
+    const int donor_i = required_simple_col(idx, "donor_genotype", path);
+    const int current_i = required_simple_col(idx, "current_donor_genotype", path);
+    vector<CandidateHypothesis> out;
+    long line_no = 1;
+    while (gzgets(gz, buf, sizeof(buf))){
+        ++line_no;
+        string line(buf); line.erase(remove(line.begin(), line.end(), '\n'), line.end()); line.erase(remove(line.begin(), line.end(), '\r'), line.end());
+        if (line.empty()) continue;
+        vector<string> f = split_tsv_strict(line);
+        if (f.size() != header.size()) die(path + ": malformed candidate row at line " + to_string(line_no));
+        CandidateHypothesis c;
+        c.library = f[lib_i]; c.barcode = f[bc_i]; c.hypothesis_id = f[hyp_i]; c.state_notation = f[state_i]; c.donor_genotype = trim(f[donor_i]); c.current_donor_genotype = trim(f[current_i]);
+        // Candidate scoring intentionally supports only one/two SNP-resolvable donors.
+        const size_t first_plus = c.donor_genotype.find('+');
+        const bool too_many = first_plus != string::npos && c.donor_genotype.find('+', first_plus + 1) != string::npos;
+        if (!c.donor_genotype.empty() && !too_many){
+            try { c.identity = parse_identity(c.donor_genotype, sample2idx); c.scoreable = true; }
+            catch (...) { c.scoreable = false; }
+        }
+        const size_t index = out.size();
+        out.push_back(c);
+        by_cell[bc_ul(c.barcode)].push_back(index);
+    }
+    if (gzclose(gz) != Z_OK) die("failed closing candidate manifest: " + path);
+    return out;
+}
+
+static void score_candidate_counts(
+    const string& path,
+    vector<CandidateHypothesis>& candidates,
+    const unordered_map<unsigned long, vector<size_t>>& by_cell,
+    double e_ref,
+    double e_alt){
+    gzFile gz = gzopen(path.c_str(), "rb");
+    if (!gz) die("could not open counts: " + path);
+    char buf[1<<20];
+    while (gzgets(gz, buf, sizeof(buf))){
+        vector<string> f = split(string(buf), '\t');
+        if (f.size() < 7) continue;
+        const unsigned long cell = strtoul(f[0].c_str(), nullptr, 10);
+        auto hit = by_cell.find(cell); if (hit == by_cell.end()) continue;
+        const int indv1 = atoi(f[1].c_str()), type1 = atoi(f[2].c_str());
+        const int indv2 = atoi(f[3].c_str()), type2 = atoi(f[4].c_str());
+        const double ref = atof(f[5].c_str()), alt = atof(f[6].c_str());
+        for (size_t ci : hit->second){
+            CandidateHypothesis& c = candidates[ci]; if (!c.scoreable) continue;
+            double expected = 0.0;
+            if (!expected_for_record(c.identity, indv1, type1, indv2, type2, expected)) continue;
+            update_score(c.accum, expected, ref, alt, e_ref, e_alt);
+            c.log_likelihood += binom_log_kernel(ref, alt, adjust_expected(expected, e_ref, e_alt));
+        }
+    }
+    if (gzclose(gz) != Z_OK) die("failed closing counts: " + path);
+}
+
+static void write_candidate_scores(
+    const string& output,
+    const vector<CandidateHypothesis>& candidates,
+    const unordered_map<unsigned long, vector<size_t>>& by_cell,
+    long min_evidence,
+    const string& score_prefix){
+    vector<int> ranks(candidates.size(), 0);
+    vector<double> current_ll(candidates.size(), NAN);
+    for (const auto& kv : by_cell){
+        vector<size_t> scoreable;
+        double cur = NAN;
+        for (size_t ci : kv.second){
+            const CandidateHypothesis& c = candidates[ci];
+            if (!c.scoreable || c.accum.depth < min_evidence) continue;
+            scoreable.push_back(ci);
+            if (c.state_notation == "" || c.donor_genotype == "") continue;
+        }
+        sort(scoreable.begin(), scoreable.end(), [&](size_t a, size_t b){ return candidates[a].log_likelihood > candidates[b].log_likelihood; });
+        for (size_t r=0; r<scoreable.size(); ++r) ranks[scoreable[r]] = (int)r + 1;
+        // Compare every hypothesis to the frozen current donor genotype from the
+        // candidate manifest.  Do not infer the reference from row order or IDs.
+        size_t cur_idx = (size_t)-1;
+        for (size_t ci : kv.second){
+            if (candidates[ci].scoreable &&
+                candidates[ci].donor_genotype == candidates[ci].current_donor_genotype){
+                cur_idx = ci;
+                break;
+            }
+        }
+        if (cur_idx == (size_t)-1 && !kv.second.empty()) cur_idx = kv.second.front();
+        if (cur_idx != (size_t)-1 && candidates[cur_idx].scoreable && candidates[cur_idx].accum.depth >= min_evidence) cur = candidates[cur_idx].log_likelihood;
+        for (size_t ci : kv.second) current_ll[ci] = cur;
+    }
+
+    gzFile out = gzopen(output.c_str(), "wb"); if (!out) die("could not open candidate score output: " + output);
+    const string pre = score_prefix.empty() ? "" : score_prefix + "_";
+    gzprintf(out, "library\tbarcode\thypothesis_id\tstate_notation\tdonor_genotype\t%slog_likelihood\t%sdelta_ll_vs_current\t%srank_within_candidates\t%sinformative_depth\t%sinformative_units\t%sdosage_concordance\t%sresidual_mismatch\t%sdepth_normalized_delta\tcomparison_state\t%sscore_status\tschema_version\n",
+        pre.c_str(), pre.c_str(), pre.c_str(), pre.c_str(), pre.c_str(), pre.c_str(), pre.c_str(), pre.c_str(), pre.c_str());
+    for (size_t i=0; i<candidates.size(); ++i){
+        const CandidateHypothesis& c = candidates[i];
+        double conc = concordance(c.accum, min_evidence);
+        double residual = isfinite(conc) ? 1.0 - conc : NAN;
+        const double cur = current_ll[i];
+        const double delta = c.scoreable && isfinite(cur) && c.accum.depth >= min_evidence ? c.log_likelihood - cur : NAN;
+        const double norm = isfinite(delta) && c.accum.depth > 0 ? delta / c.accum.depth : NAN;
+        string status = !c.scoreable ? "UNSUPPORTED_COMPONENT_COUNT_OR_PANEL_IDENTITY" : (c.accum.depth < min_evidence ? "LOW_EVIDENCE" : "PASS");
+        gzprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%ld\t%s\t%s\t%s\t%s\t%s\tidentity_hypothesis_scores_v1\n",
+            c.library.c_str(), c.barcode.c_str(), c.hypothesis_id.c_str(), c.state_notation.c_str(), c.donor_genotype.c_str(),
+            fmt(c.scoreable && c.accum.depth >= min_evidence ? c.log_likelihood : NAN).c_str(), fmt(delta).c_str(), ranks[i], fmt(c.accum.depth).c_str(), c.accum.bins,
+            fmt(conc).c_str(), fmt(residual).c_str(), fmt(norm).c_str(), isfinite(delta) ? "present" : "unavailable", status.c_str());
+    }
+    if (gzclose(out) != Z_OK) die("failed closing candidate score output: " + output);
+}
+
+struct FoldSite { vector<int> genotype; };
+struct FoldAccum { double ll = 0.0; double depth = 0.0; long units = 0; };
+
+static uint64_t site_key(int tid, int pos){ return (uint64_t)(uint32_t)tid << 32 | (uint32_t)pos; }
+static int stable_fold_cpp(int tid, int pos, int folds){
+    uint64_t x = site_key(tid,pos); x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+    return folds > 0 ? (int)(x % (uint64_t)folds) : 0;
+}
+
+static void score_site_folds(
+    const string& sites_path,
+    const string& obs_path,
+    const string& output,
+    vector<CandidateHypothesis>& candidates,
+    const unordered_map<unsigned long, vector<size_t>>& by_cell,
+    int n_samples,
+    int folds,
+    double e_ref,
+    double e_alt){
+    if (output.empty()) return;
+    if (folds < 1) folds = 1;
+    vector<vector<FoldAccum>> accum(candidates.size(), vector<FoldAccum>(folds));
+    if (!file_exists(sites_path) || !file_exists(obs_path)){
+        gzFile out = gzopen(output.c_str(), "wb"); if (!out) die("could not open fold output: " + output);
+        gzprintf(out, "library\tbarcode\thypothesis_id\tfold\tfold_delta_ll\tfold_informative_depth\tfold_status\tschema_version\n");
+        for (const auto& c : candidates) for (int f=0; f<folds; ++f) gzprintf(out, "%s\t%s\t%s\t%d\tNA\t0\tSITE_FOLD_UNAVAILABLE\tidentity_site_fold_scores_v1\n", c.library.c_str(), c.barcode.c_str(), c.hypothesis_id.c_str(), f);
+        gzclose(out); return;
+    }
+    unordered_map<uint64_t, FoldSite> sites;
+    gzFile sgz = gzopen(sites_path.c_str(), "rb"); if (!sgz) die("could not open pileup sites: " + sites_path);
+    char buf[1<<20];
+    while (gzgets(sgz, buf, sizeof(buf))){
+        vector<string> f = split(string(buf), '\t'); if ((int)f.size() < 5 + n_samples) continue;
+        int tid = atoi(f[0].c_str()), pos = atoi(f[2].c_str()); FoldSite site; site.genotype.resize(n_samples, -1);
+        for (int i=0;i<n_samples;++i) site.genotype[i]=atoi(f[5+i].c_str()); sites[site_key(tid,pos)] = site;
+    }
+    gzclose(sgz);
+    gzFile ogz = gzopen(obs_path.c_str(), "rb"); if (!ogz) die("could not open pileup observations: " + obs_path);
+    while (gzgets(ogz, buf, sizeof(buf))){
+        vector<string> f = split(string(buf), '\t'); if (f.size() < 5) continue;
+        unsigned long bc = strtoul(f[0].c_str(), nullptr, 10); auto hit = by_cell.find(bc); if (hit == by_cell.end()) continue;
+        int tid=atoi(f[1].c_str()), pos=atoi(f[2].c_str()); auto sit=sites.find(site_key(tid,pos)); if (sit==sites.end()) continue;
+        double ref=atof(f[3].c_str()), alt=atof(f[4].c_str()); int fold=stable_fold_cpp(tid,pos,folds);
+        for (size_t ci : hit->second){
+            const CandidateHypothesis& c=candidates[ci]; if(!c.scoreable) continue;
+            int ga = c.identity.a >= 0 && c.identity.a < n_samples ? sit->second.genotype[c.identity.a] : -1;
+            int gb = c.identity.b >= 0 && c.identity.b < n_samples ? sit->second.genotype[c.identity.b] : -1;
+            if (ga < 0 || ga > 2) continue;
+            double p = 0.0;
+            if (c.identity.b < 0 || c.identity.a == c.identity.b) p = ga / 2.0;
+            else { if (gb < 0 || gb > 2) continue; p = (ga + gb) / 4.0; }
+            FoldAccum& a=accum[ci][fold]; a.ll += binom_log_kernel(ref,alt,adjust_expected(p,e_ref,e_alt)); a.depth += ref+alt; a.units += 1;
+        }
+    }
+    gzclose(ogz);
+    vector<vector<double>> current(candidates.size(), vector<double>(folds,NAN));
+    for (const auto& kv:by_cell){
+        size_t cur=(size_t)-1; for(size_t ci:kv.second){if(candidates[ci].donor_genotype==candidates[ci].current_donor_genotype){cur=ci;break;}}
+        if(cur==(size_t)-1&&!kv.second.empty()) cur=kv.second.front();
+        if(cur!=(size_t)-1) for(int f=0;f<folds;++f) for(size_t ci:kv.second) current[ci][f]=accum[cur][f].depth>0?accum[cur][f].ll:NAN;
+    }
+    gzFile out=gzopen(output.c_str(),"wb"); if(!out)die("could not open fold output: "+output);
+    gzprintf(out,"library\tbarcode\thypothesis_id\tfold\tfold_delta_ll\tfold_informative_depth\tfold_status\tschema_version\n");
+    for(size_t i=0;i<candidates.size();++i) for(int f=0;f<folds;++f){
+        double delta=(accum[i][f].depth>0&&isfinite(current[i][f]))?accum[i][f].ll-current[i][f]:NAN;
+        gzprintf(out,"%s\t%s\t%s\t%d\t%s\t%s\t%s\tidentity_site_fold_scores_v1\n",candidates[i].library.c_str(),candidates[i].barcode.c_str(),candidates[i].hypothesis_id.c_str(),f,fmt(delta).c_str(),fmt(accum[i][f].depth).c_str(),accum[i][f].depth>0?"PASS":"NO_INFORMATIVE_SITES");
+    }
+    gzclose(out);
+}
+
 static void usage(){
     fprintf(stderr,
         "tetra_score_calls --counts FILE --samples FILE --assignments FILE --diagnostics FILE --output FILE [options]\n"
@@ -803,12 +1032,20 @@ static void usage(){
         "  --min_evidence INT             default 10\n"
         "  --error_ref FLOAT              default 0.001\n"
         "  --error_alt FLOAT              default 0.001\n"
-        "  --strict | --best-effort       default best-effort\n");
+        "  --strict | --best-effort       default best-effort\n"
+        "  --candidate_manifest FILE       targeted identity-reconciliation hypotheses\n"
+        "  --pileup-sites FILE             optional headerless pileup site table for fold scoring\n"
+        "  --pileup-observations FILE      optional headerless pileup observation table\n"
+        "  --site-folds N                  deterministic site folds (default 5)\n"
+        "  --site-fold-output FILE         candidate-by-fold score output\n"
+        "  --score-prefix STR              prefix candidate score columns (e.g. atac)\n");
 }
 
 int main(int argc, char** argv){
     string counts, samples_path, assignments, diagnostics, output, runnerups, panel_path, libname="NA";
     string species_counts, species_condf, species_samples_path, condf;
+    string candidate_manifest, pileup_sites, pileup_observations, site_fold_output, score_prefix;
+    int site_folds = 5;
     long min_evidence = 10;
     double e_ref = 0.001, e_alt = 0.001;
     double species_support_threshold = 0.70;
@@ -833,12 +1070,18 @@ int main(int argc, char** argv){
         else if (a == "--error_ref") { string tmp; need(tmp); e_ref = atof(tmp.c_str()); }
         else if (a == "--error_alt") { string tmp; need(tmp); e_alt = atof(tmp.c_str()); }
         else if (a == "--species_support_threshold") { string tmp; need(tmp); species_support_threshold = atof(tmp.c_str()); }
+        else if (a == "--candidate_manifest") need(candidate_manifest);
+        else if (a == "--pileup-sites") need(pileup_sites);
+        else if (a == "--pileup-observations") need(pileup_observations);
+        else if (a == "--site-fold-output") need(site_fold_output);
+        else if (a == "--score-prefix") need(score_prefix);
+        else if (a == "--site-folds") { string tmp; need(tmp); site_folds = atoi(tmp.c_str()); }
         else if (a == "--strict") strict = true;
         else if (a == "--best-effort") strict = false;
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         else die("unknown argument: " + a);
     }
-    if (counts.empty() || samples_path.empty() || assignments.empty() || diagnostics.empty() || output.empty()){
+    if (counts.empty() || samples_path.empty() || assignments.empty() || output.empty() || (candidate_manifest.empty() && diagnostics.empty())){
         usage();
         return 1;
     }
@@ -846,6 +1089,18 @@ int main(int argc, char** argv){
     vector<string> samples = load_samples(samples_path);
     unordered_map<string,int> sample2idx;
     for (int i=0; i<(int)samples.size(); ++i) sample2idx[samples[i]] = i;
+    if (!candidate_manifest.empty()){
+        unordered_map<unsigned long, vector<size_t>> candidate_by_cell;
+        vector<CandidateHypothesis> candidates = load_candidate_manifest(candidate_manifest, sample2idx, candidate_by_cell);
+        if (candidates.empty()) die("candidate manifest contained no hypotheses");
+        score_candidate_counts(counts, candidates, candidate_by_cell, e_ref, e_alt);
+        write_candidate_scores(output, candidates, candidate_by_cell, min_evidence, score_prefix);
+        if (!site_fold_output.empty()){
+            score_site_folds(pileup_sites, pileup_observations, site_fold_output, candidates, candidate_by_cell, (int)samples.size(), site_folds, e_ref, e_alt);
+        }
+        fprintf(stderr, "Wrote targeted identity hypothesis scores for %lu candidate rows to %s\n", (unsigned long)candidates.size(), output.c_str());
+        return 0;
+    }
     unordered_map<string,string> panel = load_panel(panel_path);
     unordered_map<unsigned long, CellInfo> cells;
     vector<unsigned long> order;

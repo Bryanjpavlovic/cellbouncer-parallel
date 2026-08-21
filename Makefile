@@ -29,7 +29,7 @@ CXXFLAGS_PARALLEL = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$
 CXXFLAGS_TET = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -DNBITS=$(NBITS) \
                -O3 $(ARCHFLAGS) -fopenmp
 CXXFLAGS_CACHE = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
-CXXFLAGS_MT = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
+CXXFLAGS_MT = -std=c++17 -fPIC -D_REENTRANT -DCELLBOUNCER_SOURCE_REVISION=\"$(SOURCE_REVISION)\" -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
 CXXFLAGS_SCRUB = -std=c++11 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra
 CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 $(ARCHFLAGS)
 
@@ -64,10 +64,10 @@ OPTIMML_PATCH_STAMP = $(OPTIMML_PATCH_DIR)/.cellbouncer_patch_v3
 OPTIMML_SOURCE_FILES = $(shell find dependencies/optimML -type f \
     -not -path '*/build/*' -not -path '*/lib/*' 2>/dev/null)
 
-# Executable names consumed by orchestrate_pipeline.py are unchanged.
+# Executables installed for orchestrated production stages.
 ORCHESTRATOR_BINS = demux_parallel vcf_loader_daemon tet_ambient_profile \
                     tet_contam_estimate legacy2c_contam_estimate \
-                    tetra_score_calls tetra_refine
+                    tetra_score_calls tetra_refine mt_identity_score
 AUX_ROOT_BINS = demux_mt demux_species demux_tags doublet_dragon bulkprops \
                 bam_ram_host_daemon genotype_scrub_bam snps_per_read \
                 mt_fusion_ratio
@@ -76,7 +76,8 @@ DEPRECATED_BINS = demux_vcf quant_contam quant3_contam quant3_contam_ap \
 UTIL_BINS = utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs \
             utils/bam_cb_cache_extract utils/split_read_files \
             utils/atac_fq_preprocess utils/combine_species_counts \
-            utils/composite_bam2counts utils/downsample_vcf_parallel
+            utils/composite_bam2counts utils/downsample_vcf_parallel \
+            utils/nuclear_panel_distinguishability
 
 # Preserve the unrelated FASTK utility when the full upstream source subtree is
 # present in the real checkout. The lean source bundle does not carry FASTK, so
@@ -235,13 +236,22 @@ snps_per_read: src/snps_per_read.cpp | lib/libhtswrapper.a
 	    -fopenmp -Wall -Wextra src/snps_per_read.cpp -o $@ \
 	    $(LFLAGS) -lhts -lz -lpthread
 
-mt_fusion_ratio: src/mt_fusion_ratio.cpp
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) src/mt_fusion_ratio.cpp \
+mt_fusion_ratio: src/mt_fusion_ratio.cpp src/mt_ratio_model.cpp src/mt_ratio_model.h src/mt_evidence.cpp src/mt_evidence.h
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) src/mt_fusion_ratio.cpp src/mt_ratio_model.cpp src/mt_evidence.cpp \
+	    -o $@ $(LFLAGS) $(DEPS_MT)
+
+mt_identity_score: src/mt_identity_score.cpp src/mt_evidence.cpp src/mt_evidence.h
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) src/mt_identity_score.cpp src/mt_evidence.cpp \
 	    -o $@ $(LFLAGS) $(DEPS_MT)
 
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
+
+utils/nuclear_panel_distinguishability: src/nuclear_panel_distinguishability.cpp
+	mkdir -p utils
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) src/nuclear_panel_distinguishability.cpp \
+	    -o $@ $(LFLAGS) $(DEPS_MT)
 
 utils/refine_vcf: src/refine_vcf.cpp src/refine_vcf.h src/vcf_hts.h \
     build/common_parallel.o build/vcf_hts.o $(DEPS)

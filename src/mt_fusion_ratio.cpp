@@ -3,8 +3,12 @@
 #include <htslib/vcf.h>
 #include <zlib.h>
 
+#include "mt_ratio_model.h"
+#include "mt_evidence.h"
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstring>
@@ -12,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <getopt.h>
 #include <iomanip>
@@ -23,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -31,6 +37,8 @@
 namespace {
 
 constexpr double kTiny = 1e-12;
+constexpr int kReconciledPairPanelMinDepth = 10;
+constexpr double kReconciledPairHomoplasmyAf = 0.95;
 
 struct Options {
     std::string bam;
@@ -43,7 +51,14 @@ struct Options {
     std::string mt_mask_bed;
     std::string library_id;
     std::string site_manifest;
+    std::string site_calibration;
+    std::string site_calibration_stratum;
+    std::string calibration_reference;
+    std::string rho_reference;
+    std::string rho_mode = "free";
+    std::string site_influence_mode = "full";
     std::string likelihood = "beta_binomial";
+    std::string assay_mode = "RNA";
     std::string mito_chrom = "chrM";
     std::string barcode_tag = "CB";
     std::string umi_tag = "UB";
@@ -60,6 +75,12 @@ struct Options {
     double tolerance = 1e-8;
     double overdispersion_initial = 0.02;
     double overdispersion_max = 0.25;
+    double pooled_rho = std::numeric_limits<double>::quiet_NaN();
+    double rho_prior_strength = 10.0;
+    double ambient_qc_max = std::numeric_limits<double>::quiet_NaN();
+    int rho_low_information_molecules = 50;
+    double single_parent_epsilon = 0.02;
+    double profile_grid_step = 0.005;
     bool ambient_none = false;
     bool allow_no_umi = false;
     bool keep_duplicates = false;
@@ -67,6 +88,8 @@ struct Options {
     bool allow_unanchored_ambient = false;
     bool legacy_panel_gt = false;
     bool write_site_counts = true;
+    bool write_profile_grid = false;
+    bool atac_include_singletons = false;
 };
 
 struct Interval {
@@ -78,6 +101,15 @@ struct AlleleCount {
     uint64_t ref = 0;
     uint64_t alt = 0;
     uint64_t total() const { return ref + alt; }
+};
+
+struct RawFragmentSite {
+    int site_index = -1;
+    uint8_t allele = 0;
+};
+
+struct RawFragmentObservation {
+    std::vector<RawFragmentSite> sites;
 };
 
 struct MtSite {
@@ -103,7 +135,10 @@ struct CellInfo {
     std::string parent2;
     int parent1_index = -1;
     int parent2_index = -1;
+    std::string calibration_true_parent;
+    std::string original_identity;
     std::unordered_map<int, AlleleCount> counts;
+    std::vector<RawFragmentObservation> fragments;
 };
 
 struct ReadStats {
@@ -124,6 +159,15 @@ struct ReadStats {
     uint64_t reject_nonpanel_allele = 0;
     uint64_t accepted_observations = 0;
     uint64_t conflicting_molecules = 0;
+    uint64_t atac_reads_considered = 0;
+    uint64_t atac_reject_unpaired = 0;
+    uint64_t atac_reject_mate_off_mito = 0;
+    uint64_t atac_orphan_fragments = 0;
+    uint64_t atac_fragments_accepted = 0;
+    uint64_t atac_fragments_multisite = 0;
+    uint64_t atac_fragment_site_observations = 0;
+    uint64_t atac_overlap_agreements = 0;
+    uint64_t atac_overlap_conflicts = 0;
 };
 
 struct PileupReader {
@@ -157,35 +201,28 @@ struct PairManifest {
     int ambient_only_sites_available = 0;
 };
 
-struct SiteObservation {
-    int site_index = -1;
-    uint64_t ref = 0;
-    uint64_t alt = 0;
-    double parent1_alt_probability = 0.0;
-    double parent2_alt_probability = 0.0;
-    double ambient_alt_probability = 0.0;
-    ManifestSiteClass site_class = MANIFEST_LEGACY_RATIO;
-    bool ratio_informative = false;
-    bool ambient_anchor = false;
+struct SiteCalibrationRecord {
+    double parent1_alt_probability = std::numeric_limits<double>::quiet_NaN();
+    double parent2_alt_probability = std::numeric_limits<double>::quiet_NaN();
+    bool has_parent1 = false;
+    bool has_parent2 = false;
+    int parent1_priority = -1;
+    int parent2_priority = -1;
+    std::string calibration_id;
 };
 
-struct FitResult {
-    double parent1_weight = std::numeric_limits<double>::quiet_NaN();
-    double parent2_weight = std::numeric_limits<double>::quiet_NaN();
-    double ambient_weight = std::numeric_limits<double>::quiet_NaN();
-    double parent2_fraction = std::numeric_limits<double>::quiet_NaN();
-    double log_likelihood = std::numeric_limits<double>::quiet_NaN();
-    double ratio_se = std::numeric_limits<double>::quiet_NaN();
-    double ratio_se_robust = std::numeric_limits<double>::quiet_NaN();
-    double ambient_se = std::numeric_limits<double>::quiet_NaN();
-    double ambient_se_robust = std::numeric_limits<double>::quiet_NaN();
-    double overdispersion_rho = std::numeric_limits<double>::quiet_NaN();
-    double overdispersion_se = std::numeric_limits<double>::quiet_NaN();
-    double information_condition = std::numeric_limits<double>::quiet_NaN();
-    double min_information_eigenvalue = std::numeric_limits<double>::quiet_NaN();
-    int iterations = 0;
-    bool converged = false;
-    bool joint_ambient = false;
+struct SiteCalibrationData {
+    std::unordered_map<std::string, std::unordered_map<int, SiteCalibrationRecord>> by_pair;
+    std::set<std::string> calibration_ids;
+    uint64_t loaded_rows = 0;
+};
+
+struct RhoReferenceEntry {
+    std::string assay_mode;
+    std::string library_id;
+    std::string canonical_parent1;
+    std::string canonical_parent2;
+    double rho = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct LocalMolecule {
@@ -212,25 +249,39 @@ void usage(FILE* out, int code) {
         "  --site_manifest FILE          Per-library three-class site manifest\n"
         "  --output_prefix PREFIX        Output prefix\n"
         "\n"
-        "Ambient profile (choose exactly one):\n"
+        "MT ambient/background source (choose exactly one):\n"
         "  --empty_barcodes FILE         Same-library empty-droplet barcode list\n"
         "  --ambient_profile FILE        Site-level mt ambient-profile TSV\n"
-        "  --ambient_none                Explicitly disable ambient correction\n"
+        "  --ambient_none                No MT ambient/background source\n"
+        "  --ambient_qc_max FLOAT        Exclude MT ratio inference above independent anchor-only c [disabled]\n"
         "\n"
         "Likelihood and identifiability:\n"
         "  --likelihood NAME             beta_binomial (default) or binomial\n"
         "  --overdispersion_initial X    Initial beta-binomial rho [0.02]\n"
         "  --overdispersion_max X        Upper bound for fitted rho [0.25]\n"
-        "  --min_ambient_only_sites INT  Observed ambient anchors required for joint c [1]\n"
-        "  --allow_unanchored_ambient    Diagnostic override; retains weak-ID labeling\n"
-        "  --ambient_fraction_file FILE  Explicit fixed per-cell c_mito override\n"
+        "  --min_ambient_only_sites INT  Legacy compatibility option [1]\n"
+        "  --allow_unanchored_ambient    Legacy compatibility option\n"
+        "  --ambient_fraction_file FILE  Optional precomputed per-cell ambient QC fraction override\n"
         "  --legacy_panel_gt             Diagnostic only; ignore manifest and use GT-different sites\n"
+        "  --single_parent_epsilon FLOAT Practical single-parent boundary [0.02]\n"
+        "  --write_profile_grid          Write PREFIX.mt_profile.tsv.gz for population modeling\n"
+        "  --profile_grid_step FLOAT     Population-profile grid spacing [0.005]\n"
+        "  --assay_mode MODE             RNA (default), ATAC, or GENERIC\n"
+        "  --site_calibration FILE       Optional site-specific parental ALT probabilities\n"
+        "  --site_calibration_stratum S  Calibration stratum key [library_id]\n"
+        "  --calibration_reference FILE  Score listed control barcodes against cross-parent pairs\n"
+        "  --rho_mode MODE               free (default), fixed, low_information_fixed, or shrink\n"
+        "  --pooled_rho FLOAT            Pooled rho used by fixed/shrink modes\n"
+        "  --rho_reference FILE          Optional assay/library/pair-specific pooled-rho TSV\n"
+        "  --rho_low_information_molecules INT  Fixed-rho cutoff [50]\n"
+        "  --rho_prior_strength FLOAT    Shrinkage penalty strength [10]\n"
         "\n"
         "Counting and filters:\n"
         "  --mito_chrom NAME             Mitochondrial contig [chrM]\n"
         "  --barcode_tag TAG             Cell barcode BAM tag [CB]\n"
         "  --umi_tag TAG                 Corrected UMI BAM tag [UB]\n"
-        "  --allow_no_umi                Use read name when UB is absent\n"
+        "  --allow_no_umi                Use read name when UB is absent (RNA/GENERIC only)\n"
+        "  --atac_include_singletons     In ATAC mode, retain unmatched/unpaired reads as fragments\n"
         "  --min_mapq INT                MAPQ floor [30]\n"
         "  --min_baseq INT               Base-quality floor [20]\n"
         "  --error_rate FLOAT            Parental-state error probability [0.005]\n"
@@ -243,8 +294,9 @@ void usage(FILE* out, int code) {
         "  --max_iterations INT          Coordinate-ascent maximum [500]\n"
         "  --tolerance FLOAT             Convergence tolerance [1e-8]\n"
         "  --pileup_max_depth INT        Per-position pileup cap [10000000]\n"
-        "  --threads INT                 HTSlib decompression threads [4]\n"
+        "  --threads INT                 HTSlib decode / post-count fit worker threads [4]\n"
         "  --no_site_counts              Suppress per-cell site-count output\n"
+        "  --site_influence_mode MODE    full (default) or none; none keeps site rows but skips LOO refits\n"
         "  --help                        Show this help\n"
         "\n"
         "The autosomal numts.bed is not accepted here because it is in nuclear, not\n"
@@ -259,6 +311,32 @@ std::string trim(std::string value) {
     if (first == std::string::npos) return "";
     const auto last = value.find_last_not_of(ws);
     return value.substr(first, last - first + 1);
+}
+
+// Keep mitochondrial sidecar matching backward-compatible with legacy panel
+// metadata that used bare numeric library IDs (for example, "19") while
+// downstream code uses the canonical "lib19" form.  This intentionally
+// mirrors mt_identity_score.cpp.
+std::string canonical_library_key(const std::string& raw) {
+    std::string s = trim(raw);
+    if (s.size() > 3 &&
+        (s[0] == 'l' || s[0] == 'L') &&
+        (s[1] == 'i' || s[1] == 'I') &&
+        (s[2] == 'b' || s[2] == 'B')) {
+        bool numeric = true;
+        for (size_t i = 3; i < s.size(); ++i) {
+            if (s[i] < '0' || s[i] > '9') {
+                numeric = false;
+                break;
+            }
+        }
+        if (numeric) s = s.substr(3);
+    }
+    return s;
+}
+
+bool same_library_key(const std::string& a, const std::string& b) {
+    return a == b || canonical_library_key(a) == canonical_library_key(b);
 }
 
 std::vector<std::string> split_ws(const std::string& line) {
@@ -407,6 +485,21 @@ Options parse_options(int argc, char** argv) {
         {"min_ambient_only_sites", required_argument, nullptr, 1026},
         {"allow_unanchored_ambient", no_argument, nullptr, 1027},
         {"legacy_panel_gt", no_argument, nullptr, 1028},
+        {"single_parent_epsilon", required_argument, nullptr, 1029},
+        {"write_profile_grid", no_argument, nullptr, 1030},
+        {"profile_grid_step", required_argument, nullptr, 1031},
+        {"assay_mode", required_argument, nullptr, 1032},
+        {"site_calibration", required_argument, nullptr, 1033},
+        {"site_calibration_stratum", required_argument, nullptr, 1034},
+        {"calibration_reference", required_argument, nullptr, 1035},
+        {"rho_mode", required_argument, nullptr, 1036},
+        {"pooled_rho", required_argument, nullptr, 1037},
+        {"rho_reference", required_argument, nullptr, 1038},
+        {"rho_low_information_molecules", required_argument, nullptr, 1039},
+        {"rho_prior_strength", required_argument, nullptr, 1040},
+        {"atac_include_singletons", no_argument, nullptr, 1041},
+        {"site_influence_mode", required_argument, nullptr, 1042},
+        {"ambient_qc_max", required_argument, nullptr, 1043},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -449,6 +542,21 @@ Options parse_options(int argc, char** argv) {
             case 1026: opt.min_ambient_only_sites = std::stoi(optarg); break;
             case 1027: opt.allow_unanchored_ambient = true; break;
             case 1028: opt.legacy_panel_gt = true; break;
+            case 1029: opt.single_parent_epsilon = std::stod(optarg); break;
+            case 1030: opt.write_profile_grid = true; break;
+            case 1031: opt.profile_grid_step = std::stod(optarg); break;
+            case 1032: opt.assay_mode = optarg; break;
+            case 1033: opt.site_calibration = optarg; break;
+            case 1034: opt.site_calibration_stratum = optarg; break;
+            case 1035: opt.calibration_reference = optarg; break;
+            case 1036: opt.rho_mode = optarg; break;
+            case 1037: opt.pooled_rho = std::stod(optarg); break;
+            case 1038: opt.rho_reference = optarg; break;
+            case 1039: opt.rho_low_information_molecules = std::stoi(optarg); break;
+            case 1040: opt.rho_prior_strength = std::stod(optarg); break;
+            case 1041: opt.atac_include_singletons = true; break;
+            case 1042: opt.site_influence_mode = optarg; break;
+            case 1043: opt.ambient_qc_max = std::stod(optarg); break;
             default: usage(stderr, 2);
         }
     }
@@ -479,6 +587,30 @@ Options parse_options(int argc, char** argv) {
             "ERROR: --ambient_fraction_file cannot be used with --ambient_none\n");
         std::exit(2);
     }
+    if (std::isfinite(opt.ambient_qc_max) && opt.ambient_none) {
+        std::fprintf(stderr,
+            "ERROR: --ambient_qc_max requires --empty_barcodes or --ambient_profile\n");
+        std::exit(2);
+    }
+    if (opt.assay_mode == "ATAC" && opt.allow_no_umi) {
+        std::fprintf(stderr,
+            "ERROR: --allow_no_umi is an RNA/GENERIC fallback; ATAC mode uses paired fragments directly\n");
+        std::exit(2);
+    }
+    if (opt.rho_mode != "free" && opt.rho_mode != "fixed" &&
+        opt.rho_mode != "low_information_fixed" && opt.rho_mode != "shrink") {
+        std::fprintf(stderr, "ERROR: --rho_mode must be free, fixed, low_information_fixed, or shrink\n");
+        std::exit(2);
+    }
+    if (opt.assay_mode == "ATAC" && opt.rho_mode != "free") {
+        std::fprintf(stderr,
+            "ERROR: rho modes apply to RNA/GENERIC beta-binomial site counts; formal ATAC uses fragment likelihoods\n");
+        std::exit(2);
+    }
+    if (opt.site_influence_mode != "full" && opt.site_influence_mode != "none") {
+        std::fprintf(stderr, "ERROR: --site_influence_mode must be full or none\n");
+        std::exit(2);
+    }
     if (opt.barcode_tag.size() != 2 || opt.umi_tag.size() != 2 ||
         opt.min_mapq < 0 || opt.min_baseq < 0 || opt.min_molecules < 0 ||
         opt.min_sites < 1 || opt.ambient_min_molecules < 1 ||
@@ -488,10 +620,23 @@ Options parse_options(int argc, char** argv) {
         opt.overdispersion_initial < 0.0 ||
         opt.overdispersion_max <= 0.0 || opt.overdispersion_max >= 1.0 ||
         opt.overdispersion_initial > opt.overdispersion_max ||
+        (std::isfinite(opt.pooled_rho) && (opt.pooled_rho < 0.0 || opt.pooled_rho > opt.overdispersion_max)) ||
+        opt.rho_low_information_molecules < 1 || opt.rho_prior_strength < 0.0 ||
+        (std::isfinite(opt.ambient_qc_max) &&
+         (opt.ambient_qc_max < 0.0 || opt.ambient_qc_max > 0.99)) ||
+        opt.single_parent_epsilon <= 0.0 || opt.single_parent_epsilon >= 0.5 ||
+        opt.profile_grid_step <= 0.0 || opt.profile_grid_step > 0.05 ||
+        (opt.assay_mode != "RNA" && opt.assay_mode != "ATAC" && opt.assay_mode != "GENERIC") ||
         (opt.likelihood != "beta_binomial" && opt.likelihood != "binomial")) {
         std::fprintf(stderr, "ERROR: invalid numeric/tag option\n");
         std::exit(2);
     }
+    if (opt.rho_mode != "free" && !std::isfinite(opt.pooled_rho) && opt.rho_reference.empty()) {
+        std::fprintf(stderr,
+            "ERROR: --rho_mode %s requires --pooled_rho or --rho_reference\n", opt.rho_mode.c_str());
+        std::exit(2);
+    }
+    if (opt.site_calibration_stratum.empty()) opt.site_calibration_stratum = opt.library_id;
     return opt;
 }
 
@@ -642,7 +787,7 @@ std::unordered_map<std::string, PairManifest> load_site_manifest(
                                      std::to_string(line_index + 1) + " in " +
                                      opt.site_manifest);
         }
-        if (fields[library_col] != opt.library_id) continue;
+        if (!same_library_key(fields[library_col], opt.library_id)) continue;
         ++matching_rows;
         if (fields[chrom_col] != opt.mito_chrom) {
             throw std::runtime_error("Manifest library " + opt.library_id +
@@ -741,16 +886,204 @@ std::unordered_map<std::string, PairManifest> load_site_manifest(
     return result;
 }
 
+
+PairManifest derive_pair_manifest_from_panel(
+        const std::string& parent_a,
+        const std::string& parent_b,
+        const mt_evidence::Panel& panel,
+        const std::vector<MtSite>& sites,
+        const std::unordered_map<int64_t, int>& position_to_site) {
+    const std::pair<std::string, std::string> canonical =
+        canonical_parents(parent_a, parent_b);
+    PairManifest pair;
+    pair.canonical_parent1 = canonical.first;
+    pair.canonical_parent2 = canonical.second;
+
+    const auto p1_found = panel.sample_index.find(pair.canonical_parent1);
+    const auto p2_found = panel.sample_index.find(pair.canonical_parent2);
+    if (p1_found == panel.sample_index.end() || p2_found == panel.sample_index.end()) {
+        throw std::runtime_error(
+            "Reconciled pair parent is missing from the mitochondrial panel: " +
+            pair.canonical_parent1 + "+" + pair.canonical_parent2);
+    }
+    const int p1_index = p1_found->second;
+    const int p2_index = p2_found->second;
+
+    for (const mt_evidence::Site& evidence_site : panel.sites) {
+        const auto local_found = position_to_site.find(evidence_site.pos);
+        if (local_found == position_to_site.end()) continue;
+        const int site_index = local_found->second;
+        const MtSite& local_site = sites[site_index];
+        const char evidence_ref = static_cast<char>(
+            std::toupper(static_cast<unsigned char>(evidence_site.ref)));
+        const char evidence_alt = static_cast<char>(
+            std::toupper(static_cast<unsigned char>(evidence_site.alt)));
+        if (evidence_ref != local_site.ref || evidence_alt != local_site.alt) {
+            throw std::runtime_error(
+                "Mitochondrial panel REF/ALT mismatch while deriving reconciled pair " +
+                pair.canonical_parent1 + "+" + pair.canonical_parent2 + " at " +
+                panel.chrom + ":" + std::to_string(evidence_site.pos + 1));
+        }
+
+        const int state1 = evidence_site.state[p1_index];
+        const int state2 = evidence_site.state[p2_index];
+        if (state1 < 0 || state2 < 0) continue;
+
+        ManifestSite entry;
+        entry.site_index = site_index;
+        entry.canonical_parent1_state = static_cast<int8_t>(state1);
+        entry.canonical_parent2_state = static_cast<int8_t>(state2);
+
+        if (state1 != state2) {
+            entry.site_class = state1 == 1
+                ? MANIFEST_A_ALT_B_REF : MANIFEST_A_REF_B_ALT;
+            ++pair.ratio_sites_available;
+        } else {
+            bool other_donor_differs = false;
+            for (int8_t state : evidence_site.state) {
+                if (state >= 0 && state != state1) {
+                    other_donor_differs = true;
+                    break;
+                }
+            }
+            if (!other_donor_differs) continue;
+            entry.site_class = MANIFEST_AMBIENT_ONLY;
+            ++pair.ambient_only_sites_available;
+        }
+        pair.sites[site_index] = entry;
+    }
+    return pair;
+}
+
+std::unordered_map<std::string, PairManifest> derive_missing_pair_manifests(
+        const Options& opt,
+        const std::vector<CellInfo>& cells,
+        const std::unordered_map<std::string, PairManifest>& library_pair_manifests,
+        const std::vector<MtSite>& sites,
+        const std::unordered_map<int64_t, int>& position_to_site) {
+    std::map<std::string, std::pair<std::string, std::string>> missing_pairs;
+    for (const CellInfo& cell : cells) {
+        if (cell.parent1 == cell.parent2) continue;
+        const std::string key = pair_manifest_key(cell.parent1, cell.parent2);
+        if (library_pair_manifests.count(key)) continue;
+        missing_pairs.emplace(key, canonical_parents(cell.parent1, cell.parent2));
+    }
+
+    std::unordered_map<std::string, PairManifest> derived;
+    if (missing_pairs.empty() || opt.legacy_panel_gt) return derived;
+
+    // Match the donor-state interpretation used by mt_identity_score. Existing
+    // library manifests remain authoritative for expected pairs; this fallback
+    // is only for reconciliation-supported pairs absent from the historical
+    // library design.
+    const mt_evidence::Panel evidence_panel = mt_evidence::load_panel(
+        opt.vcf, opt.mito_chrom, kReconciledPairPanelMinDepth,
+        kReconciledPairHomoplasmyAf, nullptr);
+
+    for (const auto& item : missing_pairs) {
+        PairManifest pair = derive_pair_manifest_from_panel(
+            item.second.first, item.second.second, evidence_panel, sites,
+            position_to_site);
+        std::fprintf(
+            stderr,
+            "Derived reconciled MT pair %s+%s from existing panel: %d ratio sites, %d ambient-only sites\n",
+            pair.canonical_parent1.c_str(), pair.canonical_parent2.c_str(),
+            pair.ratio_sites_available, pair.ambient_only_sites_available);
+        derived.emplace(item.first, std::move(pair));
+    }
+    return derived;
+}
+
 std::vector<CellInfo> load_assignments(const std::string& filename,
+                                       const std::string& calibration_reference,
+                                       const std::string& library_id,
                                        const std::unordered_map<std::string, int>& sample_index,
                                        std::unordered_map<std::string, int>& barcode_to_cell) {
-    std::vector<CellInfo> cells;
+    std::unordered_map<std::string, std::string> assignment_identity;
+    std::vector<std::pair<std::string, std::string>> assignment_rows;
     for (const std::string& line : read_text_lines(filename)) {
         if (line.empty() || line[0] == '#') continue;
         const std::vector<std::string> fields = split_ws(line);
         if (fields.size() < 2 || fields[0] == "barcode") continue;
-        const std::string& barcode = fields[0];
-        const std::string& identity = fields[1];
+        if (!assignment_identity.emplace(fields[0], fields[1]).second) {
+            throw std::runtime_error("Duplicate barcode in assignments: " + fields[0]);
+        }
+        assignment_rows.emplace_back(fields[0], fields[1]);
+    }
+
+    std::vector<CellInfo> cells;
+    if (!calibration_reference.empty()) {
+        const std::vector<std::string> lines = read_text_lines(calibration_reference);
+        if (lines.empty()) throw std::runtime_error(
+            "Calibration-reference file is empty: " + calibration_reference);
+        const std::vector<std::string> header = split_tab(lines[0]);
+        auto find_col = [&](const std::string& name, bool required) {
+            for (size_t i = 0; i < header.size(); ++i) if (header[i] == name) return static_cast<int>(i);
+            if (required) throw std::runtime_error(
+                "Calibration-reference file missing required column: " + name);
+            return -1;
+        };
+        const int barcode_col = find_col("barcode", true);
+        const int p1_col = find_col("canonical_parent1", true);
+        const int p2_col = find_col("canonical_parent2", true);
+        const int true_col = find_col("true_parent", true);
+        const int lib_col = find_col("library_id", false);
+        for (size_t line_index = 1; line_index < lines.size(); ++line_index) {
+            if (lines[line_index].empty() || lines[line_index][0] == '#') continue;
+            const std::vector<std::string> fields = split_tab(lines[line_index]);
+            const int max_col = std::max({barcode_col, p1_col, p2_col, true_col, lib_col});
+            if (static_cast<int>(fields.size()) <= max_col) {
+                throw std::runtime_error("Short calibration-reference row " +
+                                         std::to_string(line_index + 1));
+            }
+            if (lib_col >= 0 && !same_library_key(fields[lib_col], library_id) &&
+                fields[lib_col] != "*" && fields[lib_col] != "ALL") continue;
+            const std::string& barcode = fields[barcode_col];
+            std::string parent1 = fields[p1_col];
+            std::string parent2 = fields[p2_col];
+            const std::string true_parent = fields[true_col];
+            if (parent1.empty() || parent2.empty() || parent1 == parent2) {
+                throw std::runtime_error("Calibration-reference parents must be distinct at row " +
+                                         std::to_string(line_index + 1));
+            }
+            if (parent2 < parent1) std::swap(parent1, parent2);
+            if (true_parent != parent1 && true_parent != parent2) {
+                throw std::runtime_error("Calibration-reference true_parent must equal one reference parent at row " +
+                                         std::to_string(line_index + 1));
+            }
+            const auto p1 = sample_index.find(parent1);
+            const auto p2 = sample_index.find(parent2);
+            if (p1 == sample_index.end() || p2 == sample_index.end()) {
+                throw std::runtime_error("Calibration-reference parent missing from mt-panel VCF: " +
+                                         parent1 + "+" + parent2);
+            }
+            const auto original = assignment_identity.find(barcode);
+            if (original == assignment_identity.end()) {
+                throw std::runtime_error("Calibration-reference barcode missing from assignments: " + barcode);
+            }
+            if (barcode_to_cell.count(barcode)) {
+                throw std::runtime_error("Duplicate barcode in calibration-reference file: " + barcode);
+            }
+            CellInfo cell;
+            cell.barcode = barcode;
+            cell.identity = parent1 + "+" + parent2;
+            cell.parent1 = parent1;
+            cell.parent2 = parent2;
+            cell.parent1_index = p1->second;
+            cell.parent2_index = p2->second;
+            cell.calibration_true_parent = true_parent;
+            cell.original_identity = original->second;
+            barcode_to_cell[barcode] = static_cast<int>(cells.size());
+            cells.push_back(std::move(cell));
+        }
+        if (cells.empty()) throw std::runtime_error(
+            "No calibration-reference rows matched library_id '" + library_id + "'");
+        return cells;
+    }
+
+    for (const auto& item : assignment_rows) {
+        const std::string& barcode = item.first;
+        const std::string& identity = item.second;
         const size_t plus = identity.find('+');
         if (plus == std::string::npos || identity.find('+', plus + 1) != std::string::npos) continue;
         const std::string parent1 = identity.substr(0, plus);
@@ -760,9 +1093,6 @@ std::vector<CellInfo> load_assignments(const std::string& filename,
         if (p1 == sample_index.end() || p2 == sample_index.end()) {
             throw std::runtime_error("Assignment parent missing from mt-panel VCF: " + identity);
         }
-        if (barcode_to_cell.count(barcode)) {
-            throw std::runtime_error("Duplicate barcode in assignments: " + barcode);
-        }
         CellInfo cell;
         cell.barcode = barcode;
         cell.identity = identity;
@@ -770,12 +1100,192 @@ std::vector<CellInfo> load_assignments(const std::string& filename,
         cell.parent2 = parent2;
         cell.parent1_index = p1->second;
         cell.parent2_index = p2->second;
+        cell.original_identity = identity;
         barcode_to_cell[barcode] = static_cast<int>(cells.size());
         cells.push_back(std::move(cell));
     }
     if (cells.empty()) throw std::runtime_error(
         "No two-parent fusion assignments were found in: " + filename);
     return cells;
+}
+
+
+std::string file_fingerprint(const std::string& filename) {
+    if (filename.empty()) return "NA";
+    std::ifstream input(filename, std::ios::binary);
+    if (!input) return "UNAVAILABLE";
+    uint64_t hash = 1469598103934665603ULL;
+    char buffer[1 << 16];
+    while (input) {
+        input.read(buffer, sizeof(buffer));
+        const std::streamsize n = input.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            hash ^= static_cast<unsigned char>(buffer[i]);
+            hash *= 1099511628211ULL;
+        }
+    }
+    std::ostringstream out;
+    out << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return out.str();
+}
+
+std::string path_basename(const std::string& path) {
+    if (path.empty()) return "NA";
+    const size_t pos = path.find_last_of("/\\");
+    return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+bool wildcard_match(const std::string& value, const std::string& requested) {
+    return same_library_key(value, requested) || value == "*" || value == "ALL" || value.empty();
+}
+
+SiteCalibrationData load_site_calibration(
+        const Options& opt,
+        const std::unordered_map<int64_t, int>& position_to_site) {
+    SiteCalibrationData data;
+    if (opt.site_calibration.empty()) return data;
+    const std::vector<std::string> lines = read_text_lines(opt.site_calibration);
+    if (lines.empty()) throw std::runtime_error("Site-calibration file is empty: " + opt.site_calibration);
+    const std::vector<std::string> header = split_tab(lines[0]);
+    auto col = [&](const std::string& name, bool required) {
+        for (size_t i = 0; i < header.size(); ++i) if (header[i] == name) return static_cast<int>(i);
+        if (required) throw std::runtime_error("Site-calibration file missing required column: " + name);
+        return -1;
+    };
+    const int id_col = col("calibration_id", true);
+    const int assay_col = col("assay_mode", true);
+    const int stratum_col = col("library_or_stratum", true);
+    const int p1_col = col("canonical_parent1", true);
+    const int p2_col = col("canonical_parent2", true);
+    const int chrom_col = col("chrom", true);
+    const int pos_col = col("pos", true);
+    const int parent_col = col("parent", true);
+    const int prob_col = col("alt_probability", true);
+    for (size_t line_index = 1; line_index < lines.size(); ++line_index) {
+        if (lines[line_index].empty() || lines[line_index][0] == '#') continue;
+        const std::vector<std::string> fields = split_tab(lines[line_index]);
+        const int max_col = std::max({id_col, assay_col, stratum_col, p1_col, p2_col,
+                                      chrom_col, pos_col, parent_col, prob_col});
+        if (static_cast<int>(fields.size()) <= max_col) {
+            throw std::runtime_error("Short site-calibration row " + std::to_string(line_index + 1));
+        }
+        if (!wildcard_match(fields[assay_col], opt.assay_mode) ||
+            !wildcard_match(fields[stratum_col], opt.site_calibration_stratum)) continue;
+        if (fields[chrom_col] != opt.mito_chrom) continue;
+        int64_t pos0 = -1;
+        double probability = std::numeric_limits<double>::quiet_NaN();
+        try {
+            pos0 = std::stoll(fields[pos_col]) - 1;
+            probability = std::stod(fields[prob_col]);
+        } catch (...) {
+            throw std::runtime_error("Invalid site-calibration numeric field at row " +
+                                     std::to_string(line_index + 1));
+        }
+        if (probability <= 0.0 || probability >= 1.0) {
+            throw std::runtime_error("Site-calibration alt_probability must be strictly between 0 and 1 at row " +
+                                     std::to_string(line_index + 1));
+        }
+        const auto site_it = position_to_site.find(pos0);
+        if (site_it == position_to_site.end()) continue;
+        std::string p1 = fields[p1_col];
+        std::string p2 = fields[p2_col];
+        if (p1.empty() || p2.empty() || p1 == p2) {
+            throw std::runtime_error("Invalid site-calibration parental pair at row " +
+                                     std::to_string(line_index + 1));
+        }
+        if (p2 < p1) std::swap(p1, p2);
+        const std::string parent = fields[parent_col];
+        if (parent != p1 && parent != p2) {
+            throw std::runtime_error("Site-calibration parent is not a member of its pair at row " +
+                                     std::to_string(line_index + 1));
+        }
+        int priority = 0;
+        if (fields[assay_col] == opt.assay_mode) priority += 2;
+        if (same_library_key(fields[stratum_col], opt.site_calibration_stratum)) priority += 1;
+        SiteCalibrationRecord& record = data.by_pair[pair_manifest_key(p1, p2)][site_it->second];
+        bool* has = parent == p1 ? &record.has_parent1 : &record.has_parent2;
+        double* dest = parent == p1 ? &record.parent1_alt_probability : &record.parent2_alt_probability;
+        int* dest_priority = parent == p1 ? &record.parent1_priority : &record.parent2_priority;
+        if (*has && priority == *dest_priority && std::fabs(*dest - probability) > 1e-12) {
+            throw std::runtime_error("Conflicting site-calibration rows at equal priority for " +
+                                     p1 + "+" + p2 + " " + opt.mito_chrom + ":" +
+                                     std::to_string(pos0 + 1));
+        }
+        if (!*has || priority > *dest_priority) {
+            *has = true;
+            *dest = probability;
+            *dest_priority = priority;
+            if (record.calibration_id.empty()) record.calibration_id = fields[id_col];
+            else if (record.calibration_id != fields[id_col]) record.calibration_id = "MIXED";
+        }
+        data.calibration_ids.insert(fields[id_col]);
+        ++data.loaded_rows;
+    }
+    return data;
+}
+
+std::vector<RhoReferenceEntry> load_rho_reference(const Options& opt) {
+    std::vector<RhoReferenceEntry> rows;
+    if (opt.rho_reference.empty()) return rows;
+    const std::vector<std::string> lines = read_text_lines(opt.rho_reference);
+    if (lines.empty()) throw std::runtime_error("Rho-reference file is empty: " + opt.rho_reference);
+    const std::vector<std::string> header = split_tab(lines[0]);
+    auto col = [&](const std::string& name, bool required) {
+        for (size_t i = 0; i < header.size(); ++i) if (header[i] == name) return static_cast<int>(i);
+        if (required) throw std::runtime_error("Rho-reference file missing required column: " + name);
+        return -1;
+    };
+    const int assay_col = col("assay_mode", true);
+    const int lib_col = col("library_id", true);
+    const int p1_col = col("canonical_parent1", true);
+    const int p2_col = col("canonical_parent2", true);
+    const int rho_col = col("rho", true);
+    for (size_t i = 1; i < lines.size(); ++i) {
+        if (lines[i].empty() || lines[i][0] == '#') continue;
+        const auto fields = split_tab(lines[i]);
+        const int max_col = std::max({assay_col, lib_col, p1_col, p2_col, rho_col});
+        if (static_cast<int>(fields.size()) <= max_col) throw std::runtime_error(
+            "Short rho-reference row " + std::to_string(i + 1));
+        RhoReferenceEntry row;
+        row.assay_mode = fields[assay_col];
+        row.library_id = fields[lib_col];
+        row.canonical_parent1 = fields[p1_col];
+        row.canonical_parent2 = fields[p2_col];
+        if (row.canonical_parent2 < row.canonical_parent1 && row.canonical_parent1 != "*" &&
+            row.canonical_parent2 != "*") std::swap(row.canonical_parent1, row.canonical_parent2);
+        try { row.rho = std::stod(fields[rho_col]); }
+        catch (...) { throw std::runtime_error("Invalid rho-reference value at row " + std::to_string(i + 1)); }
+        if (row.rho < 0.0 || row.rho > opt.overdispersion_max) throw std::runtime_error(
+            "Rho-reference value outside configured bounds at row " + std::to_string(i + 1));
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+double resolve_pooled_rho(const Options& opt,
+                          const std::vector<RhoReferenceEntry>& rows,
+                          const std::string& canonical_parent1,
+                          const std::string& canonical_parent2) {
+    double best = opt.pooled_rho;
+    int best_priority = std::isfinite(best) ? -1 : -1000;
+    for (const RhoReferenceEntry& row : rows) {
+        if (!wildcard_match(row.assay_mode, opt.assay_mode) ||
+            !wildcard_match(row.library_id, opt.library_id)) continue;
+        const bool pair_exact = row.canonical_parent1 == canonical_parent1 &&
+                                row.canonical_parent2 == canonical_parent2;
+        const bool pair_wild = (row.canonical_parent1 == "*" || row.canonical_parent1 == "ALL") &&
+                               (row.canonical_parent2 == "*" || row.canonical_parent2 == "ALL");
+        if (!pair_exact && !pair_wild) continue;
+        int priority = 0;
+        if (row.assay_mode == opt.assay_mode) priority += 4;
+        if (same_library_key(row.library_id, opt.library_id)) priority += 2;
+        if (pair_exact) priority += 1;
+        if (priority > best_priority) {
+            best_priority = priority;
+            best = row.rho;
+        }
+    }
+    return best;
 }
 
 std::unordered_set<std::string> load_empty_barcodes(
@@ -1087,330 +1597,600 @@ void count_molecules(const Options& opt,
     sam_close(bam);
 }
 
-double clamp_probability(double value) {
+
+struct AtacFragmentAccumulator {
+    int target_index = -2;  // >=0 cell, -1 empty, -2 unset
+    bool seen_first = false;
+    bool seen_second = false;
+    int accepted_reads = 0;
+    std::unordered_map<int, uint8_t> alleles;
+};
+
+bool accept_atac_read(const Options& opt, const bam1_t* record, int mt_tid, ReadStats& stats) {
+    ++stats.seen;
+    ++stats.atac_reads_considered;
+    const uint16_t flag = record->core.flag;
+    if (flag & BAM_FUNMAP) { ++stats.reject_unmapped; return false; }
+    if (flag & BAM_FSECONDARY) { ++stats.reject_secondary; return false; }
+    if (flag & BAM_FSUPPLEMENTARY) { ++stats.reject_supplementary; return false; }
+    if (flag & BAM_FQCFAIL) { ++stats.reject_qcfail; return false; }
+    if (!opt.keep_duplicates && (flag & BAM_FDUP)) { ++stats.reject_duplicate; return false; }
+    if (record->core.qual < opt.min_mapq) { ++stats.reject_mapq; return false; }
+    if (!opt.allow_ambiguous_alignments) {
+        uint8_t* nh = bam_aux_get(record, "NH");
+        if ((nh && bam_aux2i(nh) > 1) || bam_aux_get(record, "SA") || bam_aux_get(record, "XA")) {
+            ++stats.reject_multimapping;
+            return false;
+        }
+    }
+    if (!(flag & BAM_FPAIRED)) {
+        if (!opt.atac_include_singletons) { ++stats.atac_reject_unpaired; return false; }
+    } else if ((flag & BAM_FMUNMAP) || record->core.mtid != mt_tid) {
+        if (!opt.atac_include_singletons) { ++stats.atac_reject_mate_off_mito; return false; }
+    }
+    ++stats.accepted_for_pileup;
+    return true;
+}
+
+std::unordered_map<int, uint8_t> extract_atac_site_alleles(
+        const Options& opt,
+        const bam1_t* record,
+        const std::vector<MtSite>& sites,
+        const std::unordered_map<int64_t, int>& position_to_site,
+        ReadStats& stats) {
+    std::unordered_map<int, uint8_t> result;
+    int64_t ref_pos = record->core.pos;
+    int query_pos = 0;
+    const uint32_t* cigar = bam_get_cigar(record);
+    const uint8_t* sequence = bam_get_seq(record);
+    const uint8_t* qualities = bam_get_qual(record);
+    for (uint32_t ci = 0; ci < record->core.n_cigar; ++ci) {
+        const int op = bam_cigar_op(cigar[ci]);
+        const int len = bam_cigar_oplen(cigar[ci]);
+        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
+            for (int k = 0; k < len; ++k) {
+                const auto found = position_to_site.find(ref_pos + k);
+                if (found == position_to_site.end()) continue;
+                ++stats.pileup_bases;
+                const int qpos = query_pos + k;
+                if (qualities && qualities[qpos] < opt.min_baseq) {
+                    ++stats.reject_baseq;
+                    continue;
+                }
+                const MtSite& site = sites[found->second];
+                const char base = static_cast<char>(
+                    std::toupper(seq_nt16_str[bam_seqi(sequence, qpos)]));
+                uint8_t allele = 2;
+                if (base == site.ref) allele = 0;
+                else if (base == site.alt) allele = 1;
+                else {
+                    ++stats.reject_nonpanel_allele;
+                    continue;
+                }
+                result[found->second] = allele;
+            }
+            ref_pos += len;
+            query_pos += len;
+        } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
+            query_pos += len;
+        } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
+            ref_pos += len;
+        }
+    }
+    return result;
+}
+
+void count_atac_fragments(const Options& opt,
+                          const std::vector<MtSite>& sites,
+                          const std::unordered_map<int64_t, int>& position_to_site,
+                          const std::unordered_map<std::string, int>& barcode_to_cell,
+                          const std::unordered_set<std::string>& empty_barcodes,
+                          std::vector<CellInfo>& cells,
+                          std::vector<AmbientSite>& ambient,
+                          ReadStats& stats) {
+    samFile* bam = sam_open(opt.bam.c_str(), "r");
+    if (!bam) throw std::runtime_error("Could not open BAM/CRAM: " + opt.bam);
+    hts_set_threads(bam, opt.threads);
+    sam_hdr_t* header = sam_hdr_read(bam);
+    if (!header) { sam_close(bam); throw std::runtime_error("Could not read BAM header"); }
+    const int mt_tid = sam_hdr_name2tid(header, opt.mito_chrom.c_str());
+    if (mt_tid < 0) throw std::runtime_error(
+        "Mitochondrial contig missing from BAM header: " + opt.mito_chrom);
+    hts_idx_t* index = sam_index_load(bam, opt.bam.c_str());
+    if (!index) throw std::runtime_error("Could not load BAM/CRAM index: " + opt.bam);
+    hts_itr_t* iterator = sam_itr_querys(index, header, opt.mito_chrom.c_str());
+    if (!iterator) throw std::runtime_error("Could not create BAM chrM iterator");
+
+    std::unordered_map<std::string, AtacFragmentAccumulator> pending;
+    pending.reserve(1 << 16);
+    auto finalize = [&](AtacFragmentAccumulator& acc) {
+        RawFragmentObservation fragment;
+        fragment.sites.reserve(acc.alleles.size());
+        for (const auto& item : acc.alleles) {
+            if (item.second > 1) continue;
+            fragment.sites.push_back({item.first, item.second});
+        }
+        if (fragment.sites.empty()) return;
+        std::sort(fragment.sites.begin(), fragment.sites.end(),
+                  [](const RawFragmentSite& a, const RawFragmentSite& b) {
+                      return a.site_index < b.site_index;
+                  });
+        if (acc.target_index >= 0) {
+            for (const RawFragmentSite& site : fragment.sites) {
+                AlleleCount& count = cells[acc.target_index].counts[site.site_index];
+                if (site.allele == 0) ++count.ref; else ++count.alt;
+            }
+            cells[acc.target_index].fragments.push_back(fragment);
+        } else if (acc.target_index == -1) {
+            for (const RawFragmentSite& site : fragment.sites) {
+                if (site.allele == 0) ++ambient[site.site_index].ref;
+                else ++ambient[site.site_index].alt;
+            }
+        }
+        ++stats.atac_fragments_accepted;
+        if (fragment.sites.size() > 1) ++stats.atac_fragments_multisite;
+        stats.atac_fragment_site_observations += fragment.sites.size();
+        stats.accepted_observations += fragment.sites.size();
+    };
+
+    bam1_t* record = bam_init1();
+    while (sam_itr_next(bam, iterator, record) >= 0) {
+        if (!accept_atac_read(opt, record, mt_tid, stats)) continue;
+        const char* barcode_ptr = aux_string(record, opt.barcode_tag);
+        if (!barcode_ptr || !*barcode_ptr) { ++stats.reject_missing_barcode; continue; }
+        const std::string barcode(barcode_ptr);
+        const auto cell_it = barcode_to_cell.find(barcode);
+        const bool is_empty = empty_barcodes.count(barcode) > 0;
+        if (cell_it == barcode_to_cell.end() && !is_empty) {
+            ++stats.reject_irrelevant_barcode;
+            continue;
+        }
+        std::unordered_map<int, uint8_t> alleles = extract_atac_site_alleles(
+            opt, record, sites, position_to_site, stats);
+        if (alleles.empty()) continue;
+        const uint16_t flag = record->core.flag;
+        const bool paired = flag & BAM_FPAIRED;
+        if (!paired || ((flag & BAM_FMUNMAP) || record->core.mtid != mt_tid)) {
+            AtacFragmentAccumulator singleton;
+            singleton.target_index = is_empty ? -1 : cell_it->second;
+            singleton.accepted_reads = 1;
+            singleton.alleles = std::move(alleles);
+            finalize(singleton);
+            continue;
+        }
+        std::string key;
+        const char* qname = bam_get_qname(record);
+        key.reserve(barcode.size() + std::strlen(qname) + 1);
+        key.append(barcode);
+        key.push_back('\x1f');
+        key.append(qname);
+        AtacFragmentAccumulator& acc = pending[key];
+        const int target_index = is_empty ? -1 : cell_it->second;
+        if (acc.target_index == -2) acc.target_index = target_index;
+        else if (acc.target_index != target_index) {
+            throw std::runtime_error("ATAC fragment barcode target changed for QNAME " + std::string(qname));
+        }
+        ++acc.accepted_reads;
+        if (flag & BAM_FREAD1) acc.seen_first = true;
+        if (flag & BAM_FREAD2) acc.seen_second = true;
+        for (const auto& item : alleles) {
+            auto prior = acc.alleles.find(item.first);
+            if (prior == acc.alleles.end()) acc.alleles[item.first] = item.second;
+            else if (prior->second == item.second) ++stats.atac_overlap_agreements;
+            else {
+                prior->second = 2;
+                ++stats.atac_overlap_conflicts;
+                ++stats.conflicting_molecules;
+            }
+        }
+        if ((acc.seen_first && acc.seen_second) || acc.accepted_reads >= 2) {
+            finalize(acc);
+            pending.erase(key);
+        }
+    }
+    for (auto& item : pending) {
+        ++stats.atac_orphan_fragments;
+        if (opt.atac_include_singletons) finalize(item.second);
+    }
+    bam_destroy1(record);
+    hts_itr_destroy(iterator);
+    hts_idx_destroy(index);
+    sam_hdr_destroy(header);
+    sam_close(bam);
+}
+
+double clamp_probability_local(double value) {
     return std::max(kTiny, std::min(1.0 - kTiny, value));
 }
 
-double predicted_alt_probability(const SiteObservation& obs,
-                                 double parent2_fraction,
-                                 double ambient_fraction) {
-    const double r = std::max(0.0, std::min(1.0, parent2_fraction));
+struct AmbientQcEstimate {
+    double fraction = std::numeric_limits<double>::quiet_NaN();
+    int sites_observed = 0;
+    int sites_used = 0;
+    uint64_t molecules = 0;
+    std::string status = "NOT_REQUESTED";
+    std::string reason = "ambient_qc_not_requested";
+};
+
+struct AmbientAnchorObservation {
+    uint64_t ref = 0;
+    uint64_t alt = 0;
+    double theta = 0.5;
+    double ambient_alt = 0.5;
+};
+
+double ambient_anchor_log_likelihood(
+        const std::vector<AmbientAnchorObservation>& observations,
+        double ambient_fraction) {
     const double c = std::max(0.0, std::min(0.99, ambient_fraction));
-    const double parental = (1.0 - r) * obs.parent1_alt_probability +
-                            r * obs.parent2_alt_probability;
-    return clamp_probability((1.0 - c) * parental + c * obs.ambient_alt_probability);
-}
-
-double binomial_log_pmf(uint64_t alt, uint64_t ref, double q) {
-    const double n = static_cast<double>(alt + ref);
-    const double k = static_cast<double>(alt);
-    q = clamp_probability(q);
-    return std::lgamma(n + 1.0) - std::lgamma(k + 1.0) -
-           std::lgamma(n - k + 1.0) + k * std::log(q) +
-           (n - k) * std::log1p(-q);
-}
-
-double beta_binomial_log_pmf(uint64_t alt,
-                             uint64_t ref,
-                             double q,
-                             double rho) {
-    if (rho <= 1e-9 || alt + ref <= 1) return binomial_log_pmf(alt, ref, q);
-    q = clamp_probability(q);
-    rho = std::max(1e-9, std::min(0.999999, rho));
-    const double concentration = 1.0 / rho - 1.0;
-    const double alpha = std::max(kTiny, q * concentration);
-    const double beta = std::max(kTiny, (1.0 - q) * concentration);
-    const double n = static_cast<double>(alt + ref);
-    const double k = static_cast<double>(alt);
-    return std::lgamma(n + 1.0) - std::lgamma(k + 1.0) -
-           std::lgamma(n - k + 1.0) +
-           std::lgamma(k + alpha) + std::lgamma(n - k + beta) -
-           std::lgamma(n + alpha + beta) -
-           std::lgamma(alpha) - std::lgamma(beta) +
-           std::lgamma(alpha + beta);
-}
-
-double site_log_likelihood(const SiteObservation& obs,
-                           double parent2_fraction,
-                           double ambient_fraction,
-                           double rho,
-                           bool use_beta_binomial) {
-    const double q = predicted_alt_probability(obs, parent2_fraction, ambient_fraction);
-    return use_beta_binomial
-        ? beta_binomial_log_pmf(obs.alt, obs.ref, q, rho)
-        : binomial_log_pmf(obs.alt, obs.ref, q);
-}
-
-double log_likelihood(const std::vector<SiteObservation>& observations,
-                      double parent2_fraction,
-                      double ambient_fraction,
-                      double rho,
-                      bool use_beta_binomial) {
     double value = 0.0;
-    for (const SiteObservation& obs : observations) {
-        value += site_log_likelihood(obs, parent2_fraction, ambient_fraction,
-                                     rho, use_beta_binomial);
+    for (const AmbientAnchorObservation& obs : observations) {
+        const double p = clamp_probability_local(
+            (1.0 - c) * obs.theta + c * obs.ambient_alt);
+        value += static_cast<double>(obs.alt) * std::log(p) +
+                 static_cast<double>(obs.ref) * std::log(1.0 - p);
     }
     return value;
 }
 
-template <typename Function>
-double golden_maximize(Function function,
-                       double lower,
-                       double upper,
-                       int max_iterations,
-                       double tolerance,
-                       int& iterations) {
-    if (!(upper > lower)) {
-        iterations = 0;
-        return lower;
+double ambient_anchor_score(
+        const std::vector<AmbientAnchorObservation>& observations,
+        double ambient_fraction) {
+    const double c = std::max(0.0, std::min(0.99, ambient_fraction));
+    double value = 0.0;
+    for (const AmbientAnchorObservation& obs : observations) {
+        const double delta = obs.ambient_alt - obs.theta;
+        if (std::fabs(delta) <= kTiny) continue;
+        const double p = clamp_probability_local(
+            (1.0 - c) * obs.theta + c * obs.ambient_alt);
+        value += delta * (
+            static_cast<double>(obs.alt) / p -
+            static_cast<double>(obs.ref) / (1.0 - p));
     }
-    const double phi = (std::sqrt(5.0) - 1.0) / 2.0;
-    double left = lower;
-    double right = upper;
-    double x1 = right - phi * (right - left);
-    double x2 = left + phi * (right - left);
-    double f1 = function(x1);
-    double f2 = function(x2);
-    iterations = 0;
-    while (iterations < max_iterations && right - left > tolerance) {
-        if (f1 < f2) {
-            left = x1;
-            x1 = x2;
-            f1 = f2;
-            x2 = left + phi * (right - left);
-            f2 = function(x2);
-        } else {
-            right = x2;
-            x2 = x1;
-            f2 = f1;
-            x1 = right - phi * (right - left);
-            f1 = function(x1);
-        }
-        ++iterations;
-    }
-    const double interior = 0.5 * (left + right);
-    const double f_interior = function(interior);
-    const double f_lower = function(lower);
-    const double f_upper = function(upper);
-    if (f_lower >= f_interior && f_lower >= f_upper) return lower;
-    if (f_upper >= f_interior && f_upper >= f_lower) return upper;
-    return interior;
+    return value;
 }
 
-struct FitStart {
-    double ratio;
-    double ambient;
-    double rho;
-};
+double maximize_ambient_anchor_fraction(
+        const std::vector<AmbientAnchorObservation>& observations) {
+    constexpr double lower = 0.0;
+    constexpr double upper = 0.99;
+    const double lower_score = ambient_anchor_score(observations, lower);
+    const double upper_score = ambient_anchor_score(observations, upper);
+    if (!std::isfinite(lower_score) || !std::isfinite(upper_score)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (lower_score <= 0.0) return lower;
+    if (upper_score >= 0.0) return upper;
 
-FitResult fit_parameters(const std::vector<SiteObservation>& observations,
-                         const Options& opt,
-                         bool ambient_enabled,
-                         const double* fixed_ambient) {
-    const bool use_beta = opt.likelihood == "beta_binomial";
-    const bool ambient_free = ambient_enabled && fixed_ambient == nullptr;
-    const double fixed_c = !ambient_enabled ? 0.0 :
-                           (fixed_ambient != nullptr ? *fixed_ambient : 0.0);
-    const double rho_lower = 1e-8;
-    std::vector<FitStart> starts;
-    starts.push_back({0.50, ambient_free ? 0.05 : fixed_c, opt.overdispersion_initial});
-    starts.push_back({0.20, ambient_free ? 0.10 : fixed_c, opt.overdispersion_initial});
-    starts.push_back({0.80, ambient_free ? 0.10 : fixed_c, opt.overdispersion_initial});
-    starts.push_back({0.50, ambient_free ? 0.30 : fixed_c, std::min(0.10, opt.overdispersion_max)});
-    starts.push_back({0.10, ambient_free ? 0.50 : fixed_c, std::min(0.05, opt.overdispersion_max)});
-    starts.push_back({0.90, ambient_free ? 0.50 : fixed_c, std::min(0.05, opt.overdispersion_max)});
+    double lo = lower;
+    double hi = upper;
+    for (int iteration = 0; iteration < 100 && hi - lo > 1e-10; ++iteration) {
+        const double mid = 0.5 * (lo + hi);
+        const double score = ambient_anchor_score(observations, mid);
+        if (!std::isfinite(score)) return std::numeric_limits<double>::quiet_NaN();
+        if (score > 0.0) lo = mid;
+        else hi = mid;
+    }
+    const double candidate = 0.5 * (lo + hi);
 
-    FitResult best;
-    best.joint_ambient = ambient_free;
-    double best_ll = -std::numeric_limits<double>::infinity();
-
-    for (const FitStart& start : starts) {
-        double r = std::max(0.0, std::min(1.0, start.ratio));
-        double c = ambient_free ? std::max(0.0, std::min(0.99, start.ambient)) : fixed_c;
-        double rho = use_beta
-            ? std::max(rho_lower, std::min(opt.overdispersion_max, start.rho))
-            : 0.0;
-        bool converged = false;
-        int iteration = 0;
-        double previous_ll = log_likelihood(observations, r, c, rho, use_beta);
-
-        for (; iteration < opt.max_iterations; ++iteration) {
-            const double old_r = r;
-            const double old_c = c;
-            const double old_rho = rho;
-            int inner = 0;
-            r = golden_maximize(
-                [&](double candidate) {
-                    return log_likelihood(observations, candidate, c, rho, use_beta);
-                }, 0.0, 1.0, 100, opt.tolerance, inner);
-
-            if (ambient_free) {
-                c = golden_maximize(
-                    [&](double candidate) {
-                        return log_likelihood(observations, r, candidate, rho, use_beta);
-                    }, 0.0, 0.99, 100, opt.tolerance, inner);
-            }
-
-            if (use_beta) {
-                rho = golden_maximize(
-                    [&](double candidate) {
-                        return log_likelihood(observations, r, c, candidate, true);
-                    }, rho_lower, opt.overdispersion_max, 100, opt.tolerance, inner);
-                const double boundary_snap = std::max(10.0 * opt.tolerance, 1e-7);
-                if (rho <= rho_lower + boundary_snap) rho = rho_lower;
-                if (rho >= opt.overdispersion_max - boundary_snap) {
-                    rho = opt.overdispersion_max;
-                }
-            }
-
-            const double current_ll = log_likelihood(observations, r, c, rho, use_beta);
-            const double parameter_delta = std::max({std::fabs(r - old_r),
-                                                     std::fabs(c - old_c),
-                                                     std::fabs(rho - old_rho)});
-            const double relative_ll_delta =
-                std::fabs(current_ll - previous_ll) /
-                (1.0 + std::fabs(previous_ll));
-            previous_ll = current_ll;
-            const double parameter_tolerance = std::max(10.0 * opt.tolerance, 1e-7);
-            const double likelihood_tolerance = std::max(opt.tolerance, 1e-10);
-            if (parameter_delta <= parameter_tolerance &&
-                relative_ll_delta <= likelihood_tolerance) {
-                converged = true;
-                ++iteration;
-                break;
-            }
-        }
-
-        const double ll = log_likelihood(observations, r, c, rho, use_beta);
+    // The anchor binomial log likelihood is concave in c. Keep the explicit
+    // boundary comparison so finite-precision score behavior reproduces a
+    // bounded scalar maximum rather than forcing an interior value.
+    double best_c = candidate;
+    double best_ll = ambient_anchor_log_likelihood(observations, candidate);
+    for (double boundary : {lower, upper}) {
+        const double ll = ambient_anchor_log_likelihood(observations, boundary);
         if (ll > best_ll) {
             best_ll = ll;
-            best.parent2_fraction = r;
-            best.ambient_weight = c;
-            best.parent1_weight = (1.0 - c) * (1.0 - r);
-            best.parent2_weight = (1.0 - c) * r;
-            best.overdispersion_rho = use_beta ? rho : 0.0;
-            best.log_likelihood = ll;
-            // Report coordinate-ascent sweeps. Golden-section evaluations are
-            // an implementation detail and should not inflate this diagnostic.
-            best.iterations = iteration;
-            best.converged = converged;
-            best.joint_ambient = ambient_free;
+            best_c = boundary;
         }
     }
-    return best;
+    return best_c;
 }
 
-double finite_step(double value, double lower, double upper) {
-    const double distance = std::min(value - lower, upper - value);
-    if (distance <= 1e-7) return 0.0;
-    return std::min(1e-4, 0.25 * distance);
-}
+AmbientQcEstimate estimate_ambient_qc(
+        const Options& opt,
+        const CellInfo& cell,
+        const PairManifest* pair_manifest,
+        const std::vector<AmbientSite>& ambient,
+        const double* precomputed_fraction) {
+    AmbientQcEstimate out;
+    if (!std::isfinite(opt.ambient_qc_max)) return out;
 
-void compute_uncertainty(const std::vector<SiteObservation>& observations,
-                         const Options& opt,
-                         FitResult& fit,
-                         bool ambient_parameter_free) {
-    const bool use_beta = opt.likelihood == "beta_binomial";
-    const double r = fit.parent2_fraction;
-    const double c = fit.ambient_weight;
-    const double rho = use_beta ? fit.overdispersion_rho : 0.0;
-    const double hr = finite_step(r, 0.0, 1.0);
-    const double hc = ambient_parameter_free ? finite_step(c, 0.0, 0.99) : 0.0;
-    if (hr <= 0.0) return;
+    out.status = "NOT_ESTIMABLE";
+    out.reason = "no_usable_ambient_anchor_observations";
+    if (!pair_manifest) return out;
 
-    const auto total_ll = [&](double rr, double cc) {
-        return log_likelihood(observations, rr, cc, rho, use_beta);
-    };
-    const double center = total_ll(r, c);
-    const double i_rr = -(total_ll(r + hr, c) - 2.0 * center +
-                          total_ll(r - hr, c)) / (hr * hr);
-
-    if (!ambient_parameter_free) {
-        if (i_rr > kTiny && std::isfinite(i_rr)) {
-            fit.ratio_se = std::sqrt(1.0 / i_rr);
-            double b_rr = 0.0;
-            for (const SiteObservation& obs : observations) {
-                const double score = (site_log_likelihood(obs, r + hr, c, rho, use_beta) -
-                                      site_log_likelihood(obs, r - hr, c, rho, use_beta)) /
-                                     (2.0 * hr);
-                b_rr += score * score;
-            }
-            fit.ratio_se_robust = std::sqrt(std::max(0.0, b_rr / (i_rr * i_rr)));
-            fit.information_condition = 1.0;
-            fit.min_information_eigenvalue = i_rr;
+    std::vector<AmbientAnchorObservation> observations;
+    observations.reserve(static_cast<size_t>(
+        std::max(0, pair_manifest->ambient_only_sites_available)));
+    bool has_contrast = false;
+    for (const auto& item : cell.counts) {
+        const int site_index = item.first;
+        const AlleleCount& count = item.second;
+        if (count.total() == 0) continue;
+        const auto manifest_found = pair_manifest->sites.find(site_index);
+        if (manifest_found == pair_manifest->sites.end()) continue;
+        const ManifestSite& manifest_site = manifest_found->second;
+        if (manifest_site.site_class != MANIFEST_AMBIENT_ONLY ||
+            manifest_site.canonical_parent1_state != manifest_site.canonical_parent2_state) {
+            continue;
         }
-    } else if (hc > 0.0) {
-        const double i_cc = -(total_ll(r, c + hc) - 2.0 * center +
-                              total_ll(r, c - hc)) / (hc * hc);
-        const double i_rc = -(total_ll(r + hr, c + hc) - total_ll(r + hr, c - hc) -
-                              total_ll(r - hr, c + hc) + total_ll(r - hr, c - hc)) /
-                            (4.0 * hr * hc);
-        const double trace = i_rr + i_cc;
-        const double discriminant = std::sqrt(std::max(0.0,
-            (i_rr - i_cc) * (i_rr - i_cc) + 4.0 * i_rc * i_rc));
-        const double lambda_max = 0.5 * (trace + discriminant);
-        const double lambda_min = 0.5 * (trace - discriminant);
-        fit.min_information_eigenvalue = lambda_min;
-        fit.information_condition = lambda_max / std::max(lambda_min, kTiny);
-        const double determinant = i_rr * i_cc - i_rc * i_rc;
-        if (determinant > kTiny && i_rr > 0.0 && i_cc > 0.0 &&
-            std::isfinite(determinant)) {
-            const double inv_rr = i_cc / determinant;
-            const double inv_rc = -i_rc / determinant;
-            const double inv_cc = i_rr / determinant;
-            fit.ratio_se = std::sqrt(std::max(0.0, inv_rr));
-            fit.ambient_se = std::sqrt(std::max(0.0, inv_cc));
-
-            double b_rr = 0.0;
-            double b_rc = 0.0;
-            double b_cc = 0.0;
-            for (const SiteObservation& obs : observations) {
-                const double score_r =
-                    (site_log_likelihood(obs, r + hr, c, rho, use_beta) -
-                     site_log_likelihood(obs, r - hr, c, rho, use_beta)) / (2.0 * hr);
-                const double score_c =
-                    (site_log_likelihood(obs, r, c + hc, rho, use_beta) -
-                     site_log_likelihood(obs, r, c - hc, rho, use_beta)) / (2.0 * hc);
-                b_rr += score_r * score_r;
-                b_rc += score_r * score_c;
-                b_cc += score_c * score_c;
-            }
-            const double v_rr = inv_rr * (b_rr * inv_rr + b_rc * inv_rc) +
-                                inv_rc * (b_rc * inv_rr + b_cc * inv_rc);
-            const double v_cc = inv_rc * (b_rr * inv_rc + b_rc * inv_cc) +
-                                inv_cc * (b_rc * inv_rc + b_cc * inv_cc);
-            fit.ratio_se_robust = std::sqrt(std::max(0.0, v_rr));
-            fit.ambient_se_robust = std::sqrt(std::max(0.0, v_cc));
+        ++out.sites_observed;
+        if (site_index < 0 || static_cast<size_t>(site_index) >= ambient.size() ||
+            !ambient[site_index].usable ||
+            !std::isfinite(ambient[site_index].alt_fraction)) {
+            continue;
         }
+        AmbientAnchorObservation obs;
+        obs.ref = count.ref;
+        obs.alt = count.alt;
+        obs.theta = manifest_site.canonical_parent1_state == 1
+            ? 1.0 - opt.error_rate : opt.error_rate;
+        obs.ambient_alt = clamp_probability_local(ambient[site_index].alt_fraction);
+        if (std::fabs(obs.ambient_alt - obs.theta) > kTiny) has_contrast = true;
+        observations.push_back(obs);
+        ++out.sites_used;
+        out.molecules += count.total();
     }
 
-    if (use_beta) {
-        const double h_rho = finite_step(rho, 1e-8, opt.overdispersion_max);
-        if (h_rho > 0.0) {
-            const double ll_plus = log_likelihood(observations, r, c, rho + h_rho, true);
-            const double ll_minus = log_likelihood(observations, r, c, rho - h_rho, true);
-            const double info = -(ll_plus - 2.0 * center + ll_minus) /
-                                (h_rho * h_rho);
-            if (info > kTiny && std::isfinite(info)) fit.overdispersion_se = std::sqrt(1.0 / info);
-        }
+    if (precomputed_fraction && std::isfinite(*precomputed_fraction)) {
+        out.fraction = std::max(0.0, std::min(0.99, *precomputed_fraction));
+        out.status = out.fraction > opt.ambient_qc_max ? "HIGH_MT_AMBIENT" : "PASS";
+        out.reason = out.status == "PASS"
+            ? "ambient_fraction_within_qc_max_precomputed"
+            : "ambient_fraction_exceeds_qc_max";
+        return out;
     }
-}
 
-FitResult fit_cell(const std::vector<SiteObservation>& observations,
-                   const Options& opt,
-                   bool ambient_enabled,
-                   const double* fixed_ambient) {
-    FitResult fit = fit_parameters(observations, opt, ambient_enabled, fixed_ambient);
-    compute_uncertainty(observations, opt, fit,
-                        ambient_enabled && fixed_ambient == nullptr);
-    return fit;
+    if (observations.empty() || out.molecules == 0 || !has_contrast) {
+        if (!has_contrast && !observations.empty()) {
+            out.reason = "ambient_anchor_profile_has_no_contrast";
+        }
+        return out;
+    }
+
+    out.fraction = maximize_ambient_anchor_fraction(observations);
+    if (!std::isfinite(out.fraction)) {
+        out.reason = "ambient_anchor_optimization_failed";
+        return out;
+    }
+    out.status = out.fraction > opt.ambient_qc_max ? "HIGH_MT_AMBIENT" : "PASS";
+    out.reason = out.status == "PASS"
+        ? "ambient_fraction_within_qc_max"
+        : "ambient_fraction_exceeds_qc_max";
+    return out;
 }
 
 std::string format_double(double value, int precision = 8) {
     if (!std::isfinite(value)) return "NA";
     std::ostringstream out;
     out << std::fixed << std::setprecision(precision) << value;
+    return out.str();
+}
+
+#ifndef CELLBOUNCER_SOURCE_REVISION
+#define CELLBOUNCER_SOURCE_REVISION "unknown"
+#endif
+
+constexpr const char* kMtModelVersion = "mt_fusion_ratio_full_v5_anchor_ambient_qc";
+
+std::string assay_estimand(const std::string& assay_mode) {
+    if (assay_mode == "ATAC") return "mtDNA_parental_fragment_fraction";
+    if (assay_mode == "GENERIC") return "parental_mitochondrial_alignment_fraction";
+    return "mtRNA_parental_molecule_fraction";
+}
+
+struct CalibrationProbabilityResult {
+    double parent1_alt_probability = std::numeric_limits<double>::quiet_NaN();
+    double parent2_alt_probability = std::numeric_limits<double>::quiet_NaN();
+    bool parent1_calibrated = false;
+    bool parent2_calibrated = false;
+    std::string status = "NOT_REQUESTED";
+};
+
+CalibrationProbabilityResult calibration_probabilities(
+        const Options& opt,
+        const SiteCalibrationData& calibration,
+        const PairManifest& pair_manifest,
+        int site_index,
+        bool assignment_matches_canonical,
+        int assignment_parent1_state,
+        int assignment_parent2_state) {
+    CalibrationProbabilityResult out;
+    out.parent1_alt_probability = assignment_parent1_state == 1
+        ? 1.0 - opt.error_rate : opt.error_rate;
+    out.parent2_alt_probability = assignment_parent2_state == 1
+        ? 1.0 - opt.error_rate : opt.error_rate;
+    if (opt.site_calibration.empty()) return out;
+    out.status = "FALLBACK";
+    const auto pair_it = calibration.by_pair.find(
+        pair_manifest_key(pair_manifest.canonical_parent1, pair_manifest.canonical_parent2));
+    if (pair_it == calibration.by_pair.end()) return out;
+    const auto site_it = pair_it->second.find(site_index);
+    if (site_it == pair_it->second.end()) return out;
+    const SiteCalibrationRecord& record = site_it->second;
+    if (assignment_matches_canonical) {
+        if (record.has_parent1) {
+            out.parent1_alt_probability = record.parent1_alt_probability;
+            out.parent1_calibrated = true;
+        }
+        if (record.has_parent2) {
+            out.parent2_alt_probability = record.parent2_alt_probability;
+            out.parent2_calibrated = true;
+        }
+    } else {
+        if (record.has_parent2) {
+            out.parent1_alt_probability = record.parent2_alt_probability;
+            out.parent1_calibrated = true;
+        }
+        if (record.has_parent1) {
+            out.parent2_alt_probability = record.parent1_alt_probability;
+            out.parent2_calibrated = true;
+        }
+    }
+    if (out.parent1_calibrated && out.parent2_calibrated) out.status = "FULL";
+    else if (out.parent1_calibrated || out.parent2_calibrated) out.status = "PARTIAL";
+    return out;
+}
+
+MtRatioFitConfig make_fit_config(const Options& opt,
+                                 double pooled_rho,
+                                 uint64_t ratio_molecules) {
+    MtRatioFitConfig config;
+    config.use_beta_binomial = opt.assay_mode != "ATAC" && opt.likelihood == "beta_binomial";
+    config.ambient_enabled = false;
+    config.ambient_fixed = false;
+    config.fixed_ambient = 0.0;
+    config.overdispersion_initial = opt.overdispersion_initial;
+    config.overdispersion_max = opt.overdispersion_max;
+    if (config.use_beta_binomial && opt.rho_mode == "fixed") {
+        config.overdispersion_fixed = true;
+        config.fixed_overdispersion = pooled_rho;
+    } else if (config.use_beta_binomial && opt.rho_mode == "low_information_fixed" &&
+               ratio_molecules < static_cast<uint64_t>(opt.rho_low_information_molecules)) {
+        config.overdispersion_fixed = true;
+        config.fixed_overdispersion = pooled_rho;
+    } else if (config.use_beta_binomial && opt.rho_mode == "shrink") {
+        config.overdispersion_penalized = true;
+        config.overdispersion_prior_mean = pooled_rho;
+        config.overdispersion_prior_strength = opt.rho_prior_strength;
+        config.overdispersion_initial = pooled_rho;
+    }
+    config.max_iterations = opt.max_iterations;
+    config.tolerance = opt.tolerance;
+    return config;
+}
+
+
+
+std::unordered_map<int, double> compute_rna_site_influence(
+        const std::vector<MtRatioObservation>& observations,
+        const MtRatioFitConfig& config,
+        const MtRatioFitResult& full_fit) {
+    std::unordered_map<int, double> result;
+    if (!full_fit.converged || !std::isfinite(full_fit.parent2_fraction)) return result;
+    for (const MtRatioObservation& target : observations) {
+        std::vector<MtRatioObservation> reduced;
+        reduced.reserve(observations.size() > 0 ? observations.size() - 1 : 0);
+        for (const MtRatioObservation& obs : observations) {
+            if (obs.site_index != target.site_index) reduced.push_back(obs);
+        }
+        if (reduced.empty()) {
+            result[target.site_index] = std::numeric_limits<double>::quiet_NaN();
+            continue;
+        }
+        MtRatioFitResult loo = fit_mt_ratio(reduced, config);
+        result[target.site_index] = loo.converged && std::isfinite(loo.parent2_fraction)
+            ? loo.parent2_fraction - full_fit.parent2_fraction
+            : std::numeric_limits<double>::quiet_NaN();
+    }
+    return result;
+}
+
+std::unordered_map<int, double> compute_atac_site_influence(
+        const std::vector<MtRatioFragmentObservation>& fragments,
+        const MtRatioFitConfig& config,
+        const MtRatioFitResult& full_fit,
+        const std::unordered_set<int>& used_sites) {
+    std::unordered_map<int, double> result;
+    if (!full_fit.converged || !std::isfinite(full_fit.parent2_fraction)) return result;
+    for (int site_index : used_sites) {
+        std::vector<MtRatioFragmentObservation> reduced;
+        reduced.reserve(fragments.size());
+        for (const MtRatioFragmentObservation& fragment : fragments) {
+            MtRatioFragmentObservation copy;
+            copy.sites.reserve(fragment.sites.size());
+            for (const MtRatioFragmentSite& site : fragment.sites) {
+                if (site.site_index != site_index) copy.sites.push_back(site);
+            }
+            if (!copy.sites.empty()) reduced.push_back(std::move(copy));
+        }
+        if (reduced.empty()) {
+            result[site_index] = std::numeric_limits<double>::quiet_NaN();
+            continue;
+        }
+        MtRatioFitResult loo = fit_mt_fragment_ratio(reduced, config);
+        result[site_index] = loo.converged && std::isfinite(loo.parent2_fraction)
+            ? loo.parent2_fraction - full_fit.parent2_fraction
+            : std::numeric_limits<double>::quiet_NaN();
+    }
+    return result;
+}
+
+double site_deviance_residual(const MtRatioObservation& obs,
+                              double predicted,
+                              double rho,
+                              bool use_beta) {
+    const uint64_t total = obs.ref + obs.alt;
+    if (total == 0) return std::numeric_limits<double>::quiet_NaN();
+    const double observed = static_cast<double>(obs.alt) / static_cast<double>(total);
+    const double fitted_ll = mt_ratio_count_log_likelihood(
+        obs.ref, obs.alt, predicted, rho, use_beta);
+    const double saturated_ll = mt_ratio_count_log_likelihood(
+        obs.ref, obs.alt, std::max(kTiny, std::min(1.0 - kTiny, observed)), rho, use_beta);
+    const double dev = std::max(0.0, 2.0 * (saturated_ll - fitted_ll));
+    const double sign = observed >= predicted ? 1.0 : -1.0;
+    return sign * std::sqrt(dev);
+}
+
+std::string calibration_ids_string(const SiteCalibrationData& data) {
+    if (data.calibration_ids.empty()) return "NA";
+    std::ostringstream out;
+    bool first = true;
+    for (const std::string& id : data.calibration_ids) {
+        if (!first) out << ',';
+        out << id;
+        first = false;
+    }
+    return out.str();
+}
+
+MtRatioProfileResult canonicalize_profile(MtRatioProfileResult profile,
+                                          bool assignment_matches_canonical) {
+    if (assignment_matches_canonical) return profile;
+    const double old_low = profile.parent2_ci_low;
+    const double old_high = profile.parent2_ci_high;
+    if (std::isfinite(old_low) && std::isfinite(old_high)) {
+        profile.parent2_ci_low = 1.0 - old_high;
+        profile.parent2_ci_high = 1.0 - old_low;
+        profile.parent1_ci_low = 1.0 - profile.parent2_ci_high;
+        profile.parent1_ci_high = 1.0 - profile.parent2_ci_low;
+    }
+    std::swap(profile.delta_ll_parent1_only, profile.delta_ll_parent2_only);
+    if (profile.inheritance_class == "ONLY_PARENT1") {
+        profile.inheritance_class = "ONLY_PARENT2";
+    } else if (profile.inheritance_class == "ONLY_PARENT2") {
+        profile.inheritance_class = "ONLY_PARENT1";
+    }
+    if (profile.inheritance_class_reason == "PROFILE_INTERVAL_WITHIN_PARENT1_REGION") {
+        profile.inheritance_class_reason = "PROFILE_INTERVAL_WITHIN_PARENT2_REGION";
+    } else if (profile.inheritance_class_reason == "PROFILE_INTERVAL_WITHIN_PARENT2_REGION") {
+        profile.inheritance_class_reason = "PROFILE_INTERVAL_WITHIN_PARENT1_REGION";
+    }
+    if (!profile.grid_delta_log_likelihood.empty()) {
+        std::reverse(profile.grid_delta_log_likelihood.begin(),
+                     profile.grid_delta_log_likelihood.end());
+    }
+    return profile;
+}
+
+void gz_write_text(gzFile out, const std::string& text) {
+    if (!out) return;
+    const int written = gzwrite(out, text.data(), static_cast<unsigned int>(text.size()));
+    if (written != static_cast<int>(text.size())) {
+        throw std::runtime_error("Failed while writing compressed mt profile output");
+    }
+}
+
+std::string profile_delta_csv(const std::vector<double>& values) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6);
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) out << ',';
+        if (std::isfinite(values[i])) out << values[i];
+        else out << "NA";
+    }
     return out.str();
 }
 
@@ -1430,11 +2210,39 @@ int main(int argc, char** argv) {
 
         std::unordered_map<std::string, int> barcode_to_cell;
         std::vector<CellInfo> cells = load_assignments(
-            opt.assignments, sample_index, barcode_to_cell);
+            opt.assignments, opt.calibration_reference, opt.library_id,
+            sample_index, barcode_to_cell);
+        const std::unordered_map<std::string, PairManifest> derived_pair_manifests =
+            derive_missing_pair_manifests(
+                opt, cells, pair_manifests, sites, position_to_site);
         std::unordered_set<std::string> empty_barcodes = load_empty_barcodes(
             opt.empty_barcodes, barcode_to_cell);
         std::unordered_map<std::string, double> fixed_ambient =
             load_fixed_ambient_fractions(opt.ambient_fraction_file);
+        const SiteCalibrationData site_calibration =
+            load_site_calibration(opt, position_to_site);
+        const std::vector<RhoReferenceEntry> rho_reference = load_rho_reference(opt);
+        const std::string panel_fingerprint = file_fingerprint(opt.vcf);
+        const std::string manifest_fingerprint = opt.legacy_panel_gt
+            ? "NA" : file_fingerprint(opt.site_manifest);
+        const std::string calibration_fingerprint = opt.site_calibration.empty()
+            ? "NA" : file_fingerprint(opt.site_calibration);
+        const bool ambient_background_available = !opt.ambient_none;
+        const bool ambient_qc_requested = std::isfinite(opt.ambient_qc_max);
+        const std::string ambient_mode = opt.ambient_none ? "NONE" :
+            (!opt.empty_barcodes.empty() ? "QC_EMPTY_BARCODES" : "QC_PROFILE_FILE");
+        const std::string ambient_profile_id = !opt.ambient_profile.empty()
+            ? path_basename(opt.ambient_profile)
+            : (!opt.empty_barcodes.empty() ? "INLINE_EMPTY_BARCODES" : "NA");
+        const std::string ambient_profile_fingerprint = !opt.ambient_profile.empty()
+            ? file_fingerprint(opt.ambient_profile) : "NA";
+        const std::string ambient_fraction_fingerprint = !opt.ambient_fraction_file.empty()
+            ? file_fingerprint(opt.ambient_fraction_file) : "NA";
+        const std::string experimental_mode =
+            !opt.site_calibration.empty() && ambient_qc_requested
+                ? "SITE_CALIBRATION_PLUS_AMBIENT_QC"
+                : (!opt.site_calibration.empty() ? "SITE_CALIBRATION"
+                   : (ambient_qc_requested ? "AMBIENT_QC" : "BASELINE"));
 
         std::vector<AmbientSite> ambient(sites.size());
         if (!opt.ambient_profile.empty()) {
@@ -1456,13 +2264,18 @@ int main(int argc, char** argv) {
         }
         if (!fixed_ambient.empty()) {
             std::fprintf(stderr,
-                "Fixed ambient fractions loaded: %zu (explicit per-cell override)\n",
+                "Precomputed ambient QC fractions loaded: %zu (optional per-cell QC override)\n",
                 fixed_ambient.size());
         }
 
         ReadStats stats;
-        count_molecules(opt, sites, position_to_site, barcode_to_cell,
-                        empty_barcodes, cells, ambient, stats);
+        if (opt.assay_mode == "ATAC") {
+            count_atac_fragments(opt, sites, position_to_site, barcode_to_cell,
+                                 empty_barcodes, cells, ambient, stats);
+        } else {
+            count_molecules(opt, sites, position_to_site, barcode_to_cell,
+                            empty_barcodes, cells, ambient, stats);
+        }
         if (stats.pileup_bases == 0) {
             throw std::runtime_error(
                 "The BAM contains the mitochondrial contig but no reads overlap the selected "
@@ -1471,8 +2284,9 @@ int main(int argc, char** argv) {
         }
         if (stats.accepted_observations == 0) {
             throw std::runtime_error(
-                "No UMI-collapsed mitochondrial molecule/site observations were accepted. "
-                "Check CB/UB tags, barcode agreement, mapping filters, and panel overlap.");
+                opt.assay_mode == "ATAC"
+                    ? "No mitochondrial ATAC fragment/site observations were accepted. Check paired-read flags, CB tags, mapping filters, and panel overlap."
+                    : "No UMI-collapsed mitochondrial molecule/site observations were accepted. Check CB/UB tags, barcode agreement, mapping filters, and panel overlap.");
         }
 
         if (!empty_barcodes.empty()) {
@@ -1484,14 +2298,16 @@ int main(int argc, char** argv) {
             }
         }
 
-        const bool ambient_enabled = !opt.ambient_none;
+        // The selected experimental architecture uses MT ambient/background only
+        // as an independent anchor-derived QC measurement. It is never enabled
+        // in the parental-ratio likelihood.
         int usable_ambient_sites = 0;
-        if (ambient_enabled) {
+        if (ambient_background_available) {
             for (const AmbientSite& a : ambient) if (a.usable) ++usable_ambient_sites;
-            if (usable_ambient_sites == 0) {
+            if (ambient_qc_requested && usable_ambient_sites == 0) {
                 throw std::runtime_error(
                     "No mt-panel sites have a usable ambient profile; provide more empty-droplet "
-                    "evidence, lower --ambient_min_molecules, or explicitly use --ambient_none");
+                    "evidence or lower --ambient_min_molecules for --ambient_qc_max");
             }
         }
 
@@ -1504,7 +2320,7 @@ int main(int argc, char** argv) {
                         << sites[i].ref << '\t' << sites[i].alt << '\t'
                         << ambient[i].ref << '\t' << ambient[i].alt << '\t'
                         << format_double(ambient[i].alt_fraction) << '\t'
-                        << (!ambient_enabled ? "NOT_USED" :
+                        << (!ambient_background_available ? "NOT_USED" :
                             (ambient[i].usable ? "PASS" : "LOW_COUNTS")) << '\n';
         }
 
@@ -1521,7 +2337,43 @@ int main(int argc, char** argv) {
                   << "\tratio_molecules\ttotal_molecules_used\tsites_used"
                   << "\traw_parent1_support\traw_parent2_support\traw_parent1_fraction"
                   << "\tlog_likelihood\tinformation_condition\tmin_information_eigenvalue"
-                  << "\titerations\tconverged\tfit_mode\tstatus\n";
+                  << "\titerations\tconverged\tfit_mode\tstatus"
+                  << "\tsource_revision\tmodel_version\tassay_mode\testimand"
+                  << "\tcanonical_parent1\tcanonical_parent2\tassignment_matches_canonical"
+                  << "\tcanonical_parent1_fraction\tcanonical_parent2_fraction"
+                  << "\tparent1_profile_ci_low\tparent1_profile_ci_high"
+                  << "\tparent2_profile_ci_low\tparent2_profile_ci_high"
+                  << "\tprofile_ci_level\tprofile_status\tprofile_evaluations"
+                  << "\tprofile_failed_evaluations\tsingle_parent_epsilon"
+                  << "\tinheritance_class\tinheritance_class_reason"
+                  << "\tdelta_ll_parent1_only\tdelta_ll_both\tdelta_ll_parent2_only"
+                  << "\tpanel_fingerprint\tmanifest_fingerprint\tsite_calibration_id"
+                  << "\tsite_calibration_fingerprint\tsite_calibration_stratum"
+                  << "\tsite_calibration_fraction\tsite_calibration_status"
+                  << "\tuncalibrated_canonical_parent2_fraction\tuncalibrated_log_likelihood"
+                  << "\tcalibration_shift_parent2\tmax_abs_site_influence"
+                  << "\tmost_influential_site\tfraction_support_from_top_site"
+                  << "\trho_mode\trho_mode_effective\tpooled_rho_used\trho_prior_strength"
+                  << "\tfit_objective\tcalibration_reference_mode\tcalibration_true_parent"
+                  << "\tcalibration_original_identity\tatac_fragments_used"
+                  << "\tatac_multisite_fragments_used\tatac_fragment_site_observations_used"
+                  << "\tpair_definition_source\texperimental_mode\tambient_mode"
+                  << "\tambient_profile_id\tambient_profile_fingerprint"
+                  << "\tambient_fraction_file_fingerprint"
+                  << "\tambient_qc_max\tambient_qc_status\tambient_qc_reason"
+                  << "\tambient_anchor_molecules\n";
+
+        gzFile profile_out = nullptr;
+        const std::string profile_path = opt.output_prefix + ".mt_profile.tsv.gz";
+        if (opt.write_profile_grid) {
+            profile_out = gzopen(profile_path.c_str(), "wb");
+            if (!profile_out) throw std::runtime_error("Could not write: " + profile_path);
+            gz_write_text(profile_out,
+                "library_id\tbarcode\tidentity\tcanonical_parent1\tcanonical_parent2"
+                "\tcanonical_parent2_fraction_mle\tgrid_start\tgrid_step\tgrid_points"
+                "\tdelta_log_likelihood_csv\tprofile_status\tprofile_objective"
+                "\tsite_calibration_status\trho_mode\n");
+        }
 
         std::ofstream site_out;
         if (opt.write_site_counts) {
@@ -1531,29 +2383,134 @@ int main(int argc, char** argv) {
             site_out << "library_id\tbarcode\tidentity\tchrom\tpos\tref\talt\tsite_class"
                      << "\tparent1_state\tparent2_state\tratio_informative\tambient_anchor"
                      << "\tref_molecules\talt_molecules\tambient_ref_molecules"
-                     << "\tambient_alt_molecules\tambient_alt_fraction\tused_in_fit\n";
+                     << "\tambient_alt_molecules\tambient_alt_fraction\tused_in_fit"
+                     << "\tparent1_alt_probability\tparent2_alt_probability"
+                     << "\tpredicted_alt_probability\tsite_log_likelihood"
+                     << "\tsite_deviance_residual\tleave_one_site_out_delta_r"
+                     << "\tsite_influence_status\tsite_calibration_status"
+                     << "\tcalibration_true_parent\tassay_mode"
+                     << "\tcanonical_parent1\tcanonical_parent2\n";
         }
 
+        struct CellCounters {
+            uint64_t pass_cells = 0;
+            uint64_t weak_cells = 0;
+            uint64_t low_cells = 0;
+            uint64_t fixed_cells = 0;
+            uint64_t pair_missing_cells = 0;
+            uint64_t derived_pair_cells = 0;
+            uint64_t collapsed_pair_cells = 0;
+            uint64_t unanchored_cells = 0;
+            uint64_t profile_attempted_cells = 0;
+            uint64_t profile_pass_cells = 0;
+            uint64_t profile_partial_cells = 0;
+            uint64_t profile_failed_cells = 0;
+            uint64_t profile_multimodal_cells = 0;
+            uint64_t inheritance_parent1_cells = 0;
+            uint64_t inheritance_both_cells = 0;
+            uint64_t inheritance_parent2_cells = 0;
+            uint64_t inheritance_ambiguous_cells = 0;
+            uint64_t calibration_full_cells = 0;
+            uint64_t calibration_partial_cells = 0;
+            uint64_t calibration_fallback_cells = 0;
+            uint64_t calibration_full_site_uses = 0;
+            uint64_t calibration_partial_site_uses = 0;
+            uint64_t calibration_fallback_site_uses = 0;
+            uint64_t rho_fixed_cells = 0;
+            uint64_t rho_shrunk_cells = 0;
+            uint64_t high_mt_ambient_cells = 0;
+            uint64_t ambient_qc_not_estimable_cells = 0;
+        };
+
+        struct CellResult {
+            std::string ratio_row;
+            std::string profile_row;
+            std::string site_rows;
+            CellCounters counters;
+            std::exception_ptr error;
+        };
         uint64_t pass_cells = 0;
         uint64_t weak_cells = 0;
         uint64_t low_cells = 0;
         uint64_t fixed_cells = 0;
         uint64_t pair_missing_cells = 0;
+        uint64_t derived_pair_cells = 0;
         uint64_t collapsed_pair_cells = 0;
         uint64_t unanchored_cells = 0;
+        uint64_t profile_attempted_cells = 0;
+        uint64_t profile_pass_cells = 0;
+        uint64_t profile_partial_cells = 0;
+        uint64_t profile_failed_cells = 0;
+        uint64_t profile_multimodal_cells = 0;
+        uint64_t inheritance_parent1_cells = 0;
+        uint64_t inheritance_both_cells = 0;
+        uint64_t inheritance_parent2_cells = 0;
+        uint64_t inheritance_ambiguous_cells = 0;
+        uint64_t calibration_full_cells = 0;
+        uint64_t calibration_partial_cells = 0;
+        uint64_t calibration_fallback_cells = 0;
+        uint64_t calibration_full_site_uses = 0;
+        uint64_t calibration_partial_site_uses = 0;
+        uint64_t calibration_fallback_site_uses = 0;
+        uint64_t rho_fixed_cells = 0;
+        uint64_t rho_shrunk_cells = 0;
+        uint64_t high_mt_ambient_cells = 0;
+        uint64_t ambient_qc_not_estimable_cells = 0;
 
-        for (CellInfo& cell : cells) {
+        std::vector<CellResult> cell_results(cells.size());
+
+        auto process_cell = [&](size_t cell_index) {
+            CellResult& cell_result = cell_results[cell_index];
+            try {
+                const CellInfo& cell = cells[cell_index];
+                std::ostringstream ratio_out;
+                std::ostringstream site_out;
+            auto& pass_cells = cell_result.counters.pass_cells;
+            auto& weak_cells = cell_result.counters.weak_cells;
+            auto& low_cells = cell_result.counters.low_cells;
+            auto& fixed_cells = cell_result.counters.fixed_cells;
+            auto& pair_missing_cells = cell_result.counters.pair_missing_cells;
+            auto& derived_pair_cells = cell_result.counters.derived_pair_cells;
+            auto& collapsed_pair_cells = cell_result.counters.collapsed_pair_cells;
+            auto& unanchored_cells = cell_result.counters.unanchored_cells;
+            auto& profile_attempted_cells = cell_result.counters.profile_attempted_cells;
+            auto& profile_pass_cells = cell_result.counters.profile_pass_cells;
+            auto& profile_partial_cells = cell_result.counters.profile_partial_cells;
+            auto& profile_failed_cells = cell_result.counters.profile_failed_cells;
+            auto& profile_multimodal_cells = cell_result.counters.profile_multimodal_cells;
+            auto& inheritance_parent1_cells = cell_result.counters.inheritance_parent1_cells;
+            auto& inheritance_both_cells = cell_result.counters.inheritance_both_cells;
+            auto& inheritance_parent2_cells = cell_result.counters.inheritance_parent2_cells;
+            auto& inheritance_ambiguous_cells = cell_result.counters.inheritance_ambiguous_cells;
+            auto& calibration_full_cells = cell_result.counters.calibration_full_cells;
+            auto& calibration_partial_cells = cell_result.counters.calibration_partial_cells;
+            auto& calibration_fallback_cells = cell_result.counters.calibration_fallback_cells;
+            auto& calibration_full_site_uses = cell_result.counters.calibration_full_site_uses;
+            auto& calibration_partial_site_uses = cell_result.counters.calibration_partial_site_uses;
+            auto& calibration_fallback_site_uses = cell_result.counters.calibration_fallback_site_uses;
+            auto& rho_fixed_cells = cell_result.counters.rho_fixed_cells;
+            auto& rho_shrunk_cells = cell_result.counters.rho_shrunk_cells;
+            auto& high_mt_ambient_cells = cell_result.counters.high_mt_ambient_cells;
+            auto& ambient_qc_not_estimable_cells = cell_result.counters.ambient_qc_not_estimable_cells;
             std::string status = "PASS";
             std::string fit_mode;
             if (opt.legacy_panel_gt) fit_mode = "LEGACY_GT_";
-            fit_mode += opt.likelihood == "beta_binomial" ? "BETA_BINOMIAL_" : "BINOMIAL_";
-            fit_mode += ambient_enabled ? "JOINT_MT_AMBIENT" : "NO_AMBIENT";
+            if (opt.assay_mode == "ATAC") {
+                fit_mode += "ATAC_FRAGMENT_";
+                fit_mode += "NO_AMBIENT";
+            } else {
+                fit_mode += opt.likelihood == "beta_binomial" ? "BETA_BINOMIAL_" : "BINOMIAL_";
+                fit_mode += "NO_AMBIENT";
+            }
+            if (ambient_qc_requested) fit_mode += "_AMBIENT_QC";
 
             const bool same_parent = cell.parent1_index == cell.parent2_index;
             const PairManifest* pair_manifest = nullptr;
+            std::string pair_definition_source = same_parent ? "NOT_APPLICABLE" : "UNAVAILABLE";
             PairManifest legacy_manifest;
             if (!same_parent) {
                 if (opt.legacy_panel_gt) {
+                    pair_definition_source = "LEGACY_GT_PANEL";
                     const std::pair<std::string, std::string> canonical =
                         canonical_parents(cell.parent1, cell.parent2);
                     legacy_manifest.canonical_parent1 = canonical.first;
@@ -1577,21 +2534,25 @@ int main(int argc, char** argv) {
                     }
                     pair_manifest = &legacy_manifest;
                 } else {
-                    const auto found = pair_manifests.find(
-                        pair_manifest_key(cell.parent1, cell.parent2));
-                    if (found != pair_manifests.end()) pair_manifest = &found->second;
+                    const std::string pair_key = pair_manifest_key(cell.parent1, cell.parent2);
+                    const auto found = pair_manifests.find(pair_key);
+                    if (found != pair_manifests.end()) {
+                        pair_manifest = &found->second;
+                        pair_definition_source = "LIBRARY_SITE_MANIFEST";
+                    } else {
+                        const auto derived_found = derived_pair_manifests.find(pair_key);
+                        if (derived_found != derived_pair_manifests.end()) {
+                            pair_manifest = &derived_found->second;
+                            pair_definition_source = "RECONCILED_PAIR_FROM_PANEL";
+                            ++derived_pair_cells;
+                        }
+                    }
                 }
             }
 
             const auto fixed_it = fixed_ambient.find(cell.barcode);
             const double* fixed_value = fixed_it == fixed_ambient.end() ? nullptr : &fixed_it->second;
-            if (fixed_value) {
-                fit_mode = (opt.legacy_panel_gt ? "LEGACY_GT_" : "") +
-                           std::string(opt.likelihood == "beta_binomial" ?
-                                       "BETA_BINOMIAL_FIXED_AMBIENT" : "BINOMIAL_FIXED_AMBIENT");
-                ++fixed_cells;
-            }
-            const bool joint_ambient = ambient_enabled && fixed_value == nullptr;
+            if (fixed_value && ambient_qc_requested) ++fixed_cells;
 
             int ratio_sites_available = pair_manifest ? pair_manifest->ratio_sites_available : 0;
             int ambient_sites_available = pair_manifest ? pair_manifest->ambient_only_sites_available : 0;
@@ -1603,8 +2564,15 @@ int main(int argc, char** argv) {
             uint64_t total_molecules_used = 0;
             uint64_t support_parent1 = 0;
             uint64_t support_parent2 = 0;
-            std::vector<SiteObservation> observations;
+            std::vector<MtRatioObservation> observations;
+            std::vector<MtRatioObservation> uncalibrated_observations;
+            std::vector<MtRatioFragmentObservation> fragment_observations;
+            std::vector<MtRatioFragmentObservation> uncalibrated_fragment_observations;
             std::unordered_set<int> used_site_indices;
+            uint64_t fully_calibrated_used_sites = 0;
+            uint64_t partially_calibrated_used_sites = 0;
+            uint64_t atac_multisite_fragments_used = 0;
+            uint64_t atac_fragment_site_observations_used = 0;
 
             if (same_parent) {
                 status = "SAME_PARENT_UNIDENTIFIABLE";
@@ -1630,6 +2598,13 @@ int main(int argc, char** argv) {
                 }
             }
 
+            const std::pair<std::string, std::string> fallback_canonical =
+                canonical_parents(cell.parent1, cell.parent2);
+            const std::string canonical_parent1 = pair_manifest
+                ? pair_manifest->canonical_parent1 : fallback_canonical.first;
+            const std::string canonical_parent2 = pair_manifest
+                ? pair_manifest->canonical_parent2 : fallback_canonical.second;
+
             if (pair_manifest) {
                 for (const auto& item : cell.counts) {
                     const int site_index = item.first;
@@ -1641,12 +2616,11 @@ int main(int argc, char** argv) {
                     int p2_state = manifest_site.canonical_parent2_state;
                     if (!assignment_matches_canonical) std::swap(p1_state, p2_state);
                     const bool ratio_informative = p1_state != p2_state;
-                    const bool ambient_anchor =
-                        manifest_site.site_class == MANIFEST_AMBIENT_ONLY;
+                    const bool ambient_anchor = manifest_site.site_class == MANIFEST_AMBIENT_ONLY;
                     if (count.total() == 0) continue;
                     if (ratio_informative) {
                         ++ratio_sites_observed;
-                        ratio_molecules += count.total();
+                        if (opt.assay_mode != "ATAC") ratio_molecules += count.total();
                         if (p1_state == 0) {
                             support_parent1 += count.ref;
                             support_parent2 += count.alt;
@@ -1658,27 +2632,85 @@ int main(int argc, char** argv) {
                         ++ambient_sites_observed;
                     }
 
-                    const bool ambient_ok = !ambient_enabled || ambient[site_index].usable;
-                    const bool class_used = ratio_informative || (ambient_enabled && ambient_anchor);
-                    if (!ambient_ok || !class_used) continue;
-                    SiteObservation obs;
+                    if (!ratio_informative) continue;
+                    const CalibrationProbabilityResult probabilities = calibration_probabilities(
+                        opt, site_calibration, *pair_manifest, site_index,
+                        assignment_matches_canonical, p1_state, p2_state);
+                    MtRatioObservation obs;
                     obs.site_index = site_index;
                     obs.ref = count.ref;
                     obs.alt = count.alt;
-                    obs.parent1_alt_probability = p1_state == 1
-                        ? 1.0 - opt.error_rate : opt.error_rate;
-                    obs.parent2_alt_probability = p2_state == 1
-                        ? 1.0 - opt.error_rate : opt.error_rate;
-                    obs.ambient_alt_probability = ambient_enabled
-                        ? clamp_probability(ambient[site_index].alt_fraction) : 0.5;
-                    obs.site_class = manifest_site.site_class;
+                    obs.parent1_alt_probability = probabilities.parent1_alt_probability;
+                    obs.parent2_alt_probability = probabilities.parent2_alt_probability;
+                    obs.ambient_alt_probability = 0.5;
                     obs.ratio_informative = ratio_informative;
                     obs.ambient_anchor = ambient_anchor;
                     observations.push_back(obs);
+
+                    MtRatioObservation uncalibrated = obs;
+                    uncalibrated.parent1_alt_probability = p1_state == 1
+                        ? 1.0 - opt.error_rate : opt.error_rate;
+                    uncalibrated.parent2_alt_probability = p2_state == 1
+                        ? 1.0 - opt.error_rate : opt.error_rate;
+                    uncalibrated_observations.push_back(uncalibrated);
                     used_site_indices.insert(site_index);
-                    total_molecules_used += count.total();
+                    if (probabilities.parent1_calibrated && probabilities.parent2_calibrated) {
+                        ++fully_calibrated_used_sites;
+                    } else if (probabilities.parent1_calibrated || probabilities.parent2_calibrated) {
+                        ++partially_calibrated_used_sites;
+                    }
+                    if (opt.assay_mode != "ATAC") total_molecules_used += count.total();
                     if (ratio_informative) ++ratio_sites_used;
                     if (ambient_anchor) ++ambient_sites_used;
+                }
+
+                if (opt.assay_mode == "ATAC") {
+                    ratio_molecules = 0;
+                    total_molecules_used = 0;
+                    for (const RawFragmentObservation& raw_fragment : cell.fragments) {
+                        MtRatioFragmentObservation fragment;
+                        MtRatioFragmentObservation uncalibrated_fragment;
+                        bool has_ratio_evidence = false;
+                        for (const RawFragmentSite& raw_site : raw_fragment.sites) {
+                            const int site_index = raw_site.site_index;
+                            const auto manifest_found = pair_manifest->sites.find(site_index);
+                            if (manifest_found == pair_manifest->sites.end()) continue;
+                            const ManifestSite& manifest_site = manifest_found->second;
+                            int p1_state = manifest_site.canonical_parent1_state;
+                            int p2_state = manifest_site.canonical_parent2_state;
+                            if (!assignment_matches_canonical) std::swap(p1_state, p2_state);
+                            const bool ratio_informative = p1_state != p2_state;
+                            const bool ambient_anchor = manifest_site.site_class == MANIFEST_AMBIENT_ONLY;
+                            if (!ratio_informative) continue;
+                            const CalibrationProbabilityResult probabilities = calibration_probabilities(
+                                opt, site_calibration, *pair_manifest, site_index,
+                                assignment_matches_canonical, p1_state, p2_state);
+                            MtRatioFragmentSite fragment_site;
+                            fragment_site.site_index = site_index;
+                            fragment_site.allele = raw_site.allele;
+                            fragment_site.parent1_alt_probability = probabilities.parent1_alt_probability;
+                            fragment_site.parent2_alt_probability = probabilities.parent2_alt_probability;
+                            fragment_site.ambient_alt_probability = 0.5;
+                            fragment_site.ratio_informative = ratio_informative;
+                            fragment_site.ambient_anchor = ambient_anchor;
+                            fragment.sites.push_back(fragment_site);
+
+                            MtRatioFragmentSite uncalibrated_site = fragment_site;
+                            uncalibrated_site.parent1_alt_probability = p1_state == 1
+                                ? 1.0 - opt.error_rate : opt.error_rate;
+                            uncalibrated_site.parent2_alt_probability = p2_state == 1
+                                ? 1.0 - opt.error_rate : opt.error_rate;
+                            uncalibrated_fragment.sites.push_back(uncalibrated_site);
+                            if (ratio_informative) has_ratio_evidence = true;
+                        }
+                        if (fragment.sites.empty()) continue;
+                        if (has_ratio_evidence) ++ratio_molecules;
+                        ++total_molecules_used;
+                        atac_fragment_site_observations_used += fragment.sites.size();
+                        if (fragment.sites.size() > 1) ++atac_multisite_fragments_used;
+                        fragment_observations.push_back(std::move(fragment));
+                        uncalibrated_fragment_observations.push_back(std::move(uncalibrated_fragment));
+                    }
                 }
             }
 
@@ -1688,37 +2720,65 @@ int main(int argc, char** argv) {
                        ratio_molecules < static_cast<uint64_t>(opt.min_molecules)) {
                 status = "LOW_RATIO_MOLECULES";
             } else if (status == "PASS" && ratio_sites_used < opt.min_sites) {
-                status = ambient_enabled ? "LOW_AMBIENT_COVERED_RATIO_SITES" :
-                                           "LOW_RATIO_SITES";
+                status = "LOW_RATIO_SITES";
             }
 
-            const bool missing_anchor = joint_ambient &&
-                ambient_sites_used < opt.min_ambient_only_sites;
-            if (status == "PASS" && missing_anchor && !opt.allow_unanchored_ambient) {
-                status = "NO_AMBIENT_ANCHOR_OBSERVED";
-                ++unanchored_cells;
+            const AmbientQcEstimate ambient_qc = estimate_ambient_qc(
+                opt, cell, pair_manifest, ambient, fixed_value);
+            if (ambient_qc_requested) {
+                ambient_sites_observed = ambient_qc.sites_observed;
+                ambient_sites_used = ambient_qc.sites_used;
+                if (ambient_qc.status == "HIGH_MT_AMBIENT") {
+                    ++high_mt_ambient_cells;
+                    if (status == "PASS") status = "HIGH_MT_AMBIENT";
+                } else if (ambient_qc.status == "NOT_ESTIMABLE") {
+                    ++ambient_qc_not_estimable_cells;
+                    if (status == "PASS") status = "MT_AMBIENT_NOT_ESTIMABLE";
+                }
             }
 
-            FitResult fit;
-            if (status == "PASS") {
-                fit = fit_cell(observations, opt, ambient_enabled, fixed_value);
-                // Missing ambient-only evidence is a structural limitation, not
-                // merely an optimizer outcome.  When the user explicitly asks
-                // for this diagnostic fit, preserve that scientific status even
-                // if the optimizer drifts along the expected shallow ridge.
-                if (missing_anchor) {
-                    status = "WEAKLY_IDENTIFIABLE_UNANCHORED";
-                    ++unanchored_cells;
-                } else if (!fit.converged) {
+            const double pooled_rho_for_cell = pair_manifest
+                ? resolve_pooled_rho(opt, rho_reference, canonical_parent1, canonical_parent2)
+                : opt.pooled_rho;
+            if (opt.assay_mode != "ATAC" && opt.rho_mode != "free" &&
+                pair_manifest && !std::isfinite(pooled_rho_for_cell)) {
+                throw std::runtime_error("No pooled rho reference matched pair " +
+                    canonical_parent1 + "+" + canonical_parent2 + " for library " + opt.library_id);
+            }
+            const MtRatioFitConfig fit_config = make_fit_config(
+                opt, pooled_rho_for_cell, ratio_molecules);
+            std::string rho_mode_effective = "NOT_APPLICABLE";
+            if (fit_config.use_beta_binomial) {
+                if (fit_config.overdispersion_fixed) {
+                    rho_mode_effective = opt.rho_mode == "low_information_fixed"
+                        ? "FIXED_LOW_INFORMATION" : "FIXED";
+                    ++rho_fixed_cells;
+                    if (opt.rho_mode != "free") fit_mode += "_RHO_FIXED";
+                } else if (fit_config.overdispersion_penalized) {
+                    rho_mode_effective = "SHRINK";
+                    ++rho_shrunk_cells;
+                    fit_mode += "_RHO_SHRINK";
+                } else {
+                    rho_mode_effective = opt.rho_mode == "low_information_fixed"
+                        ? "FREE_HIGH_INFORMATION" : "FREE";
+                }
+            }
+
+            MtRatioFitResult fit;
+            MtRatioFitResult uncalibrated_fit;
+            const bool fit_attempted = status == "PASS";
+            if (fit_attempted) {
+                fit = opt.assay_mode == "ATAC"
+                    ? fit_mt_fragment_ratio(fragment_observations, fit_config)
+                    : fit_mt_ratio(observations, fit_config);
+                if (!opt.site_calibration.empty()) {
+                    uncalibrated_fit = opt.assay_mode == "ATAC"
+                        ? fit_mt_fragment_ratio(uncalibrated_fragment_observations, fit_config)
+                        : fit_mt_ratio(uncalibrated_observations, fit_config);
+                }
+                if (!fit.converged) {
                     status = "NOT_CONVERGED";
-                } else if (fit.joint_ambient &&
-                           (fit.information_condition > 1e8 ||
-                            fit.min_information_eigenvalue < 1e-4 ||
-                            !std::isfinite(fit.ratio_se))) {
-                    status = "WEAKLY_IDENTIFIABLE";
-                } else if (fit.ambient_weight > 0.98) {
-                    status = "PARENTAL_SIGNAL_ABSENT";
-                } else if (opt.likelihood == "beta_binomial" &&
+                } else if (fit_config.use_beta_binomial && !fit_config.overdispersion_fixed &&
                            fit.overdispersion_rho >= 0.999 * opt.overdispersion_max) {
                     status = "OVERDISPERSION_AT_BOUND";
                 }
@@ -1727,8 +2787,6 @@ int main(int argc, char** argv) {
             if (status == "PASS") {
                 ++pass_cells;
             } else if (status == "WEAKLY_IDENTIFIABLE" ||
-                       status == "WEAKLY_IDENTIFIABLE_UNANCHORED" ||
-                       status == "PARENTAL_SIGNAL_ABSENT" ||
                        status == "OVERDISPERSION_AT_BOUND") {
                 ++weak_cells;
             } else {
@@ -1755,16 +2813,135 @@ int main(int argc, char** argv) {
                 ? static_cast<double>(support_parent1) / raw_total
                 : std::numeric_limits<double>::quiet_NaN();
 
+            const double canonical_parent2_fraction =
+                std::isfinite(fit.parent2_fraction) && pair_manifest
+                    ? (assignment_matches_canonical
+                        ? fit.parent2_fraction : 1.0 - fit.parent2_fraction)
+                    : std::numeric_limits<double>::quiet_NaN();
+            const double canonical_parent1_fraction =
+                std::isfinite(canonical_parent2_fraction)
+                    ? 1.0 - canonical_parent2_fraction
+                    : std::numeric_limits<double>::quiet_NaN();
+            const double uncalibrated_canonical_parent2_fraction =
+                std::isfinite(uncalibrated_fit.parent2_fraction) && pair_manifest
+                    ? (assignment_matches_canonical
+                        ? uncalibrated_fit.parent2_fraction : 1.0 - uncalibrated_fit.parent2_fraction)
+                    : std::numeric_limits<double>::quiet_NaN();
+            const double calibration_shift_parent2 =
+                std::isfinite(canonical_parent2_fraction) &&
+                std::isfinite(uncalibrated_canonical_parent2_fraction)
+                    ? canonical_parent2_fraction - uncalibrated_canonical_parent2_fraction
+                    : std::numeric_limits<double>::quiet_NaN();
+
+            std::string site_calibration_status = "NOT_REQUESTED";
+            const uint64_t used_site_count = used_site_indices.size();
+            if (!opt.site_calibration.empty()) {
+                if (used_site_count == 0) site_calibration_status = "NO_USED_SITES";
+                else if (fully_calibrated_used_sites == used_site_count) site_calibration_status = "FULL";
+                else if (fully_calibrated_used_sites + partially_calibrated_used_sites > 0) {
+                    site_calibration_status = "PARTIAL";
+                } else site_calibration_status = "FALLBACK";
+            }
+            const double site_calibration_fraction = used_site_count > 0
+                ? static_cast<double>(fully_calibrated_used_sites) /
+                  static_cast<double>(used_site_count)
+                : std::numeric_limits<double>::quiet_NaN();
+            if (site_calibration_status == "FULL") ++calibration_full_cells;
+            else if (site_calibration_status == "PARTIAL") ++calibration_partial_cells;
+            else if (site_calibration_status == "FALLBACK") ++calibration_fallback_cells;
+            calibration_full_site_uses += fully_calibrated_used_sites;
+            calibration_partial_site_uses += partially_calibrated_used_sites;
+            if (!opt.site_calibration.empty() && used_site_count >
+                    fully_calibrated_used_sites + partially_calibrated_used_sites) {
+                calibration_fallback_site_uses += used_site_count -
+                    fully_calibrated_used_sites - partially_calibrated_used_sites;
+            }
+
+            MtRatioProfileResult profile;
+            profile.profile_status = "NOT_ATTEMPTED";
+            profile.inheritance_class = "AMBIGUOUS";
+            profile.inheritance_class_reason = "PRIMARY_FIT_NOT_SUCCESSFUL";
+            profile.single_parent_epsilon = opt.single_parent_epsilon;
+            if (fit.converged && std::isfinite(fit.log_likelihood) && pair_manifest) {
+                ++profile_attempted_cells;
+                profile = opt.assay_mode == "ATAC"
+                    ? profile_mt_fragment_ratio(fragment_observations, fit_config, fit,
+                        opt.single_parent_epsilon, opt.profile_grid_step, opt.write_profile_grid)
+                    : profile_mt_ratio(observations, fit_config, fit, opt.single_parent_epsilon,
+                        opt.profile_grid_step, opt.write_profile_grid);
+                profile = canonicalize_profile(profile, assignment_matches_canonical);
+                if (profile.profile_status == "PASS") ++profile_pass_cells;
+                else if (profile.profile_status == "PARTIAL") ++profile_partial_cells;
+                else if (profile.profile_status == "MULTIMODAL") ++profile_multimodal_cells;
+                else ++profile_failed_cells;
+            }
+
+            const std::unordered_map<int, double> site_influence =
+                fit.converged && opt.write_site_counts && opt.site_influence_mode == "full"
+                ? (opt.assay_mode == "ATAC"
+                    ? compute_atac_site_influence(fragment_observations, fit_config, fit, used_site_indices)
+                    : compute_rna_site_influence(observations, fit_config, fit))
+                : std::unordered_map<int, double>();
+            double max_abs_site_influence = std::numeric_limits<double>::quiet_NaN();
+            double sum_abs_site_influence = 0.0;
+            int most_influential_site_index = -1;
+            for (const auto& item : site_influence) {
+                if (!std::isfinite(item.second)) continue;
+                const double value = std::fabs(item.second);
+                sum_abs_site_influence += value;
+                if (!std::isfinite(max_abs_site_influence) || value > max_abs_site_influence) {
+                    max_abs_site_influence = value;
+                    most_influential_site_index = item.first;
+                }
+            }
+            const double fraction_support_from_top_site =
+                std::isfinite(max_abs_site_influence) && sum_abs_site_influence > 0.0
+                    ? max_abs_site_influence / sum_abs_site_influence
+                    : (std::isfinite(max_abs_site_influence) ? 0.0
+                       : std::numeric_limits<double>::quiet_NaN());
+            const std::string most_influential_site = most_influential_site_index >= 0
+                ? opt.mito_chrom + ":" + std::to_string(sites[most_influential_site_index].pos + 1)
+                : "NA";
+
+            if (profile.inheritance_class == "ONLY_PARENT1") ++inheritance_parent1_cells;
+            else if (profile.inheritance_class == "BOTH") ++inheritance_both_cells;
+            else if (profile.inheritance_class == "ONLY_PARENT2") ++inheritance_parent2_cells;
+            else ++inheritance_ambiguous_cells;
+
+            if (opt.write_profile_grid && profile_out && !profile.grid_delta_log_likelihood.empty()) {
+                const double effective_grid_step = profile.grid_r.size() > 1
+                    ? profile.grid_r[1] - profile.grid_r[0] : 1.0;
+                const std::string profile_objective = opt.assay_mode == "ATAC"
+                    ? "FRAGMENT_LOG_LIKELIHOOD"
+                    : (fit_config.overdispersion_penalized
+                        ? "PENALIZED_RHO_PROFILE" : "PROFILE_LOG_LIKELIHOOD");
+                std::ostringstream row;
+                row << (opt.legacy_panel_gt ? "NA" : opt.library_id) << '\t'
+                    << cell.barcode << '\t' << cell.identity << '\t'
+                    << canonical_parent1 << '\t' << canonical_parent2 << '\t'
+                    << format_double(canonical_parent2_fraction) << '\t'
+                    << "0.0" << '\t' << format_double(effective_grid_step, 8) << '\t'
+                    << profile.grid_delta_log_likelihood.size() << '\t'
+                    << profile_delta_csv(profile.grid_delta_log_likelihood) << '\t'
+                    << profile.profile_status << '\t' << profile_objective << '\t'
+                    << site_calibration_status << '\t' << opt.rho_mode << '\n';
+                cell_result.profile_row = row.str();
+            }
+
+            const std::string likelihood_label = opt.assay_mode == "ATAC"
+                ? "fragment_mixture" : opt.likelihood;
+            const double reported_ambient_fraction = ambient_qc_requested
+                ? ambient_qc.fraction : fit.ambient_fraction;
             ratio_out << (opt.legacy_panel_gt ? "NA" : opt.library_id) << '\t'
                       << cell.barcode << '\t' << cell.identity << '\t'
                       << cell.parent1 << '\t' << cell.parent2 << '\t'
-                      << opt.likelihood << '\t'
+                      << likelihood_label << '\t'
                       << format_double(parent1_fraction) << '\t'
                       << format_double(fit.parent2_fraction) << '\t'
                       << format_double(fit.ratio_se) << '\t'
                       << format_double(fit.ratio_se_robust) << '\t'
                       << format_double(ci_low) << '\t' << format_double(ci_high) << '\t'
-                      << format_double(fit.ambient_weight) << '\t'
+                      << format_double(reported_ambient_fraction) << '\t'
                       << format_double(fit.ambient_se) << '\t'
                       << format_double(fit.ambient_se_robust) << '\t'
                       << format_double(fit.overdispersion_rho) << '\t'
@@ -1779,7 +2956,56 @@ int main(int argc, char** argv) {
                       << format_double(fit.information_condition) << '\t'
                       << format_double(fit.min_information_eigenvalue) << '\t'
                       << fit.iterations << '\t' << (fit.converged ? 1 : 0) << '\t'
-                      << fit_mode << '\t' << status << '\n';
+                      << fit_mode << '\t' << status << '\t'
+                      << CELLBOUNCER_SOURCE_REVISION << '\t' << kMtModelVersion << '\t'
+                      << opt.assay_mode << '\t' << assay_estimand(opt.assay_mode) << '\t'
+                      << canonical_parent1 << '\t' << canonical_parent2 << '\t'
+                      << (pair_manifest ? (assignment_matches_canonical ? "1" : "0") : "NA") << '\t'
+                      << format_double(canonical_parent1_fraction) << '\t'
+                      << format_double(canonical_parent2_fraction) << '\t'
+                      << format_double(profile.parent1_ci_low) << '\t'
+                      << format_double(profile.parent1_ci_high) << '\t'
+                      << format_double(profile.parent2_ci_low) << '\t'
+                      << format_double(profile.parent2_ci_high) << '\t'
+                      << format_double(profile.profile_ci_level, 2) << '\t'
+                      << profile.profile_status << '\t' << profile.evaluations << '\t'
+                      << profile.failed_evaluations << '\t'
+                      << format_double(opt.single_parent_epsilon, 6) << '\t'
+                      << profile.inheritance_class << '\t'
+                      << profile.inheritance_class_reason << '\t'
+                      << format_double(profile.delta_ll_parent1_only) << '\t'
+                      << format_double(profile.delta_ll_both) << '\t'
+                      << format_double(profile.delta_ll_parent2_only) << '\t'
+                      << panel_fingerprint << '\t' << manifest_fingerprint << '\t'
+                      << calibration_ids_string(site_calibration) << '\t'
+                      << calibration_fingerprint << '\t' << opt.site_calibration_stratum << '\t'
+                      << format_double(site_calibration_fraction) << '\t'
+                      << site_calibration_status << '\t'
+                      << format_double(uncalibrated_canonical_parent2_fraction) << '\t'
+                      << format_double(uncalibrated_fit.log_likelihood) << '\t'
+                      << format_double(calibration_shift_parent2) << '\t'
+                      << format_double(max_abs_site_influence) << '\t'
+                      << most_influential_site << '\t'
+                      << format_double(fraction_support_from_top_site) << '\t'
+                      << opt.rho_mode << '\t' << rho_mode_effective << '\t'
+                      << format_double((fit_config.overdispersion_fixed || fit_config.overdispersion_penalized)
+                           ? pooled_rho_for_cell : std::numeric_limits<double>::quiet_NaN()) << '\t'
+                      << format_double(fit_config.overdispersion_penalized
+                           ? opt.rho_prior_strength : 0.0) << '\t'
+                      << format_double(fit.objective_value) << '\t'
+                      << (opt.calibration_reference.empty() ? 0 : 1) << '\t'
+                      << (cell.calibration_true_parent.empty() ? "NA" : cell.calibration_true_parent) << '\t'
+                      << (cell.original_identity.empty() ? "NA" : cell.original_identity) << '\t'
+                      << (opt.assay_mode == "ATAC" ? fragment_observations.size() : 0) << '\t'
+                      << (opt.assay_mode == "ATAC" ? atac_multisite_fragments_used : 0) << '\t'
+                      << (opt.assay_mode == "ATAC" ? atac_fragment_site_observations_used : 0) << '\t'
+                      << pair_definition_source << '\t'
+                      << experimental_mode << '\t' << ambient_mode << '\t'
+                      << ambient_profile_id << '\t' << ambient_profile_fingerprint << '\t'
+                      << ambient_fraction_fingerprint << '\t'
+                      << format_double(opt.ambient_qc_max) << '\t'
+                      << ambient_qc.status << '\t' << ambient_qc.reason << '\t'
+                      << ambient_qc.molecules << '\n';
 
             if (opt.write_site_counts && pair_manifest) {
                 for (const auto& item : cell.counts) {
@@ -1791,10 +3017,42 @@ int main(int argc, char** argv) {
                     int p2_state = manifest_site.canonical_parent2_state;
                     if (!assignment_matches_canonical) std::swap(p1_state, p2_state);
                     const bool ratio_informative = p1_state != p2_state;
-                    const bool ambient_anchor =
-                        manifest_site.site_class == MANIFEST_AMBIENT_ONLY;
+                    const bool ambient_anchor = manifest_site.site_class == MANIFEST_AMBIENT_ONLY;
                     const AlleleCount& count = item.second;
                     const MtSite& site = sites[site_index];
+                    const CalibrationProbabilityResult probabilities = calibration_probabilities(
+                        opt, site_calibration, *pair_manifest, site_index,
+                        assignment_matches_canonical, p1_state, p2_state);
+                    MtRatioObservation site_observation;
+                    site_observation.site_index = site_index;
+                    site_observation.ref = count.ref;
+                    site_observation.alt = count.alt;
+                    site_observation.parent1_alt_probability = probabilities.parent1_alt_probability;
+                    site_observation.parent2_alt_probability = probabilities.parent2_alt_probability;
+                    site_observation.ambient_alt_probability = 0.5;
+                    site_observation.ratio_informative = ratio_informative;
+                    site_observation.ambient_anchor = ambient_anchor;
+                    const bool used = used_site_indices.count(site_index) > 0;
+                    const double predicted = used && fit.converged
+                        ? mt_ratio_predicted_alt_probability(site_observation,
+                            fit.parent2_fraction, fit.ambient_fraction)
+                        : std::numeric_limits<double>::quiet_NaN();
+                    const bool site_beta = opt.assay_mode != "ATAC" && fit_config.use_beta_binomial;
+                    const double site_rho = site_beta && std::isfinite(fit.overdispersion_rho)
+                        ? fit.overdispersion_rho : 0.0;
+                    const double site_ll = used && std::isfinite(predicted)
+                        ? mt_ratio_count_log_likelihood(count.ref, count.alt, predicted, site_rho, site_beta)
+                        : std::numeric_limits<double>::quiet_NaN();
+                    const double deviance = used && std::isfinite(predicted)
+                        ? site_deviance_residual(site_observation, predicted, site_rho, site_beta)
+                        : std::numeric_limits<double>::quiet_NaN();
+                    const auto influence_it = site_influence.find(site_index);
+                    const double influence = influence_it == site_influence.end()
+                        ? std::numeric_limits<double>::quiet_NaN() : influence_it->second;
+                    const std::string influence_status = !used ? "NOT_USED" :
+                        (opt.site_influence_mode == "none" ? "DISABLED" :
+                         (!fit.converged ? "PRIMARY_FIT_UNAVAILABLE" :
+                          (std::isfinite(influence) ? "PASS" : "LOO_FAILED")));
                     site_out << (opt.legacy_panel_gt ? "NA" : opt.library_id) << '\t'
                              << cell.barcode << '\t' << cell.identity << '\t'
                              << opt.mito_chrom << '\t' << site.pos + 1 << '\t'
@@ -1806,9 +3064,92 @@ int main(int argc, char** argv) {
                              << count.ref << '\t' << count.alt << '\t'
                              << ambient[site_index].ref << '\t' << ambient[site_index].alt << '\t'
                              << format_double(ambient[site_index].alt_fraction) << '\t'
-                             << (used_site_indices.count(site_index) ? 1 : 0) << '\n';
+                             << (used ? 1 : 0) << '\t'
+                             << format_double(probabilities.parent1_alt_probability) << '\t'
+                             << format_double(probabilities.parent2_alt_probability) << '\t'
+                             << format_double(predicted) << '\t' << format_double(site_ll) << '\t'
+                             << format_double(deviance) << '\t' << format_double(influence) << '\t'
+                             << influence_status << '\t' << probabilities.status << '\t'
+                             << (cell.calibration_true_parent.empty() ? "NA" : cell.calibration_true_parent) << '\t'
+                             << opt.assay_mode << '\t'
+                             << canonical_parent1 << '\t' << canonical_parent2
+                             << '\n';
                 }
             }
+                cell_result.ratio_row = ratio_out.str();
+                cell_result.site_rows = site_out.str();
+            } catch (...) {
+                cell_result.error = std::current_exception();
+            }
+        };
+
+        const size_t worker_count = cells.empty() ? 0 : std::min(
+            cells.size(), static_cast<size_t>(std::max(1, opt.threads)));
+        if (worker_count <= 1) {
+            for (size_t cell_index = 0; cell_index < cells.size(); ++cell_index) {
+                process_cell(cell_index);
+            }
+        } else {
+            std::atomic<size_t> next_cell{0};
+            std::vector<std::thread> workers;
+            workers.reserve(worker_count);
+            for (size_t worker = 0; worker < worker_count; ++worker) {
+                workers.emplace_back([&]() {
+                    while (true) {
+                        const size_t cell_index = next_cell.fetch_add(1);
+                        if (cell_index >= cells.size()) break;
+                        process_cell(cell_index);
+                    }
+                });
+            }
+            for (std::thread& worker : workers) worker.join();
+        }
+
+        // Preserve deterministic failure attribution and output ordering.
+        for (const CellResult& cell_result : cell_results) {
+            if (cell_result.error) std::rethrow_exception(cell_result.error);
+        }
+        for (const CellResult& cell_result : cell_results) {
+            pass_cells += cell_result.counters.pass_cells;
+            weak_cells += cell_result.counters.weak_cells;
+            low_cells += cell_result.counters.low_cells;
+            fixed_cells += cell_result.counters.fixed_cells;
+            pair_missing_cells += cell_result.counters.pair_missing_cells;
+            derived_pair_cells += cell_result.counters.derived_pair_cells;
+            collapsed_pair_cells += cell_result.counters.collapsed_pair_cells;
+            unanchored_cells += cell_result.counters.unanchored_cells;
+            profile_attempted_cells += cell_result.counters.profile_attempted_cells;
+            profile_pass_cells += cell_result.counters.profile_pass_cells;
+            profile_partial_cells += cell_result.counters.profile_partial_cells;
+            profile_failed_cells += cell_result.counters.profile_failed_cells;
+            profile_multimodal_cells += cell_result.counters.profile_multimodal_cells;
+            inheritance_parent1_cells += cell_result.counters.inheritance_parent1_cells;
+            inheritance_both_cells += cell_result.counters.inheritance_both_cells;
+            inheritance_parent2_cells += cell_result.counters.inheritance_parent2_cells;
+            inheritance_ambiguous_cells += cell_result.counters.inheritance_ambiguous_cells;
+            calibration_full_cells += cell_result.counters.calibration_full_cells;
+            calibration_partial_cells += cell_result.counters.calibration_partial_cells;
+            calibration_fallback_cells += cell_result.counters.calibration_fallback_cells;
+            calibration_full_site_uses += cell_result.counters.calibration_full_site_uses;
+            calibration_partial_site_uses += cell_result.counters.calibration_partial_site_uses;
+            calibration_fallback_site_uses += cell_result.counters.calibration_fallback_site_uses;
+            rho_fixed_cells += cell_result.counters.rho_fixed_cells;
+            rho_shrunk_cells += cell_result.counters.rho_shrunk_cells;
+            high_mt_ambient_cells += cell_result.counters.high_mt_ambient_cells;
+            ambient_qc_not_estimable_cells += cell_result.counters.ambient_qc_not_estimable_cells;
+            ratio_out << cell_result.ratio_row;
+            if (profile_out && !cell_result.profile_row.empty()) {
+                gz_write_text(profile_out, cell_result.profile_row);
+            }
+            if (opt.write_site_counts && !cell_result.site_rows.empty()) {
+                site_out << cell_result.site_rows;
+            }
+        }
+        if (profile_out) {
+            if (gzclose(profile_out) != Z_OK) {
+                throw std::runtime_error("Failed to close compressed mt profile output: " + profile_path);
+            }
+            profile_out = nullptr;
         }
 
         const std::string qc_path = opt.output_prefix + ".mt_qc.tsv";
@@ -1826,14 +3167,23 @@ int main(int argc, char** argv) {
         qc << "allow_unanchored_ambient\t" << (opt.allow_unanchored_ambient ? 1 : 0) << '\n';
         qc << "panel_sites\t" << sites.size() << '\n';
         qc << "manifest_pairs\t" << pair_manifests.size() << '\n';
+        qc << "derived_reconciled_pairs\t" << derived_pair_manifests.size() << '\n';
+        qc << "derived_pair_panel_min_depth\t" << kReconciledPairPanelMinDepth << '\n';
+        qc << "derived_pair_panel_homoplasmy_af\t" << kReconciledPairHomoplasmyAf << '\n';
         qc << "fusion_cells\t" << cells.size() << '\n';
         qc << "empty_barcodes\t" << empty_barcodes.size() << '\n';
         qc << "usable_ambient_sites\t" << usable_ambient_sites << '\n';
         qc << "fixed_ambient_cells\t" << fixed_cells << '\n';
+        qc << "ambient_qc_enabled\t" << (ambient_qc_requested ? 1 : 0) << '\n';
+        qc << "ambient_qc_max\t" << format_double(opt.ambient_qc_max) << '\n';
+        qc << "high_mt_ambient_cells\t" << high_mt_ambient_cells << '\n';
+        qc << "ambient_qc_not_estimable_cells\t" << ambient_qc_not_estimable_cells << '\n';
+        qc << "ambient_background_used_in_ratio_likelihood\t0\n";
         qc << "pass_cells\t" << pass_cells << '\n';
         qc << "weak_cells\t" << weak_cells << '\n';
         qc << "low_or_unfit_cells\t" << low_cells << '\n';
         qc << "pair_missing_cells\t" << pair_missing_cells << '\n';
+        qc << "derived_reconciled_pair_cells\t" << derived_pair_cells << '\n';
         qc << "haplotype_collapsed_pair_cells\t" << collapsed_pair_cells << '\n';
         qc << "unanchored_joint_fit_cells\t" << unanchored_cells << '\n';
         qc << "reads_seen_chrM\t" << stats.seen << '\n';
@@ -1853,23 +3203,85 @@ int main(int argc, char** argv) {
         qc << "reject_nonpanel_allele\t" << stats.reject_nonpanel_allele << '\n';
         qc << "conflicting_molecules\t" << stats.conflicting_molecules << '\n';
         qc << "accepted_molecule_site_observations\t" << stats.accepted_observations << '\n';
-        qc << "ambient_mode\t" << (opt.ambient_none ? "NONE" :
-            (!opt.empty_barcodes.empty() ? "EMPTY_BARCODES" : "PROFILE_FILE")) << '\n';
+        qc << "experimental_mode\t" << experimental_mode << '\n';
+        qc << "ambient_mode\t" << ambient_mode << '\n';
+        qc << "ambient_profile_id\t" << ambient_profile_id << '\n';
+        qc << "ambient_profile_fingerprint\t" << ambient_profile_fingerprint << '\n';
+        qc << "ambient_fraction_file\t"
+           << (opt.ambient_fraction_file.empty() ? "NA" : opt.ambient_fraction_file) << '\n';
+        qc << "ambient_fraction_file_fingerprint\t" << ambient_fraction_fingerprint << '\n';
         qc << "min_mapq\t" << opt.min_mapq << '\n';
         qc << "min_baseq\t" << opt.min_baseq << '\n';
         qc << "error_rate\t" << opt.error_rate << '\n';
         qc << "ambiguous_alignments_allowed\t" << (opt.allow_ambiguous_alignments ? 1 : 0) << '\n';
         qc << "duplicates_kept\t" << (opt.keep_duplicates ? 1 : 0) << '\n';
+        qc << "source_revision\t" << CELLBOUNCER_SOURCE_REVISION << '\n';
+        qc << "model_version\t" << kMtModelVersion << '\n';
+        qc << "assay_mode\t" << opt.assay_mode << '\n';
+        qc << "profile_summary_attempted_cells\t" << profile_attempted_cells << '\n';
+        qc << "profile_summary_pass_cells\t" << profile_pass_cells << '\n';
+        qc << "profile_summary_partial_cells\t" << profile_partial_cells << '\n';
+        qc << "profile_summary_failed_cells\t" << profile_failed_cells << '\n';
+        qc << "profile_multimodal_cells\t" << profile_multimodal_cells << '\n';
+        qc << "profile_grid_written\t" << (opt.write_profile_grid ? 1 : 0) << '\n';
+        qc << "profile_grid_step\t" << opt.profile_grid_step << '\n';
+        qc << "single_parent_epsilon\t" << opt.single_parent_epsilon << '\n';
+        qc << "inheritance_only_parent1_cells\t" << inheritance_parent1_cells << '\n';
+        qc << "inheritance_both_cells\t" << inheritance_both_cells << '\n';
+        qc << "inheritance_only_parent2_cells\t" << inheritance_parent2_cells << '\n';
+        qc << "inheritance_ambiguous_cells\t" << inheritance_ambiguous_cells << '\n';
+        qc << "estimand\t" << assay_estimand(opt.assay_mode) << '\n';
+        qc << "panel_fingerprint\t" << panel_fingerprint << '\n';
+        qc << "manifest_fingerprint\t" << manifest_fingerprint << '\n';
+        qc << "site_calibration\t" << (opt.site_calibration.empty() ? "NA" : opt.site_calibration) << '\n';
+        qc << "site_calibration_id\t" << calibration_ids_string(site_calibration) << '\n';
+        qc << "site_calibration_fingerprint\t" << calibration_fingerprint << '\n';
+        qc << "site_calibration_stratum\t" << (opt.site_calibration_stratum.empty() ? "NA" : opt.site_calibration_stratum) << '\n';
+        qc << "site_calibration_full_cells\t" << calibration_full_cells << '\n';
+        qc << "site_calibration_partial_cells\t" << calibration_partial_cells << '\n';
+        qc << "site_calibration_fallback_cells\t" << calibration_fallback_cells << '\n';
+        qc << "site_calibration_full_site_uses\t" << calibration_full_site_uses << '\n';
+        qc << "site_calibration_partial_site_uses\t" << calibration_partial_site_uses << '\n';
+        qc << "site_calibration_fallback_site_uses\t" << calibration_fallback_site_uses << '\n';
+        qc << "calibration_reference_mode\t" << (opt.calibration_reference.empty() ? 0 : 1) << '\n';
+        qc << "calibration_reference\t" << (opt.calibration_reference.empty() ? "NA" : opt.calibration_reference) << '\n';
+        qc << "rho_mode\t" << opt.rho_mode << '\n';
+        qc << "pooled_rho_option\t" << format_double(opt.pooled_rho) << '\n';
+        qc << "rho_reference\t" << (opt.rho_reference.empty() ? "NA" : opt.rho_reference) << '\n';
+        qc << "rho_low_information_molecules\t" << opt.rho_low_information_molecules << '\n';
+        qc << "rho_prior_strength\t" << opt.rho_prior_strength << '\n';
+        qc << "rho_fixed_cells\t" << rho_fixed_cells << '\n';
+        qc << "rho_shrunk_cells\t" << rho_shrunk_cells << '\n';
+        qc << "atac_formal_fragment_mode\t" << (opt.assay_mode == "ATAC" ? 1 : 0) << '\n';
+        qc << "atac_include_singletons\t" << (opt.atac_include_singletons ? 1 : 0) << '\n';
+        qc << "atac_reads_considered\t" << stats.atac_reads_considered << '\n';
+        qc << "atac_reject_unpaired\t" << stats.atac_reject_unpaired << '\n';
+        qc << "atac_reject_mate_off_mito\t" << stats.atac_reject_mate_off_mito << '\n';
+        qc << "atac_orphan_fragments\t" << stats.atac_orphan_fragments << '\n';
+        qc << "atac_fragments_accepted\t" << stats.atac_fragments_accepted << '\n';
+        qc << "atac_fragments_multisite\t" << stats.atac_fragments_multisite << '\n';
+        qc << "atac_fragment_site_observations\t" << stats.atac_fragment_site_observations << '\n';
+        qc << "atac_overlap_agreements\t" << stats.atac_overlap_agreements << '\n';
+        qc << "atac_overlap_conflicts\t" << stats.atac_overlap_conflicts << '\n';
 
         std::fprintf(stderr, "\nMitochondrial fusion-ratio estimation complete\n");
         std::fprintf(stderr, "  cells: pass=%llu weak=%llu other=%llu\n",
             static_cast<unsigned long long>(pass_cells),
             static_cast<unsigned long long>(weak_cells),
             static_cast<unsigned long long>(low_cells));
-        std::fprintf(stderr, "  accepted molecule-site observations: %llu\n",
-            static_cast<unsigned long long>(stats.accepted_observations));
+        if (opt.assay_mode == "ATAC") {
+            std::fprintf(stderr, "  accepted ATAC fragments: %llu (%llu fragment-site observations)\n",
+                static_cast<unsigned long long>(stats.atac_fragments_accepted),
+                static_cast<unsigned long long>(stats.atac_fragment_site_observations));
+        } else {
+            std::fprintf(stderr, "  accepted molecule-site observations: %llu\n",
+                static_cast<unsigned long long>(stats.accepted_observations));
+        }
         std::fprintf(stderr, "  ratio table: %s\n", ratio_path.c_str());
         std::fprintf(stderr, "  ambient profile: %s\n", ambient_path.c_str());
+        if (opt.write_profile_grid) {
+            std::fprintf(stderr, "  profile grid: %s\n", profile_path.c_str());
+        }
         std::fprintf(stderr, "  QC: %s\n", qc_path.c_str());
         return 0;
     } catch (const std::exception& error) {

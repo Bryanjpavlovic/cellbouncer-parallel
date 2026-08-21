@@ -195,6 +195,31 @@ std::string trim(std::string value) {
     return value.substr(first, last - first + 1);
 }
 
+
+std::string canonical_library_id(std::string value) {
+    value = trim(value);
+    if (value.empty()) return value;
+
+    size_t digit_start = 0;
+    if (value.size() >= 3 &&
+        std::tolower(static_cast<unsigned char>(value[0])) == 'l' &&
+        std::tolower(static_cast<unsigned char>(value[1])) == 'i' &&
+        std::tolower(static_cast<unsigned char>(value[2])) == 'b') {
+        digit_start = 3;
+    }
+    if (digit_start >= value.size()) return value;
+
+    for (size_t i = digit_start; i < value.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(value[i]))) return value;
+    }
+
+    std::string digits = value.substr(digit_start);
+    const size_t first_nonzero = digits.find_first_not_of('0');
+    if (first_nonzero == std::string::npos) digits = "0";
+    else if (first_nonzero > 0) digits.erase(0, first_nonzero);
+    return "lib" + digits;
+}
+
 std::vector<std::string> split(const std::string& value, char delim) {
     std::vector<std::string> out;
     std::stringstream ss(value);
@@ -381,13 +406,14 @@ std::vector<LibraryDef> load_libraries(const Config& config,
         if (line.empty() || line[0] == '#') continue;
         const std::string::size_type tab = line.find('\t');
         if (tab == std::string::npos) continue;
-        const std::string library_id = trim(line.substr(0, tab));
+        const std::string raw_library_id = trim(line.substr(0, tab));
         const std::string identities_field = trim(line.substr(tab + 1));
-        if (first_data_line && library_id == "library_id") {
+        if (first_data_line && raw_library_id == "library_id") {
             first_data_line = false;
             continue;
         }
         first_data_line = false;
+        const std::string library_id = canonical_library_id(raw_library_id);
         if (library_id.empty() || identities_field.empty()) continue;
         if (!seen_library_ids.insert(library_id).second) {
             throw std::runtime_error("Duplicate library_id in pool combinations: " + library_id);

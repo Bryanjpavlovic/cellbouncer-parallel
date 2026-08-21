@@ -1322,7 +1322,9 @@ bool count_alleles_parallel(
     AcceptedSiteWeightMap* accepted_site_weights,
     const NativeSpeciesTargetTable* species_native_targets,
     robin_hood::unordered_map<unsigned long, AlignedCellCounts>* species_native_counts,
-    int species_native_n_samples){
+    int species_native_n_samples,
+    const BarcodeRemap* barcode_remap,
+    BarcodeRemapStats* barcode_remap_stats){
     size_t n_identity_states = 0;
     size_t bytes_per_cell = 0;
     string request_error;
@@ -1627,6 +1629,13 @@ bool count_alleles_parallel(
     vector<robin_hood::unordered_map<unsigned long,
         robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights(n_threads);
+    // Optional ATAC->RNA barcode namespace remap.  Tracking is per-thread so
+    // the hot counting loop remains lock-free; unique barcode sets are merged
+    // after counting.
+    vector<set<unsigned long>> thread_raw_barcodes(n_threads);
+    vector<set<unsigned long>> thread_direct_target_barcodes(n_threads);
+    vector<set<unsigned long>> thread_mapped_target_barcodes(n_threads);
+    vector<set<unsigned long>> thread_map_entries_used(n_threads);
     ParallelOperationStatus operation_status;
     std::atomic<bool> hts_thread_warning_emitted(false);
     
@@ -1637,6 +1646,10 @@ bool count_alleles_parallel(
         robin_hood::unordered_map<unsigned long, CellCounts>* local_species_native =
             collect_species_native ? &thread_species_native_counts[thread_id] : nullptr;
         auto& local_site_weights = thread_site_weights[thread_id];
+        auto& local_raw_barcodes = thread_raw_barcodes[thread_id];
+        auto& local_direct_barcodes = thread_direct_target_barcodes[thread_id];
+        auto& local_mapped_barcodes = thread_mapped_target_barcodes[thread_id];
+        auto& local_map_entries = thread_map_entries_used[thread_id];
         
         // Each thread gets its own BAM reader. All workers still encounter the
         // same OpenMP work-sharing construct; a failed worker sets shared status.
@@ -1777,9 +1790,24 @@ bool count_alleles_parallel(
                         const char* cb_str = bam_aux2Z(cb_tag);
                         bc cb_bits;
                         str2bc(cb_str, cb_bits);
-                        unsigned long bc_key = cb_bits.to_ulong();
+                        const unsigned long raw_bc_key = cb_bits.to_ulong();
+                        unsigned long bc_key = raw_bc_key;
+                        local_raw_barcodes.insert(raw_bc_key);
+                        if (!has_bc_list || valid_barcodes.find(raw_bc_key) != valid_barcodes.end()){
+                            local_direct_barcodes.insert(raw_bc_key);
+                        }
+                        if (barcode_remap != nullptr){
+                            auto remap_it = barcode_remap->find(raw_bc_key);
+                            if (remap_it != barcode_remap->end()){
+                                bc_key = remap_it->second;
+                                local_map_entries.insert(raw_bc_key);
+                            }
+                        }
+                        if (!has_bc_list || valid_barcodes.find(bc_key) != valid_barcodes.end()){
+                            local_mapped_barcodes.insert(bc_key);
+                        }
                         
-                        // Skip if not in whitelist
+                        // Skip if the direct/remapped barcode is not in the RNA-space whitelist.
                         if (has_bc_list && valid_barcodes.find(bc_key) == valid_barcodes.end()){
                             continue;
                         }
@@ -1962,6 +1990,24 @@ bool count_alleles_parallel(
     }
     thread_site_weights.clear();
     thread_site_weights.shrink_to_fit();
+
+    if (barcode_remap_stats != nullptr){
+        set<unsigned long> raw_all, direct_all, mapped_all, used_all;
+        for (int t = 0; t < n_threads; ++t){
+            raw_all.insert(thread_raw_barcodes[t].begin(), thread_raw_barcodes[t].end());
+            direct_all.insert(thread_direct_target_barcodes[t].begin(), thread_direct_target_barcodes[t].end());
+            mapped_all.insert(thread_mapped_target_barcodes[t].begin(), thread_mapped_target_barcodes[t].end());
+            used_all.insert(thread_map_entries_used[t].begin(), thread_map_entries_used[t].end());
+        }
+        barcode_remap_stats->observed_raw_barcodes = raw_all.size();
+        barcode_remap_stats->direct_target_barcodes = direct_all.size();
+        barcode_remap_stats->mapped_target_barcodes = mapped_all.size();
+        barcode_remap_stats->map_entries_used = used_all.size();
+    }
+    thread_raw_barcodes.clear();
+    thread_direct_target_barcodes.clear();
+    thread_mapped_target_barcodes.clear();
+    thread_map_entries_used.clear();
 
     // Final cleanup
     thread_counts.clear();

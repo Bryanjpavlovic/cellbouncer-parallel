@@ -4,6 +4,9 @@
 // header block. Stable pipeline source name; version is tracked in-file.
 //
 // Revision history
+//   V2.14  Identity reconciliation ATAC barcode namespace support: optional
+//          --atac_barcode_map remaps ATAC CB tags into the RNA barcode namespace
+//          during count-only evidence collection and writes .atac_qc.tsv.
 //   V2.13.3 Targeted reliability repair: skip BAM targets with no active panel
 //          SNPs, fall back to synchronous I/O when optional HTSlib helper-thread
 //          setup fails, and preserve staged-output cleanup even when a legacy
@@ -94,9 +97,9 @@ using namespace std;
 #define CELLBOUNCER_SOURCE_REVISION "unknown"
 #endif
 
-const string VERSION = "2.13.3";
-const string VERSION_MESSAGE = "parallel production demultiplexer with fail-closed counting and explicit comparison semantics";
-const string VERSION_NEW = "v2.13.3: SNP-bearing BAM targets only, synchronous fallback for optional HTSlib helper threads, and exit-safe staged-output cleanup; includes the v2.13.2 index-statistics fix";
+const string VERSION = "2.14";
+const string VERSION_MESSAGE = "parallel production demultiplexer with fail-closed counting, explicit comparison semantics, and ATAC barcode remapping";
+const string VERSION_NEW = "v2.14: optional ATAC-to-RNA barcode remapping and ATAC namespace QC for identity reconciliation; retains v2.13.3 reliability fixes";
 
 // Global verbose flag (defined in demux_parallel_llr.cpp)
 extern bool g_verbose;
@@ -2008,6 +2011,7 @@ void help(int code){
     fprintf(stderr, "    --atac_het_vcf FILE  ATAC-side het VCF for ATAC het balance diagnostics\n");
     fprintf(stderr, "    --atac_shared_vcf NAME   Shared-memory ATAC VCF (mutually exclusive with --atac_vcf)\n");
     fprintf(stderr, "    --atac_shared_het_vcf NAME   Shared-memory ATAC het VCF\n");
+    fprintf(stderr, "    --atac_barcode_map FILE  Optional two-column ATAC_CB->RNA_CB map for separate whitelist namespaces\n");
     fprintf(stderr, "\n===== IDENTITY PRIOR (2B) =====\n");
     fprintf(stderr, "    --identity_prior FILE  NOT IMPLEMENTED / NOT USED IN IDENTITY SCORING; passing it is a fatal error\n");
     fprintf(stderr, "\n===== SPECIES PANEL (2C) =====\n");
@@ -2263,6 +2267,47 @@ bool write_runner_ups_gz(
 }
 
 
+
+static bool load_atac_barcode_remap(const string& path, BarcodeRemap& remap){
+    remap.clear();
+    if (path.empty()) return true;
+    ifstream in(path.c_str());
+    if (!in){
+        fprintf(stderr, "ERROR: could not open ATAC barcode map: %s\n", path.c_str());
+        return false;
+    }
+    string line;
+    long n = 0;
+    while (getline(in, line)){
+        if (line.empty() || line[0] == '#') continue;
+        size_t tab = line.find('\t');
+        if (tab == string::npos) continue;
+        string atac = line.substr(0, tab);
+        string rna = line.substr(tab + 1);
+        size_t extra = rna.find('\t');
+        if (extra != string::npos) rna.resize(extra);
+        if (atac == "atac_barcode" && rna == "rna_barcode") continue;
+        bc a_bits, r_bits;
+        str2bc(atac.c_str(), a_bits);
+        str2bc(rna.c_str(), r_bits);
+        const unsigned long a = a_bits.to_ulong();
+        const unsigned long r = r_bits.to_ulong();
+        auto it = remap.find(a);
+        if (it != remap.end() && it->second != r){
+            fprintf(stderr, "ERROR: ATAC barcode map has conflicting mappings for %s\n", atac.c_str());
+            return false;
+        }
+        remap[a] = r;
+        ++n;
+    }
+    if (remap.empty()){
+        fprintf(stderr, "ERROR: ATAC barcode map contains no usable barcode pairs: %s\n", path.c_str());
+        return false;
+    }
+    fprintf(stderr, "Loaded %ld ATAC->RNA barcode mappings from %s\n", n, path.c_str());
+    return true;
+}
+
 int main(int argc, char *argv[]) {    
     
     // Start timing
@@ -2335,6 +2380,7 @@ int main(int argc, char *argv[]) {
        {"atac_het_vcf", required_argument, 0, 1022},
        {"atac_shared_vcf", required_argument, 0, 1023},
        {"atac_shared_het_vcf", required_argument, 0, 1024},
+       {"atac_barcode_map", required_argument, 0, 1025},
        // 2B: identity prior
        {"identity_prior", required_argument, 0, 1030},
        // 2C: species panel
@@ -2425,6 +2471,7 @@ int main(int argc, char *argv[]) {
     string atac_het_vcf_file = "";
     string atac_shared_vcf_name = "";
     string atac_shared_het_vcf_name = "";
+    string atac_barcode_map_file = "";
 
     // 2B: identity prior
     string identity_prior_file = "";
@@ -2626,6 +2673,9 @@ int main(int argc, char *argv[]) {
             case 1024:  // --atac_shared_het_vcf
                 atac_shared_het_vcf_name = optarg;
                 break;
+            case 1025:  // --atac_barcode_map
+                atac_barcode_map_file = optarg;
+                break;
             case 1030:  // --identity_prior
                 identity_prior_file = optarg;
                 break;
@@ -2795,6 +2845,10 @@ int main(int argc, char *argv[]) {
         }
         if (atac_vcf_file.length() > 0 && atac_shared_vcf_name.length() > 0){
             fprintf(stderr, "ERROR: --atac_vcf and --atac_shared_vcf are mutually exclusive\n");
+            return 1;
+        }
+        if (!atac_barcode_map_file.empty() && !file_exists(atac_barcode_map_file)){
+            fprintf(stderr, "ERROR: --atac_barcode_map does not exist: %s\n", atac_barcode_map_file.c_str());
             return 1;
         }
     }
@@ -3722,41 +3776,66 @@ int main(int argc, char *argv[]) {
 
         precompute_all_genotypes(atac_snpdat, samples.size());
 
+        BarcodeRemap atac_barcode_remap;
+        BarcodeRemapStats atac_barcode_stats;
+        const BarcodeRemap* atac_barcode_remap_ptr = nullptr;
+        if (!atac_barcode_map_file.empty()){
+            if (!load_atac_barcode_remap(atac_barcode_map_file, atac_barcode_remap)) return 1;
+            atac_barcode_remap_ptr = &atac_barcode_remap;
+        }
+
         if (n_threads > 1){
             robin_hood::unordered_map<unsigned long, AlignedCellCounts> atac_parallel_counts;
             if (!count_alleles_parallel(atac_bamfile, atac_snpdat, atac_parallel_counts,
-                    cell_barcodes, samples.size(), n_threads, htslib_threads)){
+                    cell_barcodes, samples.size(), n_threads, htslib_threads, false, "", nullptr,
+                    nullptr, nullptr, 0, atac_barcode_remap_ptr, &atac_barcode_stats)){
                 fprintf(stderr, "ERROR: ATAC allele counting failed\n");
                 return 1;
             }
             finalize_parallel_counts(atac_parallel_counts, atac_cell_counts);
         }
         else{
-            map<pair<int, int>, map<int, float>> atac_cond_fracs, atac_cond_tots;
-            if (!count_alleles_single_threaded(atac_bamfile, atac_snpdat, atac_cell_counts,
-                    cell_barcodes, samples.size(), atac_cond_fracs, atac_cond_tots, false)){
+            robin_hood::unordered_map<unsigned long, AlignedCellCounts> atac_parallel_counts;
+            if (!count_alleles_parallel(atac_bamfile, atac_snpdat, atac_parallel_counts,
+                    cell_barcodes, samples.size(), 1, 1, false, "", nullptr,
+                    nullptr, nullptr, 0, atac_barcode_remap_ptr, &atac_barcode_stats)){
                 fprintf(stderr, "ERROR: ATAC allele counting failed\n");
                 return 1;
             }
+            finalize_parallel_counts(atac_parallel_counts, atac_cell_counts);
         }
 
-        // CB tag intersection check
-        int n_intersect = 0;
-        int n_rna = (int)cell_counts.size();
-        int n_atac = (int)atac_cell_counts.size();
-        for (auto& kv : atac_cell_counts){
-            if (cell_counts.count(kv.first) > 0) n_intersect++;
+        // Barcode namespace QC is based on barcodes actually observed at panel
+        // sites, not preallocated count-map keys. Direct mode measures raw ATAC
+        // CBs already in RNA space; mapped mode measures remapped RNA-space CBs.
+        const double denom = cell_barcodes.empty() ? 0.0 : (double)cell_barcodes.size();
+        const double direct_overlap_frac = denom > 0.0 ?
+            (double)atac_barcode_stats.direct_target_barcodes / denom : 0.0;
+        const double mapped_overlap_frac = denom > 0.0 ?
+            (double)atac_barcode_stats.mapped_target_barcodes / denom : 0.0;
+        const bool mapped_mode = atac_barcode_remap_ptr != nullptr;
+        const double active_overlap = mapped_mode ? mapped_overlap_frac : direct_overlap_frac;
+        fprintf(stderr, "ATAC/RNA barcode overlap (%s): %.3f (direct %.3f, mapped %.3f)\n",
+            mapped_mode ? "mapped" : "direct", active_overlap, direct_overlap_frac, mapped_overlap_frac);
+        if (active_overlap < 0.10){
+            fprintf(stderr, "ERROR: ATAC/RNA barcode overlap (%.3f) below threshold (0.10) in %s mode.\n",
+                active_overlap, mapped_mode ? "mapped" : "direct");
+            return 1;
         }
-        int min_set = (n_rna < n_atac) ? n_rna : n_atac;
-        if (min_set > 0){
-            double overlap_frac = (double)n_intersect / (double)min_set;
-            fprintf(stderr, "ATAC/RNA barcode overlap: %d / %d = %.3f\n",
-                n_intersect, min_set, overlap_frac);
-            if (overlap_frac < 0.10){
-                fprintf(stderr, "ERROR: ATAC/RNA barcode overlap (%.3f) below threshold (0.10).\n"
-                    "Check that the ATAC BAM CB tag holds RNA-aligned barcodes.\n", overlap_frac);
-                return 1;
-            }
+
+        {
+            string qcname = output_prefix + ".atac_qc.tsv";
+            ofstream qcout(qcname.c_str());
+            if (!qcout){ fprintf(stderr, "ERROR: could not open %s for writing\n", qcname.c_str()); return 1; }
+            qcout << "atac_requested\tatac_barcode_mode\tatac_barcode_map_path\tatac_observed_raw_barcodes\tatac_direct_target_barcodes\tatac_mapped_target_barcodes\tatac_map_entries_used\tatac_direct_overlap_fraction\tatac_mapped_overlap_fraction\tatac_status\n";
+            qcout << "1\t" << (mapped_mode ? "mapped" : "direct") << "\t"
+                  << (mapped_mode ? atac_barcode_map_file : "NA") << "\t"
+                  << atac_barcode_stats.observed_raw_barcodes << "\t"
+                  << atac_barcode_stats.direct_target_barcodes << "\t"
+                  << atac_barcode_stats.mapped_target_barcodes << "\t"
+                  << atac_barcode_stats.map_entries_used << "\t"
+                  << direct_overlap_frac << "\t" << mapped_overlap_frac << "\tATAC_COUNTED\n";
+            qcout.close();
         }
 
         // Write ATAC counts
