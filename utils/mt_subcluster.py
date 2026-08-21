@@ -30,7 +30,28 @@ def parse_args():
 
 def main(args):
     options = parse_args()
-    script_dir = '/'.join(os.path.abspath(__file__).split('/')[0:-1])
+    # Resolve companion programs in both supported layouts:
+    #   source tree:  utils/mt_subcluster.py + utils/mt_merge_hierarchical.py,
+    #                 with demux_mt in the repository root
+    #   installed:    all three live together in .../cellbouncer/dev/bin/
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(script_dir)
+
+    demux_mt = os.path.join(script_dir, 'demux_mt')
+    if not (os.path.isfile(demux_mt) and os.access(demux_mt, os.X_OK)):
+        demux_mt = os.path.join(parent_dir, 'demux_mt')
+    if not (os.path.isfile(demux_mt) and os.access(demux_mt, os.X_OK)):
+        print("ERROR: could not locate executable demux_mt next to mt_subcluster.py "
+              "or in its parent directory", file=sys.stderr)
+        exit(1)
+
+    merge_hierarchical = os.path.join(script_dir, 'mt_merge_hierarchical.py')
+    if not (os.path.isfile(merge_hierarchical) and os.access(merge_hierarchical, os.X_OK)):
+        merge_hierarchical = os.path.join(parent_dir, 'utils', 'mt_merge_hierarchical.py')
+    if not (os.path.isfile(merge_hierarchical) and os.access(merge_hierarchical, os.X_OK)):
+        print("ERROR: could not locate executable mt_merge_hierarchical.py next to "
+              "mt_subcluster.py or under the repository utils directory", file=sys.stderr)
+        exit(1)
     
     if not os.path.isfile(options.bam):
         print("ERROR: BAM file {} does not exist".format(options.bam), file=sys.stderr)
@@ -123,7 +144,7 @@ def main(args):
     for ci, clust in enumerate(clustname_sorted):
         if clust in clustset:
             print("Subcluster root cluster {}...".format(clust), file=sys.stderr)
-            cmd = ['{}/demux_mt'.format(script_dir), '-b', options.bam, '-m', \
+            cmd = [demux_mt, '-b', options.bam, '-m', \
                 chrM, '-f', '{}.{}.bcs'.format(options.out, clust), \
                 '-o', '{}.{}'.format(options.out, clust), '-D', '0.0']
             subprocess.call(cmd)
@@ -135,7 +156,7 @@ def main(args):
                 merge_str[ci] = 'NA'
 
     # Merge hierarchically
-    cmd = ['{}/utils/mt_merge_hierarchical.py'.format(script_dir), '-b', options.bam, \
+    cmd = [merge_hierarchical, '-b', options.bam, \
         '-r', options.inbase, '-D', '{}'.format(options.doublet_rate), \
         '-o', options.out]
     cmd.append('-l')
