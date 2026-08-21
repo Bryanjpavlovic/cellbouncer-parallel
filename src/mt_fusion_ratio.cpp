@@ -2472,7 +2472,6 @@ int main(int argc, char** argv) {
             auto& pair_missing_cells = cell_result.counters.pair_missing_cells;
             auto& derived_pair_cells = cell_result.counters.derived_pair_cells;
             auto& collapsed_pair_cells = cell_result.counters.collapsed_pair_cells;
-            auto& unanchored_cells = cell_result.counters.unanchored_cells;
             auto& profile_attempted_cells = cell_result.counters.profile_attempted_cells;
             auto& profile_pass_cells = cell_result.counters.profile_pass_cells;
             auto& profile_partial_cells = cell_result.counters.profile_partial_cells;
