@@ -60,7 +60,7 @@ HTSWRAPPER_HEADER_STAMP = include/htswrapper/.headers_installed
 # optimML is patched only in a private build copy. The vendored source remains
 # unchanged, and the patch is rebuilt when this Makefile changes.
 OPTIMML_PATCH_DIR = build/optimML_cellbouncer
-OPTIMML_PATCH_STAMP = $(OPTIMML_PATCH_DIR)/.cellbouncer_patch_v3
+OPTIMML_PATCH_STAMP = $(OPTIMML_PATCH_DIR)/.cellbouncer_patch_v4
 OPTIMML_SOURCE_FILES = $(shell find dependencies/optimML -type f \
     -not -path '*/build/*' -not -path '*/lib/*' 2>/dev/null)
 
@@ -391,6 +391,12 @@ $(OPTIMML_PATCH_STAMP): $(OPTIMML_SOURCE_FILES) Makefile
 	    -e 's|mixcompsum_f += mixcompfracs_sparse\[i\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
 	    -e 's|mixcompsum_f += mixcompfracs\[i\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
 	    $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
+	# STLBFGS interprets ftol as a relative objective tolerance. Change only the
+	# multivar_ml_solver default; explicit caller set_delta() values still win.
+	sed -i \
+	    -e '/multivar_ml_solver::multivar_ml_solver(){/a\        delta_thresh = 1e-6;' \
+	    -e '/init(params_init, ll, dll);/a\        delta_thresh = 1e-6;' \
+	    $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
 	sed -i \
 	    -e 's|mixcompsum_f += mixcompfracs_sparse\[jid\]\[k\] / (exp(-x\[k\]) + 1);|mixcompsum_f += mixcompfracs_sparse[jid][k] / (exp(-x[n_param - nmixcomp + k]) + 1);|' \
 	    $(OPTIMML_PATCH_DIR)/src/multivar.cpp
@@ -398,6 +404,7 @@ $(OPTIMML_PATCH_STAMP): $(OPTIMML_SOURCE_FILES) Makefile
 	grep -Fq 'if (!std::isfinite(alpha)) throw 2;' $(OPTIMML_PATCH_DIR)/src/stlbfgs/stlbfgs.cpp
 	grep -Fq 'mixcompsum_f += mixcompfracs_sparse[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
 	grep -Fq 'mixcompsum_f += mixcompfracs[i][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp
+	test "$$(grep -Fc 'delta_thresh = 1e-6;' $(OPTIMML_PATCH_DIR)/src/multivar_ml.cpp)" -eq 2
 	grep -Fq 'mixcompsum_f += mixcompfracs_sparse[jid][k] / (exp(-x[n_param - nmixcomp + k]) + 1);' $(OPTIMML_PATCH_DIR)/src/multivar.cpp
 	touch $@
 

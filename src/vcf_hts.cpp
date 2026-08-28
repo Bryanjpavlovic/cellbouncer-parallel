@@ -83,6 +83,117 @@ static std::string format_worker_error(const char* operation, int thread_id, int
     return out.str();
 }
 
+// Molecule-aware identity scoring sidecar.  Corrected UMI plus gene is the
+// preferred RNA molecule key.  A stable query-name key is retained as an
+// explicit fallback for BAMs that do not carry 10x UB/GX (or UB/GN) tags.
+// Cell barcode is emitted separately and therefore is not folded into the
+// molecule hash.  FNV-1a is used instead of std::hash so files are reproducible
+// across processes and compiler/library upgrades.
+enum PileupMoleculeBasis : uint8_t {
+    PILEUP_MOLECULE_UB_GX = 1,
+    PILEUP_MOLECULE_UB_GN = 2,
+    PILEUP_MOLECULE_QNAME = 3,
+};
+
+struct PileupMoleculeObservation {
+    unsigned long barcode = 0;
+    uint64_t molecule_hash = 0;
+    int64_t site = 0;
+    int64_t ref_scaled = 0;
+    int64_t alt_scaled = 0;
+    uint8_t basis = PILEUP_MOLECULE_QNAME;
+};
+
+static uint64_t pileup_fnv1a_update(uint64_t hash, const char* value) {
+    static const uint64_t prime = 1099511628211ULL;
+    if (value != NULL) {
+        for (const unsigned char* p =
+                 reinterpret_cast<const unsigned char*>(value); *p; ++p) {
+            hash ^= static_cast<uint64_t>(*p);
+            hash *= prime;
+        }
+    }
+    // An explicit separator prevents ("AB","C") and ("A","BC") from
+    // sharing a key when two tags are combined.
+    hash ^= 0xffULL;
+    hash *= prime;
+    return hash;
+}
+
+static std::pair<uint64_t, uint8_t> pileup_molecule_key(const bam1_t* record) {
+    static const uint64_t offset = 1469598103934665603ULL;
+    const uint8_t* ub_tag = bam_aux_get(record, "UB");
+    const char* ub = ub_tag ? bam_aux2Z(ub_tag) : NULL;
+    const uint8_t* gx_tag = bam_aux_get(record, "GX");
+    const char* gx = gx_tag ? bam_aux2Z(gx_tag) : NULL;
+    if (ub != NULL && ub[0] != '\0' && gx != NULL && gx[0] != '\0') {
+        uint64_t hash = pileup_fnv1a_update(offset, "UB_GX");
+        hash = pileup_fnv1a_update(hash, ub);
+        hash = pileup_fnv1a_update(hash, gx);
+        return std::make_pair(hash, PILEUP_MOLECULE_UB_GX);
+    }
+    const uint8_t* gn_tag = bam_aux_get(record, "GN");
+    const char* gn = gn_tag ? bam_aux2Z(gn_tag) : NULL;
+    if (ub != NULL && ub[0] != '\0' && gn != NULL && gn[0] != '\0') {
+        uint64_t hash = pileup_fnv1a_update(offset, "UB_GN");
+        hash = pileup_fnv1a_update(hash, ub);
+        hash = pileup_fnv1a_update(hash, gn);
+        return std::make_pair(hash, PILEUP_MOLECULE_UB_GN);
+    }
+    uint64_t hash = pileup_fnv1a_update(offset, "QNAME");
+    hash = pileup_fnv1a_update(hash, bam_get_qname(record));
+    return std::make_pair(hash, PILEUP_MOLECULE_QNAME);
+}
+
+static const char* pileup_molecule_basis_name(uint8_t basis) {
+    if (basis == PILEUP_MOLECULE_UB_GX) return "UB_GX";
+    if (basis == PILEUP_MOLECULE_UB_GN) return "UB_GN";
+    return "QNAME_FALLBACK";
+}
+
+static long write_collapsed_pileup_molecules(
+        gzFile output, vector<PileupMoleculeObservation>& observations) {
+    sort(observations.begin(), observations.end(),
+        [](const PileupMoleculeObservation& a,
+           const PileupMoleculeObservation& b) {
+            if (a.barcode != b.barcode) return a.barcode < b.barcode;
+            if (a.molecule_hash != b.molecule_hash)
+                return a.molecule_hash < b.molecule_hash;
+            if (a.site != b.site) return a.site < b.site;
+            return a.basis < b.basis;
+        });
+    long rows = 0;
+    size_t begin = 0;
+    while (begin < observations.size()) {
+        size_t end = begin + 1;
+        int64_t ref_scaled = observations[begin].ref_scaled;
+        int64_t alt_scaled = observations[begin].alt_scaled;
+        uint8_t basis = observations[begin].basis;
+        while (end < observations.size() &&
+                observations[end].barcode == observations[begin].barcode &&
+                observations[end].molecule_hash ==
+                    observations[begin].molecule_hash &&
+                observations[end].site == observations[begin].site) {
+            ref_scaled += observations[end].ref_scaled;
+            alt_scaled += observations[end].alt_scaled;
+            basis = std::min(basis, observations[end].basis);
+            ++end;
+        }
+        const int tid = (int)(observations[begin].site >> 32);
+        const int pos = (int)(observations[begin].site & 0xFFFFFFFF);
+        gzprintf(output, "%lu\t%llu\t%s\t%d\t%d\t%f\t%f\n",
+            observations[begin].barcode,
+            (unsigned long long)observations[begin].molecule_hash,
+            pileup_molecule_basis_name(basis), tid, pos,
+            (double)ref_scaled / FIXED_POINT_SCALE,
+            (double)alt_scaled / FIXED_POINT_SCALE);
+        ++rows;
+        begin = end;
+    }
+    vector<PileupMoleculeObservation>().swap(observations);
+    return rows;
+}
+
 }  // namespace
 
 size_t estimate_cellcounts_bytes(int n_samples) {
@@ -1628,6 +1739,7 @@ bool count_alleles_parallel(
     // Empty and untouched unless dump_pileup is set.
     vector<robin_hood::unordered_map<unsigned long,
         robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
+    vector<vector<PileupMoleculeObservation> > thread_pileup_molecules(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights(n_threads);
     // Optional ATAC->RNA barcode namespace remap.  Tracking is per-thread so
     // the hot counting loop remains lock-free; unique barcode sets are merged
@@ -1813,6 +1925,11 @@ bool count_alleles_parallel(
                         }
                         
                         local_reads++;
+
+                        std::pair<uint64_t, uint8_t> molecule_key;
+                        if (dump_pileup) {
+                            molecule_key = pileup_molecule_key(record);
+                        }
                         
                         // Get mapping quality probability and scale to fixed-point
                         float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
@@ -1890,6 +2007,15 @@ bool count_alleles_parallel(
                                     auto& slot = thread_pileup[thread_id][bc_key][pkey];
                                     slot.first += ref_add;
                                     slot.second += alt_add;
+                                    PileupMoleculeObservation observation;
+                                    observation.barcode = bc_key;
+                                    observation.molecule_hash = molecule_key.first;
+                                    observation.site = pkey;
+                                    observation.ref_scaled = ref_add;
+                                    observation.alt_scaled = alt_add;
+                                    observation.basis = molecule_key.second;
+                                    thread_pileup_molecules[thread_id].push_back(
+                                        observation);
                                 }
                             }
                         }
@@ -2045,9 +2171,36 @@ bool count_alleles_parallel(
             }
             fprintf(stderr, "Wrote %ld pileup observations to %s\n", n_obs_written, obs_path.c_str());
         }
+
+        // One row per accepted molecule/SNP overlap.  Downstream scoring
+        // collapses duplicate molecule/site rows, groups all SNPs covered by a
+        // molecule, and can therefore report independent molecule counts and
+        // leave-one-molecule-out influence without treating a long read that
+        // covers several SNPs as several independent molecules.
+        string molecule_path = pileup_prefix + ".pileup_molecules.tsv.gz";
+        gzFile mf = gzopen(molecule_path.c_str(), "w");
+        if (!mf){
+            fprintf(stderr, "ERROR: could not open %s for writing\n",
+                molecule_path.c_str());
+            return false;
+        }
+        long n_molecule_rows = 0;
+        for (int t = 0; t < n_threads; ++t){
+            n_molecule_rows += write_collapsed_pileup_molecules(
+                mf, thread_pileup_molecules[t]);
+        }
+        if (gzclose(mf) != Z_OK){
+            fprintf(stderr, "ERROR: failed while closing %s\n",
+                molecule_path.c_str());
+            return false;
+        }
+        fprintf(stderr, "Wrote %ld molecule/SNP observations to %s\n",
+            n_molecule_rows, molecule_path.c_str());
     }
     thread_pileup.clear();
     thread_pileup.shrink_to_fit();
+    thread_pileup_molecules.clear();
+    thread_pileup_molecules.shrink_to_fit();
     
     fprintf(stderr, "Completed: %d chromosomes (%lu work units), %ld SNPs, %ld iterator records, %lu cells\n",
         n_chroms, work_units.size(), snps_processed.load(), reads_processed.load(), 
@@ -2984,6 +3137,7 @@ bool count_alleles_parallel_dual(
     // downstream contract to the single-panel path.
     vector<robin_hood::unordered_map<unsigned long,
         robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
+    vector<vector<PileupMoleculeObservation> > thread_pileup_molecules(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights_p0(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights_p1(n_threads);
     vector<SourceObservationMap> thread_source_observations(n_threads);
@@ -3144,6 +3298,11 @@ bool count_alleles_parallel_dual(
                         }
                         
                         local_reads++;
+
+                        std::pair<uint64_t, uint8_t> molecule_key;
+                        if (dump_pileup) {
+                            molecule_key = pileup_molecule_key(record);
+                        }
 
                         std::string source_label;
                         std::string source_origin;
@@ -3403,6 +3562,15 @@ bool count_alleles_parallel_dual(
                                     auto& slot = thread_pileup[thread_id][bc_key][pkey];
                                     slot.first += ref_add;
                                     slot.second += alt_add;
+                                    PileupMoleculeObservation observation;
+                                    observation.barcode = bc_key;
+                                    observation.molecule_hash = molecule_key.first;
+                                    observation.site = pkey;
+                                    observation.ref_scaled = ref_add;
+                                    observation.alt_scaled = alt_add;
+                                    observation.basis = molecule_key.second;
+                                    thread_pileup_molecules[thread_id].push_back(
+                                        observation);
                                 }
 
                                 if (local_species_native != nullptr && snp_check->panel_id == 1 &&
@@ -3558,9 +3726,31 @@ bool count_alleles_parallel_dual(
             }
             fprintf(stderr, "Wrote %ld pileup observations to %s\n", n_obs_written, obs_path.c_str());
         }
+
+        string molecule_path = pileup_prefix + ".pileup_molecules.tsv.gz";
+        gzFile mf = gzopen(molecule_path.c_str(), "w");
+        if (!mf){
+            fprintf(stderr, "ERROR: could not open %s for writing\n",
+                molecule_path.c_str());
+            return false;
+        }
+        long n_molecule_rows = 0;
+        for (int t = 0; t < n_threads; ++t){
+            n_molecule_rows += write_collapsed_pileup_molecules(
+                mf, thread_pileup_molecules[t]);
+        }
+        if (gzclose(mf) != Z_OK){
+            fprintf(stderr, "ERROR: failed while closing %s\n",
+                molecule_path.c_str());
+            return false;
+        }
+        fprintf(stderr, "Wrote %ld molecule/SNP observations to %s\n",
+            n_molecule_rows, molecule_path.c_str());
     }
     thread_pileup.clear();
     thread_pileup.shrink_to_fit();
+    thread_pileup_molecules.clear();
+    thread_pileup_molecules.shrink_to_fit();
 
     auto merge_site_weights = [n_threads](
         vector<AcceptedSiteWeightMap>& per_thread,

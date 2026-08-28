@@ -48,6 +48,8 @@ struct Options {
     std::string empty_barcodes;
     std::string ambient_profile;
     std::string ambient_fraction_file;
+    std::string rna_ambient_fraction_file;
+    std::string rna_ambient_condition = "NA";
     std::string mt_mask_bed;
     std::string library_id;
     std::string site_manifest;
@@ -78,6 +80,7 @@ struct Options {
     double pooled_rho = std::numeric_limits<double>::quiet_NaN();
     double rho_prior_strength = 10.0;
     double ambient_qc_max = std::numeric_limits<double>::quiet_NaN();
+    double rna_ambient_qc_max = std::numeric_limits<double>::quiet_NaN();
     int rho_low_information_molecules = 50;
     double single_parent_epsilon = 0.02;
     double profile_grid_step = 0.005;
@@ -262,6 +265,9 @@ void usage(FILE* out, int code) {
         "  --min_ambient_only_sites INT  Legacy compatibility option [1]\n"
         "  --allow_unanchored_ambient    Legacy compatibility option\n"
         "  --ambient_fraction_file FILE  Optional precomputed per-cell ambient QC fraction override\n"
+        "  --rna_ambient_fraction_file FILE  Optional RNA contamination .contam_rate covariate\n"
+        "  --rna_ambient_condition NAME  Provenance label for the RNA contamination condition\n"
+        "  --rna_ambient_qc_max FLOAT    Flag RNA contamination above this value; does not alter MT likelihood\n"
         "  --legacy_panel_gt             Diagnostic only; ignore manifest and use GT-different sites\n"
         "  --single_parent_epsilon FLOAT Practical single-parent boundary [0.02]\n"
         "  --write_profile_grid          Write PREFIX.mt_profile.tsv.gz for population modeling\n"
@@ -500,6 +506,9 @@ Options parse_options(int argc, char** argv) {
         {"atac_include_singletons", no_argument, nullptr, 1041},
         {"site_influence_mode", required_argument, nullptr, 1042},
         {"ambient_qc_max", required_argument, nullptr, 1043},
+        {"rna_ambient_fraction_file", required_argument, nullptr, 1044},
+        {"rna_ambient_condition", required_argument, nullptr, 1045},
+        {"rna_ambient_qc_max", required_argument, nullptr, 1046},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -557,6 +566,9 @@ Options parse_options(int argc, char** argv) {
             case 1041: opt.atac_include_singletons = true; break;
             case 1042: opt.site_influence_mode = optarg; break;
             case 1043: opt.ambient_qc_max = std::stod(optarg); break;
+            case 1044: opt.rna_ambient_fraction_file = optarg; break;
+            case 1045: opt.rna_ambient_condition = optarg; break;
+            case 1046: opt.rna_ambient_qc_max = std::stod(optarg); break;
             default: usage(stderr, 2);
         }
     }
@@ -624,11 +636,19 @@ Options parse_options(int argc, char** argv) {
         opt.rho_low_information_molecules < 1 || opt.rho_prior_strength < 0.0 ||
         (std::isfinite(opt.ambient_qc_max) &&
          (opt.ambient_qc_max < 0.0 || opt.ambient_qc_max > 0.99)) ||
+        (std::isfinite(opt.rna_ambient_qc_max) &&
+         (opt.rna_ambient_qc_max < 0.0 || opt.rna_ambient_qc_max > 0.99)) ||
         opt.single_parent_epsilon <= 0.0 || opt.single_parent_epsilon >= 0.5 ||
         opt.profile_grid_step <= 0.0 || opt.profile_grid_step > 0.05 ||
         (opt.assay_mode != "RNA" && opt.assay_mode != "ATAC" && opt.assay_mode != "GENERIC") ||
         (opt.likelihood != "beta_binomial" && opt.likelihood != "binomial")) {
         std::fprintf(stderr, "ERROR: invalid numeric/tag option\n");
+        std::exit(2);
+    }
+    if (std::isfinite(opt.rna_ambient_qc_max) &&
+        opt.rna_ambient_fraction_file.empty()) {
+        std::fprintf(stderr,
+            "ERROR: --rna_ambient_qc_max requires --rna_ambient_fraction_file\n");
         std::exit(2);
     }
     if (opt.rho_mode != "free" && !std::isfinite(opt.pooled_rho) && opt.rho_reference.empty()) {
@@ -1973,7 +1993,7 @@ std::string format_double(double value, int precision = 8) {
 #define CELLBOUNCER_SOURCE_REVISION "unknown"
 #endif
 
-constexpr const char* kMtModelVersion = "mt_fusion_ratio_full_v5_anchor_ambient_qc";
+constexpr const char* kMtModelVersion = "mt_fusion_ratio_full_v6_rna_ambient_covariate";
 
 std::string assay_estimand(const std::string& assay_mode) {
     if (assay_mode == "ATAC") return "mtDNA_parental_fragment_fraction";
@@ -2219,6 +2239,8 @@ int main(int argc, char** argv) {
             opt.empty_barcodes, barcode_to_cell);
         std::unordered_map<std::string, double> fixed_ambient =
             load_fixed_ambient_fractions(opt.ambient_fraction_file);
+        std::unordered_map<std::string, double> rna_ambient =
+            load_fixed_ambient_fractions(opt.rna_ambient_fraction_file);
         const SiteCalibrationData site_calibration =
             load_site_calibration(opt, position_to_site);
         const std::vector<RhoReferenceEntry> rho_reference = load_rho_reference(opt);
@@ -2238,11 +2260,17 @@ int main(int argc, char** argv) {
             ? file_fingerprint(opt.ambient_profile) : "NA";
         const std::string ambient_fraction_fingerprint = !opt.ambient_fraction_file.empty()
             ? file_fingerprint(opt.ambient_fraction_file) : "NA";
-        const std::string experimental_mode =
+        const std::string rna_ambient_fraction_fingerprint =
+            !opt.rna_ambient_fraction_file.empty()
+                ? file_fingerprint(opt.rna_ambient_fraction_file) : "NA";
+        std::string experimental_mode =
             !opt.site_calibration.empty() && ambient_qc_requested
                 ? "SITE_CALIBRATION_PLUS_AMBIENT_QC"
                 : (!opt.site_calibration.empty() ? "SITE_CALIBRATION"
                    : (ambient_qc_requested ? "AMBIENT_QC" : "BASELINE"));
+        if (!opt.rna_ambient_fraction_file.empty()) {
+            experimental_mode += "_RNA_AMBIENT_COVARIATE";
+        }
 
         std::vector<AmbientSite> ambient(sites.size());
         if (!opt.ambient_profile.empty()) {
@@ -2266,6 +2294,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                 "Precomputed ambient QC fractions loaded: %zu (optional per-cell QC override)\n",
                 fixed_ambient.size());
+        }
+        if (!rna_ambient.empty()) {
+            std::fprintf(stderr,
+                "RNA ambient contamination fractions loaded: %zu (covariate/QC only)\n",
+                rna_ambient.size());
         }
 
         ReadStats stats;
@@ -2361,7 +2394,10 @@ int main(int argc, char** argv) {
                   << "\tambient_profile_id\tambient_profile_fingerprint"
                   << "\tambient_fraction_file_fingerprint"
                   << "\tambient_qc_max\tambient_qc_status\tambient_qc_reason"
-                  << "\tambient_anchor_molecules\n";
+                  << "\tambient_anchor_molecules"
+                  << "\trna_ambient_fraction\trna_ambient_condition"
+                  << "\trna_ambient_fraction_file_fingerprint"
+                  << "\trna_ambient_qc_max\trna_ambient_status\n";
 
         gzFile profile_out = nullptr;
         const std::string profile_path = opt.output_prefix + ".mt_profile.tsv.gz";
@@ -2420,6 +2456,9 @@ int main(int argc, char** argv) {
             uint64_t rho_shrunk_cells = 0;
             uint64_t high_mt_ambient_cells = 0;
             uint64_t ambient_qc_not_estimable_cells = 0;
+            uint64_t rna_ambient_available_cells = 0;
+            uint64_t high_rna_ambient_cells = 0;
+            uint64_t rna_ambient_missing_cells = 0;
         };
 
         struct CellResult {
@@ -2456,6 +2495,9 @@ int main(int argc, char** argv) {
         uint64_t rho_shrunk_cells = 0;
         uint64_t high_mt_ambient_cells = 0;
         uint64_t ambient_qc_not_estimable_cells = 0;
+        uint64_t rna_ambient_available_cells = 0;
+        uint64_t high_rna_ambient_cells = 0;
+        uint64_t rna_ambient_missing_cells = 0;
 
         std::vector<CellResult> cell_results(cells.size());
 
@@ -2491,6 +2533,9 @@ int main(int argc, char** argv) {
             auto& rho_shrunk_cells = cell_result.counters.rho_shrunk_cells;
             auto& high_mt_ambient_cells = cell_result.counters.high_mt_ambient_cells;
             auto& ambient_qc_not_estimable_cells = cell_result.counters.ambient_qc_not_estimable_cells;
+            auto& rna_ambient_available_cells = cell_result.counters.rna_ambient_available_cells;
+            auto& high_rna_ambient_cells = cell_result.counters.high_rna_ambient_cells;
+            auto& rna_ambient_missing_cells = cell_result.counters.rna_ambient_missing_cells;
             std::string status = "PASS";
             std::string fit_mode;
             if (opt.legacy_panel_gt) fit_mode = "LEGACY_GT_";
@@ -2502,6 +2547,9 @@ int main(int argc, char** argv) {
                 fit_mode += "NO_AMBIENT";
             }
             if (ambient_qc_requested) fit_mode += "_AMBIENT_QC";
+            if (!opt.rna_ambient_fraction_file.empty()) {
+                fit_mode += "_RNA_AMBIENT_COVARIATE";
+            }
 
             const bool same_parent = cell.parent1_index == cell.parent2_index;
             const PairManifest* pair_manifest = nullptr;
@@ -2552,6 +2600,26 @@ int main(int argc, char** argv) {
             const auto fixed_it = fixed_ambient.find(cell.barcode);
             const double* fixed_value = fixed_it == fixed_ambient.end() ? nullptr : &fixed_it->second;
             if (fixed_value && ambient_qc_requested) ++fixed_cells;
+            const auto rna_ambient_it = rna_ambient.find(cell.barcode);
+            const double rna_ambient_fraction =
+                rna_ambient_it == rna_ambient.end()
+                    ? std::numeric_limits<double>::quiet_NaN()
+                    : rna_ambient_it->second;
+            std::string rna_ambient_status = "NOT_REQUESTED";
+            if (!opt.rna_ambient_fraction_file.empty()) {
+                if (!std::isfinite(rna_ambient_fraction)) {
+                    rna_ambient_status = "MISSING";
+                    ++rna_ambient_missing_cells;
+                } else if (std::isfinite(opt.rna_ambient_qc_max) &&
+                           rna_ambient_fraction > opt.rna_ambient_qc_max) {
+                    rna_ambient_status = "HIGH_RNA_AMBIENT";
+                    ++rna_ambient_available_cells;
+                    ++high_rna_ambient_cells;
+                } else {
+                    rna_ambient_status = "PASS";
+                    ++rna_ambient_available_cells;
+                }
+            }
 
             int ratio_sites_available = pair_manifest ? pair_manifest->ratio_sites_available : 0;
             int ambient_sites_available = pair_manifest ? pair_manifest->ambient_only_sites_available : 0;
@@ -3004,7 +3072,12 @@ int main(int argc, char** argv) {
                       << ambient_fraction_fingerprint << '\t'
                       << format_double(opt.ambient_qc_max) << '\t'
                       << ambient_qc.status << '\t' << ambient_qc.reason << '\t'
-                      << ambient_qc.molecules << '\n';
+                      << ambient_qc.molecules << '\t'
+                      << format_double(rna_ambient_fraction) << '\t'
+                      << opt.rna_ambient_condition << '\t'
+                      << rna_ambient_fraction_fingerprint << '\t'
+                      << format_double(opt.rna_ambient_qc_max) << '\t'
+                      << rna_ambient_status << '\n';
 
             if (opt.write_site_counts && pair_manifest) {
                 for (const auto& item : cell.counts) {
@@ -3136,6 +3209,9 @@ int main(int argc, char** argv) {
             rho_shrunk_cells += cell_result.counters.rho_shrunk_cells;
             high_mt_ambient_cells += cell_result.counters.high_mt_ambient_cells;
             ambient_qc_not_estimable_cells += cell_result.counters.ambient_qc_not_estimable_cells;
+            rna_ambient_available_cells += cell_result.counters.rna_ambient_available_cells;
+            high_rna_ambient_cells += cell_result.counters.high_rna_ambient_cells;
+            rna_ambient_missing_cells += cell_result.counters.rna_ambient_missing_cells;
             ratio_out << cell_result.ratio_row;
             if (profile_out && !cell_result.profile_row.empty()) {
                 gz_write_text(profile_out, cell_result.profile_row);
@@ -3209,6 +3285,19 @@ int main(int argc, char** argv) {
         qc << "ambient_fraction_file\t"
            << (opt.ambient_fraction_file.empty() ? "NA" : opt.ambient_fraction_file) << '\n';
         qc << "ambient_fraction_file_fingerprint\t" << ambient_fraction_fingerprint << '\n';
+        qc << "rna_ambient_fraction_file\t"
+           << (opt.rna_ambient_fraction_file.empty()
+               ? "NA" : opt.rna_ambient_fraction_file) << '\n';
+        qc << "rna_ambient_condition\t" << opt.rna_ambient_condition << '\n';
+        qc << "rna_ambient_fraction_file_fingerprint\t"
+           << rna_ambient_fraction_fingerprint << '\n';
+        qc << "rna_ambient_qc_max\t"
+           << format_double(opt.rna_ambient_qc_max) << '\n';
+        qc << "rna_ambient_available_cells\t"
+           << rna_ambient_available_cells << '\n';
+        qc << "high_rna_ambient_cells\t" << high_rna_ambient_cells << '\n';
+        qc << "rna_ambient_missing_cells\t" << rna_ambient_missing_cells << '\n';
+        qc << "rna_ambient_used_in_mt_likelihood\t0\n";
         qc << "min_mapq\t" << opt.min_mapq << '\n';
         qc << "min_baseq\t" << opt.min_baseq << '\n';
         qc << "error_rate\t" << opt.error_rate << '\n';

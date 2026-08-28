@@ -28,10 +28,11 @@ import pandas as pd
 import scipy
 from scipy.optimize import brentq, minimize, minimize_scalar
 from scipy.special import logsumexp, ndtr
+from scipy.stats import pearsonr, spearmanr
 
 PROFILE_DROP_95 = 1.920729410347062
 EPS = 1e-300
-POPULATION_IMPLEMENTATION_VERSION = "mt_population_structure_v2_correctness_20260818"
+POPULATION_IMPLEMENTATION_VERSION = "mt_population_structure_v3_rna_ambient_20260821"
 M2_NEAR_BEST_LL_TOLERANCE = 0.1
 M2_PROPORTION_DISAGREEMENT_TOLERANCE = 0.05
 
@@ -648,6 +649,46 @@ def _selected_model_summary(structure: str, m0: M0Result, m1: M1Result, m2: M2Re
     return math.nan, math.nan
 
 
+def _rna_ambient_association(group: pd.DataFrame) -> Dict[str, object]:
+    """Describe the RNA-contamination association without changing MT likelihoods."""
+    result: Dict[str, object] = {
+        "n_cells_with_rna_ambient": 0,
+        "rna_ambient_mean": math.nan,
+        "rna_ambient_median": math.nan,
+        "rna_ambient_pearson_r": math.nan,
+        "rna_ambient_pearson_p": math.nan,
+        "rna_ambient_spearman_r": math.nan,
+        "rna_ambient_spearman_p": math.nan,
+        "rna_ambient_ols_slope": math.nan,
+        "rna_ambient_association_status": "NOT_AVAILABLE",
+    }
+    if "rna_ambient_fraction" not in group.columns:
+        return result
+    ambient = pd.to_numeric(group["rna_ambient_fraction"], errors="coerce").to_numpy(dtype=float)
+    ratio = pd.to_numeric(
+        group["canonical_parent2_fraction"], errors="coerce").to_numpy(dtype=float)
+    keep = np.isfinite(ambient) & np.isfinite(ratio)
+    ambient = ambient[keep]
+    ratio = ratio[keep]
+    result["n_cells_with_rna_ambient"] = int(len(ambient))
+    if not len(ambient):
+        return result
+    result["rna_ambient_mean"] = float(np.mean(ambient))
+    result["rna_ambient_median"] = float(np.median(ambient))
+    if len(ambient) < 3 or np.std(ambient) == 0 or np.std(ratio) == 0:
+        result["rna_ambient_association_status"] = "INSUFFICIENT_VARIATION"
+        return result
+    pearson = pearsonr(ambient, ratio)
+    spearman = spearmanr(ambient, ratio)
+    result["rna_ambient_pearson_r"] = float(pearson.statistic)
+    result["rna_ambient_pearson_p"] = float(pearson.pvalue)
+    result["rna_ambient_spearman_r"] = float(spearman.statistic)
+    result["rna_ambient_spearman_p"] = float(spearman.pvalue)
+    result["rna_ambient_ols_slope"] = float(np.polyfit(ambient, ratio, 1)[0])
+    result["rna_ambient_association_status"] = "PASS"
+    return result
+
+
 def _group_calibration_status(group: pd.DataFrame) -> str:
     if "site_calibration_status" not in group.columns:
         return "UNCALIBRATED"
@@ -815,6 +856,39 @@ def run_population(args: argparse.Namespace) -> None:
             if metadata_col in ratio_meta.columns:
                 ratio_meta[group_col] = ratio_meta[metadata_col]
 
+    if args.rna_ambient_max is not None:
+        if "rna_ambient_fraction" not in ratio_meta.columns:
+            _write_exclusions(args.output_prefix, exclusions)
+            raise ValueError(
+                "--rna-ambient-max requested but ratio input has no "
+                "rna_ambient_fraction column")
+        rna_values = pd.to_numeric(
+            ratio_meta["rna_ambient_fraction"], errors="coerce")
+        keep_rna = np.ones(len(ratio_meta), dtype=bool)
+        for pos, (_, row) in enumerate(ratio_meta.iterrows()):
+            value = rna_values.iloc[pos]
+            lib = str(row["library_id"])
+            bc = str(row["barcode"])
+            if not np.isfinite(value):
+                keep_rna[pos] = False
+                exclusions.append({
+                    "library_id": lib,
+                    "barcode": bc,
+                    "exclusion_reason": "RNA_AMBIENT_MISSING",
+                    "detail": "no finite RNA contamination rate",
+                })
+            elif float(value) > args.rna_ambient_max:
+                keep_rna[pos] = False
+                exclusions.append({
+                    "library_id": lib,
+                    "barcode": bc,
+                    "exclusion_reason": "HIGH_RNA_AMBIENT",
+                    "detail": (
+                        f"rna_ambient_fraction={float(value):.8g}; "
+                        f"max={args.rna_ambient_max:.8g}"),
+                })
+        ratio_meta = ratio_meta.loc[keep_rna].copy()
+
     missing_group = [x for x in group_cols if x not in ratio_meta.columns]
     if missing_group:
         _write_exclusions(args.output_prefix, exclusions)
@@ -915,6 +989,7 @@ def run_population(args: argparse.Namespace) -> None:
         raw_fraction = float(np.sum(raw2[raw_ok]) / denom) if denom > 0 else math.nan
         selected_mean, selected_sd = _selected_model_summary(structure, m0, m1, m2)
         model_fit_status = f"M1:{m1.fit_status};M2:{m2.fit_status}"
+        ambient_association = _rna_ambient_association(profiled)
 
         row = {
             "group_id": gid,
@@ -965,6 +1040,7 @@ def run_population(args: argparse.Namespace) -> None:
             "membership_threshold": args.membership_threshold,
             "min_confident_fraction": args.min_confident_fraction,
             "min_cells_threshold": args.min_cells,
+            **ambient_association,
         }
         group_rows.append(row)
 
@@ -1001,6 +1077,12 @@ def run_population(args: argparse.Namespace) -> None:
                     "p_component_high": p_high,
                     "component_assignment": assignment,
                     "component_assignment_status": assignment_status,
+                    "rna_ambient_fraction": pd.to_numeric(
+                        cell.get("rna_ambient_fraction"), errors="coerce"),
+                    "rna_ambient_condition": cell.get(
+                        "rna_ambient_condition", "NA"),
+                    "rna_ambient_status": cell.get(
+                        "rna_ambient_status", "NOT_AVAILABLE"),
                 })
 
     groups_path = args.output_prefix + ".mt_population_groups.tsv"
@@ -1011,9 +1093,20 @@ def run_population(args: argparse.Namespace) -> None:
         "ratio_molecules", "ratio_sites_used", "primary_fit_status", "profile_status",
         "population_structure", "common_ratio_residual", "p_component_low", "p_component_high",
         "component_assignment", "component_assignment_status",
+        "rna_ambient_fraction", "rna_ambient_condition", "rna_ambient_status",
     ]
     pd.DataFrame(cell_rows, columns=cell_columns).to_csv(
         args.output_prefix + ".mt_population_cells.tsv", sep="\t", index=False, na_rep="NA")
+    association_columns = [
+        "group_id", *group_cols, "n_cells_profiled",
+        "n_cells_with_rna_ambient", "rna_ambient_mean", "rna_ambient_median",
+        "rna_ambient_pearson_r", "rna_ambient_pearson_p",
+        "rna_ambient_spearman_r", "rna_ambient_spearman_p",
+        "rna_ambient_ols_slope", "rna_ambient_association_status",
+    ]
+    pd.DataFrame(group_rows).reindex(columns=association_columns).to_csv(
+        args.output_prefix + ".mt_population_ambient_associations.tsv",
+        sep="\t", index=False, na_rep="NA")
     _enrich_exclusions(exclusions, ratio, ratio_meta, group_cols)
     _write_exclusions(args.output_prefix, exclusions)
 
@@ -1039,6 +1132,7 @@ def run_population(args: argparse.Namespace) -> None:
         ("min_component_separation", args.min_component_separation),
         ("membership_threshold", args.membership_threshold),
         ("min_confident_fraction", args.min_confident_fraction),
+        ("rna_ambient_max", args.rna_ambient_max if args.rna_ambient_max is not None else "NA"),
         ("calibration_status", ";".join(sorted(set(str(x) for x in pd.DataFrame(group_rows).get("calibration_status", pd.Series(dtype=str)).dropna()))) or "UNCALIBRATED"),
         ("compare_to_groups", getattr(args, "compare_to_groups", None) or "NA"),
         ("python_version", platform.python_version()),
@@ -1077,6 +1171,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-confident-fraction", type=float, default=0.70)
     p.add_argument("--compare-to-groups", default=None,
                    help="Optional previous .mt_population_groups.tsv for calibrated-vs-reference call comparison")
+    p.add_argument(
+        "--rna-ambient-max", type=float, default=None,
+        help=("Optional maximum RNA contamination fraction. Cells with missing "
+              "or larger values are excluded before population modeling."))
     return p
 
 
@@ -1093,6 +1191,8 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be in (0,1]")
     if not 0 < args.min_component_separation <= 1:
         raise ValueError("--min-component-separation must be in (0,1]")
+    if args.rna_ambient_max is not None and not 0 <= args.rna_ambient_max <= 0.99:
+        raise ValueError("--rna-ambient-max must be between 0 and 0.99")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

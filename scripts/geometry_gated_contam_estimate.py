@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Run a frozen CK geometry-gated source-exclusion condition on real libraries.
+"""Run a fixed-identity CK geometry-gated source-exclusion condition.
 
-This production helper is invoked by orchestrate_pipeline.py. It runs the
-unchanged tet_contam_estimate binary at a configured base source-exclusion
-strength, evaluates the frozen geometry gate from estimator-emitted base
-endpoint evidence, lazily runs the configured fallback strength when required
-by the gate or by a base per-cell fit failure, and atomically publishes one
-selected per-cell result plus an explicit gate audit.
+The helper preserves the historical geometry workflow by default.  When the
+forwarded estimator arguments include ``--freeze_assignments``, it activates a
+strict controlled-comparison mode: frozen assignment semantics are proved from
+R4 endpoint contracts and every per-cell output is selected from the same
+endpoint.  Legacy calls without that flag continue to accept R3 contracts and
+retain the original base-ledger publication behavior.
+
+This file deliberately remains a small evolution of the production geometry
+helper.  It does not infer or rewrite identity or ambient rosters: the caller's
+explicit inputs are forwarded unchanged, recorded in the final contract, and
+checked against both endpoint contracts.
 """
 from __future__ import annotations
 
@@ -23,8 +28,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-WORKER_VERSION = "geometry_gated_contam_estimate_V2"
-CONTRACT_VERSION = "geometry_gated_contam_estimate_run_contract_V2"
+WORKER_VERSION = "geometry_gated_contam_estimate_fixed_ambient_V2"
+CONTRACT_VERSION = "geometry_gated_contam_estimate_run_contract_V3"
+CAPABILITY_TOKEN = "identity_ambient_fixed_assignments_fixed_profile_v2"
 
 _ENDPOINT_REQUIRED_SUFFIXES = (
     ".contam_rate",
@@ -44,6 +50,11 @@ _FINAL_SELECTED_SUFFIXES = (
     ".profile_fit_diagnostics.tsv",
     ".condf_coverage.tsv",
 )
+_COMPARISON_ENDPOINT_REQUIRED_SUFFIXES = (
+    ".decontam.assignments",
+    ".cell_source_profile.tsv",
+)
+_COMPARISON_FINAL_SUFFIXES = _COMPARISON_ENDPOINT_REQUIRED_SUFFIXES
 _OPTIONAL_BASE_SUFFIXES = (
     ".model_fit.tsv",
     ".class_residuals.tsv",
@@ -213,6 +224,26 @@ def _remove_flag(arguments: Sequence[str], names: Iterable[str]) -> list[str]:
     return [str(token) for token in arguments if str(token) not in accepted]
 
 
+def _flag_count(arguments: Sequence[str], names: Iterable[str]) -> int:
+    """Count exact occurrences of valueless command-line flags."""
+    accepted = set(names)
+    return sum(str(token) in accepted for token in arguments)
+
+
+def _optional_option_value(
+    arguments: Sequence[str], names: Iterable[str], *, default: str = "",
+) -> str:
+    found = _option_occurrences(arguments, names)
+    if not found:
+        return default
+    values = {value for _, _, value in found}
+    if len(values) != 1:
+        raise GeometryGateError(
+            f"conflicting values for {sorted(set(names))}: {sorted(values)}"
+        )
+    return found[0][2]
+
+
 def _set_option_unique(arguments: Sequence[str], names: Iterable[str], value: str) -> list[str]:
     ordered = tuple(names)
     first_index: int | None = None
@@ -233,14 +264,151 @@ def _set_option_unique(arguments: Sequence[str], names: Iterable[str], value: st
 def _assert_no_active_forwarded_inputs(arguments: Sequence[str]) -> None:
     prohibited = {
         "warm_start": ("--warm_start", "-W"),
-        "fixed_ambient": ("--fixed_ambient", "-A"),
         "fix_r": ("--fix_r",),
     }
     for label, names in prohibited.items():
         if _option_occurrences(arguments, names):
             raise GeometryGateError(
-                f"geometry-gated free-r fitted-profile endpoint cannot use --{label}"
+                f"geometry-gated endpoint cannot use --{label}"
             )
+
+    freeze_count = _flag_count(arguments, ("--freeze_assignments",))
+    if freeze_count > 1:
+        raise GeometryGateError(
+            "--freeze_assignments may be supplied at most once"
+        )
+    if freeze_count and _flag_count(arguments, ("--run_once", "--run-once", "-r")):
+        raise GeometryGateError(
+            "fixed identity/ambient comparison requires iterative fitting; "
+            "--run_once/-r is prohibited with --freeze_assignments"
+        )
+    if freeze_count and _option_occurrences(arguments, ("--ids", "-i")):
+        raise GeometryGateError(
+            "fixed identity/ambient comparison requires the staged "
+            "<output_prefix>.assignments input; --ids/-i is not supported"
+        )
+    fixed_ambient = _option_occurrences(
+        arguments, ("--fixed_ambient", "-A")
+    )
+    if fixed_ambient and not freeze_count:
+        raise GeometryGateError(
+            "geometry-gated --fixed_ambient is supported only for a "
+            "--freeze_assignments controlled comparison"
+        )
+    if fixed_ambient:
+        basis = _optional_option_value(
+            arguments, ("--fixed_ambient_basis",), default=""
+        )
+        if basis != "library":
+            raise GeometryGateError(
+                "geometry-gated --fixed_ambient requires "
+                "--fixed_ambient_basis library"
+            )
+
+
+def _execution_mode(arguments: Sequence[str]) -> tuple[bool, bool, str]:
+    """Return (freeze, run_once, contract mode), preserving legacy defaults."""
+    freeze = bool(_flag_count(arguments, ("--freeze_assignments",)))
+    run_once = bool(_flag_count(arguments, ("--run_once", "--run-once", "-r")))
+    if run_once:
+        assignment_mode = "single_pass_frozen"
+    elif freeze:
+        assignment_mode = "iterative_frozen"
+    else:
+        assignment_mode = "iterative_reclassification"
+    return freeze, run_once, assignment_mode
+
+
+def _required_input_path(
+    arguments: Sequence[str], names: Iterable[str], *, label: str,
+) -> Path:
+    raw = _option_value(arguments, names)
+    path = Path(raw)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise GeometryGateError(f"required {label} input is missing or empty: {path}")
+    return path
+
+
+def _optional_input_path(
+    arguments: Sequence[str], names: Iterable[str], *, label: str,
+) -> Path | None:
+    raw = _optional_option_value(arguments, names)
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise GeometryGateError(f"configured {label} input is missing or empty: {path}")
+    return path
+
+
+def _path_record(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {"path": "", "size_bytes": -1}
+    return {"path": str(path), "size_bytes": int(path.stat().st_size)}
+
+
+def _collect_input_manifest(
+    estimator_arguments: Sequence[str], outer_prefix: Path,
+    *, strict_comparison: bool,
+) -> dict[str, dict[str, object]]:
+    """Resolve every scientific input whose identity must survive both endpoints."""
+    implicit: dict[str, Path] = {
+        "counts": Path(str(outer_prefix) + ".counts"),
+        "assignments": Path(str(outer_prefix) + ".assignments"),
+        "samples": Path(str(outer_prefix) + ".samples"),
+    }
+    for label, path in implicit.items():
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise GeometryGateError(f"required staged {label} input is missing or empty: {path}")
+
+    # Controlled comparisons require explicit receiver and ambient-source
+    # rosters.  Treating either as an implicit estimator default would make the
+    # four-arm interpretation unverifiable.
+    explicit_condf = _optional_input_path(
+        estimator_arguments, ("--condf",), label="conditional-probability"
+    )
+    condf = explicit_condf or Path(str(outer_prefix) + ".condf")
+    if not condf.is_file() or condf.stat().st_size <= 0:
+        raise GeometryGateError(
+            f"required conditional-probability input is missing or empty: {condf}"
+        )
+    expected = _optional_input_path(
+        estimator_arguments, ("--expected_lines", "-X"), label="receiver-roster"
+    )
+    ambient = _optional_input_path(
+        estimator_arguments, ("--ambient_candidates",), label="ambient-roster"
+    )
+    if strict_comparison and expected is None:
+        raise GeometryGateError(
+            "fixed identity/ambient comparison requires an explicit -X/--expected_lines roster"
+        )
+    if strict_comparison and ambient is None:
+        raise GeometryGateError(
+            "fixed identity/ambient comparison requires --ambient_candidates"
+        )
+    holdout = _optional_input_path(
+        estimator_arguments, ("--profile_holdout_barcodes",),
+        label="profile-holdout barcode",
+    )
+    surface_selector = _optional_input_path(
+        estimator_arguments, ("--r_c_surface_selector",),
+        label="r/c surface-selector",
+    )
+    fixed_ambient = _optional_input_path(
+        estimator_arguments, ("--fixed_ambient", "-A"),
+        label="fixed ambient profile",
+    )
+    manifest = {
+        **{name: _path_record(path) for name, path in implicit.items()},
+        "condf": _path_record(condf),
+        "expected_lines": _path_record(expected),
+        "ambient_candidates": _path_record(ambient),
+        "profile_holdout_barcodes": _path_record(holdout),
+        "r_c_surface_selector": _path_record(surface_selector),
+    }
+    if fixed_ambient is not None:
+        manifest["fixed_ambient"] = _path_record(fixed_ambient)
+    return manifest
 
 
 def _endpoint_arguments(
@@ -305,15 +473,21 @@ def _cleanup_staging_for_outer(outer_prefix: Path) -> None:
 
 
 def _cleanup_final_outputs(outer_prefix: Path) -> None:
-    for suffix in (*_FINAL_SELECTED_SUFFIXES, *_OPTIONAL_BASE_SUFFIXES, ".run_contract.json"):
+    for suffix in (
+        *_FINAL_SELECTED_SUFFIXES, *_COMPARISON_FINAL_SUFFIXES,
+        *_OPTIONAL_BASE_SUFFIXES, ".run_contract.json",
+    ):
         try:
             Path(str(outer_prefix) + suffix).unlink()
         except FileNotFoundError:
             pass
 
 
-def _validate_endpoint_required_files(prefix: Path) -> None:
-    for suffix in _ENDPOINT_REQUIRED_SUFFIXES:
+def _validate_endpoint_required_files(prefix: Path, *, strict_comparison: bool) -> None:
+    suffixes = list(_ENDPOINT_REQUIRED_SUFFIXES)
+    if strict_comparison:
+        suffixes.extend(_COMPARISON_ENDPOINT_REQUIRED_SUFFIXES)
+    for suffix in suffixes:
         path = Path(str(prefix) + suffix)
         if not path.is_file():
             raise GeometryGateError(f"required endpoint file is missing: {path}")
@@ -707,8 +881,61 @@ def _basis_is_no_input(value: object) -> bool:
     }
 
 
+def _normalized_path_text(value: object) -> str:
+    raw = str(value if value is not None else "").strip()
+    return os.path.abspath(os.path.normpath(raw)) if raw else ""
+
+
+def _validate_contract_path_record(
+    contract: Mapping[str, object], field: str, expected: Mapping[str, object],
+    *, contract_path: Path,
+) -> None:
+    observed = contract.get(field)
+    if not isinstance(observed, Mapping):
+        raise GeometryGateError(
+            f"endpoint run contract {contract_path} lacks path record {field!r}"
+        )
+    expected_path = str(expected.get("path", ""))
+    observed_path = str(observed.get("path", ""))
+    if _normalized_path_text(observed_path) != _normalized_path_text(expected_path):
+        raise GeometryGateError(
+            f"endpoint run contract {contract_path} has {field}.path={observed_path!r}, "
+            f"expected {expected_path!r}"
+        )
+    try:
+        observed_size = int(observed.get("size_bytes", -2))
+        expected_size = int(expected.get("size_bytes", -1))
+    except (TypeError, ValueError) as exc:
+        raise GeometryGateError(
+            f"endpoint run contract {contract_path} has invalid {field}.size_bytes"
+        ) from exc
+    if observed_size != expected_size:
+        raise GeometryGateError(
+            f"endpoint run contract {contract_path} has {field}.size_bytes={observed_size}, "
+            f"expected {expected_size}"
+        )
+
+
+def _endpoint_input_manifest(
+    input_manifest: Mapping[str, Mapping[str, object]], endpoint_prefix: Path,
+    *, condf_is_explicit: bool,
+) -> dict[str, dict[str, object]]:
+    expected = {name: dict(record) for name, record in input_manifest.items()}
+    for field, suffix in (
+        ("counts", ".counts"), ("assignments", ".assignments"),
+        ("samples", ".samples"),
+    ):
+        expected[field]["path"] = str(endpoint_prefix) + suffix
+    if not condf_is_explicit:
+        expected["condf"]["path"] = str(endpoint_prefix) + ".condf"
+    return expected
+
+
 def _load_endpoint_contract(
     path: Path, expected_strength: float, condition_key: str,
+    expected_inputs: Mapping[str, Mapping[str, object]],
+    *, freeze_requested: bool, run_once_requested: bool,
+    assignment_update_mode: str,
 ) -> dict[str, object]:
     if not path.is_file() or path.stat().st_size <= 0:
         raise GeometryGateError(f"endpoint run contract is missing: {path}")
@@ -720,6 +947,7 @@ def _load_endpoint_contract(
         raise GeometryGateError(f"endpoint run contract is not an object: {path}")
 
     exact = {
+        "tool": "tet_contam_estimate",
         "production_contract_pass": True,
         "run_class": "production",
         "panel_mode": "interindividual",
@@ -738,6 +966,37 @@ def _load_endpoint_contract(
             raise GeometryGateError(
                 f"endpoint run contract {path} has {field}={value[field]!r}, expected {expected!r}"
             )
+    contract_version = value.get("contract_version")
+    if freeze_requested:
+        mode_exact = {
+            "contract_version": "tet_contam_estimate_run_contract_V1_R4",
+            "run_once": False,
+            "freeze_assignments": True,
+            "assignment_update_mode": "iterative_frozen",
+        }
+    else:
+        if contract_version not in {
+            "tet_contam_estimate_run_contract_V1_R3",
+            "tet_contam_estimate_run_contract_V1_R4",
+        }:
+            raise GeometryGateError(
+                f"legacy endpoint contract has unsupported contract_version="
+                f"{contract_version!r}: {path}"
+            )
+        # R3 predates explicit assignment-update fields.  Preserve its accepted
+        # historical contract.  If an R4 estimator is deployed, prove that it
+        # actually ran in the non-frozen mode requested by the caller.
+        mode_exact = {} if contract_version == "tet_contam_estimate_run_contract_V1_R3" else {
+            "run_once": run_once_requested,
+            "freeze_assignments": False,
+            "assignment_update_mode": assignment_update_mode,
+        }
+    for field, expected in mode_exact.items():
+        if value.get(field) != expected:
+            raise GeometryGateError(
+                f"endpoint run contract {path} has {field}={value.get(field)!r}, "
+                f"expected {expected!r}"
+            )
     try:
         observed_strength = float(value["source_exclusion_strength"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -751,25 +1010,56 @@ def _load_endpoint_contract(
             f"endpoint run-contract strength mismatch: {observed_strength} != {expected_strength}: {path}"
         )
 
-    for field in ("warm_start_basis", "fixed_ambient_basis", "fix_r_basis", "fixed_r_basis"):
+    for field in ("warm_start_basis", "fix_r_basis", "fixed_r_basis"):
         if field in value and not _basis_is_no_input(value[field]):
             raise GeometryGateError(f"endpoint contract has active {field}: {value[field]!r}")
-    for field in ("warm_start", "fixed_ambient", "fix_r"):
+    for field in ("warm_start", "fix_r"):
         if field in value and not _path_value_empty(value[field]):
             raise GeometryGateError(f"endpoint contract has active {field} input: {value[field]!r}")
     if value.get("fixed_r_enabled", False) is not False:
         raise GeometryGateError(f"endpoint contract records fixed_r_enabled=true: {path}")
-    if value.get("fixed_ambient_enabled", False) is not False:
-        raise GeometryGateError(f"endpoint contract records fixed_ambient_enabled=true: {path}")
+    fixed_ambient_expected = "fixed_ambient" in expected_inputs
+    if fixed_ambient_expected:
+        if value.get("fixed_ambient_enabled") is not True:
+            raise GeometryGateError(
+                f"endpoint contract records fixed_ambient_enabled="
+                f"{value.get('fixed_ambient_enabled')!r}, expected true: {path}"
+            )
+        if value.get("fixed_ambient_basis") != "library":
+            raise GeometryGateError(
+                f"endpoint contract records fixed_ambient_basis="
+                f"{value.get('fixed_ambient_basis')!r}, expected 'library': {path}"
+            )
+    else:
+        if value.get("fixed_ambient_enabled", False) is not False:
+            raise GeometryGateError(
+                f"endpoint contract records fixed_ambient_enabled=true: {path}"
+            )
+        if ("fixed_ambient_basis" in value and
+                not _basis_is_no_input(value["fixed_ambient_basis"])):
+            raise GeometryGateError(
+                f"endpoint contract has active fixed_ambient_basis: "
+                f"{value['fixed_ambient_basis']!r}"
+            )
+        if "fixed_ambient" in value and not _path_value_empty(value["fixed_ambient"]):
+            raise GeometryGateError(
+                f"endpoint contract has active fixed_ambient input: "
+                f"{value['fixed_ambient']!r}"
+            )
+    for field, expected in expected_inputs.items():
+        _validate_contract_path_record(value, field, expected, contract_path=path)
     return value
 
 
 def _validate_contract_invariants(base: Mapping[str, object], fallback: Mapping[str, object]) -> None:
     fields = (
-        "tool", "tool_version", "run_class", "panel_mode", "strict_condf",
+        "contract_version", "tool", "tool_version", "run_class", "panel_mode", "strict_condf",
+        "run_once", "freeze_assignments", "assignment_update_mode",
         "assignments_basis", "expected_lines_basis", "ambient_candidates_basis",
+        "profile_holdout_basis", "profile_holdout_count",
         "condition_key", "synthetic_id", "source_exclusion_explicit",
         "production_contract_pass", "truth_assisted",
+        "fixed_ambient_enabled", "fixed_ambient_basis",
     )
     for field in fields:
         if base.get(field) != fallback.get(field):
@@ -777,6 +1067,8 @@ def _validate_contract_invariants(base: Mapping[str, object], fallback: Mapping[
                 f"base/fallback run-contract invariant mismatch for {field}: "
                 f"{base.get(field)!r} != {fallback.get(field)!r}"
             )
+    # Path records have already been validated independently against the same
+    # caller-facing manifest. Endpoint-local implicit paths intentionally differ.
 
 
 def _contract_summary(contract: Mapping[str, object]) -> dict[str, object]:
@@ -784,9 +1076,15 @@ def _contract_summary(contract: Mapping[str, object]) -> dict[str, object]:
         "contract_version", "tool", "tool_version", "run_class", "panel_mode",
         "strict_condf", "assignments_basis", "expected_lines_basis",
         "ambient_candidates_basis", "warm_start_basis", "fixed_ambient_basis",
-        "fix_r_basis", "condition_key", "synthetic_id", "source_exclusion_strength",
+        "fixed_ambient_enabled", "fix_r_basis", "run_once",
+        "freeze_assignments", "assignment_update_mode",
+        "profile_holdout_basis", "profile_holdout_count",
+        "condition_key", "synthetic_id", "source_exclusion_strength",
         "source_exclusion_explicit", "production_contract_pass",
         "production_contract_reason", "truth_assisted",
+        "counts", "condf", "assignments", "samples", "expected_lines",
+        "ambient_candidates", "fixed_ambient", "profile_holdout_barcodes",
+        "r_c_surface_selector",
     )
     return {key: contract.get(key) for key in keep if key in contract}
 
@@ -996,10 +1294,204 @@ def _write_selected_allele(
     _write_tsv(path, base_fields, rows)
 
 
+def _read_assignment_rows(
+    path: Path, expected_barcodes: set[str],
+) -> tuple[list[str], dict[str, tuple[str, str, str, str]]]:
+    """Read the headerless four-column cellbouncer assignment ledger."""
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise GeometryGateError(f"assignment ledger is missing or empty: {path}")
+    order: list[str] = []
+    by_barcode: dict[str, tuple[str, str, str, str]] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            fields = raw.rstrip("\r\n").split("\t")
+            if len(fields) != 4:
+                raise GeometryGateError(
+                    f"malformed assignment row {line_number} in {path}: expected 4 fields"
+                )
+            barcode = fields[0]
+            if not barcode or barcode in by_barcode:
+                raise GeometryGateError(
+                    f"empty or duplicate assignment barcode {barcode!r} in {path}"
+                )
+            if barcode not in expected_barcodes:
+                raise GeometryGateError(
+                    f"assignment barcode {barcode!r} is absent from endpoint diagnostics: {path}"
+                )
+            row = (fields[0], fields[1], fields[2], fields[3])
+            order.append(barcode)
+            by_barcode[barcode] = row
+    if set(by_barcode) != expected_barcodes:
+        missing = sorted(expected_barcodes - set(by_barcode))[:10]
+        raise GeometryGateError(
+            f"assignment roster differs from endpoint diagnostics in {path}; "
+            f"missing examples={missing!r}"
+        )
+    return order, by_barcode
+
+
+def _validate_frozen_assignment_identity(
+    endpoint_rows: Mapping[str, tuple[str, str, str, str]],
+    input_rows: Mapping[str, tuple[str, str, str, str]], *, endpoint_name: str,
+) -> None:
+    for barcode, row in endpoint_rows.items():
+        source = input_rows[barcode]
+        # The estimator may rewrite the numerical LLR formatting, but a frozen
+        # run must not alter the identity or singlet/doublet class.
+        if row[1:3] != source[1:3]:
+            raise GeometryGateError(
+                f"{endpoint_name} changed frozen assignment for {barcode!r}: "
+                f"{source[1:3]!r} -> {row[1:3]!r}"
+            )
+
+
+def _write_selected_assignments(
+    path: Path, *, outer_input: Path | None, base_path: Path,
+    fallback_path: Path | None, selected_endpoint: Mapping[str, str],
+    freeze_requested: bool,
+) -> None:
+    expected = set(selected_endpoint)
+    base_order, base_rows = _read_assignment_rows(base_path, expected)
+    input_rows: dict[str, tuple[str, str, str, str]] = {}
+    if freeze_requested:
+        if outer_input is None:
+            raise GeometryGateError(
+                "frozen assignment validation requires the outer assignment input"
+            )
+        _, input_rows = _read_assignment_rows(outer_input, expected)
+        _validate_frozen_assignment_identity(
+            base_rows, input_rows, endpoint_name="base endpoint"
+        )
+    if fallback_path is None:
+        # Preserve the exact successful endpoint artifact when the gate never
+        # required fallback evaluation.
+        _atomic_copy(base_path, path)
+        return
+
+    _, fallback_rows = _read_assignment_rows(fallback_path, expected)
+    if freeze_requested:
+        _validate_frozen_assignment_identity(
+            fallback_rows, input_rows, endpoint_name="fallback endpoint"
+        )
+    lines: list[str] = []
+    for barcode in base_order:
+        endpoint = selected_endpoint[barcode]
+        row = base_rows[barcode] if endpoint == "base" else fallback_rows[barcode]
+        lines.append("\t".join(row) + "\n")
+    _atomic_write_text(path, "".join(lines))
+
+
+def _profile_header(path: Path) -> tuple[str, list[str]]:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise GeometryGateError(f"cell/source profile is missing or empty: {path}")
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        raw = handle.readline()
+    fields = raw.rstrip("\r\n").split("\t")
+    if len(fields) < 2 or fields[0] != "barcode" or fields[1] != "identity":
+        raise GeometryGateError(
+            f"cell/source profile has an invalid barcode/identity header: {path}"
+        )
+    if len(set(fields)) != len(fields):
+        raise GeometryGateError(f"cell/source profile has duplicate header fields: {path}")
+    return raw.rstrip("\r\n"), fields
+
+
+def _stream_profile_rows(
+    path: Path, fields: Sequence[str], expected_identity: Mapping[str, str],
+    selected_barcodes: set[str], output_handle: object | None,
+) -> Counter[str]:
+    """Validate one profile and optionally stream selected barcode rows."""
+    counts: Counter[str] = Counter()
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        handle.readline()
+        for line_number, raw in enumerate(handle, 2):
+            if not raw.strip():
+                continue
+            row = raw.rstrip("\r\n").split("\t")
+            if len(row) != len(fields):
+                raise GeometryGateError(
+                    f"malformed cell/source profile row {line_number} in {path}: "
+                    f"expected {len(fields)} fields, observed {len(row)}"
+                )
+            barcode, identity = row[0], row[1]
+            if barcode not in expected_identity:
+                raise GeometryGateError(
+                    f"cell/source profile barcode {barcode!r} absent from diagnostics: {path}"
+                )
+            if identity != expected_identity[barcode]:
+                raise GeometryGateError(
+                    f"cell/source profile identity mismatch for {barcode!r} in {path}: "
+                    f"{identity!r} != {expected_identity[barcode]!r}"
+                )
+            counts[barcode] += 1
+            if barcode in selected_barcodes and output_handle is not None:
+                output_handle.write(raw if raw.endswith("\n") else raw + "\n")
+    if set(counts) != set(expected_identity):
+        missing = sorted(set(expected_identity) - set(counts))[:10]
+        raise GeometryGateError(
+            f"cell/source profile roster differs from diagnostics in {path}; "
+            f"missing examples={missing!r}"
+        )
+    return counts
+
+
+def _write_selected_source_profile(
+    path: Path, *, base_path: Path, fallback_path: Path | None,
+    selected_endpoint: Mapping[str, str],
+    base_identity: Mapping[str, str], fallback_identity: Mapping[str, str],
+) -> None:
+    base_header, base_fields = _profile_header(base_path)
+    if fallback_path is None:
+        # Deliberate byte-for-byte base passthrough when no fallback endpoint
+        # exists; final staging validation still proves its cell roster.
+        _atomic_copy(base_path, path)
+        return
+
+    fallback_header, fallback_fields = _profile_header(fallback_path)
+    if base_fields != fallback_fields or base_header != fallback_header:
+        raise GeometryGateError("base and fallback cell/source-profile schemas differ")
+    selected_base = {
+        barcode for barcode, endpoint in selected_endpoint.items() if endpoint == "base"
+    }
+    selected_fallback = set(selected_endpoint) - selected_base
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="") as output:
+            output.write(base_header + "\n")
+            base_counts = _stream_profile_rows(
+                base_path, base_fields, base_identity, selected_base, output
+            )
+            fallback_counts = _stream_profile_rows(
+                fallback_path, fallback_fields, fallback_identity,
+                selected_fallback, output,
+            )
+            if base_counts != fallback_counts:
+                raise GeometryGateError(
+                    "base and fallback cell/source profiles have different per-cell source rosters"
+                )
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _validate_selected_staging(
     staging_prefix: Path, authoritative_order: Sequence[str], final_contract_path: Path,
+    input_manifest: Mapping[str, Mapping[str, object]],
+    *, freeze_requested: bool, run_once_requested: bool,
+    assignment_update_mode: str,
 ) -> None:
-    for suffix in _FINAL_SELECTED_SUFFIXES:
+    required_suffixes = list(_FINAL_SELECTED_SUFFIXES)
+    if freeze_requested:
+        required_suffixes.extend(_COMPARISON_FINAL_SUFFIXES)
+    for suffix in required_suffixes:
         path = Path(str(staging_prefix) + suffix)
         if not path.is_file() or path.stat().st_size <= 0:
             raise GeometryGateError(f"required staged selected output is missing: {path}")
@@ -1020,12 +1512,56 @@ def _validate_selected_staging(
     if rate_order != expected or diag_order != expected or audit_order != expected:
         raise GeometryGateError("selected rate/diagnostic/audit roster or order mismatch")
 
+    if freeze_requested:
+        expected_set = set(expected)
+        _, assignment_rows = _read_assignment_rows(
+            Path(str(staging_prefix) + ".decontam.assignments"), expected_set
+        )
+        selected_identity = {
+            str(row["barcode"]): str(row.get("identity", "")) for row in diag_rows
+        }
+        for barcode, row in assignment_rows.items():
+            if row[1] != selected_identity[barcode]:
+                raise GeometryGateError(
+                    f"selected assignment/diagnostic identity mismatch for {barcode!r}"
+                )
+        profile_path = Path(str(staging_prefix) + ".cell_source_profile.tsv")
+        _, profile_fields = _profile_header(profile_path)
+        _stream_profile_rows(
+            profile_path, profile_fields, selected_identity, set(), None
+        )
+
     try:
         parsed = json.loads(final_contract_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise GeometryGateError(f"invalid staged final run contract: {exc}") from exc
     if not isinstance(parsed, dict) or parsed.get("production_contract_pass") is not True:
         raise GeometryGateError("staged final run contract is not a passing JSON object")
+    fixed_ambient_expected = "fixed_ambient" in input_manifest
+    expected_contract_values = {
+        "fixed_identity_ambient_comparison": bool(freeze_requested),
+        "fixed_ambient_profile_comparison": fixed_ambient_expected,
+        "fixed_ambient_enabled": fixed_ambient_expected,
+        "fixed_ambient_basis": "library" if fixed_ambient_expected else "none",
+        "freeze_assignments": bool(freeze_requested),
+        "run_once": bool(run_once_requested),
+        "assignment_update_mode": assignment_update_mode,
+        "assignments_basis": "library",
+        "expected_lines_basis": "library",
+        "ambient_candidates_basis": "library",
+        "endpoint_input_contracts_validated": True,
+    }
+    for field, expected_value in expected_contract_values.items():
+        if parsed.get(field) != expected_value:
+            raise GeometryGateError(
+                f"staged final run contract has {field}={parsed.get(field)!r}, "
+                f"expected {expected_value!r}"
+            )
+    for field, record in input_manifest.items():
+        if parsed.get(field) != dict(record):
+            raise GeometryGateError(
+                f"staged final run contract did not preserve input record {field!r}"
+            )
 
 
 def _publish_staging(
@@ -1067,12 +1603,15 @@ def _write_final_contract(
     summary_counts: Mapping[str, int], reason_counts: Mapping[str, int],
     base_contract_path: Path, fallback_contract_path: Path | None,
     base_contract: Mapping[str, object], fallback_contract: Mapping[str, object] | None,
+    input_manifest: Mapping[str, Mapping[str, object]],
+    freeze_requested: bool, run_once_requested: bool, assignment_update_mode: str,
 ) -> None:
     base_finite = sum(1 for state in base_rates.values() if state["status"] == "finite")
     base_failed = total_cells - base_finite
     fallback_finite = sum(1 for state in fallback_rates.values() if state["status"] == "finite") if fallback_evaluated else 0
     fallback_failed = sum(1 for state in fallback_rates.values() if state["status"] == "failed") if fallback_evaluated else 0
     selected_na = int(summary_counts.get("selected_na_cells", 0))
+    fixed_ambient_enabled = base_contract.get("fixed_ambient_enabled") is True
     contract: dict[str, object] = {
         "contract_version": CONTRACT_VERSION,
         "tool": "geometry_gated_contam_estimate",
@@ -1088,7 +1627,36 @@ def _write_final_contract(
         "geometry_gate_parent_axis_alpha_threshold": alpha_threshold,
         "geometry_gate_ambient_orthogonal_norm_threshold": orthogonal_threshold,
         "geometry_gate_parent_mass_threshold": parent_mass_threshold,
-        "published_profile_basis": "base_endpoint_fitted_profile",
+        "published_profile_basis": (
+            "base_endpoint_fixed_library_profile"
+            if fixed_ambient_enabled else
+            "base_endpoint_fitted_profile"
+        ),
+        "published_assignment_basis": (
+            "per_cell_selected_endpoint" if freeze_requested and fallback_evaluated
+            else "base_endpoint_passthrough" if freeze_requested
+            else "base_endpoint_passthrough_if_emitted"
+        ),
+        "published_cell_source_profile_basis": (
+            "per_cell_selected_endpoint" if freeze_requested and fallback_evaluated
+            else "base_endpoint_passthrough" if freeze_requested
+            else "not_published_legacy_mode"
+        ),
+        "fixed_identity_ambient_comparison": bool(freeze_requested),
+        "freeze_assignments": bool(freeze_requested),
+        "run_once": bool(run_once_requested),
+        "assignment_update_mode": assignment_update_mode,
+        "assignments_basis": "library",
+        "expected_lines_basis": "library",
+        "ambient_candidates_basis": "library",
+        "fixed_ambient_enabled": fixed_ambient_enabled,
+        "fixed_ambient_basis": (
+            "library" if fixed_ambient_enabled else "none"
+        ),
+        "fixed_ambient_profile_comparison": fixed_ambient_enabled,
+        "profile_holdout_basis": base_contract.get("profile_holdout_basis"),
+        "profile_holdout_count": base_contract.get("profile_holdout_count"),
+        "endpoint_input_contracts_validated": True,
         "rate_roster_basis": "base_endpoint_contam_diagnostics",
         "failed_rate_encoding": "nan",
         "per_cell_fit_failures_nonfatal": True,
@@ -1121,15 +1689,25 @@ def _write_final_contract(
             else "geometry_gate_outputs_validated"
         ),
     }
+    # Publish the caller-facing (not temporary endpoint-local) scientific input
+    # records at top level so downstream completion checks can prove which
+    # assignment and receiver/source rosters produced this arm.
+    for field, record in input_manifest.items():
+        contract[field] = dict(record)
     _atomic_write_text(path, json.dumps(contract, indent=2, sort_keys=True, allow_nan=False) + "\n")
 
 
-def _copy_base_outputs_to_staging(base_prefix: Path, staging_prefix: Path) -> list[str]:
+def _copy_base_outputs_to_staging(
+    base_prefix: Path, staging_prefix: Path, *, skip_suffixes: Iterable[str] = (),
+) -> list[str]:
     staged = []
+    skipped = set(skip_suffixes)
     for suffix in (".contam_prof", ".profile_fit_diagnostics.tsv", ".condf_coverage.tsv"):
         _atomic_copy(Path(str(base_prefix) + suffix), Path(str(staging_prefix) + suffix))
         staged.append(suffix)
     for suffix in _OPTIONAL_BASE_SUFFIXES:
+        if suffix in skipped:
+            continue
         source = Path(str(base_prefix) + suffix)
         if source.is_file() and source.stat().st_size > 0:
             _atomic_copy(source, Path(str(staging_prefix) + suffix))
@@ -1144,6 +1722,9 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
             f"estimator binary is missing or not executable: {estimator_binary}"
         )
     _assert_no_active_forwarded_inputs(estimator_arguments)
+    freeze_requested, run_once_requested, assignment_update_mode = _execution_mode(
+        estimator_arguments
+    )
 
     outer_prefix = Path(_option_value(estimator_arguments, ("-o", "--output_prefix")))
     requested_contract = Path(_option_value(estimator_arguments, ("--run_contract",)))
@@ -1154,6 +1735,13 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
         raise GeometryGateError(
             f"geometry helper requires --run_contract {expected_final_contract}, got {requested_contract}"
         )
+
+    input_manifest = _collect_input_manifest(
+        estimator_arguments, outer_prefix, strict_comparison=freeze_requested
+    )
+    condf_is_explicit = bool(
+        _optional_option_value(estimator_arguments, ("--condf",))
+    )
 
     outer_prefix.parent.mkdir(parents=True, exist_ok=True)
     base_prefix = Path(str(outer_prefix) + ".geometry_base_endpoint")
@@ -1175,7 +1763,9 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
             estimator_binary, estimator_arguments, outer_prefix, base_prefix,
             args.base_strength, args.condition_key,
         )
-        _validate_endpoint_required_files(base_prefix)
+        _validate_endpoint_required_files(
+            base_prefix, strict_comparison=freeze_requested
+        )
 
         base_diag_path = Path(str(base_prefix) + ".contam_diagnostics.tsv")
         base_fields, base_rows, base_by = _read_tsv_rows(base_diag_path)
@@ -1196,7 +1786,13 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
 
         base_contract_path = Path(str(base_prefix) + ".run_contract.json")
         base_contract = _load_endpoint_contract(
-            base_contract_path, args.base_strength, args.condition_key
+            base_contract_path, args.base_strength, args.condition_key,
+            _endpoint_input_manifest(
+                input_manifest, base_prefix, condf_is_explicit=condf_is_explicit
+            ),
+            freeze_requested=freeze_requested,
+            run_once_requested=run_once_requested,
+            assignment_update_mode=assignment_update_mode,
         )
         base_profile_fields, _ = _read_profile_diagnostics(
             Path(str(base_prefix) + ".profile_fit_diagnostics.tsv")
@@ -1221,7 +1817,9 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
                 estimator_binary, estimator_arguments, outer_prefix, fallback_prefix,
                 args.fallback_strength, args.condition_key,
             )
-            _validate_endpoint_required_files(fallback_prefix)
+            _validate_endpoint_required_files(
+                fallback_prefix, strict_comparison=freeze_requested
+            )
             fallback_fields, fallback_rows, fallback_by = _read_tsv_rows(
                 Path(str(fallback_prefix) + ".contam_diagnostics.tsv")
             )
@@ -1235,7 +1833,14 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
             )
             fallback_contract_path = Path(str(fallback_prefix) + ".run_contract.json")
             fallback_contract = _load_endpoint_contract(
-                fallback_contract_path, args.fallback_strength, args.condition_key
+                fallback_contract_path, args.fallback_strength, args.condition_key,
+                _endpoint_input_manifest(
+                    input_manifest, fallback_prefix,
+                    condf_is_explicit=condf_is_explicit,
+                ),
+                freeze_requested=freeze_requested,
+                run_once_requested=run_once_requested,
+                assignment_update_mode=assignment_update_mode,
             )
             _validate_contract_invariants(base_contract, fallback_contract)
             fallback_profile_fields, _ = _read_profile_diagnostics(
@@ -1290,7 +1895,41 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
             ".contam_rate", ".contam_diagnostics.tsv", ".geometry_gate_audit.tsv",
             ".allele_ratio",
         ]
-        staged_suffixes.extend(_copy_base_outputs_to_staging(base_prefix, staging_prefix))
+        if freeze_requested:
+            base_identity = {
+                str(row["barcode"]): str(row.get("identity", "")) for row in base_rows
+            }
+            fallback_identity = {
+                str(barcode): str(row.get("identity", ""))
+                for barcode, row in fallback_by.items()
+            }
+            _write_selected_assignments(
+                Path(str(staging_prefix) + ".decontam.assignments"),
+                outer_input=Path(str(input_manifest["assignments"]["path"])),
+                base_path=Path(str(base_prefix) + ".decontam.assignments"),
+                fallback_path=(
+                    Path(str(fallback_prefix) + ".decontam.assignments")
+                    if fallback_required else None
+                ),
+                selected_endpoint=selected_endpoint,
+                freeze_requested=freeze_requested,
+            )
+            _write_selected_source_profile(
+                Path(str(staging_prefix) + ".cell_source_profile.tsv"),
+                base_path=Path(str(base_prefix) + ".cell_source_profile.tsv"),
+                fallback_path=(
+                    Path(str(fallback_prefix) + ".cell_source_profile.tsv")
+                    if fallback_required else None
+                ),
+                selected_endpoint=selected_endpoint,
+                base_identity=base_identity,
+                fallback_identity=fallback_identity,
+            )
+            staged_suffixes.extend(_COMPARISON_FINAL_SUFFIXES)
+        staged_suffixes.extend(_copy_base_outputs_to_staging(
+            base_prefix, staging_prefix,
+            skip_suffixes=_COMPARISON_FINAL_SUFFIXES if freeze_requested else (),
+        ))
 
         _write_final_contract(
             staged_contract,
@@ -1315,8 +1954,17 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
             fallback_contract_path=fallback_contract_path,
             base_contract=base_contract,
             fallback_contract=fallback_contract,
+            input_manifest=input_manifest,
+            freeze_requested=freeze_requested,
+            run_once_requested=run_once_requested,
+            assignment_update_mode=assignment_update_mode,
         )
-        _validate_selected_staging(staging_prefix, base_order, staged_contract)
+        _validate_selected_staging(
+            staging_prefix, base_order, staged_contract, input_manifest,
+            freeze_requested=freeze_requested,
+            run_once_requested=run_once_requested,
+            assignment_update_mode=assignment_update_mode,
+        )
         _publish_staging(staging_prefix, outer_prefix, staged_suffixes, staged_contract)
         success = True
         print(
@@ -1341,19 +1989,34 @@ def run(args: argparse.Namespace, estimator_arguments: Sequence[str]) -> None:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    capability_only = raw_argv == ["--capabilities"]
     parser = argparse.ArgumentParser(
         description="Internal production CK geometry-gated endpoint selector"
     )
-    parser.add_argument("--estimator-binary", required=True)
-    parser.add_argument("--condition-key", required=True)
-    parser.add_argument("--gate-version", required=True)
-    parser.add_argument("--base-strength", type=float, required=True)
-    parser.add_argument("--fallback-strength", type=float, required=True)
-    parser.add_argument("--parent-axis-alpha-threshold", type=float, required=True)
-    parser.add_argument("--ambient-orthogonal-norm-threshold", type=float, required=True)
-    parser.add_argument("--parent-mass-threshold", type=float, required=True)
+    parser.add_argument(
+        "--capabilities", action="store_true",
+        help="print the stable helper capability token and exit",
+    )
+    parser.add_argument("--estimator-binary", required=not capability_only)
+    parser.add_argument("--condition-key", required=not capability_only)
+    parser.add_argument("--gate-version", required=not capability_only)
+    parser.add_argument("--base-strength", type=float, required=not capability_only)
+    parser.add_argument("--fallback-strength", type=float, required=not capability_only)
+    parser.add_argument(
+        "--parent-axis-alpha-threshold", type=float, required=not capability_only
+    )
+    parser.add_argument(
+        "--ambient-orthogonal-norm-threshold", type=float,
+        required=not capability_only,
+    )
+    parser.add_argument("--parent-mass-threshold", type=float, required=not capability_only)
     parser.add_argument("estimator_arguments", nargs=argparse.REMAINDER)
-    parsed = parser.parse_args(argv)
+    parsed = parser.parse_args(raw_argv)
+    if parsed.capabilities:
+        if not capability_only:
+            parser.error("--capabilities must be used alone")
+        return parsed, []
     forwarded = list(parsed.estimator_arguments)
     if forwarded and forwarded[0] == "--":
         forwarded = forwarded[1:]
@@ -1378,6 +2041,9 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args, estimator_arguments = parse_args(argv)
+        if args.capabilities:
+            print(CAPABILITY_TOKEN)
+            return 0
         run(args, estimator_arguments)
     except GeometryGateError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

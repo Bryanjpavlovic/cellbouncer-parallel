@@ -2,11 +2,11 @@
 """
 identity_reconciliation_figures.py
 
-Version: V2_R8 (V2 = this conversation, second design; R8 = eighth revision)
+Version: V2_R12 (V2 = this conversation, second design; R12 = twelfth revision)
 Provenance: accessory figure generator for the Tet2025 demux -> tetra_refine ->
 identity-reconciliation chain. Deployed to the CellBouncer scripts folder
 (/nvme/software/packages/cellbouncer/dev/bin/) and callable from
-orchestrate_pipeline.py, or run standalone. Stable pipeline basename by
+orchestrate_tetraploid.py, or run standalone. Stable pipeline basename by
 contract: version lives in this header only, never in the filename.
 
 DESIGN CHANGE FROM V1
@@ -42,6 +42,16 @@ All-library aggregates (span every library present; degrade to any subset):
   A6  full_identity_catalogue every final identity with v11-aware biological relationship
   A7  library_exchange        directed distinguishing-roster exchange coverage plus candidate summary
 
+Ambient swap-test figures (standalone mode, driven by --ambient-swap-spec):
+  AS  fixed-profile assignment scatter, fixed-profile KDE by stratum, and
+      joint-profile-versus-fixed-profile delta. The same three-figure family is
+      written for all candidates across all libraries, for all candidates
+      together within each library, and separately for each proposed identity.
+      Figure files use descriptive scope/identity/condition prefixes in a flat
+      per-library directory; identities and conditions never create directories.
+      Plotting and summary ownership lives here; the orchestrator only schedules
+      estimator jobs and supplies a compact JSON input manifest.
+
 DATA CONTRACT (under --reconciliation-root)
 -------------------------------------------
   decisions/all_libraries.reconciled_cells.tsv.gz
@@ -50,6 +60,13 @@ DATA CONTRACT (under --reconciliation-root)
   metadata/library_expected_genotypes.tsv
 Optional per-library score sources (LS, A4):
   <demux-root>/Tet_2025_Multiome-RNA_{N}/demux_nomito/lib{N}_demuxed.diagnostics.gz
+
+Ambient swap-test mode requires a JSON manifest written by
+orchestrate_tetraploid.py. Each condition supplies four matched contamination
+rate files: G/H use one frozen empty-drop profile, while J/K independently fit
+the profile with original/proposed assignments. Candidate groups are discovered
+upstream from reconciliation evidence; this script never accepts a handwritten
+candidate roster.
 
 If reconciliation column names differ from the documented v11 schema, run
 harvest_reconciliation_schema.py and pass --schema <harvest.json>.
@@ -65,25 +82,23 @@ Usage (cluster)
       --output-dir /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814/identity_reconciliation_figures \
       --figures all
 
-Local validation:
-  python3 identity_reconciliation_figures.py --make-test-slice ./test_root
-  python3 identity_reconciliation_figures.py --reconciliation-root ./test_root \
-      --demux-root ./test_root/mapping_output --output-dir ./test_plots --figures all
+Ambient swap-test figures are normally scheduled by AMBIENT_SWAP_TEST. They
+can also be regenerated from its saved manifest without rerunning estimators:
+  python3 /nvme/software/packages/cellbouncer/dev/bin/identity_reconciliation_figures.py \
+      --ambient-swap-spec <ambient_swap_test_*.worker.json> \
+      --output-dir <AMBIENT_SWAP_TEST_output_directory>
 
 Revision history at bottom.
-
-Actual Used Run Command:
-python3 identity_reconciliation_figures.py --reconciliation-root /mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/retrain_nomito_20260814/identity_reconciliation \
---demux-root /mnt/beegfs/tetmultiome_rna_mapped/mapping_output --line-metadata /mnt/beegfs/tetmultiome_rna_mapped/mapping_output/Library_conversions.xlsx \
---output-dir /mnt/beegfs/tetmultiome_rna_mapped/Full_ToolChainRun_Implementation/Identityfigs --figures all
 
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import json
 import os
+import shutil
 import sys
 
 import matplotlib
@@ -95,6 +110,9 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.colors import ListedColormap, BoundaryNorm
+
+
+AMBIENT_PLOT_MAX_POINTS = 50000
 
 
 # =============================================================================
@@ -1788,6 +1806,510 @@ def figure_a7(data, out_dir, args):
 
 
 # =============================================================================
+# AS  Ambient swap-test figures (G/H fixed profile; J/K joint profile)
+# =============================================================================
+
+AMBIENT_STRATUM_ORDER = ("changed_target", "scrutinized_other", "background")
+AMBIENT_STRATUM_PRETTY = {
+    "changed_target": "changed target",
+    "scrutinized_other": "scrutinized other",
+    "background": "background",
+}
+AMBIENT_STRATUM_COLORS = {
+    "changed_target": "#CC6677",
+    "scrutinized_other": "#4477AA",
+    "background": "#BBBBBB",
+}
+
+
+def _ambient_slug(value):
+    text = str(value).strip().replace("+", "_plus_")
+    text = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
+    text = "_".join(part for part in text.split("_") if part)
+    return text or "unnamed"
+
+
+def _ambient_read_rate(path):
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"ambient swap-test rate file missing or empty: {path}")
+    values = {}
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            fields = raw.split()
+            if len(fields) < 2 or fields[0].lower() in {"barcode", "cell"}:
+                continue
+            try:
+                value = float(fields[1])
+            except ValueError:
+                continue
+            if np.isfinite(value):
+                values[fields[0]] = value
+    if not values:
+        raise RuntimeError(f"ambient swap-test rate file has no finite rows: {path}")
+    return values
+
+
+def _ambient_read_rows(path, required):
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"ambient swap-test table missing or empty: {path}")
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        missing = set(required) - set(reader.fieldnames or ())
+        if missing:
+            raise RuntimeError(
+                f"ambient swap-test table {path} lacks {sorted(missing)}")
+        rows = list(reader)
+    return rows
+
+
+def _ambient_plot_sample(rows, maximum=AMBIENT_PLOT_MAX_POINTS):
+    """Deterministically thin plotted points without changing summaries."""
+    if len(rows) <= maximum:
+        return rows
+    positions = np.linspace(0, len(rows) - 1, maximum, dtype=int)
+    return [rows[int(pos)] for pos in positions]
+
+
+def _ambient_kde_curve(values, grid):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.zeros_like(grid)
+    if values.size > AMBIENT_PLOT_MAX_POINTS:
+        positions = np.linspace(
+            0, values.size - 1, AMBIENT_PLOT_MAX_POINTS, dtype=int)
+        values = np.sort(values)[positions]
+    spread = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+    bandwidth = max(0.005, 1.06 * spread * values.size ** (-0.2))
+    density = np.zeros_like(grid)
+    normalizer = bandwidth * np.sqrt(2.0 * np.pi) * values.size
+    for start in range(0, values.size, 2000):
+        chunk = values[start:start + 2000]
+        scaled = (grid[:, None] - chunk[None, :]) / bandwidth
+        density += np.exp(-0.5 * scaled * scaled).sum(axis=1)
+    return density / normalizer
+
+
+def _ambient_summarize(rows, left, right):
+    left_values = np.asarray([row[left] for row in rows], dtype=float)
+    right_values = np.asarray([row[right] for row in rows], dtype=float)
+    delta = right_values - left_values
+    return {
+        "n_paired": int(len(rows)),
+        "median_left_c": float(np.median(left_values)),
+        "median_right_c": float(np.median(right_values)),
+        "median_delta_c": float(np.median(delta)),
+        "q25_delta_c": float(np.quantile(delta, 0.25)),
+        "q75_delta_c": float(np.quantile(delta, 0.75)),
+        "fraction_right_lower": float(np.mean(delta < 0)),
+        "fraction_equal": float(np.mean(delta == 0)),
+    }
+
+
+def _ambient_save_pair(fig, out_dir, stem, dpi, manifest, metadata):
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for suffix in ("pdf", "png"):
+        path = os.path.join(out_dir, f"{stem}.{suffix}")
+        fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
+        print(f"  wrote {path}")
+        manifest.append({**metadata, "format": suffix, "path": path})
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
+def _ambient_scope_rows(records, candidate_identity=None):
+    """Return one clean three-stratum view from a library/condition slice.
+
+    The combined scope uses every selected candidate cell and every source
+    control. An identity scope keeps only that identity's candidate cells,
+    derives its source controls from their original identities, and excludes
+    other candidate populations instead of mislabeling them as background.
+    """
+    if candidate_identity is None:
+        return [(row, row["combined_stratum"]) for row in records]
+    target = [
+        row for row in records
+        if row["candidate_identity"] == candidate_identity]
+    source_identities = {row["original_identity"] for row in target}
+    scoped = [(row, "changed_target") for row in target]
+    for row in records:
+        if row["combined_stratum"] == "changed_target":
+            continue
+        stratum = (
+            "scrutinized_other"
+            if row["original_identity"] in source_identities
+            else "background")
+        scoped.append((row, stratum))
+    return scoped
+
+
+def _ambient_render_three_figure_set(
+        scoped, out_dir, title, condition, dpi, manifest, metadata,
+        shared_joint_profile, filename_prefix):
+    scoped_rows = [row for row, _ in scoped]
+    if not scoped_rows:
+        return [], []
+    by_stratum = {
+        stratum: [row for row, observed in scoped if observed == stratum]
+        for stratum in AMBIENT_STRATUM_ORDER
+    }
+    by_stratum = {key: value for key, value in by_stratum.items() if value}
+    if "changed_target" not in by_stratum:
+        return [], []
+
+    summaries = []
+    for stratum, rows in list(by_stratum.items()) + [("all", scoped_rows)]:
+        for comparison, left, right in (
+                ("joint_profile", "joint_original_c", "joint_proposed_c"),
+                ("fixed_empty", "fixed_original_c", "fixed_proposed_c")):
+            summaries.append({
+                **metadata,
+                "stratum": stratum,
+                "comparison": comparison,
+                **_ambient_summarize(rows, left, right),
+            })
+
+    written = []
+    fig, ax = plt.subplots(figsize=(7.4, 6.8))
+    for stratum in AMBIENT_STRATUM_ORDER[::-1]:
+        rows = by_stratum.get(stratum, [])
+        if not rows:
+            continue
+        plotted = _ambient_plot_sample(rows)
+        ax.scatter(
+            [row["fixed_original_c"] for row in plotted],
+            [row["fixed_proposed_c"] for row in plotted],
+            s=7 if stratum == "background" else 17,
+            alpha=0.18 if stratum == "background" else 0.62,
+            color=AMBIENT_STRATUM_COLORS[stratum],
+            label=f"{AMBIENT_STRATUM_PRETTY[stratum]} (n={len(rows):,})")
+    all_fixed = [
+        row[key] for row in scoped_rows
+        for key in ("fixed_original_c", "fixed_proposed_c")]
+    upper = min(1.0, max(0.10, float(np.quantile(all_fixed, 0.997)) * 1.04))
+    ax.plot([0, upper], [0, upper], color="#333333", linewidth=0.8,
+            linestyle="--")
+    ax.set_xlim(0, upper)
+    ax.set_ylim(0, upper)
+    style_ax(
+        ax, title=f"{title}\n{condition}",
+        xlabel="Original assignments, frozen empty-drop profile (c)",
+        ylabel="Proposed assignments, same frozen profile (c)",
+        grid_axis=None)
+    ax.legend(frameon=False, loc="upper left")
+    fig.tight_layout()
+    written.extend(_ambient_save_pair(
+        fig, out_dir,
+        f"{filename_prefix}__fixed_empty_assignment_scatter", dpi, manifest,
+        {**metadata, "figure_kind": "fixed_empty_assignment_scatter"}))
+
+    all_values = [
+        row[key] for row in scoped_rows
+        for key in ("fixed_original_c", "fixed_proposed_c")]
+    kde_upper = min(
+        1.0, max(0.10, float(np.quantile(all_values, 0.995)) * 1.10))
+    grid = np.linspace(0.0, kde_upper, 320)
+    kde_panels = [
+        (value, by_stratum[value])
+        for value in AMBIENT_STRATUM_ORDER if value in by_stratum]
+    kde_panels.append(("all", scoped_rows))
+    fig, axes = plt.subplots(
+        len(kde_panels), 1, sharex=True, squeeze=False,
+        figsize=(9.2, 2.55 * len(kde_panels) + 1.7))
+    for ax, (stratum, rows) in zip(axes.ravel(), kde_panels):
+        left = [row["fixed_original_c"] for row in rows]
+        right = [row["fixed_proposed_c"] for row in rows]
+        ax.plot(grid, _ambient_kde_curve(left, grid), color="#4477AA",
+                linewidth=1.8, label="Original assignments / fixed profile")
+        ax.plot(grid, _ambient_kde_curve(right, grid), color="#CC6677",
+                linewidth=1.8, label="Proposed assignments / same profile")
+        panel_title = (
+            "All paired cells in scope"
+            if stratum == "all" else AMBIENT_STRATUM_PRETTY[stratum])
+        style_ax(
+            ax,
+            title=f"{panel_title} (n={len(rows):,})",
+            ylabel="Density", grid_axis="both", title_pad=9)
+    axes[0, 0].legend(frameon=False, fontsize=8, ncol=2)
+    axes[-1, 0].set_xlabel("Estimated contamination fraction (c)")
+    fig.suptitle(f"{title}: assignment-only fixed-profile KDE\n{condition}",
+                 fontsize=12.5, fontweight="bold", y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    written.extend(_ambient_save_pair(
+        fig, out_dir,
+        f"{filename_prefix}__fixed_empty_kde_by_stratum", dpi, manifest,
+        {**metadata, "figure_kind": "fixed_empty_kde_by_stratum"}))
+
+    strata = [value for value in AMBIENT_STRATUM_ORDER if value in by_stratum]
+    x = np.arange(len(strata))
+    width = 0.36
+    joint = [
+        _ambient_summarize(
+            by_stratum[value], "joint_original_c", "joint_proposed_c")
+        ["median_delta_c"] for value in strata]
+    fixed = [
+        _ambient_summarize(
+            by_stratum[value], "fixed_original_c", "fixed_proposed_c")
+        ["median_delta_c"] for value in strata]
+    fig, ax = plt.subplots(figsize=(8.8, 5.4))
+    ax.bar(x - width / 2, joint, width, color="#CCBB44",
+           label="Joint-profile original → proposed")
+    ax.bar(x + width / 2, fixed, width, color="#228833",
+           label="Fixed-profile original → proposed")
+    ax.axhline(0, color="#333333", linewidth=0.9)
+    ax.set_xticks(x)
+    ax.set_xticklabels([AMBIENT_STRATUM_PRETTY[value] for value in strata])
+    style_ax(
+        ax, title=f"{title}: joint versus assignment-only contrast\n{condition}",
+        ylabel="Median paired Δc (proposed − original)", grid_axis="y")
+    ax.legend(frameon=False, fontsize=8)
+    if shared_joint_profile:
+        help_text(ax, [
+            "The per-identity cell subset is isolated, while the joint-profile fit",
+            "is shared by all candidates in this library; no redundant per-candidate refit."
+        ], y=-0.23)
+        fig.subplots_adjust(bottom=0.20)
+    else:
+        fig.tight_layout()
+    written.extend(_ambient_save_pair(
+        fig, out_dir,
+        f"{filename_prefix}__joint_vs_fixed_delta", dpi, manifest,
+        {**metadata, "figure_kind": "joint_vs_fixed_delta"}))
+    return written, summaries
+
+
+def render_ambient_swap_figures(spec_path, output_dir, dpi=200):
+    """Render full-run ambient swap analysis from an orchestrator manifest."""
+    with open(spec_path, "r", encoding="utf-8") as handle:
+        spec = json.load(handle)
+    condition_short_names = spec.get("condition_short_names", {})
+    libraries = spec.get("libraries", [])
+    if not libraries:
+        raise RuntimeError("ambient swap-test manifest has no applicable libraries")
+    os.makedirs(output_dir, exist_ok=True)
+    data_dir = os.path.join(output_dir, "data")
+    figure_root = os.path.join(output_dir, "figures")
+    os.makedirs(data_dir, exist_ok=True)
+    # This directory is wholly owned by this rendering mode. Rebuild it so an
+    # older nested by-identity layout cannot remain beside the current figures.
+    if os.path.lexists(figure_root):
+        if os.path.islink(figure_root) or os.path.isfile(figure_root):
+            raise RuntimeError(
+                f"ambient swap figure root is not a directory: {figure_root}")
+        shutil.rmtree(figure_root)
+    os.makedirs(figure_root, exist_ok=True)
+
+    records = []
+    candidate_audit = []
+    discovery_audit = []
+    for library_spec in libraries:
+        library = int(library_spec["library"])
+        candidates = _ambient_read_rows(
+            library_spec["candidate_cells"],
+            {"barcode", "original_identity", "candidate_identity", "event_id"})
+        candidate_by_barcode = {}
+        for row in candidates:
+            barcode = row["barcode"]
+            if barcode in candidate_by_barcode:
+                raise RuntimeError(
+                    f"lib{library}: duplicate candidate barcode {barcode}")
+            candidate_by_barcode[barcode] = row
+        strata_rows = _ambient_read_rows(
+            library_spec["cell_strata"],
+            {"barcode", "original_identity", "candidate_identity", "stratum"})
+        strata = {row["barcode"]: row for row in strata_rows}
+        if len(strata) != len(strata_rows):
+            raise RuntimeError(f"lib{library}: duplicate cell-strata barcode")
+        candidate_audit.extend({"library": f"lib{library}", **row}
+                               for row in candidates)
+        event_discovery = library_spec.get("event_discovery")
+        if event_discovery:
+            discovery_audit.extend(_ambient_read_rows(
+                event_discovery,
+                {"library", "candidate_identity", "event_id"}))
+
+        for condition, paths in sorted(library_spec["conditions"].items()):
+            required_arms = {"G", "H", "J", "K"}
+            missing_arms = required_arms - set(paths)
+            if missing_arms:
+                raise RuntimeError(
+                    f"lib{library} {condition}: manifest lacks arms "
+                    f"{sorted(missing_arms)}")
+            rates = {arm: _ambient_read_rate(paths[arm])
+                     for arm in sorted(required_arms)}
+            common = sorted(set.intersection(
+                *(set(values) for values in rates.values())))
+            if not common:
+                raise RuntimeError(
+                    f"lib{library} {condition}: G/H/J/K have no paired cells")
+            for barcode in common:
+                candidate = candidate_by_barcode.get(barcode)
+                stratum_row = strata.get(barcode, {})
+                combined = stratum_row.get("stratum", "background")
+                combined = {
+                    "candidate_cell": "changed_target",
+                    "source_control": "scrutinized_other",
+                    "background": "background",
+                }.get(combined, "background")
+                records.append({
+                    "library": f"lib{library}",
+                    "library_num": library,
+                    "condition": condition,
+                    "barcode": barcode,
+                    "original_identity": stratum_row.get(
+                        "original_identity",
+                        candidate.get("original_identity", "NA")
+                        if candidate else "NA"),
+                    "candidate_identity": (
+                        candidate.get("candidate_identity", "NA")
+                        if candidate else "NA"),
+                    "event_id": (
+                        candidate.get("event_id", "NA")
+                        if candidate else "NA"),
+                    "combined_stratum": combined,
+                    "fixed_original_c": rates["G"][barcode],
+                    "fixed_proposed_c": rates["H"][barcode],
+                    "joint_original_c": rates["J"][barcode],
+                    "joint_proposed_c": rates["K"][barcode],
+                })
+
+    if not records:
+        raise RuntimeError("ambient swap-test manifest produced no paired records")
+    records_df = pd.DataFrame(records)
+    records_df["fixed_delta_c"] = (
+        records_df["fixed_proposed_c"] - records_df["fixed_original_c"])
+    records_df["joint_delta_c"] = (
+        records_df["joint_proposed_c"] - records_df["joint_original_c"])
+    records_df.to_csv(
+        os.path.join(data_dir, "ambient_swap_cell_contrasts.tsv.gz"),
+        sep="\t", index=False, compression="gzip")
+    pd.DataFrame(candidate_audit).to_csv(
+        os.path.join(data_dir, "ambient_swap_candidate_cells.tsv"),
+        sep="\t", index=False)
+    if discovery_audit:
+        pd.DataFrame(discovery_audit).to_csv(
+            os.path.join(data_dir, "ambient_swap_event_discovery_audit.tsv"),
+            sep="\t", index=False)
+    if spec.get("applicability"):
+        pd.DataFrame(spec["applicability"]).to_csv(
+            os.path.join(data_dir, "ambient_swap_library_applicability.tsv"),
+            sep="\t", index=False)
+
+    manifest = []
+    summaries = []
+    written = []
+    conditions = sorted(records_df["condition"].unique())
+    for condition in conditions:
+        condition_label = condition_short_names.get(condition, condition)
+        condition_slug = _ambient_slug(condition_label)
+        condition_records = [
+            row for row in records if row["condition"] == condition]
+        scoped = _ambient_scope_rows(condition_records)
+        out_dir = os.path.join(figure_root, "all_libraries_combined")
+        files, rows = _ambient_render_three_figure_set(
+            scoped, out_dir, "All applicable libraries | combined candidates",
+            condition_label, dpi, manifest,
+            {"scope": "all_libraries_combined", "library": "all",
+             "candidate_identity": "all", "condition": condition,
+             "condition_short_name": condition_label},
+            shared_joint_profile=False,
+            filename_prefix=f"all_libraries__{condition_slug}")
+        written.extend(files)
+        summaries.extend(rows)
+
+    for library in sorted(records_df["library_num"].unique()):
+        library_name = f"lib{int(library)}"
+        lib_records = [row for row in records if row["library_num"] == library]
+        candidates = sorted({
+            row["candidate_identity"] for row in lib_records
+            if row["candidate_identity"] not in {"", "NA"}})
+        for condition in sorted({row["condition"] for row in lib_records}):
+            condition_label = condition_short_names.get(condition, condition)
+            condition_slug = _ambient_slug(condition_label)
+            condition_records = [
+                row for row in lib_records if row["condition"] == condition]
+            library_dir = os.path.join(
+                figure_root, "by_library", library_name)
+            files, rows = _ambient_render_three_figure_set(
+                _ambient_scope_rows(condition_records), library_dir,
+                f"{library_name} | combined candidates", condition_label, dpi,
+                manifest,
+                {"scope": "library_combined", "library": library_name,
+                 "candidate_identity": "all", "condition": condition,
+                 "condition_short_name": condition_label},
+                shared_joint_profile=False,
+                filename_prefix=(
+                    f"{library_name}__all_candidates__{condition_slug}"))
+            written.extend(files)
+            summaries.extend(rows)
+            for identity in candidates:
+                files, rows = _ambient_render_three_figure_set(
+                    _ambient_scope_rows(condition_records, identity),
+                    library_dir, f"{library_name} | {identity}",
+                    condition_label,
+                    dpi, manifest,
+                    {"scope": "identity", "library": library_name,
+                     "candidate_identity": identity,
+                     "condition": condition,
+                     "condition_short_name": condition_label},
+                    shared_joint_profile=(len(candidates) > 1),
+                    filename_prefix=(
+                        f"{library_name}__{_ambient_slug(identity)}__"
+                        f"{condition_slug}"))
+                written.extend(files)
+                summaries.extend(rows)
+
+    pd.DataFrame(summaries).to_csv(
+        os.path.join(data_dir, "ambient_swap_group_summaries.tsv"),
+        sep="\t", index=False)
+    pd.DataFrame(manifest).to_csv(
+        os.path.join(data_dir, "ambient_swap_figure_manifest.tsv"),
+        sep="\t", index=False)
+    summary = {
+        "schema_version": 1,
+        "producer": "identity_reconciliation_figures.py",
+        "input_spec": os.path.abspath(spec_path),
+        "identity_event_path": spec.get("identity_event_path", "NA"),
+        "reconciliation_manifest": spec.get(
+            "reconciliation_manifest", "NA"),
+        "discovery_id": spec.get("discovery_id", "NA"),
+        "applicable_libraries": len({row["library"] for row in records}),
+        "not_applicable_libraries": sum(
+            row.get("applicable") != "yes"
+            for row in spec.get("applicability", ())),
+        "conditions": conditions,
+        "condition_short_names": {
+            condition: condition_short_names.get(condition, condition)
+            for condition in conditions
+        },
+        "candidate_identities": sorted({
+            row["candidate_identity"] for row in records
+            if row["candidate_identity"] not in {"", "NA"}}),
+        "paired_cells": len(records),
+        "figure_files": len(written),
+        "figure_layout": (
+            "flat_per_library_with_scope_identity_condition_filenames"),
+        "individual_candidate_refits": False,
+        "interpretation": (
+            "G/H hold one candidate-roster empty-drop profile fixed and differ "
+            "only in original versus proposed assignments. J/K use the same "
+            "receiver and donor rosters but fit their profiles independently. "
+            "Per-identity figures isolate that candidate's cells and source "
+            "controls; J/K remain the efficient library-wide combined fit."),
+    }
+    with open(os.path.join(output_dir, "ambient_swap_figure_summary.json"),
+              "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print(f"Ambient swap figures complete: {len(written)} file(s) under {figure_root}")
+    return written
+
+
+# =============================================================================
 # Registry
 # =============================================================================
 
@@ -1801,202 +2323,6 @@ FIGURES = {
     "A6": (figure_a6, "Full v11-aware identity catalogue + missing"),
     "A7": (figure_a7, "Library-exchange matrix from distinguishing-roster evidence"),
 }
-
-
-# =============================================================================
-# Synthetic test slice
-# =============================================================================
-
-def make_test_slice(root, demux_root=None):
-    rng = np.random.default_rng(11)
-    dec = os.path.join(root, "decisions")
-    meta = os.path.join(root, "metadata")
-    os.makedirs(dec, exist_ok=True)
-    os.makedirs(meta, exist_ok=True)
-    if demux_root is None:
-        demux_root = os.path.join(root, "mapping_output")
-
-    rosters = {
-        1: ["C3651", "H21792", "JOS3C1"],
-        2: ["C3651", "H21792", "JOS3C1"],
-        7: ["JOS3C1", "H21792", "C3651", "H25576"],
-        8: ["H20157", "H20682", "H29089", "H27322", "H21194"],
-        11: ["C40210+CongoA4B", "H27322", "C3651", "Chinobo"],
-        17: ["H21792+H28126", "Chinobo+JOS3C1", "H20961"],
-        19: ["C40210+H21792", "H27322+H28834", "H20961"],
-        20: ["H20961", "H21792", "H23555"],
-        22: ["H20961+H28126", "H20961+H23555", "C40670"],
-    }
-    exp_rows = []
-    for lib, ros in rosters.items():
-        for g in ros:
-            exp_rows.append({
-                "library": f"lib{lib}", "canonical_genotype": g,
-                "donor_components": ",".join(component_set(g)),
-                "expected_ploidy_class":
-                    "TETRAPLOID" if component_count(g) == 2 else "DIPLOID"})
-    pd.DataFrame(exp_rows).to_csv(
-        os.path.join(meta, "library_expected_genotypes.tsv"), sep="\t",
-        index=False)
-
-    cell_rows, event_rows, diag_rows = [], [], {}
-    eid = 0
-
-    def emit(lib, n, orig, final, action, applied, occ="RESOLVED",
-             proposed=None, flag="NA", llr_mu=1.5):
-        final_comps = component_set(final)
-        roster_here = set(rosters.get(lib, []))
-        donor_components_here = set()
-        composite_context = []
-        for expected_g in roster_here:
-            ecomps = component_set(expected_g)
-            donor_components_here.update(ecomps)
-            if len(final_comps) == 1 and len(ecomps) >= 2 and final_comps[0] in ecomps:
-                composite_context.append(expected_g)
-        if len(final_comps) != 1:
-            synthetic_relationship = "NOT_SINGLET"
-        elif final in roster_here:
-            synthetic_relationship = "EXPECTED_SINGLET"
-        elif final_comps[0] in donor_components_here:
-            synthetic_relationship = "EXPECTED_COMPOSITE_COMPONENT_SINGLET"
-        else:
-            synthetic_relationship = "UNEXPECTED_SINGLET"
-        for _ in range(n):
-            bc = f"BC{lib}_{len(cell_rows)}"
-            cell_rows.append({
-                "library": f"lib{lib}", "barcode": bc + "-1",
-                "original_demux_assignment": orig,
-                "original_demux_type": "D" if "+" in orig else "S",
-                "current_refined_assignment": orig,
-                "reconciled_donor_genotype": final,
-                "proposed_donor_genotype": proposed or "NA",
-                "occupancy_resolution_status": occ,
-                "explicit_multiplet_evidence":
-                    "TRUE" if flag != "NA" else "FALSE",
-                "nn_prob_tetraploid":
-                    f"{min(1, max(0, rng.normal(0.8 if '+' in final else 0.15, 0.12))):.3f}",
-                "nuclear_delta_ll": f"{rng.normal(40, 12):.2f}"
-                    if proposed else "NA",
-                "nuclear_informative_depth": f"{rng.lognormal(5.2, 0.5):.1f}",
-                "final_action": action,
-                "reassignment_applied": "TRUE" if applied else "FALSE",
-                "decision_reason_codes":
-                    "STRONG_NUCLEAR_ALTERNATIVE" if applied else "KEEP",
-                "event_id": "NA", "event_class": "NA",
-                "singlet_library_relationship": synthetic_relationship,
-                "expected_composite_context": ";".join(sorted(composite_context)) or "NA",
-                "library_exchange_evidence_eligible": "FALSE",
-                "policy_version":
-                    "identity_reconciliation_policy_v11_component_singlets_and_library_exchange"})
-            diag_rows.setdefault(lib, []).append({
-                "barcode": bc + "-1",
-                "llr_vs_runner_up":
-                    f"{max(0.01, rng.lognormal(np.log(llr_mu), 0.7)):.4f}",
-                "min_margin":
-                    f"{max(0.001, rng.lognormal(np.log(llr_mu * 0.3), 0.6)):.4f}",
-                "total_depth": f"{rng.lognormal(6, 0.5):.1f}",
-                "margin_softmax_score":
-                    f"{min(1, max(0, rng.normal(0.85, 0.1))):.4f}",
-                "margin_entropy": f"{max(0, rng.normal(0.4, 0.2)):.4f}"})
-
-    for lib, ros in rosters.items():
-        for g in ros:
-            emit(lib, 120, g, g, "KEEP", False,
-                 llr_mu=3.0 if "+" in g else 2.2)
-    for g, k in (("H20157", 45), ("H20682", 25), ("H29089", 24),
-                 ("H27322", 18), ("H21194", 14)):
-        emit(7, k, "JOS3C1", g, "REASSIGN_GENOTYPE", True, proposed=g,
-             llr_mu=3.5)
-    emit(8, 12, "H20157", "JOS3C1", "REASSIGN_GENOTYPE", True,
-         proposed="JOS3C1", llr_mu=3.2)
-    emit(8, 20, "H20157+H20682", "H20157+H20682", "REVIEW_CELLULAR_ORIGIN",
-         False, occ="DONOR_PAIR_CELLULAR_ORIGIN_UNRESOLVED",
-         proposed="H20157+H20682", llr_mu=2.0)
-    emit(19, 112, "C40210+H21792", "C40210+H27322", "REASSIGN_GENOTYPE", True,
-         proposed="C40210+H27322", llr_mu=4.0)
-    emit(19, 18, "C40210+H21792", "C40210+H21792", "REVIEW_CELLULAR_ORIGIN",
-         False, flag="LIKELY_DOUBLET", proposed="C40210+H27322", llr_mu=3.0)
-    emit(11, 160, "C40210+CongoA4B", "C40210+H27322", "REASSIGN_GENOTYPE",
-         True, proposed="C40210+H27322", llr_mu=3.8)
-    # Residual/component-derived singlet: C40210 is represented inside the
-    # expected C40210+CongoA4B composite and must not plot as foreign.
-    emit(11, 25, "C40210+CongoA4B", "C40210", "REASSIGN_GENOTYPE", True,
-         proposed="C40210", llr_mu=3.4)
-    emit(20, 60, "H20961", "H20961", "REVIEW_HOMOTET_OCCUPANCY", False,
-         occ="HOMOTET_VS_SAME_DONOR_DOUBLET_UNRESOLVED",
-         proposed="H20961+H20961", llr_mu=1.8)
-    # unexpected-identity holds (final_action REVIEW_UNEXPECTED_IDENTITY): a
-    # real fifth class present in production (441 cells on lib19)
-    emit(17, 22, "H20961", "H20961", "REVIEW_UNEXPECTED_IDENTITY", False,
-         proposed="H29089", llr_mu=2.6)
-    emit(11, 15, "C40210+CongoA4B", "C40210+CongoA4B",
-         "REVIEW_UNEXPECTED_IDENTITY", False, proposed="C40210+H27322",
-         llr_mu=2.4)
-    for lib in (1, 2):
-        emit(lib, 20, "H21792", "H28126", "REASSIGN_GENOTYPE", True,
-             proposed="H28126", llr_mu=2.5)
-    emit(17, 30, "H20961", "H23555+H28126", "REASSIGN_GENOTYPE", True,
-         proposed="H23555+H28126", llr_mu=3.0)
-    emit(22, 28, "C40670", "H20961+H27322", "REASSIGN_GENOTYPE", True,
-         proposed="H20961+H27322", llr_mu=3.0)
-
-    cells_df = pd.DataFrame(cell_rows)
-    with gzip.open(os.path.join(
-            dec, "all_libraries.reconciled_cells.tsv.gz"), "wt") as fh:
-        cells_df.to_csv(fh, sep="\t", index=False)
-    for lib, comp in ((7, "H20157"), (19, "C40210+H27322"),
-                      (11, "C40210+H27322")):
-        eid += 1
-        event_rows.append({
-            "event_id": f"E{eid}", "library": f"lib{lib}",
-            "event_scope": "EXACT", "unexpected_component": comp,
-            "n_implicated_cells": 100, "fraction_library_implicated": 0.2,
-            "primary_source_identity": "SRC",
-            "fraction_primary_source_displaced": 0.8,
-            "event_class": "UNEXPECTED_REAL_LINE", "event_confidence": "HIGH"})
-    pd.DataFrame(event_rows).to_csv(
-        os.path.join(dec, "all_libraries.identity_events.tsv"), sep="\t",
-        index=False)
-    exchange_rows = [
-        {
-            "library_a": "lib1", "library_b": "lib2",
-            "roster_relation": "ROSTER_EQUIVALENT_NONDISCRIMINATING",
-            "pair_discriminability": "NONE",
-            "a_signature_coverage_in_b": np.nan,
-            "b_signature_coverage_in_a": np.nan,
-            "a_native_retention_fraction": np.nan,
-            "b_native_retention_fraction": np.nan,
-            "a_native_displacement_fraction": np.nan,
-            "b_native_displacement_fraction": np.nan,
-            "exchange_interpretation": "ROSTER_EQUIVALENT_NONDISCRIMINATING",
-            "exchange_confidence": "NONDISCRIMINATING",
-        },
-        {
-            "library_a": "lib7", "library_b": "lib8",
-            "roster_relation": "PARTIALLY_OVERLAPPING_DONOR_ROSTERS",
-            "pair_discriminability": "STRONG",
-            "a_signature_coverage_in_b": 0.25,
-            "b_signature_coverage_in_a": 0.80,
-            "a_native_retention_fraction": 1.0,
-            "b_native_retention_fraction": 1.0,
-            "a_native_displacement_fraction": 0.0,
-            "b_native_displacement_fraction": 0.0,
-            "exchange_interpretation": "RECIPROCAL_LIBRARY_MIXING",
-            "exchange_confidence": "MODERATE",
-        },
-    ]
-    pd.DataFrame(exchange_rows).to_csv(
-        os.path.join(dec, "all_libraries.library_exchange_events.tsv"),
-        sep="\t", index=False)
-    for lib, rows in diag_rows.items():
-        d = os.path.join(demux_root, f"Tet_2025_Multiome-RNA_{lib}",
-                         "demux_nomito")
-        os.makedirs(d, exist_ok=True)
-        with gzip.open(os.path.join(d, f"lib{lib}_demuxed.diagnostics.gz"),
-                       "wt") as fh:
-            pd.DataFrame(rows).to_csv(fh, sep="\t", index=False)
-    print(f"Wrote synthetic slice under {root} ({len(cells_df):,} cells, "
-          f"{len(rosters)} libraries); diagnostics under {demux_root}")
 
 
 # =============================================================================
@@ -2046,7 +2372,11 @@ def parse_args():
     ap.add_argument("--libraries", nargs="+", default=None)
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--list", action="store_true")
-    ap.add_argument("--make-test-slice", default=None, metavar="DIR")
+    ap.add_argument(
+        "--ambient-swap-spec", default=None, metavar="JSON",
+        help=("Render the standard G/H fixed-profile and J/K joint-profile "
+              "swap-test figure sets from an orchestrator manifest. This mode "
+              "does not load the normal reconciliation figure inputs."))
     return ap.parse_args()
 
 
@@ -2055,12 +2385,15 @@ def main():
     if args.list:
         for tag, (_, desc) in FIGURES.items():
             print(f"  {tag:3s} {desc}")
-        return 0
-    if args.make_test_slice:
-        make_test_slice(os.path.abspath(args.make_test_slice))
+        print("  AS  Ambient swap-test combined/per-library/per-identity figure sets")
         return 0
     if not args.output_dir:
         sys.exit("ERROR: --output-dir is required to render figures")
+    if args.ambient_swap_spec:
+        render_ambient_swap_figures(
+            os.path.abspath(args.ambient_swap_spec),
+            os.path.abspath(args.output_dir), args.dpi)
+        return 0
     tags = list(FIGURES) if args.figures == ["all"] else args.figures
     unknown = [t for t in tags if t not in FIGURES]
     if unknown:
@@ -2086,6 +2419,27 @@ if __name__ == "__main__":
 # =============================================================================
 # Revision history
 # =============================================================================
+# V2_R12 - Added an all-paired-cells panel to every existing fixed-profile KDE
+#          while preserving the three stratum panels, figure paths, manifests,
+#          and numerical summaries. The pooled panel compares the same paired
+#          G/H assignment-only contamination estimates represented by the
+#          mutually exclusive strata in its plotting scope.
+# V2_R11 - Flattened ambient swap-test output. All-library plots now share one
+#          all_libraries_combined directory, and each library has one directory
+#          containing both combined-candidate and per-identity plots. Scope,
+#          identity, short condition, and plot kind are encoded in filenames.
+#          Rendering replaces its owned figures directory so the retired deep
+#          by_identity/<identity>/<condition> tree cannot survive regeneration.
+# V2_R10 - Ambient swap-test output folders and figure titles use short
+#          condition names supplied by the orchestrator while preserving the
+#          canonical condition key in every analysis table and summary.
+# V2_R9 - Added production ambient swap-test figure ownership. The script reads
+#         orchestrator G/H fixed-profile and J/K independently fitted-profile
+#         manifests and writes the three standard diagnostics as all-library,
+#         per-library combined-candidate, and per-library per-identity sets.
+#         Per-identity views isolate the candidate and its source controls while
+#         retaining one efficient library-wide J/K fit. Removed the embedded
+#         synthetic test-slice generator from the deployed production script.
 # V2_R8 - v11 biological-expectedness update. Exact expected genotypes, residual
 #         expected-composite component singlets, and truly unexpected identities
 #         are now separate plotting categories. LP/A3/A5/A6 no longer color a
@@ -2160,5 +2514,3 @@ if __name__ == "__main__":
 #     {N}, {0N}; unparseable rows dropped with a warning.
 #   - Optional --schema binds real column names from the harvest JSON; missing
 #     columns degrade instead of crashing.
-#   - --make-test-slice writes reconciled cells, events, rosters, and demux
-#     diagnostics so LP/LS/A1-A5 are all testable off cluster.

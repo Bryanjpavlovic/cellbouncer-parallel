@@ -51,9 +51,24 @@ using std::endl;
 using namespace std;
 
 // Version tracking
-const string QC_VERSION = "4.6-ck-crossfit-closeout";
-const string QC_VERSION_MSG = "Adds receiver-data profile cross-fitting, exact per-cell source-profile ledgers, and internally consistent r-feedback/source-exclusion scoring while preserving historical behavior when the new options are unused";
+const string QC_VERSION = "4.7-fixed-assignment-comparison";
+const string QC_VERSION_MSG = "Adds iterative fixed-assignment fitting for controlled identity/ambient-roster comparisons while preserving historical behavior unless --freeze_assignments is requested";
 const string TOOL_NAME = "tet_contam_estimate";
+
+static string assignment_update_mode_name(bool run_once, bool freeze_assignments){
+    if (run_once) return "single_pass_frozen";
+    if (freeze_assignments) return "iterative_frozen";
+    return "iterative_reclassification";
+}
+
+static void validate_assignment_update_mode(bool run_once, bool freeze_assignments){
+    if (run_once && freeze_assignments){
+        fprintf(stderr,
+            "ERROR: --run_once and --freeze_assignments are mutually exclusive; "
+            "use --freeze_assignments for iterative fixed-assignment fitting.\n");
+        exit(1);
+    }
+}
 
 static string json_escape(const string& value){
     string out;
@@ -101,6 +116,8 @@ static void write_run_contract_json(
     const string& fixed_ambient_basis,
     const string& fix_r_basis,
     bool strict_condf,
+    bool run_once,
+    bool freeze_assignments,
     const string& condition_key,
     const string& synthetic_id,
     double source_exclusion_strength,
@@ -128,7 +145,7 @@ static void write_run_contract_json(
         out << "\n";
     };
     out << "{\n";
-    field("contract_version", "tet_contam_estimate_run_contract_V1_R3");
+    field("contract_version", "tet_contam_estimate_run_contract_V1_R4");
     field("tool", TOOL_NAME);
     field("tool_version", QC_VERSION);
     field("run_class", run_class);
@@ -137,6 +154,11 @@ static void write_run_contract_json(
     field("panel_mode", use_interspecies ? "interspecies" : "interindividual");
     field("output_prefix", output_prefix);
     out << "  \"strict_condf\": " << (strict_condf ? "true" : "false") << ",\n";
+    out << "  \"run_once\": " << (run_once ? "true" : "false") << ",\n";
+    out << "  \"freeze_assignments\": "
+        << (freeze_assignments ? "true" : "false") << ",\n";
+    field("assignment_update_mode",
+        assignment_update_mode_name(run_once, freeze_assignments));
     field("assignments_basis", assignments_basis);
     field("expected_lines_basis", expected_lines_basis);
     field("ambient_candidates_basis", ambient_candidates_basis);
@@ -581,7 +603,10 @@ void help(int code){
     fprintf(stderr, "                        and solve c alone. Identities absent from FILE keep the\n");
     fprintf(stderr, "                        normal free-r fit. The pooling policy is FILE's business.\n");
     fprintf(stderr, "    --adaptive_prior    Auto-detect pathological distributions, apply fixed prior fallback\n");
-    fprintf(stderr, "    --run_once -r       Single pass, no iterative convergence\n");
+    fprintf(stderr, "    --run_once -r       Single pass, no iterative convergence; supplied identities remain fixed\n");
+    fprintf(stderr, "                        Mutually exclusive with --freeze_assignments.\n");
+    fprintf(stderr, "    --freeze_assignments  Fit profile and per-cell c/r to iterative convergence without changing supplied identities\n");
+    fprintf(stderr, "                        Mutually exclusive with --run_once.\n");
     fprintf(stderr, "    --num_threads -T    Parallel threads (default: 1)\n");
     fprintf(stderr, "    --bootstrap -b      Bootstrap replicates (default: 100)\n");
     fprintf(stderr, "    --heterotypic_start_mode MODE  single, topk (default), or exhaustive\n");
@@ -822,6 +847,7 @@ void infer_from_genotypes(string& output_prefix,
     double error_alt,
     bool weight,
     bool run_once,
+    bool freeze_assignments,
     int bootstrap,
     string& libname,
     bool seurat,
@@ -1053,6 +1079,11 @@ void infer_from_genotypes(string& output_prefix,
         fixed_ambient_loaded = true;
     }
 
+    if (freeze_assignments && !run_once){
+        fprintf(stderr, "Assignment update mode: iterative frozen assignments; "
+            "profile and per-cell c/r will converge without reclassification.\n");
+    }
+
     int nits = 0;
     while (delta > delta_thresh){
         fprintf(stderr, "===== ITERATION %d =====\n", nits+1);
@@ -1089,7 +1120,7 @@ void infer_from_genotypes(string& output_prefix,
         if (profile_restarts > 0){
             cf.set_profile_total_starts(profile_restarts);
         }
-        if (run_once){
+        if (run_once || freeze_assignments){
             cf.no_reassign();
         }
 
@@ -1595,6 +1626,11 @@ void infer_from_genotypes(string& output_prefix,
         fprintf(outf, "metric\tvalue\n");
         fprintf(outf, "tool_version\t%s\n", QC_VERSION.c_str());
         fprintf(outf, "panel_mode\t%s\n", use_interspecies ? "interspecies" : "interindividual");
+        fprintf(outf, "assignment_update_mode\t%s\n",
+            assignment_update_mode_name(run_once, freeze_assignments).c_str());
+        fprintf(outf, "run_once\t%s\n", run_once ? "true" : "false");
+        fprintf(outf, "freeze_assignments\t%s\n",
+            freeze_assignments ? "true" : "false");
         fprintf(outf, "final_loglik\t%.10f\n", final_loglik_out);
         fprintf(outf, "final_loglik_valid\t%s\n", final_loglik_valid_out ? "true" : "false");
         fprintf(outf, "ambient_profile_fixed\t%s\n", fixed_ambient_file.empty() ? "false" : "true");
@@ -2003,6 +2039,7 @@ int main(int argc, char *argv[]) {
        {"synthetic_id", required_argument, 0, 2039},
        {"profile_holdout_barcodes", required_argument, 0, 2040},
        {"profile_holdout_basis", required_argument, 0, 2041},
+       {"freeze_assignments", no_argument, 0, 2042},
        {0, 0, 0, 0}
     };
 
@@ -2025,6 +2062,7 @@ int main(int argc, char *argv[]) {
     bool seurat = false;
     bool underscore = false;
     bool run_once = false;
+    bool freeze_assignments = false;
     int bootstrap = 100;
     double doublet_rate = -1.0;
     int num_threads = 0;
@@ -2289,6 +2327,9 @@ int main(int argc, char *argv[]) {
             case 2041:
                 profile_holdout_basis = optarg;
                 break;
+            case 2042:
+                freeze_assignments = true;
+                break;
             case 'g':
                 skipgenesfile = optarg;
                 break;
@@ -2366,6 +2407,7 @@ int main(int argc, char *argv[]) {
     // ========================================================================
     // Validation
     // ========================================================================
+    validate_assignment_update_mode(run_once, freeze_assignments);
     if (source_exclusion_explicit){
         if (!std::isfinite(source_exclusion_strength) ||
             source_exclusion_strength < 0.0 || source_exclusion_strength > 1.0){
@@ -2843,6 +2885,7 @@ int main(int argc, char *argv[]) {
             error_alt,
             weight,
             run_once,
+            freeze_assignments,
             bootstrap,
             libname,
             seurat,
@@ -2907,7 +2950,8 @@ int main(int argc, char *argv[]) {
             ambient_candidates_file, warm_start_file, fixed_ambient_file, fix_r_file,
             assignments_basis, expected_lines_basis, ambient_candidates_basis,
             warm_start_basis, effective_fixed_ambient_basis, effective_fixed_r_basis,
-            strict_condf, condition_key, synthetic_id, source_exclusion_strength,
+            strict_condf, run_once, freeze_assignments,
+            condition_key, synthetic_id, source_exclusion_strength,
             source_exclusion_explicit, profile_holdout_barcodes_file,
             profile_holdout_basis, (unsigned long)profile_holdout_barcodes.size(),
             r_c_surface_selector_file, r_c_surface_out_file);

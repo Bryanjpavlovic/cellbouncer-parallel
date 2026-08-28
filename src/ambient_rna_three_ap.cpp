@@ -4,10 +4,18 @@
 //
 // Provenance: CellBouncer tet_contam_estimate ambient-RNA estimator
 //   (contamFinder3). Part of the Tet2025 synthetic ambient-RNA benchmark.
-//   Current version: V1_R23 (see Revision History block at end of file for the
+//   Current version: V1_R25 (see Revision History block at end of file for the
 //   full chronological log; the newest entries are summarized below).
 //
-// V1_R23 (this revision): keeps failed per-cell contamination fits unavailable
+// V1_R25 (this revision): gives broad fixed-c bulk donor rosters adaptive
+//   iteration headroom and uses the established 1e-6 acceptance threshold as
+//   the convergence threshold. Unconverged fits remain fail-closed.
+//
+// V1_R24: replaces transformed-BFGS only for fixed-c bulk empty-droplet profile
+//   fitting with monotone projected optimization on the donor simplex,
+//   preserving nested full-versus-donor-removed likelihoods.
+//
+// V1_R23: keeps failed per-cell contamination fits unavailable
 //   during profile compilation and optional reclassification instead of
 //   inserting c=0, and preserves accepted state when reassignment is unresolved.
 //
@@ -46,6 +54,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <functional>
 #include <stdexcept>
 #include <map>
 #include <unordered_map>
@@ -77,8 +86,8 @@ using namespace std;
 //
 // ============================================================================
 
-const string AMBIENT_RNA_VERSION = "3.2-ck-phase1-cbr008-009";
-const string AMBIENT_RNA_VERSION_MSG = "Prevents failed per-cell contamination fits from becoming implicit c=0 state and freezes unresolved reclassification without deleting supported cells";
+const string AMBIENT_RNA_VERSION = "3.3-bulk-simplex-cbr008-009";
+const string AMBIENT_RNA_VERSION_MSG = "Uses monotone simplex optimization for fixed-c bulk profiles while preserving failed-fit and unresolved-reclassification safeguards";
 
 /**
  * Three-component contamination model for single-cell RNA data with tetraploid
@@ -3687,6 +3696,15 @@ void contamFinder3::get_reads_expectations(unsigned long barcode,
             }
         }
     }
+
+    // A valid assignment can legitimately have no usable conditional-count
+    // observations.  Such cells cannot receive a contamination estimate, so
+    // record an explicit data failure instead of leaving the optimistic
+    // native-assignment label in place.  Downstream geometry-gate validation
+    // can then distinguish an expected omitted rate from a silent output loss.
+    if (n.empty()){
+        compile_status_by_cell[barcode] = "no_observations";
+    }
 }
 
 /**
@@ -4886,6 +4904,21 @@ void contamFinder3::est_contam_cells(){
     optimizer_status_by_cell.clear();
     prior_training_reason_by_cell.clear();
 
+    // Assignment rows with no compiled observations are not part of
+    // cell_to_idx and therefore never enter either fitting loop below.  Keep
+    // them in the diagnostic ledger as explicit data failures so downstream
+    // consumers can distinguish a legitimately absent rate from an
+    // accidentally dropped output row.
+    for (robin_hood::unordered_map<unsigned long, int>::const_iterator ai =
+            assn.begin(); ai != assn.end(); ++ai){
+        if (cell_to_idx.count(ai->first) == 0){
+            compile_status_by_cell[ai->first] = "no_observations";
+            optimizer_status_by_cell[ai->first] = "no_observations";
+            profile_validation_status_by_cell[ai->first] = "no_observations";
+            prior_training_reason_by_cell[ai->first] = "fit_failed";
+        }
+    }
+
     vector<pair<unsigned long, vector<int> > > cells;
     cells.reserve(cell_to_idx.size());
     for (map<unsigned long, vector<int> >::iterator ci = cell_to_idx.begin();
@@ -5777,6 +5810,302 @@ void contamFinder3::compile_bulk_amb_prof_dat(
     }
 }
 
+namespace {
+
+struct BulkSimplexFitResult {
+    bool success;
+    vector<double> proportions;
+    double log_likelihood;
+    double projected_gradient_norm;
+    int iterations;
+    int iteration_limit;
+
+    BulkSimplexFitResult(): success(false),
+        log_likelihood(-DBL_MAX),
+        projected_gradient_norm(std::numeric_limits<double>::infinity()),
+        iterations(0),
+        iteration_limit(0) {}
+};
+
+// The bulk-profile acceptance gate has always required a projected gradient
+// no larger than 1e-6.  Use that same value as the loop's stopping criterion;
+// continuing toward the former 1e-8 target spent iterations without changing
+// whether a fit was accepted.
+static const double BULK_SIMPLEX_GRADIENT_TOLERANCE = 1e-6;
+
+static int bulk_simplex_iteration_limit(int donor_count){
+    // Broader donor rosters need more projected steps than small production
+    // rosters.  Scale the ceiling with fitted dimensionality while keeping a
+    // finite upper bound.  Converged fits still stop immediately at the common
+    // tolerance, so ordinary 14--17 donor runs do not pay for this headroom.
+    const int bounded_donor_count = std::max(1, donor_count);
+    return std::min(50000, std::max(5000, 1000 * bounded_donor_count));
+}
+
+static vector<double> project_to_probability_simplex(
+        const vector<double>& values){
+    vector<double> sorted(values);
+    std::sort(sorted.begin(), sorted.end(), std::greater<double>());
+    double cumulative = 0.0;
+    int rho = -1;
+    for (int i = 0; i < (int)sorted.size(); ++i){
+        cumulative += sorted[i];
+        const double threshold = (cumulative - 1.0) / (double)(i + 1);
+        if (sorted[i] > threshold){
+            rho = i;
+        }
+    }
+    vector<double> projected(values.size(), 0.0);
+    if (rho < 0){
+        if (!projected.empty()){
+            const double uniform = 1.0 / (double)projected.size();
+            std::fill(projected.begin(), projected.end(), uniform);
+        }
+        return projected;
+    }
+    cumulative = 0.0;
+    for (int i = 0; i <= rho; ++i){
+        cumulative += sorted[i];
+    }
+    const double threshold = (cumulative - 1.0) / (double)(rho + 1);
+    double total = 0.0;
+    for (int i = 0; i < (int)values.size(); ++i){
+        projected[i] = std::max(0.0, values[i] - threshold);
+        total += projected[i];
+    }
+    if (total > 0.0 && std::isfinite(total)){
+        for (int i = 0; i < (int)projected.size(); ++i){
+            projected[i] /= total;
+        }
+    }
+    return projected;
+}
+
+static bool bulk_simplex_objective_gradient(
+        const vector<vector<double> >& mixfracs,
+        const vector<double>& weights,
+        const vector<double>& n,
+        const vector<double>& k,
+        const vector<double>& proportions,
+        double total_weighted_observations,
+        double& objective,
+        vector<double>* gradient){
+    if (mixfracs.empty() || proportions.empty() ||
+        mixfracs.size() != n.size() || mixfracs.size() != k.size() ||
+        (!weights.empty() && weights.size() != mixfracs.size()) ||
+        !(total_weighted_observations > 0.0)){
+        return false;
+    }
+    objective = 0.0;
+    if (gradient){
+        gradient->assign(proportions.size(), 0.0);
+    }
+    const double probability_floor = 1e-12;
+    for (int row = 0; row < (int)mixfracs.size(); ++row){
+        if (mixfracs[row].size() != proportions.size()){
+            return false;
+        }
+        const double weight = weights.empty() ? 1.0 : weights[row];
+        if (!(weight > 0.0) || !(n[row] > 0.0)){
+            continue;
+        }
+        double probability = 0.0;
+        for (int donor = 0; donor < (int)proportions.size(); ++donor){
+            probability += proportions[donor] * mixfracs[row][donor];
+        }
+        probability = std::max(probability_floor,
+            std::min(1.0 - probability_floor, probability));
+        objective += weight * (k[row] * std::log(probability) +
+            (n[row] - k[row]) * std::log1p(-probability));
+        if (gradient){
+            const double d_ll_d_probability = weight *
+                (k[row] / probability -
+                 (n[row] - k[row]) / (1.0 - probability));
+            for (int donor = 0; donor < (int)proportions.size(); ++donor){
+                (*gradient)[donor] +=
+                    d_ll_d_probability * mixfracs[row][donor];
+            }
+        }
+    }
+    objective /= total_weighted_observations;
+    if (!std::isfinite(objective)){
+        return false;
+    }
+    if (gradient){
+        for (int donor = 0; donor < (int)gradient->size(); ++donor){
+            (*gradient)[donor] /= total_weighted_observations;
+            if (!std::isfinite((*gradient)[donor])){
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static double bulk_simplex_reported_log_likelihood(
+        const vector<vector<double> >& mixfracs,
+        const vector<double>& weights,
+        const vector<double>& n,
+        const vector<double>& k,
+        const vector<double>& proportions){
+    const double probability_floor = 1e-12;
+    double result = 0.0;
+    for (int row = 0; row < (int)mixfracs.size(); ++row){
+        const double weight = weights.empty() ? 1.0 : weights[row];
+        if (!(weight > 0.0) || !(n[row] > 0.0)){
+            continue;
+        }
+        double probability = 0.0;
+        for (int donor = 0; donor < (int)proportions.size(); ++donor){
+            probability += proportions[donor] * mixfracs[row][donor];
+        }
+        probability = std::max(probability_floor,
+            std::min(1.0 - probability_floor, probability));
+        result += weight * logbinom(n[row], k[row], probability);
+    }
+    return result;
+}
+
+static double bulk_simplex_projected_gradient_norm(
+        const vector<double>& proportions,
+        const vector<double>& gradient){
+    vector<double> trial(proportions.size(), 0.0);
+    for (int donor = 0; donor < (int)proportions.size(); ++donor){
+        trial[donor] = proportions[donor] + gradient[donor];
+    }
+    const vector<double> projected = project_to_probability_simplex(trial);
+    double result = 0.0;
+    for (int donor = 0; donor < (int)proportions.size(); ++donor){
+        result = std::max(result,
+            std::fabs(projected[donor] - proportions[donor]));
+    }
+    return result;
+}
+
+static BulkSimplexFitResult solve_bulk_profile_on_simplex(
+        const vector<vector<double> >& mixfracs,
+        const vector<double>& weights,
+        const vector<double>& n,
+        const vector<double>& k,
+        const vector<double>& start){
+    BulkSimplexFitResult result;
+    if (start.empty()){
+        return result;
+    }
+    result.iteration_limit = bulk_simplex_iteration_limit((int)start.size());
+    vector<double> proportions(start.size(), 0.0);
+    double start_total = 0.0;
+    for (int donor = 0; donor < (int)start.size(); ++donor){
+        if (std::isfinite(start[donor]) && start[donor] > 0.0){
+            proportions[donor] = start[donor];
+            start_total += start[donor];
+        }
+    }
+    if (!(start_total > 0.0)){
+        std::fill(proportions.begin(), proportions.end(),
+            1.0 / (double)proportions.size());
+    } else {
+        for (int donor = 0; donor < (int)proportions.size(); ++donor){
+            proportions[donor] /= start_total;
+        }
+    }
+
+    double total_weighted_observations = 0.0;
+    for (int row = 0; row < (int)n.size(); ++row){
+        const double weight = weights.empty() ? 1.0 : weights[row];
+        if (weight > 0.0 && n[row] > 0.0){
+            total_weighted_observations += weight * n[row];
+        }
+    }
+    double objective = 0.0;
+    vector<double> gradient;
+    if (!bulk_simplex_objective_gradient(
+            mixfracs, weights, n, k, proportions,
+            total_weighted_observations, objective, &gradient)){
+        return result;
+    }
+
+    double step = 1.0;
+    int small_improvement_iterations = 0;
+    const int maximum_iterations = result.iteration_limit;
+    for (int iteration = 0; iteration < maximum_iterations; ++iteration){
+        result.iterations = iteration + 1;
+        const double projected_norm =
+            bulk_simplex_projected_gradient_norm(proportions, gradient);
+        if (projected_norm <= BULK_SIMPLEX_GRADIENT_TOLERANCE){
+            break;
+        }
+
+        bool accepted = false;
+        vector<double> candidate;
+        double candidate_objective = objective;
+        double accepted_directional_gain = 0.0;
+        double trial_step = step;
+        for (int backtrack = 0; backtrack < 80; ++backtrack){
+            vector<double> trial(proportions.size(), 0.0);
+            for (int donor = 0; donor < (int)proportions.size(); ++donor){
+                trial[donor] = proportions[donor] +
+                    trial_step * gradient[donor];
+            }
+            candidate = project_to_probability_simplex(trial);
+            double directional_gain = 0.0;
+            for (int donor = 0; donor < (int)proportions.size(); ++donor){
+                directional_gain += gradient[donor] *
+                    (candidate[donor] - proportions[donor]);
+            }
+            if (!(directional_gain > 0.0)){
+                trial_step *= 0.5;
+                continue;
+            }
+            if (!bulk_simplex_objective_gradient(
+                    mixfracs, weights, n, k, candidate,
+                    total_weighted_observations, candidate_objective, NULL)){
+                trial_step *= 0.5;
+                continue;
+            }
+            if (candidate_objective >=
+                    objective + 1e-4 * directional_gain - 1e-15){
+                accepted = true;
+                accepted_directional_gain = directional_gain;
+                break;
+            }
+            trial_step *= 0.5;
+        }
+        if (!accepted){
+            break;
+        }
+        const double improvement = candidate_objective - objective;
+        proportions.swap(candidate);
+        objective = candidate_objective;
+        step = std::min(1e6, trial_step * 1.5);
+        if (!bulk_simplex_objective_gradient(
+                mixfracs, weights, n, k, proportions,
+                total_weighted_observations, objective, &gradient)){
+            return result;
+        }
+        if (improvement <= 1e-13 && accepted_directional_gain <= 1e-9){
+            small_improvement_iterations++;
+        } else {
+            small_improvement_iterations = 0;
+        }
+        if (small_improvement_iterations >= 5){
+            break;
+        }
+    }
+
+    result.projected_gradient_norm =
+        bulk_simplex_projected_gradient_norm(proportions, gradient);
+    result.log_likelihood = bulk_simplex_reported_log_likelihood(
+        mixfracs, weights, n, k, proportions);
+    result.proportions = proportions;
+    result.success = std::isfinite(result.log_likelihood) &&
+        std::isfinite(result.projected_gradient_norm) &&
+        result.projected_gradient_norm <= BULK_SIMPLEX_GRADIENT_TOLERANCE;
+    return result;
+}
+
+} // namespace
+
 /**
  * Models ambient RNA as a mixture of individuals. Updates the 
  * ambient RNA alt allele fractions so est_contam_cells() can find
@@ -6061,51 +6390,176 @@ double contamFinder3::update_amb_prof_mixture(bool solve_for_c, double& init_c, 
             fprintf(stderr, "WARNING: all ambient profile mixture solves failed; keeping initial profile\n");
         }
     }
-    else{
-        vector<double> trialprops;
-        bool solve_ok = false;
+    else if (bulk_mode){
+        // With c fixed at one, this objective is concave in donor proportions
+        // on the probability simplex.  The generic transformed-BFGS path can
+        // move downhill from a valid start and return a finite but inferior
+        // terminal state.  That made donor-removed models appear better than
+        // their containing full model.  Solve this special case directly on
+        // the simplex with projected-gradient ascent and a monotone line
+        // search; all starts now target the same global optimum.
+        const int requested_starts = std::max(1, profile_total_starts);
+        vector<vector<double> > starts;
+        starts.push_back(startprops);
+        vector<double> uniform(startprops.size(),
+            1.0 / (double)startprops.size());
+        double uniform_l1 = 0.0;
+        for (int i = 0; i < (int)startprops.size(); ++i){
+            uniform_l1 += std::fabs(startprops[i] - uniform[i]);
+        }
+        if ((int)starts.size() < requested_starts && uniform_l1 > 1e-12){
+            starts.push_back(uniform);
+        }
+        unsigned int seed = 0xB0175A47u
+            + (unsigned int)startprops.size() * 131u
+            + (unsigned int)mixfracs.size() * 17u;
+        for (int i = 0; i < (int)idx2samp.size(); ++i){
+            seed = seed * 1664525u
+                + (unsigned int)(idx2samp[i] + 1) * 1013904223u;
+        }
+        std::mt19937 profile_rng(seed);
+        std::gamma_distribution<double> profile_gamma(1.0, 1.0);
+        while ((int)starts.size() < requested_starts){
+            vector<double> trial(startprops.size(), 0.0);
+            double total = 0.0;
+            for (int i = 0; i < (int)trial.size(); ++i){
+                trial[i] = profile_gamma(profile_rng);
+                total += trial[i];
+            }
+            if (!(total > 0.0) || !std::isfinite(total)){
+                continue;
+            }
+            for (int i = 0; i < (int)trial.size(); ++i){
+                trial[i] /= total;
+            }
+            starts.push_back(trial);
+        }
+
+        vector<double> lls;
+        vector<vector<double> > solutions;
         vector<double> maxres;
-        double maxll = -1e30;
+        double maxll = -DBL_MAX;
+        int best_idx = -1;
+        for (int start_idx = 0; start_idx < (int)starts.size(); ++start_idx){
+            const BulkSimplexFitResult fit = solve_bulk_profile_on_simplex(
+                mixfracs, weights, n, k, starts[start_idx]);
+            fprintf(stderr,
+                "  Bulk simplex start %d/%d: status=%s iterations=%d/%d "
+                "projected_gradient=%.6g log_likelihood=%.10f\n",
+                start_idx + 1, (int)starts.size(),
+                fit.success ? "PASS" : "FAILED", fit.iterations,
+                fit.iteration_limit, fit.projected_gradient_norm,
+                fit.log_likelihood);
+            if (!fit.success ||
+                fit.proportions.size() != startprops.size()){
+                continue;
+            }
+            const int result_idx = (int)lls.size();
+            lls.push_back(fit.log_likelihood);
+            solutions.push_back(fit.proportions);
+            if (best_idx < 0 || fit.log_likelihood > maxll){
+                best_idx = result_idx;
+                maxll = fit.log_likelihood;
+                maxres = fit.proportions;
+            }
+        }
+
+        multistart_attempted = true;
+        multistart_configured_starts = (int)starts.size();
+        multistart_successful_starts = (int)lls.size();
+        multistart_best_ll = best_idx >= 0 ? maxll : -DBL_MAX;
+        multistart_second_best_ll = -DBL_MAX;
+        multistart_near_optimal_count = 0;
+        multistart_near_optimal_l1_spread = best_idx >= 0
+            ? 0.0 : std::numeric_limits<double>::quiet_NaN();
+        for (int i = 0; i < (int)lls.size(); ++i){
+            if (i != best_idx && lls[i] > multistart_second_best_ll){
+                multistart_second_best_ll = lls[i];
+            }
+        }
+        if (best_idx >= 0){
+            const double near_tol = std::max(
+                0.1, 1e-9 * std::max(1.0, std::fabs(maxll)));
+            for (int i = 0; i < (int)lls.size(); ++i){
+                if (maxll - lls[i] <= near_tol){
+                    multistart_near_optimal_count++;
+                    double l1 = 0.0;
+                    for (int j = 0; j < (int)solutions[i].size(); ++j){
+                        l1 += std::fabs(
+                            solutions[i][j] - solutions[best_idx][j]);
+                    }
+                    multistart_near_optimal_l1_spread = std::max(
+                        multistart_near_optimal_l1_spread, l1);
+                }
+            }
+        }
+
+        if (best_idx >= 0){
+            profile_successful_starts = (int)lls.size();
+            profile_near_optimal_count = multistart_near_optimal_count;
+            profile_best_ll = maxll;
+            profile_second_best_ll = multistart_second_best_ll;
+            profile_near_optimal_l1_spread =
+                multistart_near_optimal_l1_spread;
+            solver.log_likelihood = maxll;
+            solver.results_mixcomp = maxres;
+            contam_prof.clear();
+            for (int i = 0; i < (int)idx2samp.size(); ++i){
+                contam_prof[idx2samp[i]] = maxres[i];
+            }
+            if (inter_species){
+                contam_prof[-1] = maxres[maxres.size() - 1];
+            }
+        } else {
+            profile_successful_starts = 0;
+            profile_near_optimal_count = 0;
+            profile_best_ll = -DBL_MAX;
+            profile_second_best_ll = -DBL_MAX;
+            profile_near_optimal_l1_spread =
+                std::numeric_limits<double>::quiet_NaN();
+            solver.log_likelihood = -DBL_MAX;
+            fprintf(stderr,
+                "WARNING: all bulk simplex profile solves failed; "
+                "keeping initial profile\n");
+        }
+    }
+    else{
+        // Preserve the historical single no-c refinement for ordinary cell
+        // profile estimation.  Only bulk empty-droplet fitting uses the direct
+        // simplex optimizer above.
+        bool solve_ok = false;
         try {
-            solver.solve();
-            if (std::isfinite(solver.log_likelihood)){
-                maxres = solver.results_mixcomp;
-                maxll = solver.log_likelihood;
-                solve_ok = true;
-            } else {
-                fprintf(stderr, "WARNING: ambient profile mixture solver returned non-finite LL (no-c path); keeping initial profile\n");
-            }
+            solve_ok = solver.solve() &&
+                std::isfinite(solver.log_likelihood) &&
+                solver.results_mixcomp.size() == startprops.size();
         } catch (...) {
-            fprintf(stderr, "WARNING: ambient profile mixture solver failed (no-c path); keeping initial profile\n");
+            solve_ok = false;
         }
-        /* 
-        for (int i = 0; i < contam_prof.size() * n_mixprop_trials; ++i){
-            //rdirichlet(startprops, trialprops);
-            //solver.add_mixcomp_fracs(trialprops);
-            solver.randomize_mixcomps();
-            solver.solve();
-            if (maxll == 0 || solver.log_likelihood > maxll){
-                maxres = solver.results_mixcomp;
-                maxll = solver.log_likelihood;
-            }
-        }
-        */
-        // Update stored contamination profile (mixture of individuals)
         if (solve_ok){
             profile_successful_starts = 1;
             profile_near_optimal_count = 1;
-            profile_best_ll = maxll;
+            profile_best_ll = solver.log_likelihood;
             profile_second_best_ll = -DBL_MAX;
             profile_near_optimal_l1_spread = 0.0;
             contam_prof.clear();
             for (int i = 0; i < (int)idx2samp.size(); ++i){
-                int samp = idx2samp[i];
-                contam_prof.insert(make_pair(samp, maxres[i]));
+                contam_prof[idx2samp[i]] = solver.results_mixcomp[i];
             }
             if (inter_species){
-                contam_prof.insert(make_pair(-1, 
-                    maxres[maxres.size()-1]));
+                contam_prof[-1] =
+                    solver.results_mixcomp[solver.results_mixcomp.size() - 1];
             }
+        } else {
+            profile_successful_starts = 0;
+            profile_near_optimal_count = 0;
+            profile_best_ll = -DBL_MAX;
+            profile_second_best_ll = -DBL_MAX;
+            profile_near_optimal_l1_spread =
+                std::numeric_limits<double>::quiet_NaN();
+            solver.log_likelihood = -DBL_MAX;
+            fprintf(stderr,
+                "WARNING: ambient profile mixture solve failed "
+                "(no-c path); keeping initial profile\n");
         }
     }
     
@@ -7987,9 +8441,6 @@ double contamFinder3::compute_ll(){
  * Return overall log likelihood.
  */
 void contamFinder3::fit(){
-    // Report active mechanisms
-    fprintf(stderr, "Three-component model active for heterotypic tetraploid cells\n");
-
     // Bulk mode: simplified flow for empty-droplet profiling
     if (bulk_mode){
         fprintf(stderr, "Bulk mode: solving for ambient profile only (c fixed at 1.0)\n");
@@ -8027,9 +8478,19 @@ void contamFinder3::fit(){
         double dummy = -1.0;
         double loglik = this->update_amb_prof_mixture(false, dummy, false);
         fprintf(stderr, "Bulk mode log likelihood: %f\n", loglik);
+        // Empty-droplet donor-evidence diagnostics compare this fitted model
+        // with otherwise identical donor-removed fits.  Preserve the bulk
+        // objective just like the ordinary per-cell path preserves its final
+        // objective; callers must not have to scrape stderr to recover it.
+        this->final_loglik = loglik;
+        this->final_loglik_valid = std::isfinite(loglik);
         this->amb_mu_available = true;
         return;
     }
+
+    // Report the receiver-cell mechanism only on the ordinary per-cell path.
+    // Bulk empty-droplet fitting has no receiver cells or ploidy-specific arm.
+    fprintf(stderr, "Three-component model active for heterotypic tetraploid cells\n");
 
     if (use_fi_weight){
         fprintf(stderr, "FI-weight mode: continuous Fisher Information weighting active\n");
@@ -8534,4 +8995,16 @@ void contamFinder3::fit(){
 //        Reclassification branches without an accepted comparison now retain
 //        the prior cell state at every unit size; the arbitrary removal threshold
 //        and cell-deletion path are gone.
+// V1_R24: Fixed-c bulk empty-droplet profiles use deterministic projected
+//        optimization directly on the donor probability simplex. The objective
+//        is concave in donor mass, line search is monotone, and full versus
+//        donor-removed fits now preserve the required nested likelihood order.
+//        Ordinary cell-profile estimation retains its historical solver path.
+// V1_R25: Use one 1e-6 projected-gradient criterion for both convergence and
+//        acceptance in the fixed-c bulk simplex solver. Scale the iteration
+//        ceiling from 5,000 to 1,000 per fitted donor (bounded to 5,000--50,000)
+//        so broad diagnostic rosters receive sufficient headroom while ordinary
+//        rosters still stop early. Failed fits remain fail-closed and never
+//        promote the uniform initialization. Bulk mode no longer prints the
+//        receiver-cell tetraploid-mechanism banner.
 // ============================================================================

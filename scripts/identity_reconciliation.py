@@ -16,6 +16,7 @@ import sys
 # -----------------------------------------------------------------------------
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -443,6 +444,18 @@ TECHNICAL_MULTIPLET_FIELDS = [
     "identification_status", "schema_version",
 ]
 
+CANDIDATE_AUDIT_REQUIRED_FIELDS = [
+    "library", "barcode", "event_id", "candidate_raw",
+    "candidate_canonical", "candidate_kind", "candidate_components",
+    "candidate_source", "candidate_tier", "candidate_rank_within_source",
+    "candidate_eligibility", "candidate_set_aside_reason",
+    "selected_as_proposal", "selected_for_candidate_axis",
+    "axis_endpoint_role", "lower_rank_considered_after_set_aside",
+]
+CANDIDATE_AUDIT_FIELDS = list(dict.fromkeys(
+    CANDIDATE_AUDIT_REQUIRED_FIELDS + FIELDS + TECHNICAL_MULTIPLET_FIELDS
+))
+
 DOUBLET_SUMMARY_FIELDS = [
     "library", "status", "eligible_singlet_cells", "usable_doublet_cells",
     "excluded_real_biological_pair_cells", "excluded_unresolvable_doublet_cells",
@@ -660,6 +673,8 @@ def candidates_main():
             event_donor = ""  # event component must be one donor token
 
         rows = []
+        candidate_audit_rows = []
+        candidate_audit_by_key = {}
         technical_by_key: Dict[Tuple[str, str, str], dict] = {}
         universe: Set[str] = set()
         for bc, cur in current.items():
@@ -673,6 +688,7 @@ def candidates_main():
             u_g = canonical_genotype(uncon.get(bc, {}).get("assignment", "") or sw.get("audit_unconstrained_best", ""))
             c_g = canonical_genotype(constrained.get(bc, {}).get("assignment", "") or sw.get("audit_constrained_best", ""))
             origins: Dict[str, Set[str]] = defaultdict(set)
+            raw_labels: Dict[str, Set[str]] = defaultdict(set)
             notes: Dict[str, List[str]] = defaultdict(list)
             partner_info: Dict[str, Tuple[str, str, str]] = {}
 
@@ -717,6 +733,7 @@ def candidates_main():
 
             def add(g: str, origin: str, note: str = "") -> bool:
                 nonlocal filtered_global
+                raw = clean(g)
                 g = canonical_genotype(g)
                 if not g:
                     return False
@@ -737,6 +754,7 @@ def candidates_main():
                         filtered_global += 1
                         return False
                 origins[g].add(origin)
+                raw_labels[g].add(raw or g)
                 if note:
                     notes[g].append(note)
                 return True
@@ -821,6 +839,7 @@ def candidates_main():
                 kept.append(g)
 
             current_state = state_for(cur_g)
+            output_by_candidate = {}
             for rank, g in enumerate(kept, 1):
                 state = state_for(g, False)
                 comps = donor_components(g)
@@ -840,7 +859,7 @@ def candidates_main():
                     droplet_state = "SINGLE_CELL_CANDIDATE" if len(comps) <= 2 else "TECHNICAL_MULTIPLET_CANDIDATE"
                     droplet_constituents = "|".join(f"D[{x}]" for x in comps) if len(comps) >= 3 else ""
                     biological_ploidy = ploidy_for(g, False)
-                rows.append({
+                candidate_output = {
                     "library": lib, "barcode": bc, "hypothesis_id": f"{lib}:{bc}:H{rank:02d}",
                     "state_notation": state, "donor_genotype": g, "donor_components": ",".join(comps),
                     "biological_ploidy": biological_ploidy, "droplet_state": droplet_state,
@@ -858,14 +877,154 @@ def candidates_main():
                     + (";CANDIDATE_CAP_APPLIED" if len(origins) > len(kept) else "")
                     + (f";GLOBAL_UNIVERSE_FILTERED={filtered_global}" if filtered_global else ""),
                     "schema_version": SCHEMA_VERSION,
-                })
+                }
+                rows.append(candidate_output)
+                output_by_candidate[g] = candidate_output
                 if len(comps) <= 2: universe.add(g)
+
+            source_rank = defaultdict(int)
+            ranks_by_candidate = defaultdict(list)
+            for g in ordered:
+                for source in sorted(origins[g], key=lambda x: (priority_order.get(x, 99), x)):
+                    source_rank[source] += 1
+                    ranks_by_candidate[g].append(f"{source}:{source_rank[source]}")
+            for material_rank, g in enumerate(ordered, 1):
+                project_status, admissibility = candidate_biological_status(
+                    g, expected, global_lines, global_donors
+                )
+                candidate_kind = (
+                    "CURRENT_TECHNICAL_COMPOSITION"
+                    if admissibility not in {
+                        "SINGLET_IDENTITY_CANDIDATE",
+                        "BIOLOGICAL_SINGLE_CELL_ALLOWED",
+                    } else
+                    "EXPECTED_LIBRARY_BIOLOGICAL_IDENTITY"
+                    if g in expected else
+                    "GLOBALLY_REAL_UNEXPECTED_BIOLOGICAL_IDENTITY"
+                )
+                evidence = dict(output_by_candidate.get(g, {}))
+                if not evidence:
+                    evidence.update({
+                        "library": lib,
+                        "barcode": bc,
+                        "state_notation": state_for(g),
+                        "donor_genotype": g,
+                        "donor_components": ",".join(donor_components(g)),
+                        "biological_ploidy": ploidy_for(g),
+                        "droplet_state": "SINGLE_CELL_CANDIDATE",
+                        "candidate_origin": ",".join(sorted(
+                            origins[g], key=lambda x: (priority_order.get(x, 99), x))),
+                        "current_state_notation": current_state,
+                        "current_donor_genotype": cur_g,
+                        "expected_genotype_status": (
+                            "EXPECTED" if g in expected else
+                            "UNEXPECTED_OR_EVENT_NOMINATED"),
+                        "project_genotype_status": project_status,
+                        "biological_admissibility": admissibility,
+                        "candidate_priority": material_rank,
+                        "candidate_generation_notes": ";".join(
+                            sorted(set(notes[g]))),
+                        "schema_version": SCHEMA_VERSION,
+                    })
+                evidence.update({
+                    "library": lib,
+                    "barcode": bc,
+                    "event_id": "",
+                    "candidate_raw": "|".join(sorted(raw_labels[g], key=natural_key)) or g,
+                    "candidate_canonical": g,
+                    "candidate_kind": candidate_kind,
+                    "candidate_components": ",".join(donor_components(g)),
+                    "candidate_source": ",".join(sorted(
+                        origins[g], key=lambda x: (priority_order.get(x, 99), x))),
+                    "candidate_tier": str(min(
+                        priority_order.get(source, 99) for source in origins[g])),
+                    "candidate_rank_within_source": ";".join(ranks_by_candidate[g]),
+                    "candidate_eligibility": (
+                        "SCOREABLE" if g in output_by_candidate else "SET_ASIDE"),
+                    "candidate_set_aside_reason": (
+                        "" if g in output_by_candidate else "MAX_CANDIDATES_CAP"),
+                    "selected_as_proposal": False,
+                    "selected_for_candidate_axis": False,
+                    "axis_endpoint_role": "",
+                    "lower_rank_considered_after_set_aside": False,
+                })
+                candidate_audit_rows.append(evidence)
+                candidate_audit_by_key[(bc, g)] = evidence
 
         out_path = out_root / f"{lib}.identity_candidates.tsv.gz"
         write_tsv(str(out_path), rows, FIELDS)
         technical_rows = list(technical_by_key.values())
         write_tsv(str(out_root / f"{lib}.technical_multiplet_candidates.tsv.gz"),
                   technical_rows, TECHNICAL_MULTIPLET_FIELDS)
+        technical_rank = Counter()
+        for technical in sorted(
+                technical_rows,
+                key=lambda row: (
+                    natural_key(clean(row.get("barcode"))),
+                    natural_key(clean(row.get("donor_composition"))),
+                    clean(row.get("technical_class")))):
+            barcode = clean(technical.get("barcode"))
+            technical_rank[barcode] += 1
+            canonical = canonical_genotype(technical.get("donor_composition", ""))
+            audit = dict(technical)
+            audit.update({
+                "library": lib,
+                "barcode": barcode,
+                "event_id": "",
+                "candidate_raw": clean(technical.get("donor_composition")),
+                "candidate_canonical": canonical,
+                "candidate_kind": "TECHNICAL_MULTIPLET_HYPOTHESIS",
+                "candidate_components": ",".join(donor_components(canonical)),
+                "candidate_source": clean(technical.get("candidate_origin")),
+                "candidate_tier": "TECHNICAL",
+                "candidate_rank_within_source": (
+                    f"TECHNICAL:{technical_rank[barcode]}"),
+                "candidate_eligibility": "TECHNICAL_ONLY",
+                "candidate_set_aside_reason": "NOT_A_BIOLOGICAL_SINGLE_CELL_LINE",
+                "selected_as_proposal": False,
+                "selected_for_candidate_axis": False,
+                "axis_endpoint_role": "",
+                "lower_rank_considered_after_set_aside": False,
+            })
+            existing = candidate_audit_by_key.get((barcode, canonical))
+            if existing is None:
+                candidate_audit_rows.append(audit)
+                candidate_audit_by_key[(barcode, canonical)] = audit
+            else:
+                existing["candidate_raw"] = "|".join(sorted({
+                    value for value in (
+                        clean(existing.get("candidate_raw")),
+                        clean(audit.get("candidate_raw")))
+                    if value
+                }, key=natural_key))
+                existing["candidate_source"] = ",".join(sorted({
+                    value
+                    for source in (
+                        clean(existing.get("candidate_source")),
+                        clean(audit.get("candidate_source")))
+                    for value in source.split(",") if value
+                }, key=natural_key))
+                existing["candidate_rank_within_source"] = ";".join(sorted({
+                    value
+                    for ranks in (
+                        clean(existing.get("candidate_rank_within_source")),
+                        clean(audit.get("candidate_rank_within_source")))
+                    for value in ranks.split(";") if value
+                }, key=natural_key))
+                for field, value in technical.items():
+                    if not clean(existing.get(field)) and clean(value):
+                        existing[field] = value
+        audit_keys = [
+            (clean(row.get("barcode")),
+             canonical_genotype(row.get("candidate_canonical", "")))
+            for row in candidate_audit_rows
+        ]
+        if len(audit_keys) != len(set(audit_keys)):
+            raise ValueError(f"{lib} candidate audit contains duplicate canonical candidates")
+        write_tsv(
+            str(out_root / f"{lib}.identity_candidate_audit.tsv.gz"),
+            candidate_audit_rows, CANDIDATE_AUDIT_FIELDS,
+        )
         (out_root / f"{lib}.target_identity_universe.txt").write_text("".join(g + "\n" for g in sorted(universe)))
         print(f"{lib}: {len(rows)} biological candidate rows, {len(technical_rows)} technical-multiplet candidates, {len(universe)} scoreable identities")
 
@@ -1101,7 +1260,7 @@ def reconcile_parse_args():
     p.add_argument("--doublet-context-root", default="")
     p.add_argument("--nuclear-root", required=True)
     p.add_argument("--mt-root", required=True)
-    p.add_argument("--atac-root", required=True)
+    p.add_argument("--atac-root", default="")
     p.add_argument("--nn-root", required=True)
     p.add_argument("--refined-root", default="")
     p.add_argument("--refined-optional", action="store_true")
@@ -1686,6 +1845,8 @@ def decision_for_cell(cell: dict, policy: Mapping[str, object], auto_apply: bool
 
 def reconcile_main():
     args = reconcile_parse_args(); libs = parse_library_spec(args.libraries)
+    if args.evidence_mode == "rna-atac" and not args.atac_root:
+        raise SystemExit("--atac-root is required only for rna-atac evidence mode")
     policy = dict(DEFAULT_IDENTITY_POLICY); policy_hash = DEFAULT_IDENTITY_POLICY_SHA256
     auto_apply = bool(policy.get("auto_apply_decisive", True)) if args.auto_apply is None else args.auto_apply
     meta = metadata_map(args.metadata_root); panel = panel_species(args.panel_metadata)
@@ -1708,8 +1869,11 @@ def reconcile_main():
         mt_path = os.path.join(args.mt_root, f"{lib}.mt_identity_scores.tsv.gz")
         mt = score_map(mt_path)
         mt_donors = mt_donor_score_map(mt_path)
-        atac_path = os.path.join(args.atac_root, f"{lib}.atac_identity_scores.tsv.gz")
-        atac = score_map(atac_path) if args.evidence_mode == "rna-atac" else defaultdict(dict)
+        atac = (
+            score_map(os.path.join(
+                args.atac_root, f"{lib}.atac_identity_scores.tsv.gz"))
+            if args.evidence_mode == "rna-atac" else defaultdict(dict)
+        )
         nn = nn_map(os.path.join(args.nn_root, f"{lib}.ploidy_calls_nn.tsv"))
         qc = call_qc_map(os.path.join(args.audit_root, lib, f"{lib}.call_qc.tsv.gz"))
         dd_summary_rows = read_optional_tsv(os.path.join(args.doublet_context_root, f"{lib}.doublet_dragon_summary.tsv")) if args.doublet_context_root else []
@@ -1758,45 +1922,6 @@ def reconcile_main():
             fold = folds.get((bc, clean(cand.get("hypothesis_id"))), {})
             nnrow = nn.get(bc, {}); ptet = ffloat(nnrow.get("prob_tetraploid")); qctxt = clean(nnrow.get("qc_pass") or nnrow.get("status"))
             nn_qc = qctxt.lower() not in {"0", "false", "fail", "failed", "qc_fail"}
-
-            # If the best donor-substitution hypothesis does not clear the strong,
-            # replicated nuclear bar, fall back to the same-donor homotet question.
-            # The NN is used only in its strong direction (diploid -> tetraploid),
-            # and only when the exact A+A line is globally real.
-            alt_robust = robust_nuclear_support(
-                delta,
-                ffloat(sc.get("nuclear_depth_normalized_delta") or sc.get("depth_normalized_delta")),
-                ffloat(sc.get("nuclear_informative_depth") or sc.get("informative_depth"), 0.0),
-                ffloat(fold.get("fold_support_fraction")),
-                fint(fold.get("folds_evaluable")),
-                policy,
-            ) if best_alt_row else False
-            cur_comps_for_fallback = donor_components(cur_g)
-            if (
-                len(cur_comps_for_fallback) == 1
-                and nn_qc
-                and math.isfinite(ptet)
-                and ptet >= float(policy.get("nn_homotypic_prob_tet", 0.90))
-                and not alt_robust
-            ):
-                homotet_g = canonical_genotype(cur_comps_for_fallback[0] + "+" + cur_comps_for_fallback[0])
-                if homotet_g in global_lines:
-                    homotet_choice = None
-                    for hcand in cand_rows:
-                        if canonical_genotype(hcand.get("donor_genotype", "")) != homotet_g:
-                            continue
-                        hhid = clean(hcand.get("hypothesis_id"))
-                        hsc = nuc_rows.get(hhid)
-                        if hsc:
-                            homotet_choice = (hcand, hsc)
-                            break
-                    if homotet_choice is not None:
-                        cand, sc = homotet_choice
-                        best_alt = homotet_g
-                        best_alt_row = homotet_choice
-                        alt_ll = ffloat(sc.get("log_likelihood") or sc.get("nuclear_log_likelihood"))
-                        delta = alt_ll - cur_ll if math.isfinite(alt_ll) and math.isfinite(cur_ll) else ffloat(sc.get("delta_ll_vs_current"))
-                        fold = folds.get((bc, clean(cand.get("hypothesis_id"))), {})
 
             qcrow = qc.get(bc, {})
             sp_cur = species_status(cur_g, qcrow, panel); sp_alt = species_status(best_alt or cur_g, qcrow, panel)
@@ -2703,12 +2828,3795 @@ def optional_status_main():
     return 0
 
 
+# -----------------------------------------------------------------------------
+# score-pairs
+# -----------------------------------------------------------------------------
+
+SCORE_PAIR_SCHEMA = "identity_reconciliation_score_pair_manifest_v2"
+SCORE_PAIR_CONTRACT = (
+    "ORIGINAL_ALLOWED_DEMUX_VS_RECONCILIATION_NOMINATED_SWAP_ONLY"
+)
+SCORE_PAIR_ROLES = (
+    "ORIGINAL_ALLOWED_DEMUX",
+    "RECONCILIATION_NOMINATED_SWAP",
+)
+SCORE_PAIR_SUPPORTED_SWAP_EVENT_CLASSES = {
+    "LIKELY_UNEXPECTED_INTACT_BIOLOGICAL_LINE",
+    "LIKELY_UNEXPECTED_SINGLET_POPULATION",
+}
+SCORE_PAIR_APPLIED_REASSIGNMENT = "APPLIED_REASSIGNMENT"
+SCORE_PAIR_RECOMMENDED_NOT_APPLIED = "RECOMMENDED_NOT_APPLIED"
+SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL = "SUPPORTED_EVENT_HELD_CELL"
+SCORE_PAIR_REVIEW_ONLY = "REVIEW_ONLY_UNEXPECTED_IDENTITY"
+SCORE_PAIR_REASSIGNMENT_SCOPES = {
+    SCORE_PAIR_APPLIED_REASSIGNMENT,
+    SCORE_PAIR_RECOMMENDED_NOT_APPLIED,
+}
+SCORE_PAIR_EXTRA_FIELDS = [
+    "score_pair_id", "score_pair_role", "score_pair_source",
+    "score_population_scope", "supported_event_key",
+    "reconciliation_event_id", "reconciliation_event_class",
+    "reconciliation_event_confidence", "reconciliation_final_action",
+    "reconciliation_decision_confidence",
+    "reconciliation_reassignment_applied",
+    "reconciliation_current_refined_assignment",
+    "original_demux_assignment", "proposed_donor_genotype",
+    "score_scope_contract",
+]
+SCORE_PAIR_SUMMARY_FIELDS = [
+    "library", "source_decisions", "source_decisions_sha256",
+    "validation_summary", "validation_summary_sha256",
+    "score_pair_builder", "score_pair_builder_sha256",
+    "metadata_expected_genotypes_sha256",
+    "metadata_global_biological_lines_sha256", "metadata_global_donors_sha256",
+    "n_decision_rows", "n_not_reconciliation_nominated",
+    "n_candidate_rows_considered", "n_supported_event_keys",
+    "n_supported_reassignment_pairs", "n_supported_event_held_pairs",
+    "n_review_only_pairs", "n_score_pairs", "n_manifest_rows",
+    "n_candidate_rows_excluded", "exclusion_reason_counts",
+    "score_scope_contract", "schema_version",
+]
+SCORE_PAIR_EXCLUSION_FIELDS = [
+    "library", "barcode", "original_demux_assignment",
+    "proposed_donor_genotype", "reconciliation_event_id",
+    "reconciliation_event_class", "reconciliation_final_action",
+    "exclusion_reason", "detail", "score_scope_contract", "schema_version",
+]
+
+
+def score_pairs_parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Build exact post-reconciliation identity-score pairs. Only the "
+            "original allowed demux winner and the reconciliation-nominated "
+            "biological swap are emitted."
+        )
+    )
+    p.add_argument("--libraries", nargs="+", required=True)
+    p.add_argument("--decisions-root", required=True)
+    p.add_argument("--metadata-root", required=True)
+    p.add_argument("--validation-summary", required=True)
+    p.add_argument("--output-root", required=True)
+    return p.parse_args()
+
+
+def _score_pair_ploidy(genotype: str) -> str:
+    components = donor_components(genotype)
+    if len(components) == 1:
+        return "DIPLOID"
+    if len(components) == 2:
+        return "TETRAPLOID"
+    return "UNRESOLVED"
+
+
+def _score_pair_same_snp_identity(left: str, right: str) -> bool:
+    """Return true for A versus A+A, which nuclear SNP dosage cannot resolve."""
+    left_components = donor_components(left)
+    right_components = donor_components(right)
+    return (
+        bool(left_components)
+        and bool(right_components)
+        and len(set(left_components)) == 1
+        and len(set(right_components)) == 1
+        and left_components[0] == right_components[0]
+    )
+
+
+def _score_pair_event_key(source: Mapping[str, object]) -> Tuple[str, str]:
+    """Return the frozen reconciliation event and exact proposed identity."""
+    return (
+        clean(source.get("event_id")),
+        canonical_genotype(source.get("proposed_donor_genotype", "")),
+    )
+
+
+def _score_pair_event_key_text(
+    library: str, event_key: Tuple[str, str]
+) -> str:
+    event_id, proposed = event_key
+    return f"{library}|{event_id}|{proposed}"
+
+
+def _score_pair_nonidentity_event_reason(
+    source: Mapping[str, object],
+) -> Tuple[str, str]:
+    event_class = clean(source.get("event_class")).upper()
+    action = clean(source.get("final_action")).upper()
+    if "HOMOTET" in event_class or "OCCUPANCY" in event_class:
+        return (
+            "HOMOTET_OCCUPANCY_REVIEW_NOT_IDENTITY_SWAP",
+            "same-donor ploidy/occupancy ambiguity is handled by the NN route",
+        )
+    if "PLOIDY" in event_class or action == "RECLASSIFY_PLOIDY":
+        return (
+            "PLOIDY_RECLASSIFICATION_NOT_IDENTITY_SWAP",
+            "ploidy reclassification is not an original-versus-swap comparison",
+        )
+    if event_class in {
+        "NO_METADATA_PROBLEM",
+        "EXPECTED_COMPOSITE_COMPONENT_SINGLET_POPULATION",
+    }:
+        return (
+            "NOT_A_SAMPLE_SWAP_RECONCILIATION_EVENT",
+            f"event_class={event_class or 'MISSING'}",
+        )
+    return "", ""
+
+
+def _score_pair_population_scope(
+    source: Mapping[str, object],
+    supported_event_keys: Set[Tuple[str, str]],
+) -> str:
+    """Apply the established v10 decision boundary without new thresholds.
+
+    The supported-event report includes REASSIGN_GENOTYPE decisions plus
+    REVIEW_CELLULAR_ORIGIN context cells attached to the same event and exact
+    proposed identity.  Applied, recommended-not-applied, and attached-held
+    scopes remain distinct downstream; held cells never vote in the
+    authoritative reassignment verdict.  REVIEW_UNEXPECTED_IDENTITY remains
+    scoreable only as a separate review-only population.  KEEP, unresolved,
+    conflicted, ploidy, homotet-occupancy, and standalone cellular-origin
+    proposals are outside the identity-swap scoring universe.
+    """
+    action = clean(source.get("final_action")).upper()
+    event_class = clean(source.get("event_class")).upper()
+    event_key = _score_pair_event_key(source)
+    if (
+        action == "REASSIGN_GENOTYPE"
+        and event_class in SCORE_PAIR_SUPPORTED_SWAP_EVENT_CLASSES
+    ):
+        applied = clean(source.get("reassignment_applied")).upper()
+        if applied in {"TRUE", "1", "YES", "Y"}:
+            return SCORE_PAIR_APPLIED_REASSIGNMENT
+        if applied in {"FALSE", "0", "NO", "N"}:
+            return SCORE_PAIR_RECOMMENDED_NOT_APPLIED
+        raise ValueError(
+            f"{clean(source.get('library'))} {clean(source.get('barcode'))}: "
+            "reassignment_applied must be an explicit TRUE or FALSE value"
+        )
+    if action == "REVIEW_CELLULAR_ORIGIN" and event_key in supported_event_keys:
+        return SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL
+    if action == "REVIEW_UNEXPECTED_IDENTITY":
+        return SCORE_PAIR_REVIEW_ONLY
+    return ""
+
+
+def _score_pair_scope_exclusion_reason(
+    source: Mapping[str, object],
+    supported_event_keys: Set[Tuple[str, str]],
+) -> Tuple[str, str]:
+    action = clean(source.get("final_action")).upper()
+    event_class = clean(source.get("event_class")).upper()
+    event_key = _score_pair_event_key(source)
+    if (
+        action == "REASSIGN_GENOTYPE"
+        and event_class not in SCORE_PAIR_SUPPORTED_SWAP_EVENT_CLASSES
+    ):
+        return (
+            "REASSIGNMENT_NOT_A_SUPPORTED_SAMPLE_SWAP_EVENT",
+            "cell-level reassignment is outside the established v10 "
+            f"population-supported swap classes; event_class={event_class or 'MISSING'}",
+        )
+    if action == "KEEP":
+        return (
+            "FINAL_ACTION_KEEP_NOT_A_SUPPORTED_SWAP",
+            "the final v10 reconciliation decision retained the original identity",
+        )
+    if action == "REVIEW_CELLULAR_ORIGIN":
+        return (
+            "STANDALONE_CELLULAR_ORIGIN_REVIEW_NOT_SUPPORTED_SWAP",
+            "no REASSIGN_GENOTYPE cell exists for the same event and exact proposed identity"
+            if event_key not in supported_event_keys
+            else "cellular-origin review was not admitted by the supported-event gate",
+        )
+    if action == "REVIEW_HOMOTET_OCCUPANCY":
+        return (
+            "HOMOTET_OCCUPANCY_REVIEW_NOT_IDENTITY_SWAP",
+            "same-donor ploidy/occupancy ambiguity is handled by the NN route",
+        )
+    if action == "RECLASSIFY_PLOIDY":
+        return (
+            "PLOIDY_RECLASSIFICATION_NOT_IDENTITY_SWAP",
+            "ploidy reclassification is not an original-versus-swap comparison",
+        )
+    if action == "KEEP_CURRENT_CONFLICTED":
+        return (
+            "CONFLICTED_PROPOSAL_NOT_SUPPORTED_SWAP",
+            "the final reconciliation decision found conflicting evidence",
+        )
+    if action == "UNRESOLVED_INSUFFICIENT_EVIDENCE":
+        return (
+            "UNRESOLVED_PROPOSAL_NOT_SUPPORTED_SWAP",
+            "the final reconciliation decision found insufficient evidence",
+        )
+    return (
+        "FINAL_ACTION_OUTSIDE_SUPPORTED_SWAP_SCOPE",
+        f"final_action={action or 'MISSING'}",
+    )
+
+
+def _score_pair_candidate_row(
+    source: Mapping[str, object],
+    library: str,
+    barcode: str,
+    pair_id: str,
+    role: str,
+    genotype: str,
+    original: str,
+    proposed: str,
+    project_status: str,
+    admissibility: str,
+    expected_status: str,
+    score_population_scope: str,
+    supported_event_key: str,
+) -> dict:
+    ploidy = _score_pair_ploidy(genotype)
+    origin = (
+        "ORIGINAL_ALLOWED_DEMUX"
+        if role == "ORIGINAL_ALLOWED_DEMUX"
+        else "RECONCILIATION_NOMINATED_SWAP"
+    )
+    return {
+        "library": library,
+        "barcode": barcode,
+        "hypothesis_id": pair_id + (
+            ":ORIGINAL" if role == "ORIGINAL_ALLOWED_DEMUX" else ":SWAP"
+        ),
+        "state_notation": biological_state(genotype, ploidy),
+        "donor_genotype": genotype,
+        "donor_components": ",".join(donor_components(genotype)),
+        "biological_ploidy": ploidy,
+        "droplet_state": "SINGLE_CELL_CANDIDATE",
+        "droplet_constituents": "",
+        "candidate_origin": origin,
+        "current_state_notation": biological_state(original, _score_pair_ploidy(original)),
+        "current_donor_genotype": original,
+        "expected_genotype_status": expected_status,
+        "project_genotype_status": project_status,
+        "biological_admissibility": admissibility,
+        "physical_resolution_status": (
+            "CONSTRAINED_DEMUX_TOP_WINNER"
+            if role == "ORIGINAL_ALLOWED_DEMUX"
+            else clean(source.get("proposed_uid_resolution_status"))
+            or "RECONCILIATION_NOMINATED"
+        ),
+        "source_identity": clean(source.get("source_identity")),
+        "replaced_component": clean(source.get("replaced_component")),
+        "replacement_component": clean(source.get("replacement_component")),
+        "preserved_partner": clean(source.get("preserved_partner")),
+        "candidate_priority": 1 if role == "ORIGINAL_ALLOWED_DEMUX" else 2,
+        "candidate_generation_notes": (
+            "FROZEN_ORIGINAL_ALLOWED_DEMUX_TOP_WINNER"
+            if role == "ORIGINAL_ALLOWED_DEMUX"
+            else "EXACT_RECONCILIATION_PROPOSAL;UNCONSTRAINED_DISCOVERY_NOT_DIRECTLY_SCORED"
+        ),
+        "schema_version": SCORE_PAIR_SCHEMA,
+        "score_pair_id": pair_id,
+        "score_pair_role": role,
+        "score_pair_source": "POST_RECONCILIATION_DECISION_TABLE",
+        "score_population_scope": score_population_scope,
+        "supported_event_key": supported_event_key,
+        "reconciliation_event_id": clean(source.get("event_id")),
+        "reconciliation_event_class": clean(source.get("event_class")),
+        "reconciliation_event_confidence": clean(source.get("event_confidence")),
+        "reconciliation_final_action": clean(source.get("final_action")),
+        "reconciliation_decision_confidence": clean(source.get("decision_confidence")),
+        "reconciliation_reassignment_applied": clean(source.get("reassignment_applied")),
+        "reconciliation_current_refined_assignment": canonical_genotype(
+            source.get("current_refined_assignment", "")
+        ),
+        "original_demux_assignment": original,
+        "proposed_donor_genotype": proposed,
+        "score_scope_contract": SCORE_PAIR_CONTRACT,
+    }
+
+
+def score_pairs_main():
+    args = score_pairs_parse_args()
+    libraries = parse_library_spec(args.libraries)
+    decisions_root = Path(args.decisions_root)
+    output_root = Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    validation_path = Path(args.validation_summary)
+    if not validation_path.is_file():
+        raise FileNotFoundError(
+            f"required validation summary is missing: {validation_path}"
+        )
+    validation_rows = read_tsv(str(validation_path))
+    if not validation_rows or any(
+        clean(row.get("status")).upper() != "PASS"
+        or int(float(clean(row.get("n_failures")) or -1)) != 0
+        for row in validation_rows
+    ):
+        raise ValueError(
+            f"validation summary is not an all-PASS ledger: {validation_path}"
+        )
+    validation_sha256 = sha256_file(str(validation_path))
+
+    expected_by_library = expected_metadata(args.metadata_root)
+    global_lines, global_donors = project_biological_universe(args.metadata_root)
+    manifest_fields = FIELDS + SCORE_PAIR_EXTRA_FIELDS
+    all_summaries = []
+    all_exclusions = []
+
+    for library_number in libraries:
+        library = f"lib{library_number}"
+        decisions_path = decisions_root / f"{library}.reconciled_cells.tsv.gz"
+        if not decisions_path.is_file():
+            raise FileNotFoundError(
+                f"{library}: required reconciliation decision table is missing: "
+                f"{decisions_path}"
+            )
+        if validation_path.stat().st_mtime_ns < decisions_path.stat().st_mtime_ns:
+            raise ValueError(
+                f"{library}: validation summary predates the decision table; "
+                "rerun validation before score-pair construction"
+            )
+        rows = read_tsv(str(decisions_path))
+        required = {
+            "library", "barcode", "original_demux_assignment",
+            "proposed_donor_genotype", "proposed_biological_admissibility",
+            "proposed_global_biological_status",
+            "proposed_library_expected_status", "proposed_droplet_state",
+            "event_id", "event_class", "event_confidence", "final_action",
+            "decision_confidence", "reassignment_applied",
+        }
+        if rows:
+            missing = sorted(required - set(rows[0]))
+            if missing:
+                raise ValueError(
+                    f"{decisions_path}: required reconciliation columns missing: "
+                    + ", ".join(missing)
+                )
+
+        expected_here = expected_by_library.get(library, {})
+        supported_event_keys = {
+            _score_pair_event_key(source)
+            for source in rows
+            if clean(source.get("final_action")).upper() == "REASSIGN_GENOTYPE"
+            and not _score_pair_nonidentity_event_reason(source)[0]
+            and clean(source.get("event_class")).upper()
+            in SCORE_PAIR_SUPPORTED_SWAP_EVENT_CLASSES
+            and clean(source.get("event_id"))
+            and canonical_genotype(source.get("proposed_donor_genotype", ""))
+            and canonical_genotype(source.get("proposed_donor_genotype", ""))
+            != canonical_genotype(source.get("original_demux_assignment", ""))
+        }
+        manifest_rows = []
+        exclusions = []
+        summary_reasons = Counter()
+        n_not_nominated = 0
+        n_considered = 0
+
+        def exclude(source, reason, detail):
+            summary_reasons[reason] += 1
+            exclusions.append({
+                "library": library,
+                "barcode": clean(source.get("barcode")),
+                "original_demux_assignment": canonical_genotype(
+                    source.get("original_demux_assignment", "")
+                ),
+                "proposed_donor_genotype": canonical_genotype(
+                    source.get("proposed_donor_genotype", "")
+                ),
+                "reconciliation_event_id": clean(source.get("event_id")),
+                "reconciliation_event_class": clean(source.get("event_class")),
+                "reconciliation_final_action": clean(source.get("final_action")),
+                "exclusion_reason": reason,
+                "detail": detail,
+                "score_scope_contract": SCORE_PAIR_CONTRACT,
+                "schema_version": SCORE_PAIR_SCHEMA,
+            })
+
+        seen_barcodes = set()
+        for source in rows:
+            barcode = clean(source.get("barcode"))
+            if not barcode:
+                raise ValueError(f"{decisions_path}: blank barcode")
+            if barcode in seen_barcodes:
+                raise ValueError(f"{decisions_path}: duplicate barcode {barcode}")
+            seen_barcodes.add(barcode)
+
+            original = canonical_genotype(source.get("original_demux_assignment", ""))
+            proposed = canonical_genotype(source.get("proposed_donor_genotype", ""))
+            event_id = clean(source.get("event_id"))
+            event_class = clean(source.get("event_class"))
+            if not event_id or not proposed or proposed == original:
+                n_not_nominated += 1
+                continue
+            n_considered += 1
+
+            nonidentity_reason, nonidentity_detail = (
+                _score_pair_nonidentity_event_reason(source)
+            )
+            if nonidentity_reason:
+                exclude(source, nonidentity_reason, nonidentity_detail)
+                continue
+
+            score_population_scope = _score_pair_population_scope(
+                source, supported_event_keys
+            )
+            if not score_population_scope:
+                reason, detail = _score_pair_scope_exclusion_reason(
+                    source, supported_event_keys
+                )
+                exclude(source, reason, detail)
+                continue
+            supported_event_key = (
+                _score_pair_event_key_text(
+                    library, _score_pair_event_key(source)
+                )
+                if score_population_scope in (
+                    SCORE_PAIR_REASSIGNMENT_SCOPES
+                    | {SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL}
+                )
+                else "NA"
+            )
+            if not original:
+                exclude(source, "MISSING_ORIGINAL_ALLOWED_DEMUX", "original assignment is blank")
+                continue
+            original_status, original_admissibility = candidate_biological_status(
+                original, expected_here, global_lines, global_donors
+            )
+            if original not in expected_here:
+                exclude(
+                    source,
+                    "ORIGINAL_NOT_IN_ALLOWED_LIBRARY_ROSTER",
+                    f"original={original}; project_status={original_status}",
+                )
+                continue
+            if original_admissibility not in {
+                "SINGLET_IDENTITY_CANDIDATE", "BIOLOGICAL_SINGLE_CELL_ALLOWED"
+            }:
+                exclude(
+                    source,
+                    "ORIGINAL_NOT_A_BIOLOGICAL_SINGLE_CELL_IDENTITY",
+                    f"original={original}; admissibility={original_admissibility}",
+                )
+                continue
+
+            proposed_status, proposed_admissibility = candidate_biological_status(
+                proposed, expected_here, global_lines, global_donors
+            )
+            declared_admissibility = clean(source.get("proposed_biological_admissibility"))
+            if proposed_admissibility not in {
+                "SINGLET_IDENTITY_CANDIDATE", "BIOLOGICAL_SINGLE_CELL_ALLOWED"
+            }:
+                exclude(
+                    source,
+                    "PROPOSED_SWAP_NOT_A_REAL_BIOLOGICAL_LINE",
+                    f"proposed={proposed}; project_status={proposed_status}",
+                )
+                continue
+            if declared_admissibility and declared_admissibility != proposed_admissibility:
+                exclude(
+                    source,
+                    "RECONCILIATION_METADATA_ADMISSIBILITY_MISMATCH",
+                    f"declared={declared_admissibility}; recomputed={proposed_admissibility}",
+                )
+                continue
+            if proposed in expected_here or clean(
+                    source.get("proposed_library_expected_status")).upper() == "EXPECTED":
+                exclude(
+                    source,
+                    "PROPOSED_IDENTITY_ALREADY_ALLOWED_IN_LIBRARY",
+                    "all-expected roster alternatives are not sample-swap evidence",
+                )
+                continue
+            if "TECHNICAL" in clean(source.get("proposed_droplet_state")).upper():
+                exclude(
+                    source,
+                    "PROPOSED_TECHNICAL_MULTIPLET_NOT_AN_IDENTITY",
+                    f"proposed_droplet_state={clean(source.get('proposed_droplet_state'))}",
+                )
+                continue
+            if _score_pair_same_snp_identity(original, proposed):
+                exclude(
+                    source,
+                    "SAME_DONOR_PLOIDY_NOT_NUCLEAR_SCOREABLE",
+                    "A versus A+A is preserved for the NN/ploidy decision route",
+                )
+                continue
+
+            pair_id = f"{library}:{barcode}:RECONCILIATION_SWAP"
+            manifest_rows.append(_score_pair_candidate_row(
+                source, library, barcode, pair_id,
+                "ORIGINAL_ALLOWED_DEMUX", original, original, proposed,
+                original_status, original_admissibility, "EXPECTED",
+                score_population_scope, supported_event_key,
+            ))
+            manifest_rows.append(_score_pair_candidate_row(
+                source, library, barcode, pair_id,
+                "RECONCILIATION_NOMINATED_SWAP", proposed, original, proposed,
+                proposed_status, proposed_admissibility,
+                "UNEXPECTED_RECONCILIATION_NOMINATION",
+                score_population_scope, supported_event_key,
+            ))
+
+        manifest_path = (
+            output_root / f"{library}.reconciliation_score_pairs.tsv.gz"
+        )
+        exclusion_path = (
+            output_root / f"{library}.reconciliation_score_pair_exclusions.tsv.gz"
+        )
+        write_tsv(str(manifest_path), manifest_rows, manifest_fields)
+        write_tsv(str(exclusion_path), exclusions, SCORE_PAIR_EXCLUSION_FIELDS)
+        pair_count = len(manifest_rows) // 2
+        population_scope_counts = Counter(
+            row["score_population_scope"]
+            for row in manifest_rows
+            if row["score_pair_role"] == "ORIGINAL_ALLOWED_DEMUX"
+        )
+        summary = {
+            "library": library,
+            "source_decisions": str(decisions_path.resolve()),
+            "source_decisions_sha256": sha256_file(str(decisions_path)),
+            "validation_summary": str(validation_path.resolve()),
+            "validation_summary_sha256": validation_sha256,
+            "score_pair_builder": str(Path(__file__).resolve()),
+            "score_pair_builder_sha256": sha256_file(str(Path(__file__).resolve())),
+            "metadata_expected_genotypes_sha256": sha256_file(str(
+                Path(args.metadata_root) / "library_expected_genotypes.tsv")),
+            "metadata_global_biological_lines_sha256": sha256_file(str(
+                Path(args.metadata_root) / "global_biological_lines.tsv")),
+            "metadata_global_donors_sha256": sha256_file(str(
+                Path(args.metadata_root) / "global_donors.tsv")),
+            "n_decision_rows": len(rows),
+            "n_not_reconciliation_nominated": n_not_nominated,
+            "n_candidate_rows_considered": n_considered,
+            "n_supported_event_keys": len(supported_event_keys),
+            "n_supported_reassignment_pairs": sum(
+                population_scope_counts.get(scope, 0)
+                for scope in SCORE_PAIR_REASSIGNMENT_SCOPES
+            ),
+            "n_supported_event_held_pairs": population_scope_counts.get(
+                SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL, 0
+            ),
+            "n_review_only_pairs": population_scope_counts.get(
+                SCORE_PAIR_REVIEW_ONLY, 0
+            ),
+            "n_score_pairs": pair_count,
+            "n_manifest_rows": len(manifest_rows),
+            "n_candidate_rows_excluded": len(exclusions),
+            "exclusion_reason_counts": ",".join(
+                f"{reason}:{count}" for reason, count in sorted(summary_reasons.items())
+            ) or "NONE",
+            "score_scope_contract": SCORE_PAIR_CONTRACT,
+            "schema_version": SCORE_PAIR_SCHEMA,
+        }
+        write_tsv(
+            str(output_root / f"{library}.reconciliation_score_pair_summary.tsv"),
+            [summary], SCORE_PAIR_SUMMARY_FIELDS,
+        )
+        all_summaries.append(summary)
+        all_exclusions.extend(exclusions)
+        print(
+            f"{library}: {pair_count} decision-scoped score pairs "
+            f"({population_scope_counts.get(SCORE_PAIR_APPLIED_REASSIGNMENT, 0)} applied, "
+            f"{population_scope_counts.get(SCORE_PAIR_RECOMMENDED_NOT_APPLIED, 0)} recommended, "
+            f"{population_scope_counts.get(SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL, 0)} attached held, "
+            f"{population_scope_counts.get(SCORE_PAIR_REVIEW_ONLY, 0)} review-only); "
+            f"{len(exclusions)} candidate rows excluded by the biological/scope gate"
+        )
+
+    write_tsv(
+        str(output_root / "all_libraries.reconciliation_score_pair_summary.tsv"),
+        all_summaries, SCORE_PAIR_SUMMARY_FIELDS,
+    )
+    write_tsv(
+        str(output_root / "all_libraries.reconciliation_score_pair_exclusions.tsv.gz"),
+        all_exclusions, SCORE_PAIR_EXCLUSION_FIELDS,
+    )
+    return 0
+
+
+# -----------------------------------------------------------------------------
+# candidate-axis-pairs
+# -----------------------------------------------------------------------------
+
+CANDIDATE_AXIS_PAIR_SCHEMA = "identity_candidate_axis_pair_manifest_v1"
+CANDIDATE_AXIS_OPERATIONAL_CONTRACT = (
+    "ORIGINAL_ALLOWED_DEMUX_VS_RECONCILIATION_NOMINATED_SWAP_ONLY"
+)
+CANDIDATE_AXIS_RETAINED_CONTRACT = (
+    "ORIGINAL_ALLOWED_DEMUX_VS_FROZEN_SUPPORTED_EVENT_PROPOSAL_CONTRAST_ONLY"
+)
+CANDIDATE_AXIS_RETAINED = "RETAINED_ORIGINAL_CONTRAST_ONLY"
+CANDIDATE_AXIS_POPULATIONS = {
+    SCORE_PAIR_APPLIED_REASSIGNMENT,
+    SCORE_PAIR_RECOMMENDED_NOT_APPLIED,
+    SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL,
+    SCORE_PAIR_REVIEW_ONLY,
+    CANDIDATE_AXIS_RETAINED,
+}
+CANDIDATE_AXIS_EXTRA_FIELDS = [
+    "score_pair_id", "score_pair_role", "score_pair_source",
+    "score_population_scope", "population_votes_in_authoritative_event",
+    "supported_event_key", "selected_supported_event_id",
+    "selected_supported_event_proposal", "reconciliation_event_id",
+    "reconciliation_event_class", "reconciliation_event_confidence",
+    "reconciliation_final_action", "reconciliation_decision_confidence",
+    "reconciliation_reassignment_applied",
+    "reconciliation_current_refined_assignment", "reconciled_donor_genotype",
+    "reconciled_droplet_state", "original_demux_assignment",
+    "proposed_donor_genotype", "reconciliation_nominated_swap",
+    "candidate_b_fixed_identity", "source_reconciliation_event_id",
+    "source_reconciliation_proposed_identity", "pair_construction_mode",
+    "score_scope_contract",
+]
+CANDIDATE_AXIS_EXCLUSION_FIELDS = [
+    "exclusion_stage", "library", "barcode", "original_demux_assignment",
+    "proposed_donor_genotype", "source_reconciliation_event_id",
+    "source_reconciliation_proposed_identity", "reconciliation_event_id",
+    "reconciliation_event_class", "reconciliation_final_action",
+    "exclusion_reason", "detail", "selected_supported_event_id",
+    "selected_supported_event_proposal", "score_scope_contract",
+    "schema_version",
+]
+CANDIDATE_AXIS_AUDIT_FIELDS = [
+    "status", "check", "value", "detail", "path", "size_bytes",
+    "mtime_ns", "schema_version",
+]
+CANDIDATE_AXIS_SUMMARY_FIELDS = [
+    "library", "selected_supported_event_id",
+    "selected_supported_event_proposal", "supported_event_key",
+    "selected_event_class", "selected_event_confidence",
+    "authoritative_original_assignment_strata", "n_decision_rows",
+    "n_applied_reassignment_pairs", "n_recommended_not_applied_pairs",
+    "n_supported_event_held_pairs", "n_review_only_pairs",
+    "n_retained_original_contrast_pairs", "n_score_pairs", "n_manifest_rows",
+    "n_pair_construction_exclusions", "n_explicitly_non_nominated_rows",
+    "population_scope_counts", "exclusion_reason_counts", "error_ref",
+    "error_alt", "min_evidence", "min_evidence_source",
+    "poor_fit_residual", "poor_fit_residual_source", "source_decisions",
+    "validation_summary", "samples_path", "pileup_sites_path",
+    "pileup_observations_path", "frozen_v3_probability_path",
+    "frozen_v3_provenance_path", "frozen_v6_3_cell_path",
+    "frozen_v6_3_review_only_path", "v6_3_aggregator_path",
+    "pair_builder_path", "warnings",
+    "score_scope_contract_counts", "schema_version",
+]
+
+
+def candidate_axis_pairs_parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build one library's fixed A/B candidate-axis manifest from "
+            "already-finalized supported reconciliation events. "
+            "Retained cells are nonvoting, selection-conditioned contrasts."
+        )
+    )
+    parser.add_argument("--libraries", nargs="+", required=True)
+    parser.add_argument("--decisions-root", required=True)
+    parser.add_argument("--metadata-root", required=True)
+    parser.add_argument("--validation-summary", required=True)
+    parser.add_argument("--event-id", default="")
+    parser.add_argument("--proposed-identity", default="")
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--samples", default="")
+    parser.add_argument("--pileup-sites", default="")
+    parser.add_argument("--pileup-observations", default="")
+    parser.add_argument("--frozen-v3-probability", default="")
+    parser.add_argument("--frozen-v3-provenance", default="")
+    parser.add_argument("--frozen-v6-3-cell", default="")
+    parser.add_argument("--frozen-v6-3-review-only", default="")
+    parser.add_argument(
+        "--v6-3-source",
+        default=str(Path(__file__).resolve().with_name(
+            "identity_probability_aggregate.py"
+        )),
+    )
+    parser.add_argument("--min-evidence", type=int, default=10)
+    parser.add_argument(
+        "--min-evidence-source",
+        default="AUDITED_TETRA_SCORE_CALLS_V3_DEFAULT",
+    )
+    parser.add_argument("--poor-fit-residual", type=float, default=None)
+    return parser.parse_args()
+
+
+def _candidate_axis_atomic_tsv(path: Path, rows, fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # identity_reconciliation_common.write_tsv already stages and atomically
+    # replaces while preserving gzip based on the final filename.
+    write_tsv(str(path), rows, fields)
+
+
+def _candidate_axis_file_record(path):
+    if not path:
+        return {"path": "NA", "size": "NA", "mtime": "NA"}
+    resolved = Path(path).resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"required candidate-axis input is missing: {resolved}")
+    stat_result = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size": str(stat_result.st_size),
+        "mtime": str(stat_result.st_mtime_ns),
+    }
+
+
+def _candidate_axis_optional_file_record(path):
+    if not path or not Path(path).is_file():
+        return {"path": "NA", "size": "NA", "mtime": "NA"}
+    return _candidate_axis_file_record(path)
+
+
+def _candidate_axis_unanimous_finite(rows, field):
+    values = set()
+    for row in rows:
+        raw = clean(row.get(field))
+        if not raw:
+            raise ValueError(f"frozen V3 row is missing {field}")
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(f"frozen V3 {field} is nonfinite")
+        values.add(value)
+    if len(values) != 1:
+        raise ValueError(
+            f"frozen V3 {field} must be one unanimous run-level value; saw {sorted(values)}"
+        )
+    return next(iter(values))
+
+
+def _candidate_axis_resolve_inputs(args, library):
+    decisions_root = Path(args.decisions_root).resolve()
+    identity_root = decisions_root.parent
+    nuclear_root = identity_root / "nuclear"
+    v3_probability = Path(args.frozen_v3_probability).resolve() if (
+        args.frozen_v3_probability
+    ) else nuclear_root / f"{library}.identity_pair_probabilities.tsv.gz"
+    v3_provenance = Path(args.frozen_v3_provenance).resolve() if (
+        args.frozen_v3_provenance
+    ) else nuclear_root / f"{library}.identity_pair_probability_provenance.tsv"
+    provenance = {}
+    if v3_provenance.is_file():
+        provenance_rows = read_tsv(str(v3_provenance))
+        if len(provenance_rows) == 1:
+            provenance = provenance_rows[0]
+    samples = args.samples or clean(provenance.get("samples_path"))
+    sites = args.pileup_sites or clean(provenance.get("pileup_sites_path"))
+    observations = args.pileup_observations or clean(
+        provenance.get("pileup_observations_path")
+    )
+    if not samples or not sites or not observations:
+        raise ValueError(
+            "samples, pileup sites, and pileup observations must be supplied "
+            "explicitly or recorded by frozen V3 provenance"
+        )
+    return {
+        "v3_probability": str(v3_probability),
+        "v3_provenance": str(v3_provenance) if v3_provenance.is_file() else "",
+        "v3_provenance_row": provenance,
+        "samples": str(Path(samples).resolve()),
+        "sites": str(Path(sites).resolve()),
+        "observations": str(Path(observations).resolve()),
+    }
+
+
+def _candidate_axis_bool(value):
+    normalized = clean(value).upper()
+    if normalized in {"TRUE", "1", "YES", "Y"}:
+        return True
+    if normalized in {"FALSE", "0", "NO", "N"}:
+        return False
+    raise ValueError(f"expected an explicit TRUE/FALSE value, saw {value!r}")
+
+
+def _candidate_axis_source_audit_row(status, check, value, detail="", record=None):
+    record = record or {"path": "NA", "size": "NA", "mtime": "NA"}
+    return {
+        "status": status,
+        "check": check,
+        "value": value if value not in {None, ""} else "NA",
+        "detail": detail or "NA",
+        "path": record["path"],
+        "size_bytes": record["size"],
+        "mtime_ns": record["mtime"],
+        "schema_version": "identity_candidate_axis_pair_source_audit_v1",
+    }
+
+
+def _candidate_axis_manifest_row(
+    source,
+    event_metadata,
+    library,
+    barcode,
+    pair_id,
+    role,
+    genotype,
+    original,
+    fixed_proposal,
+    project_status,
+    admissibility,
+    expected_status,
+    population,
+    retained,
+    event_key,
+):
+    ploidy = _score_pair_ploidy(genotype)
+    candidate_origin = (
+        "ORIGINAL_ALLOWED_DEMUX"
+        if role == "ORIGINAL_ALLOWED_DEMUX"
+        else (
+            "FROZEN_SUPPORTED_EVENT_PROPOSAL_CONTRAST"
+            if retained
+            else "RECONCILIATION_NOMINATED_SWAP"
+        )
+    )
+    pair_source = (
+        "RETAINED_KEEP_CELL_VS_FROZEN_SUPPORTED_EVENT_PROPOSAL"
+        if retained
+        else "POST_RECONCILIATION_DECISION_TABLE"
+    )
+    contract = (
+        CANDIDATE_AXIS_RETAINED_CONTRACT
+        if retained
+        else CANDIDATE_AXIS_OPERATIONAL_CONTRACT
+    )
+    source_event = clean(source.get("event_id"))
+    source_proposal = canonical_genotype(source.get("proposed_donor_genotype", ""))
+    return {
+        "library": library,
+        "barcode": barcode,
+        "hypothesis_id": pair_id + (
+            ":ORIGINAL" if role == "ORIGINAL_ALLOWED_DEMUX" else ":FIXED_B"
+        ),
+        "state_notation": biological_state(genotype, ploidy),
+        "donor_genotype": genotype,
+        "donor_components": ",".join(donor_components(genotype)),
+        "biological_ploidy": ploidy,
+        "droplet_state": "SINGLE_CELL_CANDIDATE",
+        "droplet_constituents": "",
+        "candidate_origin": candidate_origin,
+        "current_state_notation": biological_state(
+            original, _score_pair_ploidy(original)
+        ),
+        "current_donor_genotype": original,
+        "expected_genotype_status": expected_status,
+        "project_genotype_status": project_status,
+        "biological_admissibility": admissibility,
+        "physical_resolution_status": (
+            "CONSTRAINED_DEMUX_TOP_WINNER"
+            if role == "ORIGINAL_ALLOWED_DEMUX"
+            else (
+                "FROZEN_SUPPORTED_EVENT_CONTRAST"
+                if retained
+                else clean(source.get("proposed_uid_resolution_status"))
+                or "RECONCILIATION_NOMINATED"
+            )
+        ),
+        "source_identity": clean(source.get("source_identity")),
+        "replaced_component": clean(source.get("replaced_component")),
+        "replacement_component": clean(source.get("replacement_component")),
+        "preserved_partner": clean(source.get("preserved_partner")),
+        "candidate_priority": 1 if role == "ORIGINAL_ALLOWED_DEMUX" else 2,
+        "candidate_generation_notes": (
+            "FROZEN_ORIGINAL_ALLOWED_DEMUX_TOP_WINNER"
+            if role == "ORIGINAL_ALLOWED_DEMUX"
+            else (
+                "FROZEN_SUPPORTED_EVENT_PROPOSAL_CONTRAST_ONLY_SELECTION_CONDITIONED_NONVOTING"
+                if retained
+                else "EXACT_RECONCILIATION_PROPOSAL"
+            )
+        ),
+        "schema_version": CANDIDATE_AXIS_PAIR_SCHEMA,
+        "score_pair_id": pair_id,
+        "score_pair_role": role,
+        "score_pair_source": pair_source,
+        "score_population_scope": population,
+        "population_votes_in_authoritative_event": (
+            "TRUE" if population in SCORE_PAIR_REASSIGNMENT_SCOPES else "FALSE"
+        ),
+        "supported_event_key": event_key,
+        "selected_supported_event_id": clean(event_metadata.get("event_id")),
+        "selected_supported_event_proposal": fixed_proposal,
+        "reconciliation_event_id": clean(event_metadata.get("event_id")),
+        "reconciliation_event_class": clean(event_metadata.get("event_class")),
+        "reconciliation_event_confidence": clean(
+            event_metadata.get("event_confidence")
+        ),
+        "reconciliation_final_action": clean(source.get("final_action")),
+        "reconciliation_decision_confidence": clean(
+            source.get("decision_confidence")
+        ),
+        "reconciliation_reassignment_applied": clean(
+            source.get("reassignment_applied")
+        ),
+        "reconciliation_current_refined_assignment": canonical_genotype(
+            source.get("current_refined_assignment", "")
+        ),
+        "reconciled_donor_genotype": canonical_genotype(
+            source.get("reconciled_donor_genotype", "")
+        ),
+        "reconciled_droplet_state": clean(source.get("reconciled_droplet_state")),
+        "original_demux_assignment": original,
+        "proposed_donor_genotype": fixed_proposal,
+        "reconciliation_nominated_swap": "" if retained else fixed_proposal,
+        "candidate_b_fixed_identity": fixed_proposal,
+        "source_reconciliation_event_id": source_event,
+        "source_reconciliation_proposed_identity": source_proposal,
+        "pair_construction_mode": (
+            "SUPPORTED_EVENT_CHALLENGE"
+            if retained
+            else "RECONCILIATION_NOMINATED_SWAP"
+        ),
+        "score_scope_contract": contract,
+    }
+
+
+def candidate_axis_pairs_main():
+    args = candidate_axis_pairs_parse_args()
+    libraries = parse_library_spec(args.libraries)
+    if len(libraries) != 1:
+        raise ValueError("candidate-axis pair construction requires exactly one library")
+    library = f"lib{libraries[0]}"
+    targeted_event_id = clean(args.event_id)
+    targeted_proposal = canonical_genotype(args.proposed_identity)
+    if bool(targeted_event_id) != bool(targeted_proposal):
+        raise ValueError(
+            "candidate-axis event ID and proposal must be supplied together"
+        )
+    targeted_mode = bool(targeted_event_id)
+    output_root = Path(args.output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    audit_path = output_root / f"{library}.candidate_axis_pair_source_audit.tsv"
+    audit_rows = []
+    warnings = []
+
+    def audit(check, value, detail="", record=None, status="PASS"):
+        audit_rows.append(_candidate_axis_source_audit_row(
+            status, check, value, detail, record
+        ))
+
+    try:
+        decisions_path = (
+            Path(args.decisions_root).resolve()
+            / f"{library}.reconciled_cells.tsv.gz"
+        )
+        validation_path = Path(args.validation_summary).resolve()
+        metadata_root = Path(args.metadata_root).resolve()
+        metadata_paths = {
+            "expected_genotypes": metadata_root / "library_expected_genotypes.tsv",
+            "global_biological_lines": metadata_root / "global_biological_lines.tsv",
+            "global_donors": metadata_root / "global_donors.tsv",
+        }
+        input_paths = _candidate_axis_resolve_inputs(args, library)
+        records = {
+            "decisions": _candidate_axis_file_record(decisions_path),
+            "validation": _candidate_axis_file_record(validation_path),
+            "samples": _candidate_axis_file_record(input_paths["samples"]),
+            "pileup_sites": _candidate_axis_file_record(input_paths["sites"]),
+            "pileup_observations": _candidate_axis_file_record(
+                input_paths["observations"]
+            ),
+            "frozen_v3_provenance": _candidate_axis_optional_file_record(
+                input_paths["v3_provenance"]
+            ),
+        }
+        for name, path in metadata_paths.items():
+            records[name] = _candidate_axis_file_record(path)
+        records["frozen_v6_3_cell"] = _candidate_axis_optional_file_record(
+            args.frozen_v6_3_cell
+        )
+        records["frozen_v6_3_review_only"] = _candidate_axis_optional_file_record(
+            args.frozen_v6_3_review_only
+        )
+        for name, record in records.items():
+            audit(
+                f"INPUT_{name.upper()}",
+                "PRESENT" if record["path"] != "NA" else "OPTIONAL_ABSENT",
+                record=record,
+            )
+
+        validation_rows = read_tsv(str(validation_path))
+        if not validation_rows:
+            raise ValueError("validation summary is empty")
+        for row in validation_rows:
+            if clean(row.get("status")).upper() != "PASS" or int(float(
+                clean(row.get("n_failures")) or -1
+            )) != 0:
+                raise ValueError("validation summary is not an all-PASS zero-failure ledger")
+        if validation_path.stat().st_mtime_ns < decisions_path.stat().st_mtime_ns:
+            raise ValueError("validation summary predates the selected decision table")
+        audit("VALIDATION_LEDGER", "ALL_PASS_ZERO_FAILURES")
+
+        decisions = read_tsv(str(decisions_path))
+        if not decisions:
+            raise ValueError("selected decision table is empty")
+        seen_barcodes = set()
+        for row in decisions:
+            barcode = clean(row.get("barcode"))
+            if not barcode or barcode in seen_barcodes:
+                raise ValueError(
+                    f"decision table has blank or duplicate barcode: {barcode!r}"
+                )
+            seen_barcodes.add(barcode)
+            if clean(row.get("library")) not in {library, str(libraries[0])}:
+                raise ValueError(
+                    f"decision table contains a cross-library row: {row.get('library')!r}"
+                )
+
+        authoritative_by_event = defaultdict(list)
+        all_supported_by_stratum = defaultdict(set)
+        for row in decisions:
+            event_key = _score_pair_event_key(row)
+            original = canonical_genotype(
+                row.get("original_demux_assignment", "")
+            )
+            nonidentity_reason, _ = _score_pair_nonidentity_event_reason(row)
+            if (
+                clean(row.get("final_action")).upper() == "REASSIGN_GENOTYPE"
+                and clean(row.get("event_class")).upper()
+                in SCORE_PAIR_SUPPORTED_SWAP_EVENT_CLASSES
+                and event_key[0] and event_key[1] and original
+                and event_key[1] != original
+                and not nonidentity_reason
+            ):
+                authoritative_by_event[event_key].append(row)
+                all_supported_by_stratum[original].add(event_key)
+
+        supported_event_keys = set(authoritative_by_event)
+        requested_key = (targeted_event_id, targeted_proposal)
+        if targeted_mode:
+            if requested_key not in supported_event_keys:
+                raise ValueError(
+                    "targeted candidate-axis event is not an already-finalized "
+                    f"supported event: {library}|{targeted_event_id}|{targeted_proposal}"
+                )
+            selected_event_keys = {requested_key}
+        else:
+            selected_event_keys = set(supported_event_keys)
+
+        event_metadata = {}
+        source_strata = {}
+        metadata_keys = (
+            "event_id", "event_class", "event_confidence",
+        )
+        for selected_key in sorted(selected_event_keys):
+            rows = authoritative_by_event[selected_key]
+            for field in metadata_keys:
+                values = {clean(row.get(field)) for row in rows}
+                if len(values) != 1 or not next(iter(values)):
+                    raise ValueError(
+                        "finalized event has inconsistent or blank "
+                        f"{field}: {library}|{selected_key[0]}|{selected_key[1]} "
+                        f"values={sorted(values)}"
+                    )
+            event_metadata[selected_key] = rows[0]
+            strata = {
+                canonical_genotype(row.get("original_demux_assignment", ""))
+                for row in rows
+            }
+            if "" in strata or not strata:
+                raise ValueError(
+                    "finalized event has blank/no authoritative source strata: "
+                    f"{library}|{selected_key[0]}|{selected_key[1]}"
+                )
+            source_strata[selected_key] = strata
+        audit(
+            "SELECTED_FINALIZED_EVENT_KEYS",
+            ";".join(
+                _score_pair_event_key_text(library, key)
+                for key in sorted(selected_event_keys)
+            ) or "NONE",
+            "TARGETED_DIAGNOSTIC" if targeted_mode else "ROUTINE_AUTOMATIC",
+        )
+        audit(
+            "AUTHORITATIVE_SOURCE_STRATA",
+            ";".join(
+                f"{_score_pair_event_key_text(library, key)}="
+                + ",".join(sorted(source_strata[key]))
+                for key in sorted(selected_event_keys)
+            ) or "NONE",
+        )
+
+        records["frozen_v3_probability"] = _candidate_axis_optional_file_record(
+            input_paths["v3_probability"]
+        )
+        records["v6_3_source"] = (
+            _candidate_axis_file_record(args.v6_3_source)
+            if selected_event_keys else
+            _candidate_axis_optional_file_record(args.v6_3_source)
+        )
+        for name in ("frozen_v3_probability", "v6_3_source"):
+            record = records[name]
+            if record["path"] != "NA":
+                input_status = "PRESENT"
+            elif selected_event_keys and name == "frozen_v3_probability":
+                input_status = "OPTIONAL_ABSENT"
+            else:
+                input_status = "NOT_APPLICABLE_ZERO_EVENT"
+            audit(
+                f"INPUT_{name.upper()}",
+                input_status,
+                record=record,
+            )
+
+        expected_by_library = expected_metadata(str(metadata_root))
+        global_lines, global_donors = project_biological_universe(str(metadata_root))
+        expected_here = expected_by_library.get(library, {})
+
+        if (selected_event_keys and
+                records["frozen_v3_probability"]["path"] != "NA"):
+            v3_rows = read_tsv(input_paths["v3_probability"])
+            if not v3_rows:
+                raise ValueError("frozen V3 probability table is empty")
+            error_ref = _candidate_axis_unanimous_finite(v3_rows, "error_ref")
+            error_alt = _candidate_axis_unanimous_finite(v3_rows, "error_alt")
+            if not (0 <= error_ref <= 1 and 0 <= error_alt <= 1 and
+                    error_ref + error_alt < 1):
+                raise ValueError("frozen V3 error pair is outside the valid transform domain")
+            audit("ERROR_REF", repr(error_ref), "unanimous across finite frozen V3 rows")
+            audit("ERROR_ALT", repr(error_alt), "unanimous across finite frozen V3 rows")
+        elif selected_event_keys:
+            error_ref = error_alt = 0.001
+            audit(
+                "ERROR_REF", repr(error_ref),
+                "frozen tetra_score_calls default; optional V3 table absent",
+            )
+            audit(
+                "ERROR_ALT", repr(error_alt),
+                "frozen tetra_score_calls default; optional V3 table absent",
+            )
+        else:
+            error_ref = error_alt = 0.001
+            audit("ERROR_REF", "NOT_APPLICABLE_ZERO_EVENT")
+            audit("ERROR_ALT", "NOT_APPLICABLE_ZERO_EVENT")
+        provenance = input_paths["v3_provenance_row"]
+        if "demux_nomito" not in records["pileup_sites"]["path"].lower():
+            raise ValueError(
+                "pileup-site path does not prove the production demux_nomito nuclear source"
+            )
+        audit(
+            "NUCLEAR_EVIDENCE_IDENTITY", "EXPLICIT_DEMUX_NOMITO_INPUTS",
+            "primary mitochondrial exclusion is independently enforced by the scorer",
+        )
+        poor_fit = args.poor_fit_residual
+        poor_fit_source = "EXPLICIT_CLI"
+        if poor_fit is None:
+            raw = clean(provenance.get("poor_fit_residual"))
+            if raw:
+                poor_fit = float(raw)
+                poor_fit_source = "FROZEN_V3_PROVENANCE"
+            else:
+                poor_fit = 0.30
+                poor_fit_source = "DEFAULT_0.30"
+        if not math.isfinite(poor_fit) or not 0 <= poor_fit <= 1:
+            raise ValueError("poor_fit_residual must be finite within [0,1]")
+        if args.min_evidence < 0:
+            raise ValueError("min_evidence must be nonnegative")
+        if not selected_event_keys:
+            poor_fit_source = "NOT_APPLICABLE_ZERO_EVENT"
+        audit("MIN_EVIDENCE", str(args.min_evidence), args.min_evidence_source)
+        audit("POOR_FIT_RESIDUAL", repr(poor_fit), poor_fit_source)
+
+        samples = [line.strip() for line in Path(records["samples"]["path"]).read_text().splitlines() if line.strip()]
+        if not samples or len(samples) != len(set(samples)):
+            raise ValueError("nuclear sample vector is empty or contains duplicates")
+        sample_set = set(samples)
+        for _, selected_proposal in sorted(selected_event_keys):
+            for component in donor_components(selected_proposal):
+                if component not in sample_set:
+                    raise ValueError(
+                        "selected proposal component is absent from nuclear "
+                        f"sample vector: {component}"
+                    )
+        audit("NUCLEAR_SAMPLE_VECTOR", "UNIQUE_NONBLANK")
+
+        molecule_path = clean(provenance.get("pileup_molecules_path"))
+        molecule_basis = Counter()
+        if molecule_path and Path(molecule_path).is_file():
+            import gzip
+            with gzip.open(molecule_path, "rt") as handle:
+                for index, line in enumerate(handle):
+                    fields = line.rstrip("\n\r").split("\t")
+                    if len(fields) >= 3:
+                        molecule_basis[fields[2].strip() or "BLANK"] += 1
+                    if index >= 99999:
+                        break
+            audit(
+                "MOLECULE_SIDECAR_SCHEMA_INSPECTION",
+                ",".join(f"{key}:{value}" for key, value in sorted(molecule_basis.items())) or "EMPTY",
+                "inspection only; molecule data never changes the fixed site-balanced primary axis",
+            )
+        else:
+            audit("MOLECULE_SIDECAR_SCHEMA_INSPECTION", "ABSENT")
+
+        manifest_rows = []
+        exclusions = []
+        exclusion_counts = Counter()
+        population_counts = Counter()
+        explicitly_non_nominated = 0
+
+        def exclude(
+            source, reason, detail, contract=CANDIDATE_AXIS_OPERATIONAL_CONTRACT,
+            selected_key=None,
+        ):
+            if selected_key is None:
+                selected_key = (
+                    next(iter(selected_event_keys))
+                    if len(selected_event_keys) == 1
+                    else ("MULTIPLE", "MULTIPLE")
+                )
+            selected_metadata = event_metadata.get(selected_key, {})
+            exclusion_counts[reason] += 1
+            exclusions.append({
+                "exclusion_stage": "PAIR_CONSTRUCTION",
+                "library": library,
+                "barcode": clean(source.get("barcode")),
+                "original_demux_assignment": canonical_genotype(
+                    source.get("original_demux_assignment", "")
+                ),
+                "proposed_donor_genotype": canonical_genotype(
+                    source.get("proposed_donor_genotype", "")
+                ),
+                "source_reconciliation_event_id": clean(source.get("event_id")),
+                "source_reconciliation_proposed_identity": canonical_genotype(
+                    source.get("proposed_donor_genotype", "")
+                ),
+                "reconciliation_event_id": selected_key[0],
+                "reconciliation_event_class": (
+                    clean(selected_metadata.get("event_class")) or "MULTIPLE"
+                ),
+                "reconciliation_final_action": clean(source.get("final_action")),
+                "exclusion_reason": reason,
+                "detail": detail,
+                "selected_supported_event_id": selected_key[0],
+                "selected_supported_event_proposal": selected_key[1],
+                "score_scope_contract": contract,
+                "schema_version": CANDIDATE_AXIS_PAIR_SCHEMA,
+            })
+
+        admitted_barcodes = set()
+
+        def admit(source, population, retained, selected_key):
+            barcode = clean(source.get("barcode"))
+            if barcode in admitted_barcodes:
+                raise ValueError(
+                    f"barcode admitted to more than one candidate-axis population: {barcode}"
+                )
+            original = canonical_genotype(source.get("original_demux_assignment", ""))
+            event_id, proposal = selected_key
+            metadata = event_metadata[selected_key]
+            event_key = _score_pair_event_key_text(library, selected_key)
+            original_status, original_admissibility = candidate_biological_status(
+                original, expected_here, global_lines, global_donors
+            )
+            proposed_status, proposed_admissibility = candidate_biological_status(
+                proposal, expected_here, global_lines, global_donors
+            )
+            if not original:
+                exclude(source, "MISSING_ORIGINAL_ALLOWED_DEMUX", "original assignment is blank", selected_key=selected_key)
+                return
+            if original not in expected_here:
+                exclude(
+                    source, "ORIGINAL_NOT_IN_ALLOWED_LIBRARY_ROSTER",
+                    f"original={original}; project_status={original_status}", selected_key=selected_key,
+                )
+                return
+            allowed_admissibility = {
+                "SINGLET_IDENTITY_CANDIDATE", "BIOLOGICAL_SINGLE_CELL_ALLOWED"
+            }
+            if original_admissibility not in allowed_admissibility:
+                exclude(
+                    source, "ORIGINAL_NOT_A_BIOLOGICAL_SINGLE_CELL_IDENTITY",
+                    f"admissibility={original_admissibility}", selected_key=selected_key,
+                )
+                return
+            if proposed_admissibility not in allowed_admissibility:
+                exclude(
+                    source, "PROPOSED_SWAP_NOT_A_REAL_BIOLOGICAL_LINE",
+                    f"project_status={proposed_status}; admissibility={proposed_admissibility}", selected_key=selected_key,
+                )
+                return
+            if proposal in expected_here:
+                exclude(
+                    source, "PROPOSED_IDENTITY_ALREADY_ALLOWED_IN_LIBRARY",
+                    "fixed proposal must remain library-unexpected", selected_key=selected_key,
+                )
+                return
+            if original == proposal:
+                exclude(source, "IDENTICAL_FIXED_CANDIDATES", "A and B are identical", selected_key=selected_key)
+                return
+            if _score_pair_same_snp_identity(original, proposal):
+                exclude(
+                    source, "SAME_DONOR_PLOIDY_NOT_NUCLEAR_SCOREABLE",
+                    "A versus A+A is not admitted to the nuclear candidate axis", selected_key=selected_key,
+                )
+                return
+            missing_components = [
+                component
+                for genotype in (original, proposal)
+                for component in donor_components(genotype)
+                if component not in sample_set
+            ]
+            if missing_components:
+                exclude(
+                    source, "CANDIDATE_COMPONENT_MISSING_FROM_NUCLEAR_SAMPLE_VECTOR",
+                    ",".join(sorted(set(missing_components))), selected_key=selected_key,
+                )
+                return
+            pair_id = f"{library}:{barcode}:CANDIDATE_AXIS_PILOT"
+            b_role = (
+                "FROZEN_SUPPORTED_EVENT_PROPOSAL_CONTRAST"
+                if retained
+                else "RECONCILIATION_NOMINATED_SWAP"
+            )
+            rows = [
+                _candidate_axis_manifest_row(
+                    source, metadata, library, barcode, pair_id,
+                    "ORIGINAL_ALLOWED_DEMUX", original, original, proposal,
+                    original_status, original_admissibility, "EXPECTED",
+                    population, retained, event_key,
+                ),
+                _candidate_axis_manifest_row(
+                    source, metadata, library, barcode, pair_id,
+                    b_role, proposal, original, proposal, proposed_status,
+                    proposed_admissibility,
+                    "UNEXPECTED_RECONCILIATION_NOMINATION" if not retained
+                    else "FROZEN_SUPPORTED_EVENT_PROPOSAL_CONTRAST",
+                    population, retained, event_key,
+                ),
+            ]
+            shared_fields = [
+                field for field in CANDIDATE_AXIS_EXTRA_FIELDS
+                if field not in {"score_pair_role"}
+            ]
+            for field in shared_fields:
+                if rows[0].get(field) != rows[1].get(field):
+                    raise ValueError(
+                        f"internal candidate-axis pair metadata mismatch: {barcode} {field}"
+                    )
+            manifest_rows.extend(rows)
+            population_counts[population] += 1
+            admitted_barcodes.add(barcode)
+
+        for source in decisions:
+            row_event = clean(source.get("event_id"))
+            row_proposal = canonical_genotype(source.get("proposed_donor_genotype", ""))
+            action = clean(source.get("final_action")).upper()
+            row_key = (row_event, row_proposal)
+            if row_key in selected_event_keys:
+                population = _score_pair_population_scope(source, supported_event_keys)
+                if population in {
+                    SCORE_PAIR_APPLIED_REASSIGNMENT,
+                    SCORE_PAIR_RECOMMENDED_NOT_APPLIED,
+                    SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL,
+                    SCORE_PAIR_REVIEW_ONLY,
+                }:
+                    admit(source, population, retained=False, selected_key=row_key)
+                    continue
+                if action != "KEEP":
+                    reason, detail = _score_pair_scope_exclusion_reason(
+                        source, supported_event_keys
+                    )
+                    exclude(source, reason, detail, selected_key=row_key)
+                    continue
+
+            original = canonical_genotype(source.get("original_demux_assignment", ""))
+            if action != "KEEP":
+                explicitly_non_nominated += 1
+                continue
+            retained_contract = CANDIDATE_AXIS_RETAINED_CONTRACT
+            selected_key = None
+            if row_event or row_proposal:
+                if row_key in selected_event_keys and original in source_strata[row_key]:
+                    selected_key = row_key
+                elif any(
+                    original in source_strata[key] for key in selected_event_keys
+                ):
+                    exclude(
+                        source, "RETAINED_CELL_HAS_DIFFERENT_NOMINATED_EVENT",
+                        f"source_event={row_event or 'NA'}; source_proposal={row_proposal or 'NA'}",
+                        retained_contract, row_key if row_key in selected_event_keys else None,
+                    )
+                    continue
+                else:
+                    explicitly_non_nominated += 1
+                    continue
+            else:
+                mappings = all_supported_by_stratum.get(original, set())
+                selected_mappings = mappings & selected_event_keys
+                if len(mappings) > 1 and selected_mappings:
+                    exclude(
+                        source, "AMBIGUOUS_RETAINED_CONTRAST_EVENT_MAPPING",
+                        ";".join(
+                            f"{eid}|{candidate}"
+                            for eid, candidate in sorted(mappings)
+                        ),
+                        retained_contract,
+                    )
+                    continue
+                if len(mappings) == 1 and len(selected_mappings) == 1:
+                    selected_key = next(iter(selected_mappings))
+                else:
+                    explicitly_non_nominated += 1
+                    continue
+            try:
+                applied = _candidate_axis_bool(source.get("reassignment_applied"))
+            except ValueError:
+                exclude(
+                    source, "RETAINED_REASSIGNMENT_APPLIED_NOT_EXPLICIT_FALSE",
+                    f"value={clean(source.get('reassignment_applied')) or 'MISSING'}",
+                    retained_contract, selected_key,
+                )
+                continue
+            if applied:
+                exclude(
+                    source, "RETAINED_REASSIGNMENT_APPLIED_NOT_FALSE",
+                    "final_action KEEP cannot be a retained contrast when reassignment_applied is true",
+                    retained_contract, selected_key,
+                )
+                continue
+            reconciled = canonical_genotype(source.get("reconciled_donor_genotype", ""))
+            if reconciled != original:
+                exclude(
+                    source, "RETAINED_RECONCILED_IDENTITY_DIFFERS_FROM_ORIGINAL",
+                    f"reconciled={reconciled or 'NA'}; original={original}",
+                    retained_contract, selected_key,
+                )
+                continue
+            droplet = clean(source.get("reconciled_droplet_state")).upper()
+            if droplet != "SINGLE_CELL":
+                exclude(
+                    source, "RETAINED_NOT_RECONCILED_SINGLE_CELL",
+                    f"reconciled_droplet_state={droplet or 'MISSING'}",
+                    retained_contract, selected_key,
+                )
+                continue
+            admit(
+                source, CANDIDATE_AXIS_RETAINED, retained=True,
+                selected_key=selected_key,
+            )
+
+        manifest_fields = FIELDS + [
+            field for field in CANDIDATE_AXIS_EXTRA_FIELDS if field not in FIELDS
+        ]
+        if len(manifest_rows) % 2:
+            raise ValueError("candidate-axis manifest row count is not divisible by two")
+        pair_ids = Counter(row["score_pair_id"] for row in manifest_rows)
+        if any(count != 2 for count in pair_ids.values()):
+            raise ValueError("candidate-axis manifest contains a pair with other than two rows")
+        retained_count = population_counts[CANDIDATE_AXIS_RETAINED]
+        if retained_count == 0:
+            warnings.append("NO_UNAMBIGUOUS_RETAINED_CONTRASTS")
+        if not selected_event_keys:
+            warnings.append("NO_FINALIZED_SUPPORTED_EVENTS")
+
+        manifest_path = output_root / f"{library}.candidate_axis_pairs.tsv.gz"
+        exclusion_path = output_root / f"{library}.candidate_axis_pair_exclusions.tsv.gz"
+        summary_path = output_root / f"{library}.candidate_axis_pair_summary.tsv"
+        _candidate_axis_atomic_tsv(manifest_path, manifest_rows, manifest_fields)
+        _candidate_axis_atomic_tsv(
+            exclusion_path, exclusions, CANDIDATE_AXIS_EXCLUSION_FIELDS
+        )
+        if len(selected_event_keys) == 1:
+            summary_key = next(iter(selected_event_keys))
+            summary_metadata = event_metadata[summary_key]
+            summary_event_id, summary_proposal = summary_key
+            summary_event_key = _score_pair_event_key_text(library, summary_key)
+            summary_event_class = clean(summary_metadata.get("event_class"))
+            summary_event_confidence = clean(summary_metadata.get("event_confidence"))
+            summary_strata = ",".join(sorted(source_strata[summary_key]))
+        elif selected_event_keys:
+            summary_event_id = summary_proposal = summary_event_key = "MULTIPLE"
+            summary_event_class = summary_event_confidence = summary_strata = "MULTIPLE"
+        else:
+            summary_event_id = summary_proposal = summary_event_key = "NONE"
+            summary_event_class = summary_event_confidence = summary_strata = "NONE"
+        summary = {
+            "library": library,
+            "selected_supported_event_id": summary_event_id,
+            "selected_supported_event_proposal": summary_proposal,
+            "supported_event_key": summary_event_key,
+            "selected_event_class": summary_event_class,
+            "selected_event_confidence": summary_event_confidence,
+            "authoritative_original_assignment_strata": summary_strata,
+            "n_decision_rows": len(decisions),
+            "n_applied_reassignment_pairs": population_counts[SCORE_PAIR_APPLIED_REASSIGNMENT],
+            "n_recommended_not_applied_pairs": population_counts[SCORE_PAIR_RECOMMENDED_NOT_APPLIED],
+            "n_supported_event_held_pairs": population_counts[SCORE_PAIR_SUPPORTED_EVENT_HELD_CELL],
+            "n_review_only_pairs": population_counts[SCORE_PAIR_REVIEW_ONLY],
+            "n_retained_original_contrast_pairs": retained_count,
+            "n_score_pairs": len(pair_ids),
+            "n_manifest_rows": len(manifest_rows),
+            "n_pair_construction_exclusions": len(exclusions),
+            "n_explicitly_non_nominated_rows": explicitly_non_nominated,
+            "population_scope_counts": ",".join(
+                f"{key}:{value}" for key, value in sorted(population_counts.items())
+            ) or "NONE",
+            "exclusion_reason_counts": ",".join(
+                f"{key}:{value}" for key, value in sorted(exclusion_counts.items())
+            ) or "NONE",
+            "error_ref": repr(error_ref) if selected_event_keys else "NA",
+            "error_alt": repr(error_alt) if selected_event_keys else "NA",
+            "min_evidence": args.min_evidence,
+            "min_evidence_source": (
+                args.min_evidence_source if selected_event_keys
+                else "NOT_APPLICABLE_ZERO_EVENT"
+            ),
+            "poor_fit_residual": repr(poor_fit),
+            "poor_fit_residual_source": poor_fit_source,
+            "source_decisions": records["decisions"]["path"],
+            "validation_summary": records["validation"]["path"],
+            "samples_path": records["samples"]["path"],
+            "pileup_sites_path": records["pileup_sites"]["path"],
+            "pileup_observations_path": records["pileup_observations"]["path"],
+            "frozen_v3_probability_path": records["frozen_v3_probability"]["path"],
+            "frozen_v3_provenance_path": records["frozen_v3_provenance"]["path"],
+            "frozen_v6_3_cell_path": records["frozen_v6_3_cell"]["path"],
+            "frozen_v6_3_review_only_path": records["frozen_v6_3_review_only"]["path"],
+            "v6_3_aggregator_path": records["v6_3_source"]["path"],
+            "pair_builder_path": str(Path(__file__).resolve()),
+            "warnings": ";".join(warnings) or "NONE",
+            "score_scope_contract_counts": ",".join(
+                f"{key}:{value}" for key, value in sorted(Counter(
+                    row["score_scope_contract"] for row in manifest_rows
+                    if row["score_pair_role"] == "ORIGINAL_ALLOWED_DEMUX"
+                ).items())
+            ) or "NONE",
+            "schema_version": CANDIDATE_AXIS_PAIR_SCHEMA,
+        }
+        _candidate_axis_atomic_tsv(
+            summary_path, [summary], CANDIDATE_AXIS_SUMMARY_FIELDS
+        )
+        audit("PAIR_COUNT", str(len(pair_ids)))
+        audit("MANIFEST_ROW_COUNT", str(len(manifest_rows)))
+        audit("PAIR_CONSTRUCTION_EXCLUSION_COUNT", str(len(exclusions)))
+        audit("POPULATION_COUNTS", summary["population_scope_counts"])
+        audit("PAIR_SOURCE_GATE", "PASS")
+        _candidate_axis_atomic_tsv(
+            audit_path, audit_rows, CANDIDATE_AXIS_AUDIT_FIELDS
+        )
+        print(
+            f"{library}: candidate-axis finalized events={len(selected_event_keys)}; "
+            f"pairs={len(pair_ids)} retained={retained_count} "
+            f"exclusions={len(exclusions)}"
+        )
+        return 0
+    except Exception as exc:
+        audit("PAIR_SOURCE_GATE", "STOP", str(exc), status="STOP")
+        _candidate_axis_atomic_tsv(
+            audit_path, audit_rows, CANDIDATE_AXIS_AUDIT_FIELDS
+        )
+        raise
+
+
+# -----------------------------------------------------------------------------
+# finalize
+# -----------------------------------------------------------------------------
+
+FINAL_SCHEMA_VERSION = "identity_reconciliation_final_v2_phase3_dispositions"
+FINAL_REVIEW_DISPOSITIONS = {
+    "ACCEPT_PROPOSAL", "KEEP_CURRENT", "LEAVE_UNRESOLVED",
+}
+FINAL_NUCLEAR_PROPOSAL_PATTERNS = {
+    "ALL_PROPOSAL", "PROPOSAL_PLURALITY_WITH_CURRENT_EXCEPTIONS",
+}
+FINAL_NUCLEAR_CURRENT_PATTERNS = {
+    "ALL_CURRENT", "CURRENT_PLURALITY_WITH_PROPOSAL_EXCEPTIONS",
+}
+FINAL_PHASE3_MODIFIER_ORDER = (
+    "AMBIENT_REFIT_SENSITIVE",
+    "AMBIENT_REFIT_UNAVAILABLE",
+    "NUCLEAR_CELL_HETEROGENEITY",
+    "SAMPLING_ADJUSTED_FIT_DISAGREEMENT",
+    "NUCLEAR_NONDISCRIMINATING",
+    "NUCLEAR_UNSTABLE",
+    "PAIR_INADEQUATE",
+    "MITO_CONCORDANT",
+    "MITO_DISCORDANT",
+    "MITO_MIXED",
+    "MITO_UNAVAILABLE",
+    "PLOIDY_UNRESOLVED",
+    "OCCUPANCY_UNRESOLVED",
+    "METADATA_OR_LIBRARY_EXCHANGE_UNRESOLVED",
+    "CHINOBO_CONGO_RELATED_PAIR",
+)
+FINAL_EVENT_DISPOSITION_FIELDS = [
+    "library", "event_id", "event_class", "event_confidence",
+    "n_initial_cells", "n_interpreted_cells",
+    "n_nuclear_proposal_direction", "n_nuclear_current_direction",
+    "n_nuclear_nondirectional", "nuclear_event_pattern",
+    "controlled_ambient_pattern", "refitted_ambient_pattern",
+    "identity_evidence_disposition", "evidence_modifiers",
+    "mechanism_disposition", "review_scope", "review_reasons",
+    "production_assignment_effect", "final_schema_version",
+]
+FINAL_ACTIONABLE_REVIEW_FIELDS = [
+    "review_level", "library", "event_id", "barcode",
+    "identity_evidence_disposition", "mechanism_disposition",
+    "review_scope", "review_reasons", "review_disposition",
+    "review_rationale", "comparison_current_assignment",
+    "nominated_proposal", "production_assignment",
+    "production_assignment_effect", "final_schema_version",
+]
+FINAL_AMBIENT_FIELDS = [
+    "ambient_frozen_current_c", "ambient_frozen_proposal_c",
+    "ambient_frozen_proposal_minus_current_c",
+    "ambient_frozen_current_fit", "ambient_frozen_proposal_fit",
+    "ambient_frozen_fit_delta",
+    "ambient_frozen_current_exact_candidate_burden",
+    "ambient_frozen_proposal_exact_candidate_burden",
+    "ambient_frozen_profile_id", "ambient_frozen_evaluation_status",
+    "ambient_arm_a_c", "ambient_arm_b_c", "ambient_arm_c_c",
+    "ambient_arm_d_c", "ambient_roster_effect_b_minus_a",
+    "ambient_assignment_effect_c_minus_b",
+    "ambient_replacement_effect_d_minus_c",
+    "ambient_combined_augmented_c_minus_a", "ambient_production_arm",
+    "ambient_production_c", "ambient_production_minus_original_c",
+    "ambient_exact_donor_burden_fields", "ambient_background_shift_fields",
+    "ambient_evaluation_status",
+]
+FINAL_CELL_FIELDS = [
+    "library", "barcode", "demux_original_assignment",
+    "demux_original_assignment_raw", "refined_assignment",
+    "comparison_current_assignment", "nominated_proposal", "event_id",
+    "preliminary_reconciliation_action", "preliminary_action_applied",
+    "preliminary_reconciled_assignment", "preliminary_decision_confidence",
+    "preliminary_decision_reason_codes", "interpreted_identity",
+    "scientific_recommendation", "recommendation_basis", "review_required",
+    "review_reasons", "review_disposition", "review_rationale",
+    "review_record_scope", "review_record_target",
+    "application_state", "application_reason", "production_assignment",
+    "production_assignment_source", "candidate_roster_relationship",
+    "proposal_kind", "proposal_components", "axis_candidate_a_assignment",
+    "axis_candidate_b_assignment",
+    "axis_pair_relationship_to_current_proposal", "candidate_axis_scope_status",
+    "candidate_axis_exclusion_reason", "nuclear_reconciliation_status",
+    "nuclear_warning_reasons", "current_donor_composition",
+    "proposal_donor_composition", "current_ploidy_state",
+    "proposal_ploidy_state", "ploidy_evidence_status", "occupancy_state",
+    "occupancy_evidence_status", "known_line_relationship", "technical_state",
+    "species_evidence_status", "mitochondrial_evidence_status",
+    "mitochondrial_resolution_status", "atac_evidence_status",
+] + FINAL_AMBIENT_FIELDS + [
+    "uid_resolution_status", "uid_or_uid_set", "metadata_event_status",
+    "metadata_amendment_proposal", "library_exchange_status",
+    "downstream_release_status", "downstream_exclusion_reason",
+    "event_identity_evidence_disposition", "event_review_scope",
+    "review_scope", "cell_exception_reasons",
+    "policy_version", "run_id", "final_schema_version",
+]
+
+
+def finalize_parse_args():
+    p = argparse.ArgumentParser(
+        description="Finalize validated reconciliation with frozen nuclear and ambient evidence."
+    )
+    p.add_argument("--libraries", nargs="+", required=True)
+    p.add_argument("--demux-root", required=True)
+    p.add_argument("--candidate-root", required=True)
+    p.add_argument("--decisions-root", required=True)
+    p.add_argument("--candidate-axis-root", default="")
+    p.add_argument("--frozen-ambient-root", default="")
+    p.add_argument("--four-arm-root", default="")
+    p.add_argument("--review-input", default="")
+    p.add_argument("--evidence-mode", choices=("rna", "rna-atac"), default="rna")
+    p.add_argument("--run-id", default="")
+    p.add_argument("--output-root", required=True)
+    return p.parse_args()
+
+
+def _final_library(value):
+    value = clean(value)
+    match = re.fullmatch(r"(?:lib)?(\d+)", value, flags=re.I)
+    return f"lib{int(match.group(1))}" if match else value
+
+
+def _final_bool(value):
+    return clean(value).lower() in {"1", "true", "yes", "y"}
+
+
+def _final_na(value):
+    value = clean(value)
+    return value if value and value.upper() != "NAN" else "NA"
+
+
+def _final_float(value):
+    value = ffloat(value)
+    return value if math.isfinite(value) else math.nan
+
+
+def _final_counter(values):
+    counts = Counter(_final_na(value) for value in values)
+    return ";".join(f"{key}:{counts[key]}" for key in sorted(counts, key=natural_key)) or "NONE"
+
+
+def _final_set(values):
+    return ";".join(sorted({clean(value) for value in values if clean(value)}, key=natural_key))
+
+
+def _final_counter_keys(value):
+    keys = set()
+    for item in clean(value).split(";"):
+        item = clean(item)
+        if not item or item == "NONE":
+            continue
+        keys.add(item.rsplit(":", 1)[0] if ":" in item else item)
+    return keys
+
+
+def _final_nuclear_event_pattern(voting_rows, exclusion_rows, applicable):
+    if not applicable:
+        return "NOT_APPLICABLE", 0, 0, 0
+    statuses = [
+        clean(row.get("nuclear_reconciliation_status")).upper()
+        for row in voting_rows
+    ]
+    proposal = statuses.count("NUCLEAR_SUPPORTS_PROPOSAL")
+    current = statuses.count("NUCLEAR_SUPPORTS_CURRENT")
+    nondirectional = len(statuses) - proposal - current
+    if proposal and not current:
+        return "ALL_PROPOSAL", proposal, current, nondirectional
+    if current and not proposal:
+        return "ALL_CURRENT", proposal, current, nondirectional
+    if proposal > current:
+        return (
+            "PROPOSAL_PLURALITY_WITH_CURRENT_EXCEPTIONS",
+            proposal, current, nondirectional,
+        )
+    if current > proposal:
+        return (
+            "CURRENT_PLURALITY_WITH_PROPOSAL_EXCEPTIONS",
+            proposal, current, nondirectional,
+        )
+    if proposal and proposal == current:
+        return (
+            "DIRECTION_TIE_OR_NONDISCRIMINATING",
+            proposal, current, nondirectional,
+        )
+    unavailable_only = {
+        "NUCLEAR_UNAVAILABLE",
+        "NUCLEAR_PAIR_DOES_NOT_MATCH_CURRENT_COMPARISON",
+        "NUCLEAR_OUTSIDE_PAIR_CONTRACT",
+    }
+    nondiscriminating = {
+        "NUCLEAR_NONDISCRIMINATING", "NUCLEAR_PAIR_INADEQUATE",
+    }
+    if any(status in nondiscriminating for status in statuses):
+        return (
+            "DIRECTION_TIE_OR_NONDISCRIMINATING",
+            proposal, current, nondirectional,
+        )
+    exclusion_text = ";".join(
+        clean(row.get("exclusion_reason")).upper() for row in exclusion_rows
+    )
+    if any(token in exclusion_text for token in (
+            "NONDISCRIMINATING", "NON_DISCRIMINATING",
+            "INSUFFICIENT_CANDIDATE_SEPARATION", "SAME_SNP_IDENTITY",
+            "PAIR_INADEQUATE")):
+        return (
+            "DIRECTION_TIE_OR_NONDISCRIMINATING",
+            proposal, current, nondirectional,
+        )
+    if statuses and all(status == "NUCLEAR_NOT_APPLICABLE" for status in statuses):
+        return "NOT_APPLICABLE", proposal, current, nondirectional
+    if not statuses or all(
+            status in unavailable_only | {"", "NA"} for status in statuses):
+        return "UNAVAILABLE", proposal, current, nondirectional
+    return "UNAVAILABLE", proposal, current, nondirectional
+
+
+def _final_ambient_pattern(value, applicable, prefix):
+    if not applicable:
+        return f"{prefix}_NOT_APPLICABLE"
+    number = _final_float(value)
+    if not math.isfinite(number):
+        return f"{prefix}_UNAVAILABLE"
+    if number < 0:
+        return f"{prefix}_SUPPORTS_PROPOSAL"
+    if number > 0:
+        return f"{prefix}_SUPPORTS_CURRENT"
+    return f"{prefix}_NEUTRAL"
+
+
+def _final_identity_evidence_disposition(
+        event_class, applicable, nuclear_pattern, controlled_pattern):
+    if clean(event_class).upper() == "BELOW_EVENT_MASS_THRESHOLD":
+        return "BELOW_EVENT_MASS_THRESHOLD"
+    if not applicable:
+        return "NOT_APPLICABLE"
+    nuclear_proposal = nuclear_pattern in FINAL_NUCLEAR_PROPOSAL_PATTERNS
+    nuclear_current = nuclear_pattern in FINAL_NUCLEAR_CURRENT_PATTERNS
+    controlled_proposal = controlled_pattern == "CONTROLLED_SUPPORTS_PROPOSAL"
+    controlled_current = controlled_pattern == "CONTROLLED_SUPPORTS_CURRENT"
+    if nuclear_proposal and controlled_proposal:
+        return "RNA_SUPPORTED_RECONCILIATION"
+    if nuclear_current and controlled_current:
+        return "RNA_SUPPORTS_CURRENT"
+    if ((nuclear_proposal and controlled_current)
+            or (nuclear_current and controlled_proposal)):
+        return "RNA_DISCORDANT"
+    if controlled_proposal and not (nuclear_proposal or nuclear_current):
+        return "AMBIENT_SUPPORTED_NUCLEAR_INCONCLUSIVE"
+    if nuclear_proposal and controlled_pattern in {
+            "CONTROLLED_NEUTRAL", "CONTROLLED_UNAVAILABLE",
+            "CONTROLLED_NOT_APPLICABLE"}:
+        return "NUCLEAR_SUPPORTED_AMBIENT_INCONCLUSIVE"
+    return "RNA_INSUFFICIENT"
+
+
+def _final_status_has_unresolved(value):
+    value = clean(value).upper()
+    return any(token in value for token in (
+        "UNRESOLVED", "AMBIG", "CONFLICT", "MISSING", "UNAVAILABLE",
+        "NO_LIBRARY_METADATA_MATCH", "MULTIPLE_",
+    ))
+
+
+def _final_mechanism_disposition(event, linked, applicable):
+    if not applicable or clean(event.get("event_class")).upper() == "BELOW_EVENT_MASS_THRESHOLD":
+        return "NOT_APPLICABLE"
+    event_class = clean(event.get("event_class")).upper()
+    technical = any(
+        clean(row.get("downstream_release_status")).upper()
+        == "EXCLUDED_TECHNICAL_MULTIPLET"
+        for row in linked
+    )
+    if technical or "TECHNICAL" in event_class or "MULTIPLET" in event_class:
+        return "TECHNICAL_MIXTURE_OR_MULTIPLET"
+    exchange_unresolved = any(
+        any(token in clean(row.get("library_exchange_status")).upper()
+            for token in ("PARTIAL_RECIPROCAL", "UNRESOLVED", "ROSTER_EQUIVALENT"))
+        for row in linked
+    )
+    uid_unresolved = _final_status_has_unresolved(event.get("uid_resolution_status"))
+    if exchange_unresolved or uid_unresolved:
+        return "METADATA_OR_LIBRARY_EXCHANGE_UNRESOLVED"
+    occupancy_unresolved = (
+        "OCCUPANCY" in event_class
+        or "CELLULAR_ORIGIN" in event_class
+        or any(_final_status_has_unresolved(row.get("occupancy_evidence_status"))
+               for row in linked)
+    )
+    if occupancy_unresolved:
+        return "OCCUPANCY_OR_CELLULAR_ORIGIN_UNRESOLVED"
+    if clean(event.get("event_confidence")).upper() in {"STRONG", "DECISIVE"}:
+        return "MECHANISM_SUPPORTED"
+    return "MECHANISM_INSUFFICIENT"
+
+
+def _final_mito_modifier(linked):
+    statuses = {
+        clean(row.get("mitochondrial_evidence_status")).upper()
+        for row in linked
+    }
+    proposal = bool(statuses & {
+        "SUPPORTS_ALTERNATIVE", "SUPPORTS_PROPOSAL", "CONCORDANT",
+    })
+    current = bool(statuses & {"SUPPORTS_CURRENT", "CONTRADICTS"})
+    if proposal and current:
+        return "MITO_MIXED"
+    if proposal:
+        return "MITO_CONCORDANT"
+    if current:
+        return "MITO_DISCORDANT"
+    return "MITO_UNAVAILABLE"
+
+
+def _final_evidence_modifiers(
+        event, linked, voting_rows, nuclear_pattern, controlled_pattern,
+        refitted_pattern, mechanism_disposition):
+    modifiers = set()
+    if controlled_pattern == "CONTROLLED_SUPPORTS_PROPOSAL":
+        if refitted_pattern in {"REFIT_NEUTRAL", "REFIT_SUPPORTS_CURRENT"}:
+            modifiers.add("AMBIENT_REFIT_SENSITIVE")
+        elif refitted_pattern in {
+                "REFIT_UNAVAILABLE", "REFIT_NOT_APPLICABLE"}:
+            modifiers.add("AMBIENT_REFIT_UNAVAILABLE")
+    if nuclear_pattern in {
+            "PROPOSAL_PLURALITY_WITH_CURRENT_EXCEPTIONS",
+            "CURRENT_PLURALITY_WITH_PROPOSAL_EXCEPTIONS"}:
+        modifiers.add("NUCLEAR_CELL_HETEROGENEITY")
+    candidate_a_excess = [
+        _final_float(row.get("candidate_a_excess_brier_mean"))
+        for row in voting_rows
+    ]
+    candidate_b_excess = [
+        _final_float(row.get("candidate_b_excess_brier_mean"))
+        for row in voting_rows
+    ]
+    candidate_a_excess = [
+        value for value in candidate_a_excess if math.isfinite(value)
+    ]
+    candidate_b_excess = [
+        value for value in candidate_b_excess if math.isfinite(value)
+    ]
+    sampling_direction = "TIE_OR_UNAVAILABLE"
+    if candidate_a_excess and candidate_b_excess:
+        median_a = median(candidate_a_excess)
+        median_b = median(candidate_b_excess)
+        sampling_direction = (
+            "CURRENT" if median_a < median_b else
+            "PROPOSAL" if median_b < median_a else
+            "TIE_OR_UNAVAILABLE"
+        )
+    if ((nuclear_pattern in FINAL_NUCLEAR_PROPOSAL_PATTERNS
+         and sampling_direction == "CURRENT")
+            or (nuclear_pattern in FINAL_NUCLEAR_CURRENT_PATTERNS
+                and sampling_direction == "PROPOSAL")):
+        modifiers.add("SAMPLING_ADJUSTED_FIT_DISAGREEMENT")
+    nuclear_statuses = {
+        clean(row.get("nuclear_reconciliation_status")).upper()
+        for row in voting_rows
+    }
+    if (nuclear_pattern == "DIRECTION_TIE_OR_NONDISCRIMINATING"
+            or "NUCLEAR_NONDISCRIMINATING" in nuclear_statuses):
+        modifiers.add("NUCLEAR_NONDISCRIMINATING")
+    if "NUCLEAR_UNSTABLE" in nuclear_statuses:
+        modifiers.add("NUCLEAR_UNSTABLE")
+    if nuclear_statuses & {
+            "NUCLEAR_PAIR_INADEQUATE",
+            "NUCLEAR_PAIR_DOES_NOT_MATCH_CURRENT_COMPARISON",
+            "NUCLEAR_OUTSIDE_PAIR_CONTRACT"}:
+        modifiers.add("PAIR_INADEQUATE")
+    exclusion_text = ";".join(
+        clean(row.get("candidate_axis_exclusion_reason")).upper()
+        for row in linked
+    )
+    if any(token in exclusion_text for token in (
+            "INADEQUATE", "OUTSIDE_PAIR_CONTRACT", "PAIR_DOES_NOT_MATCH",
+            "NO_COMMON_EVIDENCE")):
+        modifiers.add("PAIR_INADEQUATE")
+    modifiers.add(_final_mito_modifier(linked))
+    ploidy_statuses = {
+        clean(row.get("ploidy_evidence_status")).upper() for row in linked
+    }
+    if ploidy_statuses & {"UNAVAILABLE", "CONFLICTED", "UNRESOLVED"}:
+        modifiers.add("PLOIDY_UNRESOLVED")
+    if any(_final_status_has_unresolved(row.get("occupancy_evidence_status"))
+           for row in linked):
+        modifiers.add("OCCUPANCY_UNRESOLVED")
+    if mechanism_disposition == "METADATA_OR_LIBRARY_EXCHANGE_UNRESOLVED":
+        modifiers.add("METADATA_OR_LIBRARY_EXCHANGE_UNRESOLVED")
+    relationship_pairs = [
+        (event.get("primary_source_identity"), event.get("unexpected_component")),
+        *(
+            (row.get("comparison_current_assignment"),
+             row.get("nominated_proposal"))
+            for row in linked
+        ),
+    ]
+    if any(
+            {"CHINOBO-MCHERRY", "CONGOA4B"} <= {
+                component.upper()
+                for value in pair
+                for component in donor_components(
+                    canonical_genotype(value or ""))
+            }
+            for pair in relationship_pairs):
+        modifiers.add("CHINOBO_CONGO_RELATED_PAIR")
+    return ";".join(
+        modifier for modifier in FINAL_PHASE3_MODIFIER_ORDER
+        if modifier in modifiers
+    ) or "NONE"
+
+
+def _final_event_review_scope(
+        event, identity_disposition, mechanism_disposition, modifiers,
+        explicit_event_review):
+    if identity_disposition == "BELOW_EVENT_MASS_THRESHOLD":
+        if explicit_event_review:
+            return "EVENT_REVIEW", "EXPLICIT_EVENT_REVIEW_RECORD"
+        return "NO_IMMEDIATE_REVIEW", "NONE"
+    reasons = set()
+    if identity_disposition in {
+            "RNA_SUPPORTS_CURRENT", "RNA_DISCORDANT", "RNA_INSUFFICIENT",
+            "AMBIENT_SUPPORTED_NUCLEAR_INCONCLUSIVE",
+            "NUCLEAR_SUPPORTED_AMBIENT_INCONCLUSIVE"}:
+        reasons.add("IDENTITY_EVIDENCE=" + identity_disposition)
+    if mechanism_disposition not in {"MECHANISM_SUPPORTED", "NOT_APPLICABLE"}:
+        reasons.add("MECHANISM=" + mechanism_disposition)
+    modifier_set = set(clean(modifiers).split(";"))
+    for modifier in (
+            "AMBIENT_REFIT_SENSITIVE", "NUCLEAR_CELL_HETEROGENEITY",
+            "SAMPLING_ADJUSTED_FIT_DISAGREEMENT", "NUCLEAR_UNSTABLE",
+            "PAIR_INADEQUATE", "MITO_DISCORDANT", "MITO_MIXED"):
+        if modifier in modifier_set:
+            reasons.add(modifier)
+    raw_reasons = _final_counter_keys(event.get("review_reason_counts"))
+    for reason in raw_reasons:
+        upper = reason.upper()
+        if (upper in {"EVENT_MECHANISM_REQUIRES_REVIEW", "LIBRARY_EXCHANGE_AMBIGUITY"}
+                or "METADATA_UID_" in upper
+                or upper.startswith("OCCUPANCY_")):
+            reasons.add(reason)
+    if explicit_event_review:
+        reasons.add("EXPLICIT_EVENT_REVIEW_RECORD")
+    if reasons:
+        return "EVENT_REVIEW", _final_set(reasons)
+    return "NO_IMMEDIATE_REVIEW", "NONE"
+
+
+def _final_cell_exception_reasons(row):
+    reasons = set()
+    production = canonical_genotype(row.get("production_assignment", ""))
+    current = canonical_genotype(row.get("comparison_current_assignment", ""))
+    proposal = canonical_genotype(row.get("nominated_proposal", ""))
+    nuclear = clean(row.get("nuclear_reconciliation_status")).upper()
+    if proposal and proposal != current:
+        if nuclear == "NUCLEAR_SUPPORTS_CURRENT" and production == proposal:
+            reasons.add("STABLE_CURRENT_SIDE_NUCLEAR_EVIDENCE_OPPOSES_PRODUCTION")
+        elif nuclear == "NUCLEAR_SUPPORTS_PROPOSAL" and production == current:
+            reasons.add("CELL_LOCAL_NUCLEAR_ASSIGNMENT_CONFLICT")
+    ploidy = clean(row.get("ploidy_evidence_status")).upper()
+    if ploidy in {"CONFLICTED", "SUPPORTS_CURRENT"} and production == proposal:
+        reasons.add("CELL_LOCAL_PLOIDY_CONFLICT")
+    occupancy = clean(row.get("occupancy_evidence_status")).upper()
+    if "CONFLICT" in occupancy and "UNRESOLVED" not in occupancy:
+        reasons.add("CELL_LOCAL_OCCUPANCY_CONFLICT")
+    if (clean(row.get("downstream_release_status")).upper()
+            == "EXCLUDED_TECHNICAL_MULTIPLET"):
+        reasons.add("TECHNICAL_MIXTURE_OR_MULTIPLET")
+    warnings = clean(row.get("nuclear_warning_reasons")).upper()
+    if "UPSTREAM_" in warnings:
+        reasons.add("CELL_LOCAL_UPSTREAM_ASSIGNMENT_WARNING")
+    if clean(row.get("review_record_scope")).upper() == "CELL":
+        reasons.add("EXPLICIT_CELL_REVIEW_RECORD")
+    return _final_set(reasons) or "NONE"
+
+
+def _final_markdown_counts(values):
+    counts = Counter(clean(value) or "NA" for value in values)
+    return "\n".join(
+        f"- `{key}`: {counts[key]}"
+        for key in sorted(counts, key=natural_key)
+    ) or "- `NONE`: 0"
+
+
+def _final_phase3_summary_text(
+        libraries, final_cells, final_events, actionable_review, review_input,
+        used_review_inputs, evidence_mode, nonfinalized_worsened):
+    library_numbers = [int(re.sub(r"\D", "", library)) for library in libraries]
+    deferred = [number for number in (38, 40) if number not in library_numbers]
+    assignment_changes = sum(
+        row["production_assignment"] != row["preliminary_reconciled_assignment"]
+        for row in final_cells
+    )
+    modifier_values = [
+        modifier
+        for row in final_events
+        for modifier in clean(row.get("evidence_modifiers")).split(";")
+        if modifier and modifier != "NONE"
+    ]
+
+    def event_text(row):
+        return (
+            f"{_final_library(row.get('library'))}/{clean(row.get('event_id'))}: "
+            f"{clean(row.get('identity_evidence_disposition'))}; "
+            f"mechanism={clean(row.get('mechanism_disposition'))}; "
+            f"modifiers={clean(row.get('evidence_modifiers'))}"
+        )
+
+    def exact_identity_event(library, candidate):
+        event_id = f"{library}:identity:{candidate}"
+        return [
+            row for row in final_events
+            if _final_library(row.get("library")) == library
+            and clean(row.get("event_id")) == event_id
+            and canonical_genotype(row.get("unexpected_component", ""))
+            == candidate
+        ]
+
+    def has_directional_candidate_axis(row):
+        return (
+            fint(row.get("n_nuclear_proposal_direction"), 0)
+            + fint(row.get("n_nuclear_current_direction"), 0)
+        ) > 0
+
+    named_specs = [
+        ("lib12 C40210+CongoA4B", "lib12", canonical_genotype("C40210+CongoA4B")),
+        ("lib4 C8861+H20961", "lib4", canonical_genotype("C8861+H20961")),
+        ("lib36 C3651+H20961", "lib36", canonical_genotype("C3651+H20961")),
+        ("lib36 Chinobo-mCherry+H20961", "lib36", canonical_genotype("Chinobo-mCherry+H20961")),
+        ("lib11 Chinobo-mCherry+CongoA4B", "lib11", canonical_genotype("Chinobo-mCherry+CongoA4B")),
+    ]
+    special_lines = []
+    for label, library, candidate in named_specs:
+        matches = exact_identity_event(library, candidate)
+        special_lines.append(
+            f"- {label}: "
+            + (" | ".join(event_text(row) for row in matches)
+               if matches else "NOT_FOUND_IN_SELECTED_EVENT_LEDGER")
+        )
+    for proposal in ("H20157", "H29089", "H21194", "H27322"):
+        matches = exact_identity_event("lib7", canonical_genotype(proposal))
+        special_lines.append(
+            f"- lib7 proposal group {proposal}: "
+            + (" | ".join(event_text(row) for row in matches)
+               if matches else "NOT_FOUND_IN_SELECTED_EVENT_LEDGER")
+        )
+
+    sampling_proposal_reversal_rows = sorted((
+        row for row in final_events
+        if "SAMPLING_ADJUSTED_FIT_DISAGREEMENT" in
+        clean(row.get("evidence_modifiers")).split(";")
+        and row.get("nuclear_event_pattern") in
+        FINAL_NUCLEAR_PROPOSAL_PATTERNS
+    ), key=lambda row: (
+        natural_key(_final_library(row.get("library"))),
+        natural_key(clean(row.get("event_id"))),
+    ))
+    sampling_current_reversal_rows = sorted((
+        row for row in final_events
+        if "SAMPLING_ADJUSTED_FIT_DISAGREEMENT" in
+        clean(row.get("evidence_modifiers")).split(";")
+        and row.get("nuclear_event_pattern") in
+        FINAL_NUCLEAR_CURRENT_PATTERNS
+    ), key=lambda row: (
+        natural_key(_final_library(row.get("library"))),
+        natural_key(clean(row.get("event_id"))),
+    ))
+    refit_reversal_rows = [
+        row for row in final_events
+        if has_directional_candidate_axis(row)
+        and row.get("controlled_ambient_pattern") == "CONTROLLED_SUPPORTS_PROPOSAL"
+        and row.get("refitted_ambient_pattern") == "REFIT_SUPPORTS_CURRENT"
+    ]
+    supported_rows = sorted(
+        (row for row in final_events
+         if row.get("identity_evidence_disposition") ==
+         "RNA_SUPPORTED_RECONCILIATION"
+         and row.get("mechanism_disposition") == "MECHANISM_SUPPORTED"
+         and row.get("review_scope") == "NO_IMMEDIATE_REVIEW"
+         and set(clean(row.get("evidence_modifiers")).split(";"))
+         <= {"NONE", "MITO_CONCORDANT"}),
+        key=lambda row: (
+            natural_key(_final_library(row.get("library"))),
+            natural_key(clean(row.get("event_id"))),
+        ),
+    )
+    event_libraries = {
+        _final_library(row.get("library")) for row in final_events
+    }
+    zero_event_libraries = [
+        library for library in libraries if library not in event_libraries
+    ]
+    not_applicable_rows = sorted(
+        (row for row in final_events
+         if row.get("identity_evidence_disposition") == "NOT_APPLICABLE"),
+        key=lambda row: (
+            natural_key(_final_library(row.get("library"))),
+            natural_key(clean(row.get("event_id"))),
+        ),
+    )
+    zero_or_not_applicable_example = (
+        zero_event_libraries[0] if zero_event_libraries else
+        event_text(not_applicable_rows[0]) if not_applicable_rows else
+        "NONE_AVAILABLE"
+    )
+    special_lines.extend([
+        "- Proposal-side median sampling-adjusted fit reversals: "
+        + (" | ".join(
+            event_text(row) for row in sampling_proposal_reversal_rows)
+           if sampling_proposal_reversal_rows
+           else "NONE_IN_SELECTED_EVENT_LEDGER"),
+        "- Separate current-side median sampling-adjusted disagreement "
+        "(excluded from the proposal-side reversal set): "
+        + (" | ".join(
+            event_text(row) for row in sampling_current_reversal_rows)
+           if sampling_current_reversal_rows
+           else "NONE_IN_SELECTED_EVENT_LEDGER"),
+        "- Finalized refitted-ambient reversals: "
+        + (" | ".join(event_text(row) for row in refit_reversal_rows)
+           if refit_reversal_rows else "NONE_IN_SELECTED_EVENT_LEDGER"),
+        "- Non-finalized controlled-ambient worsened candidate identities: "
+        + ("; ".join(nonfinalized_worsened)
+           if nonfinalized_worsened else "NONE_IN_AVAILABLE_CONTROLLED_EVIDENCE"),
+        "- Clean strongly supported example: "
+        + (event_text(supported_rows[0]) if supported_rows else "NONE_AVAILABLE"),
+        "- Zero-event/not-applicable example: "
+        + zero_or_not_applicable_example,
+    ])
+
+    return (
+        "# Identity Reconciliation Phase 3 Summary\n\n"
+        f"Selected libraries: {' '.join(str(number) for number in library_numbers)}  \n"
+        f"Deferred libraries: {' '.join(str(number) for number in deferred) or 'NONE'}  \n"
+        f"Evidence mode: {evidence_mode.upper()}  \n"
+        f"ATAC: {'ATAC_NOT_REQUESTED' if evidence_mode == 'rna' else 'RNA_ATAC'}  \n"
+        f"Review records present: {len(review_input)}  \n"
+        f"Review records applied: {len(used_review_inputs)}  \n"
+        f"Assignments changed relative to accepted Phase 2 production assignments: "
+        f"{assignment_changes}\n\n"
+        "## Accounting\n\n"
+        f"- Canonical ledger barcodes: {len(final_cells)}\n"
+        f"- Event/population rows: {len(final_events)}\n"
+        f"- Actionable event-review rows: "
+        f"{sum(row['review_level'] == 'EVENT_REVIEW' for row in actionable_review)}\n"
+        f"- Actionable cell-exception rows: "
+        f"{sum(row['review_level'] == 'CELL_EXCEPTION_REVIEW' for row in actionable_review)}\n\n"
+        "## Identity evidence dispositions\n\n"
+        + _final_markdown_counts(
+            row.get("identity_evidence_disposition") for row in final_events
+        ) + "\n\n"
+        "## Mechanism dispositions\n\n"
+        + _final_markdown_counts(
+            row.get("mechanism_disposition") for row in final_events
+        ) + "\n\n"
+        "## Evidence modifiers\n\n"
+        + _final_markdown_counts(modifier_values) + "\n\n"
+        "## Review scope counts\n\n"
+        "Event/population scope:\n\n"
+        + _final_markdown_counts(row.get("review_scope") for row in final_events)
+        + "\n\nCell scope:\n\n"
+        + _final_markdown_counts(row.get("review_scope") for row in final_cells)
+        + "\n\nActionable rows:\n\n"
+        + _final_markdown_counts(
+            row.get("review_level") for row in actionable_review
+        ) + "\n\n"
+        "## Fixed special-resolution set\n\n"
+        + "\n".join(special_lines) + "\n\n"
+        "The preliminary all-40 `reports/summary.md` is not authoritative for "
+        "this selected-scope Phase 3 result.\n"
+    )
+
+
+def _final_nonfinalized_controlled_worsened(
+        controlled, controlled_planned, selected_libraries,
+        finalized_candidate_axis_event_keys):
+    grouped = defaultdict(list)
+    for (library, barcode), rows in controlled.items():
+        if library not in selected_libraries:
+            continue
+        for row in rows:
+            event_id = clean(row.get("event_id"))
+            candidate = canonical_genotype(row.get("candidate_identity", ""))
+            plan_key = (library, barcode, event_id, candidate)
+            if (not event_id or event_id.upper() == "NA"
+                    or not candidate or candidate.upper() == "NA"
+                    or plan_key not in controlled_planned):
+                continue
+            event_key = (library, event_id, candidate)
+            value = _final_float(row.get("fixed_delta_c"))
+            if (event_key not in finalized_candidate_axis_event_keys
+                    and math.isfinite(value)):
+                grouped[event_key].append(value)
+    return [
+        f"{key[0]}/{key[1]}/{key[2]}"
+        for key, values in sorted(
+            grouped.items(),
+            key=lambda item: tuple(natural_key(value) for value in item[0]),
+        )
+        if values and median(values) > 0
+    ]
+
+
+def _final_read(path):
+    if not path:
+        return []
+    path = str(path)
+    return read_tsv(path) if os.path.isfile(path) else []
+
+
+def _final_merge_candidate_evidence(candidate, evidence, source):
+    for field, value in evidence.items():
+        if field not in candidate or not clean(candidate.get(field)):
+            candidate[field] = value
+            continue
+        if clean(candidate.get(field)) == clean(value):
+            continue
+        candidate[f"{source}_{field}"] = value
+
+
+def _final_axis_status(axis, exclusion, current, proposal, applicable):
+    warnings = set()
+    if not applicable:
+        return "NUCLEAR_NOT_APPLICABLE", warnings
+    if exclusion:
+        return "NUCLEAR_OUTSIDE_PAIR_CONTRACT", warnings
+    if not axis:
+        return "NUCLEAR_UNAVAILABLE", warnings
+    status = clean(axis.get("candidate_axis_status")).upper()
+    comparison = clean(axis.get("comparison_status_legacy")).upper()
+    structural_nonseparation = (
+        status == "INSUFFICIENT_CANDIDATE_SEPARATION"
+        or comparison == "PANEL_NONDISCRIMINATING")
+    if ((status not in {"AVAILABLE", "INSUFFICIENT_CANDIDATE_SEPARATION"}
+         and not structural_nonseparation)
+            or comparison in {"NO_COMMON_EVIDENCE", ""}):
+        return "NUCLEAR_UNAVAILABLE", warnings
+    candidate_a = canonical_genotype(axis.get("candidate_a", ""))
+    candidate_b = canonical_genotype(axis.get("candidate_b", ""))
+    if candidate_a != current or candidate_b != proposal:
+        return "NUCLEAR_PAIR_DOES_NOT_MATCH_CURRENT_COMPARISON", warnings
+    if structural_nonseparation:
+        return "NUCLEAR_NONDISCRIMINATING", warnings
+    direction = clean(axis.get("candidate_axis_direction")).upper()
+    if comparison == "LOW_EVIDENCE":
+        return "NUCLEAR_PAIR_INADEQUATE", warnings
+    if comparison == "NO_CANDIDATE_FITS":
+        warnings.add("LEGACY_RAW_RESIDUAL_NO_CANDIDATE_FITS")
+    raw_flag = clean(axis.get("raw_residual_threshold_flag")).upper()
+    if raw_flag not in {"", "NA", "UNAVAILABLE", "NEITHER_ABOVE_LEGACY_THRESHOLD"}:
+        warnings.add("RAW_RESIDUAL_THRESHOLD_WARNING=" + raw_flag)
+    unstable = (
+        clean(axis.get("candidate_axis_fold_direction_stability_status")).upper()
+        in {"DIRECTION_CHANGED_OR_TIED", "FOLD_RECONSTRUCTION_MISMATCH"}
+        or clean(axis.get("candidate_axis_direction_preserved_without_top_primary_unit")).upper()
+        == "FALSE"
+        or clean(axis.get("candidate_axis_direction_preserved_without_top_five_primary_units")).upper()
+        == "FALSE"
+    )
+    if unstable:
+        return "NUCLEAR_UNSTABLE", warnings
+    a_excess = _final_float(axis.get("candidate_a_excess_brier_mean"))
+    b_excess = _final_float(axis.get("candidate_b_excess_brier_mean"))
+    if math.isfinite(a_excess) and math.isfinite(b_excess) and a_excess != b_excess:
+        adjusted = "ORIGINAL_SIDE" if a_excess < b_excess else "PROPOSAL_SIDE"
+        if adjusted != direction:
+            warnings.add("SAMPLING_ADJUSTED_BRIER_DIRECTION_DISAGREEMENT")
+    if direction == "PROPOSAL_SIDE":
+        return "NUCLEAR_SUPPORTS_PROPOSAL", warnings
+    if direction == "ORIGINAL_SIDE":
+        return "NUCLEAR_SUPPORTS_CURRENT", warnings
+    if direction == "TIE":
+        return "NUCLEAR_NONDISCRIMINATING", warnings
+    return "NUCLEAR_UNAVAILABLE", warnings
+
+
+def _final_inferred_ploidy(genotype):
+    n_components = len(donor_components(genotype))
+    if n_components == 1:
+        return "DIPLOID"
+    if n_components == 2:
+        return "TETRAPLOID"
+    if n_components >= 3:
+        return "UNRESOLVED_MULTIPLET"
+    return "UNAVAILABLE"
+
+
+def _final_ploidy_status(preliminary, current, proposal):
+    if not proposal or proposal == current:
+        return "NOT_APPLICABLE"
+    current_state = (
+        clean(preliminary.get("current_ploidy"))
+        or _final_inferred_ploidy(current))
+    proposal_state = (
+        clean(preliminary.get("proposed_biological_ploidy"))
+        or _final_inferred_ploidy(proposal))
+    if current_state.upper() == proposal_state.upper():
+        return "NOT_APPLICABLE"
+    if not _final_bool(preliminary.get("nn_qc_pass")):
+        return "UNAVAILABLE"
+    call = clean(preliminary.get("nn_ploidy_call")).upper()
+    if not call:
+        return "UNAVAILABLE"
+    if proposal_state.upper().startswith(call[:3]) or call.startswith(proposal_state.upper()[:3]):
+        return "SUPPORTS_PROPOSAL"
+    if current_state.upper().startswith(call[:3]) or call.startswith(current_state.upper()[:3]):
+        return "SUPPORTS_CURRENT"
+    return "CONFLICTED"
+
+
+def _final_review_input(path):
+    if not path:
+        return {}
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"review input does not exist: {path}")
+    rows = read_tsv(path)
+    out = {}
+    for row in rows:
+        library = _final_library(row.get("library"))
+        target = clean(row.get("barcode_or_event_id"))
+        disposition = clean(row.get("review_disposition")).upper()
+        if not library or not target or disposition not in FINAL_REVIEW_DISPOSITIONS:
+            raise ValueError("review input has an invalid library, target, or disposition")
+        key = (library, target)
+        if key in out:
+            raise ValueError(f"duplicate review input target: {library}/{target}")
+        out[key] = {
+            "disposition": disposition,
+            "rationale": clean(row.get("rationale")),
+        }
+    return out
+
+
+def _final_demux_warning_rows(path):
+    warnings = {}
+    if not path or not os.path.isfile(path):
+        return warnings, "UNAVAILABLE"
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        fields = set(reader.fieldnames or ())
+        if "maximin_score" not in fields or not ({"barcode", "cell"} & fields):
+            return warnings, "UNAVAILABLE"
+        for row in reader:
+            barcode = clean(row.get("barcode") or row.get("cell"))
+            score = _final_float(row.get("maximin_score"))
+            if barcode and math.isfinite(score) and score <= 0:
+                winner = canonical_genotype(
+                    row.get("assignment", "")
+                    or row.get("maximin_winner", ""))
+                warnings[barcode] = (
+                    "UPSTREAM_B041_NONPOSITIVE_MAXIMIN"
+                    if "B041" in donor_components(winner) else
+                    "UPSTREAM_ACTIVE_NONPOSITIVE_MAXIMIN"
+                )
+    return warnings, "AVAILABLE"
+
+
+def _final_controlled_ambient(root):
+    root = Path(root) if root else None
+    rows = _final_read(root / "data" / "ambient_swap_cell_contrasts.tsv.gz") if root else []
+    planned_rows = _final_read(root / "data" / "ambient_swap_candidate_cells.tsv") if root else []
+    applicability = _final_read(root / "data" / "ambient_swap_library_applicability.tsv") if root else []
+    profile_by_library = {
+        _final_library(row.get("library")): _final_na(row.get("plan_fingerprint"))
+        for row in applicability
+    }
+    indexed = defaultdict(list)
+    for row in rows:
+        indexed[(_final_library(row.get("library")), clean(row.get("barcode")))].append(row)
+    planned = {
+        (
+            _final_library(row.get("library")), clean(row.get("barcode")),
+            clean(row.get("event_id")),
+            canonical_genotype(row.get("candidate_identity", "")),
+        )
+        for row in planned_rows
+        if clean(row.get("barcode")) and clean(row.get("event_id"))
+        and canonical_genotype(row.get("candidate_identity", ""))
+    }
+    return indexed, profile_by_library, planned
+
+
+def _final_four_arm_ambient(root):
+    root = Path(root) if root else None
+    data = root / "data" if root else None
+    contrasts = _final_read(data / "reconciliation_planned_contrast_cells.tsv") if data else []
+    summaries = _final_read(data / "reconciliation_planned_contrasts.tsv") if data else []
+    burdens = _final_read(data / "reconciliation_exact_donor_burden.tsv") if data else []
+    pivot = defaultdict(dict)
+    strata = {}
+    for row in contrasts:
+        key = (_final_library(row.get("library")), clean(row.get("barcode")))
+        name = clean(row.get("contrast"))
+        pivot[key][name] = row
+        strata[key] = clean(row.get("stratum")) or "full_library"
+    summary_index = defaultdict(list)
+    for row in summaries:
+        summary_index[_final_library(row.get("library"))].append(row)
+    burden_index = defaultdict(list)
+    for row in burdens:
+        burden_index[_final_library(row.get("library"))].append(row)
+    return pivot, strata, summary_index, burden_index
+
+
+def _final_four_arm_fields(library, barcode, event_bearing, pivot, strata,
+                           summaries, burdens):
+    key = (library, barcode)
+    comparisons = pivot.get(key, {})
+    roster = comparisons.get("roster_effect_demux", {})
+    assignment = comparisons.get("assignment_effect_augmented", {})
+    replacement = comparisons.get("replacement_sensitivity", {})
+    combined = comparisons.get("combined_production_change", {})
+    arm_a = roster.get("left_rate") or combined.get("left_rate")
+    arm_b = roster.get("right_rate") or assignment.get("left_rate")
+    arm_c = assignment.get("right_rate") or replacement.get("left_rate") or combined.get("right_rate")
+    arm_d = replacement.get("right_rate")
+    production_arm = "C" if event_bearing else "A"
+    production_c = arm_c if production_arm == "C" else arm_a
+    population = strata.get(key, "full_library")
+    matching_burdens = [
+        row for row in burdens.get(library, [])
+        if clean(row.get("arm")) == production_arm
+        and clean(row.get("population")) in {population, "full_library"}
+    ]
+    preferred_population = population if any(
+        clean(row.get("population")) == population for row in matching_burdens
+    ) else "full_library"
+    burden_text = ";".join(
+        f"{clean(row.get('source_label'))}={_final_na(row.get('mean_exact_contam_burden'))}"
+        for row in sorted(matching_burdens, key=lambda item: natural_key(clean(item.get("source_label"))))
+        if clean(row.get("population")) == preferred_population
+    ) or "NA"
+    background_text = ";".join(
+        f"{clean(row.get('contrast'))}:n={_final_na(row.get('n_common'))},mean={_final_na(row.get('mean_delta'))},median={_final_na(row.get('median_delta'))}"
+        for row in sorted(summaries.get(library, []), key=lambda item: natural_key(clean(item.get("contrast"))))
+        if clean(row.get("population")) == "background"
+    ) or "NA"
+    required = {"roster_effect_demux", "assignment_effect_augmented", "combined_production_change"}
+    if not event_bearing:
+        status = "NOT_APPLICABLE_ZERO_EVENT"
+    elif not comparisons:
+        status = "PLANNED_CELL_MISSING_FROM_ALL_RECONCILIATION_ARMS"
+    elif not required <= set(comparisons):
+        status = "PARTIALLY_PAIRED_RECONCILIATION_ARMS"
+    elif replacement:
+        status = "PAIRED_A_B_C_D"
+    else:
+        status = "PAIRED_A_B_C_D_NOT_APPLICABLE"
+    return {
+        "ambient_arm_a_c": _final_na(arm_a),
+        "ambient_arm_b_c": _final_na(arm_b),
+        "ambient_arm_c_c": _final_na(arm_c),
+        "ambient_arm_d_c": _final_na(arm_d),
+        "ambient_roster_effect_b_minus_a": _final_na(roster.get("right_minus_left")),
+        "ambient_assignment_effect_c_minus_b": _final_na(assignment.get("right_minus_left")),
+        "ambient_replacement_effect_d_minus_c": _final_na(replacement.get("right_minus_left")),
+        "ambient_combined_augmented_c_minus_a": _final_na(combined.get("right_minus_left")),
+        "ambient_production_arm": production_arm,
+        "ambient_production_c": _final_na(production_c),
+        "ambient_production_minus_original_c": _final_na(
+            combined.get("right_minus_left") if production_arm == "C" else 0),
+        "ambient_exact_donor_burden_fields": burden_text,
+        "ambient_background_shift_fields": background_text,
+        "ambient_evaluation_status": status,
+    }
+
+
+def finalize_main():
+    args = finalize_parse_args()
+    library_numbers = parse_library_spec(args.libraries)
+    libraries = [f"lib{number}" for number in library_numbers]
+    output_root = Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    decisions_root = Path(args.decisions_root)
+    candidate_root = Path(args.candidate_root)
+    event_rows = _final_read(decisions_root / "all_libraries.identity_events.tsv")
+    exchange_rows = _final_read(
+        decisions_root / "all_libraries.library_exchange_events.tsv")
+    amendment_rows = _final_read(
+        decisions_root / "all_libraries.metadata_amendments_proposed.tsv")
+    selected_libraries = set(libraries)
+    event_rows = [
+        row for row in event_rows
+        if _final_library(row.get("library")) in selected_libraries
+    ]
+    final_event_keys = {
+        (
+            _final_library(row.get("library")),
+            clean(row.get("event_id")),
+            canonical_genotype(row.get("unexpected_component", "")),
+        )
+        for row in event_rows
+        if clean(row.get("event_id"))
+        and canonical_genotype(row.get("unexpected_component", ""))
+    }
+    event_bearing = {
+        _final_library(row.get("library")) for row in event_rows
+        if _final_library(row.get("library")) in selected_libraries
+    }
+
+    exchange_by_library = defaultdict(list)
+    for row in exchange_rows:
+        for own, other in (("library_a", "library_b"), ("library_b", "library_a")):
+            library = _final_library(row.get(own))
+            if library:
+                exchange_by_library[library].append(
+                    f"{_final_library(row.get(other))}:"
+                    f"{_final_na(row.get('exchange_interpretation'))}:"
+                    f"{_final_na(row.get('reciprocal_exchange_status'))}"
+                )
+    amendment_by_key = defaultdict(list)
+    for row in amendment_rows:
+        key = (
+            _final_library(row.get("library")),
+            canonical_genotype(row.get("proposed_donor_genotype", "")),
+        )
+        amendment_by_key[key].append(
+            f"{_final_na(row.get('proposed_metadata_event'))}:"
+            f"{_final_na(row.get('uid_resolution_status'))}"
+        )
+
+    axis_root = Path(args.candidate_axis_root) if args.candidate_axis_root else None
+    if axis_root and (axis_root / "aggregate").is_dir():
+        axis_root = axis_root / "aggregate"
+    axis_rows = _final_read(axis_root / "candidate_axis_cell_scores.tsv.gz") if axis_root else []
+    exclusion_rows = _final_read(axis_root / "candidate_axis_pair_exclusions.tsv.gz") if axis_root else []
+    axis_rows = [
+        row for row in axis_rows
+        if (
+            _final_library(row.get("library")),
+            clean(row.get("selected_supported_event_id")),
+            canonical_genotype(
+                row.get("selected_supported_event_proposal", "")),
+        ) in final_event_keys
+    ]
+    exclusion_rows = [
+        row for row in exclusion_rows
+        if (
+            _final_library(row.get("library")),
+            clean(row.get("selected_supported_event_id")),
+            canonical_genotype(
+                row.get("selected_supported_event_proposal", "")),
+        ) in final_event_keys
+    ]
+    axis_fields = []
+    for row in axis_rows:
+        for field in row:
+            if field not in axis_fields:
+                axis_fields.append(field)
+    axis_by_cell = defaultdict(list)
+    for row in axis_rows:
+        axis_by_cell[(_final_library(row.get("library")), clean(row.get("barcode")))].append(row)
+    exclusion_by_cell = defaultdict(list)
+    for row in exclusion_rows:
+        exclusion_by_cell[(_final_library(row.get("library")), clean(row.get("barcode")))].append(row)
+
+    controlled, frozen_profile_by_library, controlled_planned = (
+        _final_controlled_ambient(args.frozen_ambient_root))
+    four_pivot, four_strata, four_summaries, four_burdens = (
+        _final_four_arm_ambient(args.four_arm_root))
+    review_input = _final_review_input(args.review_input)
+
+    preliminary_by_cell = {}
+    demux_by_library = {}
+    demux_warnings = {}
+    demux_warning_provenance = {}
+    all_candidate_audit = []
+    candidate_audit_fields = []
+    for number, library in zip(library_numbers, libraries):
+        prefix = demux_prefix(args.demux_root, number)
+        demux = read_assignments(prefix + ".assignments")
+        demux_by_library[library] = demux
+        diagnostic_path = prefix + ".diagnostics.gz"
+        (demux_warnings[library], demux_warning_provenance[library]) = (
+            _final_demux_warning_rows(diagnostic_path))
+        decision_path = decisions_root / f"{library}.reconciled_cells.tsv.gz"
+        rows = _final_read(decision_path)
+        indexed = {}
+        for row in rows:
+            barcode = clean(row.get("barcode"))
+            if not barcode or barcode in indexed:
+                raise ValueError(f"{library} preliminary decision table has a blank or duplicate barcode")
+            indexed[barcode] = row
+            preliminary_by_cell[(library, barcode)] = row
+        if set(indexed) != set(demux):
+            missing = sorted(set(demux) - set(indexed), key=natural_key)
+            extra = sorted(set(indexed) - set(demux), key=natural_key)
+            raise ValueError(
+                f"{library} preliminary/demux barcode accounting mismatch; "
+                f"missing={missing[:10]} extra={extra[:10]}"
+            )
+        candidate_rows = _final_read(candidate_root / f"{library}.identity_candidate_audit.tsv.gz")
+        identity_root = decisions_root.parent
+        evidence_sources = [
+            ("nuclear", identity_root / "nuclear" /
+             f"{library}.identity_hypothesis_scores.tsv.gz"),
+            ("mt", identity_root / "mt" /
+             f"{library}.mt_identity_scores.tsv.gz"),
+        ]
+        if args.evidence_mode == "rna-atac":
+            evidence_sources.append((
+                "atac", identity_root / "atac" /
+                f"{library}.atac_identity_scores.tsv.gz"))
+        evidence_by_source = {}
+        for source, path in evidence_sources:
+            indexed_evidence = {}
+            for evidence in _final_read(path):
+                evidence_key = (
+                    clean(evidence.get("barcode")),
+                    clean(evidence.get("hypothesis_id")),
+                )
+                if not all(evidence_key):
+                    continue
+                if evidence_key in indexed_evidence:
+                    raise ValueError(
+                        f"{library} {source} candidate evidence has a duplicate "
+                        f"barcode/hypothesis key: {evidence_key[0]}/{evidence_key[1]}")
+                indexed_evidence[evidence_key] = evidence
+            evidence_by_source[source] = indexed_evidence
+        candidate_folds = fold_map(str(
+            identity_root / "nuclear" /
+            f"{library}.identity_site_fold_scores.tsv.gz"))
+        for row in candidate_rows:
+            evidence_key = (
+                clean(row.get("barcode")), clean(row.get("hypothesis_id")))
+            if all(evidence_key):
+                for source, indexed_evidence in evidence_by_source.items():
+                    evidence = indexed_evidence.get(evidence_key)
+                    if evidence:
+                        _final_merge_candidate_evidence(row, evidence, source)
+                fold = candidate_folds.get(evidence_key)
+                if fold:
+                    _final_merge_candidate_evidence(row, fold, "nuclear_fold")
+            for field in row:
+                if field not in candidate_audit_fields:
+                    candidate_audit_fields.append(field)
+        all_candidate_audit.extend(candidate_rows)
+
+    selected_axis = {}
+    selected_exclusion = {}
+    used_review_inputs = set()
+    final_cells = []
+    for library in libraries:
+        demux = demux_by_library[library]
+        for barcode in sorted(demux, key=natural_key):
+            preliminary = preliminary_by_cell[(library, barcode)]
+            demux_raw = clean(demux[barcode].get("assignment"))
+            original = canonical_genotype(
+                preliminary.get("original_demux_assignment", ""))
+            if original != canonical_genotype(demux_raw):
+                raise ValueError(
+                    f"{library}/{barcode} immutable demux assignment mismatch")
+            refined = canonical_genotype(
+                preliminary.get("current_refined_assignment", ""))
+            current = refined or original
+            proposal = canonical_genotype(
+                preliminary.get("proposed_donor_genotype", ""))
+            event_id = clean(preliminary.get("event_id"))
+            action = clean(preliminary.get("final_action")).upper()
+            prelim_applied = _final_bool(preliminary.get("reassignment_applied"))
+            prelim_production = canonical_genotype(
+                preliminary.get("reconciled_donor_genotype", "")) or current
+            active_proposal = bool(proposal and proposal != current)
+
+            available_axis = axis_by_cell.get((library, barcode), [])
+            matching_axis = [
+                row for row in available_axis
+                if (not event_id or clean(row.get("selected_supported_event_id")) == event_id)
+                and (not proposal or canonical_genotype(row.get("candidate_b", "")) == proposal)
+            ]
+            axis = sorted(
+                matching_axis or available_axis,
+                key=lambda row: natural_key(clean(row.get("score_pair_id"))))[0] \
+                if (matching_axis or available_axis) else {}
+            available_exclusions = exclusion_by_cell.get((library, barcode), [])
+            matching_exclusions = [
+                row for row in available_exclusions
+                if (not event_id or clean(row.get("selected_supported_event_id")) == event_id)
+                and (not proposal or canonical_genotype(
+                    row.get("selected_supported_event_proposal", "")) == proposal)
+            ]
+            exclusion = sorted(
+                matching_exclusions,
+                key=lambda row: natural_key(clean(row.get("exclusion_reason"))))[0] \
+                if matching_exclusions else {}
+            selected_axis[(library, barcode)] = axis
+            selected_exclusion[(library, barcode)] = exclusion
+            nuclear_status, nuclear_warnings = _final_axis_status(
+                axis, exclusion, current, proposal,
+                active_proposal and bool(event_id),
+            )
+            if len(available_axis) > 1:
+                nuclear_warnings.add("MULTIPLE_CANDIDATE_AXIS_ROWS")
+            if demux_warnings[library].get(barcode):
+                nuclear_warnings.add(demux_warnings[library][barcode])
+
+            axis_a = canonical_genotype(axis.get("candidate_a", ""))
+            axis_b = canonical_genotype(axis.get("candidate_b", ""))
+            if axis_a or axis_b:
+                relationship = ";".join((
+                    "A=CURRENT" if axis_a == current else
+                    "A=ORIGINAL_DEMUX" if axis_a == original else "A=OTHER",
+                    "B=PROPOSAL" if axis_b == proposal else "B=OTHER",
+                ))
+            else:
+                relationship = "NOT_APPLICABLE" if not active_proposal else "NO_EMITTED_PAIR"
+
+            frozen_candidates = controlled.get((library, barcode), [])
+            frozen_matching = [
+                row for row in frozen_candidates
+                if (not event_id or clean(row.get("event_id")) == event_id)
+                and (not proposal or canonical_genotype(row.get("candidate_identity", "")) == proposal)
+            ]
+            frozen = sorted(
+                frozen_matching,
+                key=lambda row: natural_key(clean(row.get("condition"))))[0] \
+                if frozen_matching else {}
+            frozen_plan_key = (library, barcode, event_id, proposal)
+            if not active_proposal:
+                frozen_status = "NOT_APPLICABLE"
+            elif frozen:
+                frozen_current = canonical_genotype(frozen.get("original_identity", ""))
+                frozen_proposal = canonical_genotype(frozen.get("candidate_identity", ""))
+                frozen_status = (
+                    "PAIRED_FIXED_PROFILE_FIT_NOT_EMITTED"
+                    if frozen_current == current and frozen_proposal == proposal else
+                    "PAIRED_ENDPOINTS_DO_NOT_MATCH_CURRENT_COMPARISON"
+                )
+            elif frozen_plan_key in controlled_planned:
+                frozen_status = "PLANNED_NOT_EMITTED"
+            else:
+                frozen_status = "NOT_PLANNED_OR_NOT_APPLICABLE"
+            frozen_fields = {
+                "ambient_frozen_current_c": _final_na(frozen.get("fixed_original_c")),
+                "ambient_frozen_proposal_c": _final_na(frozen.get("fixed_proposed_c")),
+                "ambient_frozen_proposal_minus_current_c": _final_na(frozen.get("fixed_delta_c")),
+                "ambient_frozen_current_fit": "NA",
+                "ambient_frozen_proposal_fit": "NA",
+                "ambient_frozen_fit_delta": "NA",
+                "ambient_frozen_current_exact_candidate_burden": "NA",
+                "ambient_frozen_proposal_exact_candidate_burden": "NA",
+                "ambient_frozen_profile_id": frozen_profile_by_library.get(library, "NA"),
+                "ambient_frozen_evaluation_status": frozen_status,
+            }
+            four_fields = _final_four_arm_fields(
+                library, barcode, library in event_bearing, four_pivot,
+                four_strata, four_summaries, four_burdens,
+            )
+
+            ploidy_status = _final_ploidy_status(
+                preliminary, current, proposal)
+            occupancy = clean(preliminary.get("occupancy_resolution_status")) or "NOT_APPLICABLE"
+            technical_state = clean(preliminary.get("competing_technical_state"))
+            if (not technical_state and
+                    clean(preliminary.get("proposed_droplet_state")) ==
+                    "TECHNICAL_MULTIPLET_CANDIDATE"):
+                technical_state = (
+                    clean(preliminary.get("proposed_droplet_constituents"))
+                    or "TECHNICAL_MULTIPLET_CANDIDATE")
+            technical_state = technical_state or "NOT_APPLICABLE"
+
+            review_reasons = set()
+            if active_proposal and nuclear_status in {
+                    "NUCLEAR_SUPPORTS_CURRENT", "NUCLEAR_UNSTABLE",
+                    "NUCLEAR_NONDISCRIMINATING", "NUCLEAR_PAIR_INADEQUATE",
+                    "NUCLEAR_PAIR_DOES_NOT_MATCH_CURRENT_COMPARISON",
+                    "NUCLEAR_OUTSIDE_PAIR_CONTRACT", "NUCLEAR_UNAVAILABLE"}:
+                review_reasons.add(nuclear_status)
+            if active_proposal and ploidy_status in {"UNAVAILABLE", "CONFLICTED", "SUPPORTS_CURRENT"}:
+                review_reasons.add("PLOIDY_" + ploidy_status)
+            if "UNRESOLVED" in occupancy or "AMBIG" in occupancy:
+                review_reasons.add("OCCUPANCY_" + occupancy)
+            if technical_state != "NOT_APPLICABLE" or _final_bool(
+                    preliminary.get("explicit_multiplet_evidence")):
+                review_reasons.add("TECHNICAL_MIXTURE_OR_MULTIPLET")
+            mt_status = clean(preliminary.get("mt_alternative_status")) or "MISSING"
+            if active_proposal and mt_status in {"SUPPORTS_CURRENT", "CONTRADICTS"}:
+                review_reasons.add("MITOCHONDRIAL_" + mt_status)
+            uid_status = clean(preliminary.get("uid_resolution_status")) or "UNAVAILABLE"
+            if any(token in uid_status for token in ("CONFLICT", "MISSING")):
+                review_reasons.add("METADATA_UID_" + uid_status)
+            upstream_warning = demux_warnings[library].get(barcode)
+            if upstream_warning:
+                review_reasons.add(upstream_warning)
+            event_class = clean(preliminary.get("event_class"))
+            if active_proposal and (
+                    "UNRESOLVED" in event_class
+                    or clean(preliminary.get("event_confidence")) in {"INSUFFICIENT", "SUGGESTIVE"}):
+                review_reasons.add("EVENT_MECHANISM_REQUIRES_REVIEW")
+            library_exchange_status = _final_set(exchange_by_library.get(library, [])) or "NONE"
+            if active_proposal and any(token in library_exchange_status for token in (
+                    "PARTIAL_RECIPROCAL", "UNRESOLVED", "ROSTER_EQUIVALENT")):
+                review_reasons.add("LIBRARY_EXCHANGE_AMBIGUITY")
+            frozen_delta = _final_float(frozen_fields[
+                "ambient_frozen_proposal_minus_current_c"])
+            refit_delta = _final_float(four_fields[
+                "ambient_assignment_effect_c_minus_b"])
+            if (math.isfinite(frozen_delta) and math.isfinite(refit_delta)
+                    and frozen_delta != 0 and refit_delta != 0
+                    and (frozen_delta < 0) != (refit_delta < 0)):
+                review_reasons.add(
+                    "AMBIENT_CONTROLLED_REFITTED_DIRECTION_CONFLICT")
+
+            if not active_proposal:
+                recommendation = "NOT_APPLICABLE"
+                interpreted = current
+                recommendation_basis = "NO_ACTIVE_RECONCILIATION_PROPOSAL"
+            elif prelim_applied or action in {"REASSIGN_GENOTYPE", "RECLASSIFY_PLOIDY"}:
+                recommendation = "USE_PROPOSAL"
+                interpreted = proposal
+                recommendation_basis = "PRELIMINARY_RECONCILIATION_ACTION"
+            elif action == "KEEP":
+                recommendation = "USE_CURRENT"
+                interpreted = current
+                recommendation_basis = "PRELIMINARY_RECONCILIATION_KEEP"
+            else:
+                recommendation = "UNRESOLVED"
+                interpreted = "UNRESOLVED"
+                recommendation_basis = "PRELIMINARY_RECONCILIATION_REVIEW"
+
+            cell_review_key = (library, barcode)
+            event_review_key = (library, event_id) if event_id else None
+            review = review_input.get(cell_review_key, {})
+            review_record_scope = "CELL" if review else "NONE"
+            review_record_target = barcode if review else "NA"
+            review_key = cell_review_key if review else None
+            if not review and event_review_key:
+                review = review_input.get(event_review_key, {})
+                if review:
+                    review_record_scope = "EVENT"
+                    review_record_target = event_id
+                    review_key = event_review_key
+            if review:
+                used_review_inputs.add(review_key)
+            disposition = review.get("disposition", "")
+            rationale = review.get("rationale", "")
+            production = prelim_production
+            production_source = (
+                "PRELIMINARY_RECONCILIATION_APPLIED"
+                if prelim_applied else
+                "REFINED_ASSIGNMENT" if refined else "DEMUX_ORIGINAL_ASSIGNMENT"
+            )
+            if disposition == "ACCEPT_PROPOSAL":
+                if not active_proposal:
+                    raise ValueError(
+                        f"review ACCEPT_PROPOSAL has no active proposal: {library}/{barcode}")
+                recommendation = "USE_PROPOSAL"
+                interpreted = proposal
+                production = proposal
+                production_source = "EXPLICIT_REVIEW_ACCEPT_PROPOSAL"
+                application_state = "APPLIED"
+                application_reason = rationale or disposition
+            elif disposition == "KEEP_CURRENT":
+                recommendation = "USE_CURRENT"
+                interpreted = current
+                production = current
+                production_source = "EXPLICIT_REVIEW_KEEP_CURRENT"
+                application_state = "NOT_APPLIED"
+                application_reason = rationale or disposition
+            elif disposition == "LEAVE_UNRESOLVED":
+                recommendation = "UNRESOLVED"
+                interpreted = "UNRESOLVED"
+                application_state = "HELD_FOR_REVIEW"
+                application_reason = rationale or disposition
+            elif not active_proposal:
+                application_state = "NOT_APPLICABLE"
+                application_reason = "NO_ACTIVE_RECONCILIATION_PROPOSAL"
+            elif prelim_applied:
+                application_state = "APPLIED"
+                application_reason = "PRESERVED_PRELIMINARY_APPLICATION"
+            elif review_reasons or action != "KEEP":
+                application_state = "HELD_FOR_REVIEW"
+                application_reason = "PRESERVED_PRELIMINARY_NONAPPLICATION"
+            else:
+                application_state = "NOT_APPLIED"
+                application_reason = "PRESERVED_PRELIMINARY_CURRENT_STATE"
+
+            review_required = bool(review_reasons) and not disposition
+            current_droplet = clean(preliminary.get("reconciled_droplet_state"))
+            if current_droplet == "TECHNICAL_MULTIPLET":
+                release = "EXCLUDED_TECHNICAL_MULTIPLET"
+                exclusion_reason = "TECHNICAL_MULTIPLET"
+            elif disposition == "LEAVE_UNRESOLVED" or review_required:
+                release = "HELD_FOR_REVIEW"
+                exclusion_reason = _final_set(review_reasons) or "UNRESOLVED"
+            elif not production:
+                release = "EXCLUDED_NO_PRODUCTION_ASSIGNMENT"
+                exclusion_reason = "NO_PRODUCTION_ASSIGNMENT"
+            else:
+                release = "READY"
+                exclusion_reason = "NONE"
+
+            proposal_kind = (
+                "NOT_APPLICABLE" if not proposal else
+                "TECHNICAL_MULTIPLET_HYPOTHESIS"
+                if clean(preliminary.get("proposed_droplet_state")) ==
+                "TECHNICAL_MULTIPLET_CANDIDATE" else
+                "BIOLOGICAL_SINGLE_CELL_IDENTITY")
+            row = {
+                "library": library, "barcode": barcode,
+                "demux_original_assignment": original,
+                "demux_original_assignment_raw": demux_raw,
+                "refined_assignment": refined or "NA",
+                "comparison_current_assignment": current,
+                "nominated_proposal": proposal or "NA", "event_id": event_id or "NA",
+                "preliminary_reconciliation_action": action or "NA",
+                "preliminary_action_applied": "TRUE" if prelim_applied else "FALSE",
+                "preliminary_reconciled_assignment": prelim_production,
+                "preliminary_decision_confidence": _final_na(
+                    preliminary.get("decision_confidence")),
+                "preliminary_decision_reason_codes": _final_na(
+                    preliminary.get("decision_reason_codes")),
+                "interpreted_identity": interpreted,
+                "scientific_recommendation": recommendation,
+                "recommendation_basis": recommendation_basis,
+                "review_required": "TRUE" if review_required else "FALSE",
+                "review_reasons": _final_set(review_reasons) or "NONE",
+                "review_disposition": disposition or (
+                    "PENDING" if review_required else "NONE"),
+                "review_rationale": rationale or "NA",
+                "review_record_scope": review_record_scope,
+                "review_record_target": review_record_target,
+                "application_state": application_state,
+                "application_reason": application_reason,
+                "production_assignment": production,
+                "production_assignment_source": production_source,
+                "candidate_roster_relationship": _final_na(
+                    preliminary.get("singlet_library_relationship")
+                    or preliminary.get("proposed_library_expected_status")),
+                "proposal_kind": proposal_kind,
+                "proposal_components": ",".join(donor_components(proposal)) or "NA",
+                "axis_candidate_a_assignment": axis_a or "NA",
+                "axis_candidate_b_assignment": axis_b or "NA",
+                "axis_pair_relationship_to_current_proposal": relationship,
+                "candidate_axis_scope_status": (
+                    _final_na(axis.get("candidate_axis_status")) if axis else
+                    "EXCLUDED" if exclusion else
+                    "NOT_APPLICABLE" if not active_proposal else "UNAVAILABLE"),
+                "candidate_axis_exclusion_reason": _final_na(
+                    exclusion.get("exclusion_reason")),
+                "nuclear_reconciliation_status": nuclear_status,
+                "nuclear_warning_reasons": _final_set(nuclear_warnings) or "NONE",
+                "current_donor_composition": ",".join(donor_components(current)),
+                "proposal_donor_composition": ",".join(donor_components(proposal)) or "NA",
+                "current_ploidy_state": _final_na(
+                    preliminary.get("current_ploidy")
+                    or _final_inferred_ploidy(current)),
+                "proposal_ploidy_state": _final_na(
+                    preliminary.get("proposed_biological_ploidy")
+                    or (_final_inferred_ploidy(proposal) if proposal else "")),
+                "ploidy_evidence_status": ploidy_status,
+                "occupancy_state": _final_na(
+                    preliminary.get("proposed_droplet_state")
+                    or preliminary.get("reconciled_droplet_state")),
+                "occupancy_evidence_status": occupancy,
+                "known_line_relationship": _final_na("|".join(filter(None, (
+                    clean(preliminary.get("proposed_global_biological_status")),
+                    clean(preliminary.get("proposed_library_expected_status")))))),
+                "technical_state": technical_state,
+                "species_evidence_status": "CURRENT=" + _final_na(
+                    preliminary.get("species_current_status")) + ";PROPOSAL=" +
+                    _final_na(preliminary.get("species_alternative_status")),
+                "mitochondrial_evidence_status": _final_na(mt_status),
+                "mitochondrial_resolution_status": _final_na(
+                    preliminary.get("mt_haplotype_resolution")
+                    or preliminary.get("mt_fit_status")),
+                "atac_evidence_status": (
+                    "ATAC_NOT_REQUESTED" if args.evidence_mode == "rna" else
+                    _final_na(preliminary.get("atac_status"))),
+                **frozen_fields, **four_fields,
+                "uid_resolution_status": uid_status,
+                "uid_or_uid_set": _final_na(
+                    preliminary.get("reconciled_uid")
+                    or preliminary.get("uid_candidates")),
+                "metadata_event_status": event_class or "NO_EVENT",
+                "metadata_amendment_proposal": _final_set(
+                    amendment_by_key.get((library, proposal), [])) or "NONE",
+                "library_exchange_status": library_exchange_status,
+                "downstream_release_status": release,
+                "downstream_exclusion_reason": exclusion_reason,
+                "event_identity_evidence_disposition": "NOT_DERIVED",
+                "event_review_scope": "NOT_DERIVED",
+                "review_scope": "NO_IMMEDIATE_REVIEW",
+                "cell_exception_reasons": "NONE",
+                "policy_version": _final_na(preliminary.get("policy_version")),
+                "run_id": args.run_id or "NA",
+                "final_schema_version": FINAL_SCHEMA_VERSION,
+            }
+            for field in axis_fields:
+                if field not in row:
+                    row[field] = axis.get(field, "NA") if axis else "NA"
+            final_cells.append(row)
+
+    unused_review_inputs = sorted(
+        set(review_input) - used_review_inputs,
+        key=lambda key: (natural_key(key[0]), natural_key(key[1])))
+    if unused_review_inputs:
+        raise ValueError(
+            "review input contains targets that do not map to an exact selected "
+            "library/barcode-or-event-id: "
+            + ", ".join(f"{library}/{target}"
+                        for library, target in unused_review_inputs[:10]))
+
+    final_cell_index = {
+        (row["library"], row["barcode"]): row for row in final_cells
+    }
+    if len(final_cell_index) != len(final_cells):
+        raise ValueError("canonical final-cell ledger contains duplicate keys")
+
+    audit_by_cell = defaultdict(list)
+    for row in all_candidate_audit:
+        audit_by_cell[(_final_library(row.get("library")), clean(row.get("barcode")))].append(row)
+    for key in sorted(
+            final_cell_index,
+            key=lambda item: (natural_key(item[0]), natural_key(item[1]))):
+        rows = audit_by_cell.get(key, [])
+        if not rows:
+            raise ValueError(
+                f"candidate audit has no rows for selected cell: {key[0]}/{key[1]}")
+        preliminary = preliminary_by_cell.get(key, {})
+        current = canonical_genotype(
+            preliminary.get("current_refined_assignment", "")
+            or preliminary.get("original_demux_assignment", ""))
+        proposal = canonical_genotype(preliminary.get("proposed_donor_genotype", ""))
+        active = bool(proposal and proposal != current)
+        axis = selected_axis.get(key, {})
+        exclusion = selected_exclusion.get(key, {})
+        endpoints = {
+            "A": canonical_genotype(
+                axis.get("candidate_a", "")
+                or exclusion.get("original_demux_assignment", "")),
+            "B": canonical_genotype(
+                axis.get("candidate_b", "")
+                or exclusion.get("selected_supported_event_proposal", "")
+                or exclusion.get("proposed_donor_genotype", "")),
+        }
+        for role, endpoint in endpoints.items():
+            if not endpoint or any(
+                    canonical_genotype(row.get("candidate_canonical", "")) == endpoint
+                    for row in rows):
+                continue
+            source_field = f"candidate_{role.lower()}_origin"
+            raw_field = f"candidate_{role.lower()}"
+            synthetic = {
+                "library": key[0],
+                "barcode": key[1],
+                "event_id": clean(preliminary.get("event_id")) or "NA",
+                "candidate_raw": clean(axis.get(raw_field)) or endpoint,
+                "candidate_canonical": endpoint,
+                "candidate_kind": (
+                    "EXPECTED_LIBRARY_BIOLOGICAL_IDENTITY" if role == "A" else
+                    "GLOBALLY_REAL_UNEXPECTED_BIOLOGICAL_IDENTITY"),
+                "candidate_components": ",".join(donor_components(endpoint)),
+                "candidate_source": (
+                    clean(axis.get(source_field))
+                    or f"CANDIDATE_AXIS_FIXED_ENDPOINT_{role}"),
+                "candidate_tier": "CANDIDATE_AXIS_FIXED_ENDPOINT",
+                "candidate_rank_within_source": f"CANDIDATE_AXIS:{role}",
+                "candidate_eligibility": "SCORED" if axis else "SET_ASIDE",
+                "candidate_set_aside_reason": (
+                    "" if axis else
+                    clean(exclusion.get("exclusion_reason"))
+                    or "CANDIDATE_AXIS_PAIR_EXCLUDED"),
+                "selected_as_proposal": "FALSE",
+                "selected_for_candidate_axis": "FALSE",
+                "axis_endpoint_role": "NA",
+                "lower_rank_considered_after_set_aside": "FALSE",
+                "candidate_priority": 10**9,
+                "score_pair_id": clean(axis.get("score_pair_id")) or "NA",
+                "schema_version": FINAL_SCHEMA_VERSION,
+            }
+            rows.append(synthetic)
+            all_candidate_audit.append(synthetic)
+        matching_proposal = [
+            row for row in rows
+            if canonical_genotype(row.get("candidate_canonical", "")) == proposal
+        ]
+        def audit_selection_key(row):
+            return (
+                clean(row.get("candidate_eligibility")) != "SCOREABLE",
+                "TECHNICAL" in clean(row.get("candidate_kind")),
+                fint(row.get("candidate_priority"), 10**9),
+                natural_key(clean(row.get("candidate_source"))),
+            )
+
+        matching_proposal.sort(key=audit_selection_key)
+        chosen_proposal = matching_proposal[0] if active and matching_proposal else None
+        chosen_endpoint_roles = defaultdict(list)
+        for role, endpoint in endpoints.items():
+            matching_endpoint = [
+                row for row in rows
+                if endpoint and canonical_genotype(
+                    row.get("candidate_canonical", "")) == endpoint
+            ]
+            matching_endpoint.sort(key=audit_selection_key)
+            if matching_endpoint:
+                chosen_endpoint = (
+                    chosen_proposal
+                    if endpoint == proposal and chosen_proposal in matching_endpoint
+                    else matching_endpoint[0]
+                )
+                chosen_endpoint_roles[id(chosen_endpoint)].append(role)
+        set_aside_priorities = [
+            fint(row.get("candidate_priority"), 10**9) for row in rows
+            if clean(row.get("candidate_eligibility")) == "SET_ASIDE"
+        ]
+        for row in rows:
+            row["event_id"] = clean(preliminary.get("event_id")) or "NA"
+            row["selected_as_proposal"] = "TRUE" if row is chosen_proposal else "FALSE"
+            roles = chosen_endpoint_roles.get(id(row), [])
+            row["selected_for_candidate_axis"] = "TRUE" if roles else "FALSE"
+            row["axis_endpoint_role"] = ",".join(roles) or "NA"
+            selected_priority = fint(row.get("candidate_priority"), 10**9)
+            row["lower_rank_considered_after_set_aside"] = (
+                "TRUE" if row is chosen_proposal and any(
+                    priority < selected_priority for priority in set_aside_priorities)
+                else "FALSE"
+            )
+        if active and chosen_proposal is None:
+            raise ValueError(
+                f"selected proposal has no candidate-audit row: {key[0]}/{key[1]} {proposal}")
+
+    all_candidate_audit.sort(key=lambda row: (
+        natural_key(_final_library(row.get("library"))),
+        natural_key(clean(row.get("barcode"))),
+        fint(row.get("candidate_priority"), 10**9),
+        natural_key(clean(row.get("candidate_canonical"))),
+        natural_key(clean(row.get("candidate_kind"))),
+    ))
+
+    event_extra_fields = [
+        "initial_supporting_barcodes", "initial_supporting_count_from_cells",
+        "initial_supporting_count_from_event", "interpreted_barcodes",
+        "interpreted_barcode_count", "movement_reason_counts",
+        "original_assignment_strata", "comparison_current_assignment_strata",
+        "proposal_composition", "nuclear_status_distribution",
+        "nuclear_stability_distribution", "ploidy_status_distribution",
+        "occupancy_status_distribution", "library_exchange_status_final",
+        "ambient_frozen_delta_median", "ambient_assignment_effect_c_minus_b_median",
+        "review_required_cells", "review_reason_counts", "event_review_state",
+        "n_nuclear_proposal_direction", "n_nuclear_current_direction",
+        "n_nuclear_nondirectional", "nuclear_event_pattern",
+        "controlled_ambient_pattern", "refitted_ambient_pattern",
+        "identity_evidence_disposition", "evidence_modifiers",
+        "mechanism_disposition", "review_scope", "phase3_review_reasons",
+        "production_assignment_effect",
+        "final_schema_version",
+    ]
+    voting_rows_by_event = defaultdict(list)
+    for row in final_cells:
+        if clean(row.get("population_votes_in_authoritative_event")).upper() != "TRUE":
+            continue
+        key = (
+            row["library"], clean(row.get("selected_supported_event_id")),
+            canonical_genotype(row.get("selected_supported_event_proposal", "")),
+        )
+        if key in final_event_keys:
+            voting_rows_by_event[key].append(row)
+    exclusions_by_event = defaultdict(list)
+    for row in exclusion_rows:
+        key = (
+            _final_library(row.get("library")),
+            clean(row.get("selected_supported_event_id")),
+            canonical_genotype(row.get("selected_supported_event_proposal", "")),
+        )
+        if key in final_event_keys:
+            exclusions_by_event[key].append(row)
+    finalized_candidate_axis_event_keys = set(voting_rows_by_event)
+    final_events = []
+    for event in event_rows:
+        event_id = clean(event.get("event_id"))
+        event_library = _final_library(event.get("library"))
+        event_proposal = canonical_genotype(
+            event.get("unexpected_component", ""))
+        event_key = (event_library, event_id, event_proposal)
+        linked = [
+            row for row in final_cells
+            if row["library"] == event_library and row["event_id"] == event_id
+        ]
+        interpreted = [
+            row for row in linked if row["scientific_recommendation"]
+            in {"USE_PROPOSAL", "UNRESOLVED", "NO_IDENTITY_PREFERENCE"}
+        ]
+        movement = []
+        for row in linked:
+            movement.append({
+                "USE_PROPOSAL": "INTERPRETED_AS_PROPOSAL",
+                "USE_CURRENT": "RETAINED_CURRENT",
+                "UNRESOLVED": "INTERPRETATION_UNRESOLVED",
+                "NO_IDENTITY_PREFERENCE": "NO_IDENTITY_PREFERENCE",
+                "NOT_APPLICABLE": "NO_ACTIVE_CELL_PROPOSAL",
+            }.get(row["scientific_recommendation"], "OTHER"))
+        frozen_values = [
+            _final_float(row["ambient_frozen_proposal_minus_current_c"])
+            for row in linked
+        ]
+        frozen_values = [value for value in frozen_values if math.isfinite(value)]
+        refit_values = [
+            _final_float(row["ambient_assignment_effect_c_minus_b"])
+            for row in linked
+        ]
+        refit_values = [value for value in refit_values if math.isfinite(value)]
+        applicable = bool(
+            voting_rows_by_event.get(event_key)
+            or any(
+                canonical_genotype(row.get("nominated_proposal", ""))
+                and canonical_genotype(row.get("nominated_proposal", ""))
+                != canonical_genotype(row.get("comparison_current_assignment", ""))
+                for row in linked
+            )
+        )
+        (nuclear_pattern, nuclear_proposal_count, nuclear_current_count,
+         nuclear_nondirectional_count) = _final_nuclear_event_pattern(
+            voting_rows_by_event.get(event_key, []),
+            exclusions_by_event.get(event_key, []), applicable,
+        )
+        frozen_median = median(frozen_values) if frozen_values else "NA"
+        refit_median = median(refit_values) if refit_values else "NA"
+        controlled_pattern = _final_ambient_pattern(
+            frozen_median, applicable, "CONTROLLED")
+        refitted_pattern = _final_ambient_pattern(
+            refit_median, applicable, "REFIT")
+        identity_disposition = _final_identity_evidence_disposition(
+            event.get("event_class"), applicable, nuclear_pattern,
+            controlled_pattern,
+        )
+        mechanism_disposition = _final_mechanism_disposition(
+            event, linked, applicable)
+        modifiers = _final_evidence_modifiers(
+            event, linked, voting_rows_by_event.get(event_key, []),
+            nuclear_pattern, controlled_pattern, refitted_pattern,
+            mechanism_disposition,
+        )
+        production_changes = sum(
+            row["production_assignment"]
+            != row["preliminary_reconciled_assignment"] for row in linked
+        )
+        production_effect = (
+            f"EXPLICIT_REVIEW_CHANGED_CELLS:{production_changes}"
+            if production_changes else "NO_CHANGE_FROM_PHASE2_PRELIMINARY"
+        )
+        augmented = dict(event)
+        augmented.update({
+            "initial_supporting_barcodes": _final_set(row["barcode"] for row in linked) or "NOT_EMITTED",
+            "initial_supporting_count_from_cells": len(linked),
+            "initial_supporting_count_from_event": _final_na(event.get("n_implicated_cells")),
+            "interpreted_barcodes": _final_set(row["barcode"] for row in interpreted) or "NONE",
+            "interpreted_barcode_count": len(interpreted),
+            "movement_reason_counts": _final_counter(movement),
+            "original_assignment_strata": _final_counter(
+                row["demux_original_assignment"] for row in linked),
+            "comparison_current_assignment_strata": _final_counter(
+                row["comparison_current_assignment"] for row in linked),
+            "proposal_composition": _final_counter(
+                row["nominated_proposal"] for row in linked),
+            "nuclear_status_distribution": _final_counter(
+                row["nuclear_reconciliation_status"] for row in linked),
+            "nuclear_stability_distribution": _final_counter(
+                row.get("candidate_axis_fold_direction_stability_status", "NA")
+                for row in linked),
+            "ploidy_status_distribution": _final_counter(
+                row["ploidy_evidence_status"] for row in linked),
+            "occupancy_status_distribution": _final_counter(
+                row["occupancy_evidence_status"] for row in linked),
+            "library_exchange_status_final": _final_set(
+                row["library_exchange_status"] for row in linked) or "NONE",
+            "ambient_frozen_delta_median": frozen_median,
+            "ambient_assignment_effect_c_minus_b_median": refit_median,
+            "review_required_cells": sum(
+                row["review_required"] == "TRUE" for row in linked),
+            "review_reason_counts": _final_counter(
+                reason for row in linked
+                for reason in row["review_reasons"].split(";")
+                if reason and reason != "NONE"),
+            "event_review_state": (
+                "REVIEW_REQUIRED" if any(
+                    row["review_required"] == "TRUE" for row in linked)
+                else "NO_PENDING_CELL_REVIEW"),
+            "n_nuclear_proposal_direction": nuclear_proposal_count,
+            "n_nuclear_current_direction": nuclear_current_count,
+            "n_nuclear_nondirectional": nuclear_nondirectional_count,
+            "nuclear_event_pattern": nuclear_pattern,
+            "controlled_ambient_pattern": controlled_pattern,
+            "refitted_ambient_pattern": refitted_pattern,
+            "identity_evidence_disposition": identity_disposition,
+            "evidence_modifiers": modifiers,
+            "mechanism_disposition": mechanism_disposition,
+            "production_assignment_effect": production_effect,
+            "final_schema_version": FINAL_SCHEMA_VERSION,
+        })
+        event_review_scope, phase3_review_reasons = _final_event_review_scope(
+            augmented, identity_disposition, mechanism_disposition, modifiers,
+            (event_library, event_id) in review_input,
+        )
+        augmented["review_scope"] = event_review_scope
+        augmented["phase3_review_reasons"] = phase3_review_reasons
+        final_events.append(augmented)
+
+    event_disposition_by_id = {
+        (_final_library(row.get("library")), clean(row.get("event_id"))): row
+        for row in final_events
+    }
+    for row in final_cells:
+        event = event_disposition_by_id.get((row["library"], row["event_id"]))
+        row["event_identity_evidence_disposition"] = (
+            event["identity_evidence_disposition"] if event else
+            "NOT_APPLICABLE"
+        )
+        row["event_review_scope"] = (
+            event["review_scope"] if event else "NO_IMMEDIATE_REVIEW"
+        )
+        cell_reasons = _final_cell_exception_reasons(row)
+        row["cell_exception_reasons"] = cell_reasons
+        row["review_scope"] = (
+            "CELL_EXCEPTION_REVIEW" if cell_reasons != "NONE" else
+            "NO_IMMEDIATE_REVIEW"
+        )
+
+    run_summary_fields = [
+        "library", "input_barcodes", "output_ledger_rows", "event_count",
+        "candidate_axis_planned", "candidate_axis_scored",
+        "candidate_axis_excluded", "candidate_axis_unavailable",
+        "candidate_axis_reason_counts", "candidate_axis_frozen_match_status",
+        "ambient_frozen_planned", "ambient_frozen_emitted",
+        "ambient_frozen_paired", "ambient_frozen_missing",
+        "ambient_four_arm_comparison_counts", "evidence_status_counts",
+        "review_required_cells", "review_reason_counts",
+        "identity_disposition_counts", "mechanism_disposition_counts",
+        "event_review_scope_counts", "cell_review_scope_counts",
+        "actionable_event_review_rows", "actionable_cell_exception_rows",
+        "review_records_present", "review_records_applied",
+        "changes_demux_to_refined", "changes_current_to_preliminary_production",
+        "changes_preliminary_to_final_production", "zero_event_status",
+        "atac_evidence_mode", "accounting_status", "warnings",
+        "final_schema_version",
+    ]
+    run_summary = []
+    for library in libraries:
+        rows = [row for row in final_cells if row["library"] == library]
+        library_events = [
+            row for row in final_events
+            if _final_library(row.get("library")) == library
+        ]
+        active = [
+            row for row in rows
+            if row["nominated_proposal"] not in {"NA", row["comparison_current_assignment"]}
+        ]
+        scored_keys = {
+            (_final_library(row.get("library")), clean(row.get("barcode")))
+            for row in axis_rows if _final_library(row.get("library")) == library
+        }
+        excluded_keys = {
+            (_final_library(row.get("library")), clean(row.get("barcode")))
+            for row in exclusion_rows if _final_library(row.get("library")) == library
+        }
+        planned_keys = scored_keys | excluded_keys
+        frozen_planned_keys = {
+            key for key in controlled_planned if key[0] == library}
+        frozen_emitted_keys = {
+            (
+                key[0], key[1], clean(row.get("event_id")),
+                canonical_genotype(row.get("candidate_identity", "")),
+            )
+            for key, values in controlled.items() if key[0] == library
+            for row in values
+            if clean(row.get("event_id"))
+            and canonical_genotype(row.get("candidate_identity", ""))
+        }
+        four_counts = Counter()
+        for (lib, _), comparisons in four_pivot.items():
+            if lib == library:
+                four_counts.update(comparisons.keys())
+        review_reason_values = [
+            reason for row in rows for reason in row["review_reasons"].split(";")
+            if reason and reason != "NONE"
+        ]
+        warnings = []
+        if demux_warning_provenance[library] != "AVAILABLE":
+            warnings.append("DEMUX_MAXIMIN_PROVENANCE_UNAVAILABLE")
+        run_summary.append({
+            "library": library,
+            "input_barcodes": len(demux_by_library[library]),
+            "output_ledger_rows": len(rows),
+            "event_count": sum(
+                _final_library(event.get("library")) == library
+                for event in event_rows),
+            "candidate_axis_planned": len(planned_keys),
+            "candidate_axis_scored": len(scored_keys),
+            "candidate_axis_excluded": len(excluded_keys),
+            "candidate_axis_unavailable": sum(
+                row["nuclear_reconciliation_status"] == "NUCLEAR_UNAVAILABLE"
+                for row in active),
+            "candidate_axis_reason_counts": _final_counter(
+                row.get("exclusion_reason") for row in exclusion_rows
+                if _final_library(row.get("library")) == library),
+            "candidate_axis_frozen_match_status": (
+                "RAW_FIELDS_COPIED_VERBATIM"
+                if scored_keys else
+                "NOT_APPLICABLE_ZERO_EVENT" if library not in event_bearing else
+                "NO_SCORE_ROWS_EMITTED"),
+            "ambient_frozen_planned": len(frozen_planned_keys),
+            "ambient_frozen_emitted": len(frozen_emitted_keys),
+            "ambient_frozen_paired": len(frozen_planned_keys & frozen_emitted_keys),
+            "ambient_frozen_missing": len(frozen_planned_keys - frozen_emitted_keys),
+            "ambient_four_arm_comparison_counts": ";".join(
+                f"{key}:{four_counts[key]}" for key in sorted(four_counts)) or "NONE",
+            "evidence_status_counts": _final_counter(
+                row["nuclear_reconciliation_status"] for row in rows),
+            "review_required_cells": sum(
+                row["review_required"] == "TRUE" for row in rows),
+            "review_reason_counts": _final_counter(review_reason_values),
+            "identity_disposition_counts": _final_counter(
+                row["identity_evidence_disposition"] for row in library_events),
+            "mechanism_disposition_counts": _final_counter(
+                row["mechanism_disposition"] for row in library_events),
+            "event_review_scope_counts": _final_counter(
+                row["review_scope"] for row in library_events),
+            "cell_review_scope_counts": _final_counter(
+                row["review_scope"] for row in rows),
+            "actionable_event_review_rows": sum(
+                row["review_scope"] == "EVENT_REVIEW"
+                for row in library_events),
+            "actionable_cell_exception_rows": sum(
+                row["review_scope"] == "CELL_EXCEPTION_REVIEW"
+                for row in rows),
+            "review_records_present": sum(
+                key[0] == library for key in review_input),
+            "review_records_applied": sum(
+                key[0] == library for key in used_review_inputs),
+            "changes_demux_to_refined": sum(
+                row["refined_assignment"] != "NA"
+                and row["refined_assignment"] != row["demux_original_assignment"]
+                for row in rows),
+            "changes_current_to_preliminary_production": sum(
+                row["preliminary_reconciled_assignment"] !=
+                row["comparison_current_assignment"] for row in rows),
+            "changes_preliminary_to_final_production": sum(
+                row["production_assignment"] !=
+                row["preliminary_reconciled_assignment"] for row in rows),
+            "zero_event_status": (
+                "NOT_APPLICABLE_ZERO_EVENT_SUCCESS" if library not in event_bearing
+                else "EVENT_BEARING"),
+            "atac_evidence_mode": (
+                "ATAC_NOT_REQUESTED" if args.evidence_mode == "rna" else "RNA_ATAC"),
+            "accounting_status": "PASS",
+            "warnings": _final_set(warnings) or "NONE",
+            "final_schema_version": FINAL_SCHEMA_VERSION,
+        })
+
+    overall_reasons = [
+        reason for row in final_cells for reason in row["review_reasons"].split(";")
+        if reason and reason != "NONE"
+    ]
+    run_summary.append({
+        "library": "ALL",
+        "input_barcodes": sum(len(value) for value in demux_by_library.values()),
+        "output_ledger_rows": len(final_cells),
+        "event_count": len(event_rows),
+        "candidate_axis_planned": sum(int(row["candidate_axis_planned"]) for row in run_summary),
+        "candidate_axis_scored": sum(int(row["candidate_axis_scored"]) for row in run_summary),
+        "candidate_axis_excluded": sum(int(row["candidate_axis_excluded"]) for row in run_summary),
+        "candidate_axis_unavailable": sum(int(row["candidate_axis_unavailable"]) for row in run_summary),
+        "candidate_axis_reason_counts": _final_counter(
+            row.get("exclusion_reason") for row in exclusion_rows),
+        "candidate_axis_frozen_match_status": (
+            "RAW_FIELDS_COPIED_VERBATIM" if axis_rows else "NO_SCORE_ROWS_EMITTED"),
+        "ambient_frozen_planned": sum(int(row["ambient_frozen_planned"]) for row in run_summary),
+        "ambient_frozen_emitted": sum(int(row["ambient_frozen_emitted"]) for row in run_summary),
+        "ambient_frozen_paired": sum(int(row["ambient_frozen_paired"]) for row in run_summary),
+        "ambient_frozen_missing": sum(int(row["ambient_frozen_missing"]) for row in run_summary),
+        "ambient_four_arm_comparison_counts": _final_counter(
+            contrast for (library, _), comparisons in four_pivot.items()
+            if library in selected_libraries for contrast in comparisons),
+        "evidence_status_counts": _final_counter(
+            row["nuclear_reconciliation_status"] for row in final_cells),
+        "review_required_cells": sum(
+            row["review_required"] == "TRUE" for row in final_cells),
+        "review_reason_counts": _final_counter(overall_reasons),
+        "identity_disposition_counts": _final_counter(
+            row["identity_evidence_disposition"] for row in final_events),
+        "mechanism_disposition_counts": _final_counter(
+            row["mechanism_disposition"] for row in final_events),
+        "event_review_scope_counts": _final_counter(
+            row["review_scope"] for row in final_events),
+        "cell_review_scope_counts": _final_counter(
+            row["review_scope"] for row in final_cells),
+        "actionable_event_review_rows": sum(
+            row["review_scope"] == "EVENT_REVIEW" for row in final_events),
+        "actionable_cell_exception_rows": sum(
+            row["review_scope"] == "CELL_EXCEPTION_REVIEW"
+            for row in final_cells),
+        "review_records_present": len(review_input),
+        "review_records_applied": len(used_review_inputs),
+        "changes_demux_to_refined": sum(int(row["changes_demux_to_refined"]) for row in run_summary),
+        "changes_current_to_preliminary_production": sum(
+            int(row["changes_current_to_preliminary_production"]) for row in run_summary),
+        "changes_preliminary_to_final_production": sum(
+            int(row["changes_preliminary_to_final_production"]) for row in run_summary),
+        "zero_event_status": f"ZERO_EVENT_LIBRARIES={sum(row['zero_event_status'].startswith('NOT_APPLICABLE') for row in run_summary)}",
+        "atac_evidence_mode": (
+            "ATAC_NOT_REQUESTED" if args.evidence_mode == "rna" else "RNA_ATAC"),
+        "accounting_status": "PASS",
+        "warnings": _final_set(
+            row["warnings"] for row in run_summary if row["warnings"] != "NONE") or "NONE",
+        "final_schema_version": FINAL_SCHEMA_VERSION,
+    })
+
+    final_cells.sort(key=lambda row: (
+        natural_key(row["library"]), natural_key(row["barcode"])))
+    final_events.sort(key=lambda row: (
+        natural_key(_final_library(row.get("library"))),
+        natural_key(clean(row.get("event_id")))))
+    phase3_assignment_changes = [
+        row for row in final_cells
+        if row["production_assignment"] != row["preliminary_reconciled_assignment"]
+    ]
+    if not review_input and phase3_assignment_changes:
+        raise ValueError(
+            "production assignments changed without an explicit review record")
+    untraceable_changes = [
+        row for row in phase3_assignment_changes
+        if row["review_record_scope"] not in {"CELL", "EVENT"}
+    ]
+    if untraceable_changes:
+        raise ValueError(
+            "production assignment change is not traceable to an explicit "
+            "review record: "
+            + ", ".join(
+                f"{row['library']}/{row['barcode']}"
+                for row in untraceable_changes[:10]
+            )
+        )
+
+    review_queue = [row for row in final_cells if row["review_required"] == "TRUE"]
+    event_dispositions = []
+    for event in final_events:
+        event_dispositions.append({
+            "library": _final_library(event.get("library")),
+            "event_id": clean(event.get("event_id")) or "NA",
+            "event_class": _final_na(event.get("event_class")),
+            "event_confidence": _final_na(event.get("event_confidence")),
+            "n_initial_cells": _final_na(
+                event.get("initial_supporting_count_from_event")),
+            "n_interpreted_cells": _final_na(
+                event.get("interpreted_barcode_count")),
+            "n_nuclear_proposal_direction": event[
+                "n_nuclear_proposal_direction"],
+            "n_nuclear_current_direction": event[
+                "n_nuclear_current_direction"],
+            "n_nuclear_nondirectional": event["n_nuclear_nondirectional"],
+            "nuclear_event_pattern": event["nuclear_event_pattern"],
+            "controlled_ambient_pattern": event["controlled_ambient_pattern"],
+            "refitted_ambient_pattern": event["refitted_ambient_pattern"],
+            "identity_evidence_disposition": event[
+                "identity_evidence_disposition"],
+            "evidence_modifiers": event["evidence_modifiers"],
+            "mechanism_disposition": event["mechanism_disposition"],
+            "review_scope": event["review_scope"],
+            "review_reasons": event["phase3_review_reasons"],
+            "production_assignment_effect": event[
+                "production_assignment_effect"],
+            "final_schema_version": FINAL_SCHEMA_VERSION,
+        })
+
+    actionable_review = []
+    for event in final_events:
+        if event["review_scope"] != "EVENT_REVIEW":
+            continue
+        key = (_final_library(event.get("library")), clean(event.get("event_id")))
+        explicit = review_input.get(key, {})
+        actionable_review.append({
+            "review_level": "EVENT_REVIEW",
+            "library": key[0],
+            "event_id": key[1] or "NA",
+            "barcode": "NA",
+            "identity_evidence_disposition": event[
+                "identity_evidence_disposition"],
+            "mechanism_disposition": event["mechanism_disposition"],
+            "review_scope": "EVENT_REVIEW",
+            "review_reasons": event["phase3_review_reasons"],
+            "review_disposition": explicit.get("disposition", "PENDING"),
+            "review_rationale": explicit.get("rationale") or "NA",
+            "comparison_current_assignment": "EVENT_LEVEL",
+            "nominated_proposal": canonical_genotype(
+                event.get("unexpected_component", "")) or "NA",
+            "production_assignment": "EVENT_LEVEL",
+            "production_assignment_effect": event[
+                "production_assignment_effect"],
+            "final_schema_version": FINAL_SCHEMA_VERSION,
+        })
+    for row in final_cells:
+        if row["review_scope"] != "CELL_EXCEPTION_REVIEW":
+            continue
+        actionable_review.append({
+            "review_level": "CELL_EXCEPTION_REVIEW",
+            "library": row["library"],
+            "event_id": row["event_id"],
+            "barcode": row["barcode"],
+            "identity_evidence_disposition": row[
+                "event_identity_evidence_disposition"],
+            "mechanism_disposition": (
+                event_disposition_by_id.get(
+                    (row["library"], row["event_id"]), {}
+                ).get("mechanism_disposition", "NOT_APPLICABLE")
+            ),
+            "review_scope": "CELL_EXCEPTION_REVIEW",
+            "review_reasons": row["cell_exception_reasons"],
+            "review_disposition": row["review_disposition"],
+            "review_rationale": row["review_rationale"],
+            "comparison_current_assignment": row[
+                "comparison_current_assignment"],
+            "nominated_proposal": row["nominated_proposal"],
+            "production_assignment": row["production_assignment"],
+            "production_assignment_effect": (
+                "CHANGED_FROM_PHASE2_PRELIMINARY"
+                if row["production_assignment"]
+                != row["preliminary_reconciled_assignment"] else
+                "NO_CHANGE_FROM_PHASE2_PRELIMINARY"
+            ),
+            "final_schema_version": FINAL_SCHEMA_VERSION,
+        })
+    actionable_review.sort(key=lambda row: (
+        0 if row["review_level"] == "EVENT_REVIEW" else 1,
+        natural_key(row["library"]), natural_key(row["event_id"]),
+        natural_key(row["barcode"]),
+    ))
+
+    nonfinalized_worsened = _final_nonfinalized_controlled_worsened(
+        controlled, controlled_planned, selected_libraries,
+        finalized_candidate_axis_event_keys,
+    )
+
+    final_cell_fields = FINAL_CELL_FIELDS + [
+        field for field in axis_fields if field not in FINAL_CELL_FIELDS
+    ]
+    event_fields = RECONCILE_EVENT_FIELDS + [
+        field for field in event_extra_fields if field not in RECONCILE_EVENT_FIELDS
+    ]
+    for row in all_candidate_audit:
+        for field in row:
+            if field not in candidate_audit_fields:
+                candidate_audit_fields.append(field)
+    candidate_fields = CANDIDATE_AUDIT_REQUIRED_FIELDS + [
+        field for field in candidate_audit_fields
+        if field not in CANDIDATE_AUDIT_REQUIRED_FIELDS
+    ]
+    write_tsv(
+        str(output_root / "identity_reconciliation_final_cells.tsv.gz"),
+        final_cells, final_cell_fields)
+    write_tsv(
+        str(output_root / "identity_reconciliation_candidate_audit.tsv.gz"),
+        all_candidate_audit, candidate_fields)
+    write_tsv(
+        str(output_root / "identity_reconciliation_final_events.tsv"),
+        final_events, event_fields)
+    write_tsv(
+        str(output_root / "identity_reconciliation_review_queue.tsv.gz"),
+        review_queue, final_cell_fields)
+    write_tsv(
+        str(output_root / "identity_reconciliation_run_summary.tsv"),
+        run_summary, run_summary_fields)
+    write_tsv(
+        str(output_root / "identity_reconciliation_event_dispositions.tsv"),
+        event_dispositions, FINAL_EVENT_DISPOSITION_FIELDS)
+    write_tsv(
+        str(output_root / "identity_reconciliation_actionable_review.tsv.gz"),
+        actionable_review, FINAL_ACTIONABLE_REVIEW_FIELDS)
+    (output_root / "identity_reconciliation_phase3_summary.md").write_text(
+        _final_phase3_summary_text(
+            libraries, final_cells, final_events, actionable_review,
+            review_input, used_review_inputs, args.evidence_mode,
+            nonfinalized_worsened,
+        ),
+        encoding="utf-8",
+    )
+
+    assignments_root = output_root.parent / "final_assignments"
+    assignments_root.mkdir(parents=True, exist_ok=True)
+    for library in libraries:
+        rows = [row for row in final_cells if row["library"] == library]
+        demux = demux_by_library[library]
+        assignments = []
+        for row in rows:
+            identity = canonical_genotype(row["production_assignment"])
+            if not identity:
+                raise ValueError(
+                    f"{library}/{row['barcode']} has no production assignment")
+            assignment_type = (
+                "D" if identity.startswith("M{")
+                or len(donor_components(identity)) >= 2 else "S")
+            score = clean(demux[row["barcode"]].get("score")) or "NA"
+            assignments.append((row["barcode"], identity, assignment_type, score))
+        if len(assignments) != len(demux):
+            raise ValueError(f"{library} compatibility assignment accounting failed")
+        write_headerless_tsv(
+            str(assignments_root / f"{library}.reconciled.assignments"),
+            assignments)
+    print(
+        f"Finalized {len(final_cells)} cells, {len(final_events)} events, "
+        f"{len(actionable_review)} actionable Phase 3 review rows, and "
+        f"{len(review_queue)} legacy pending review rows")
+    return 0
+
+
 _COMMANDS = {
     "metadata": metadata_main,
     "candidates": candidates_main,
     "doublet-context": doublet_context_main,
     "reconcile": reconcile_main,
     "optional-status": optional_status_main,
+    "score-pairs": score_pairs_main,
+    "candidate-axis-pairs": candidate_axis_pairs_main,
+    "finalize": finalize_main,
     "atac-barcode-map": atac_barcode_map_main,
     "atac-finalize": atac_finalize_main,
 }

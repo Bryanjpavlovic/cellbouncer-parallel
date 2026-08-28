@@ -97,9 +97,9 @@ using namespace std;
 #define CELLBOUNCER_SOURCE_REVISION "unknown"
 #endif
 
-const string VERSION = "2.14";
+const string VERSION = "2.15";
 const string VERSION_MESSAGE = "parallel production demultiplexer with fail-closed counting, explicit comparison semantics, and ATAC barcode remapping";
-const string VERSION_NEW = "v2.14: optional ATAC-to-RNA barcode remapping and ATAC namespace QC for identity reconciliation; retains v2.13.3 reliability fixes";
+const string VERSION_NEW = "v2.15: --dump_pileup also emits molecule-aware UB+gene/QNAME-fallback evidence for common-evidence identity probabilities; retains v2.14 ATAC namespace support";
 
 // Global verbose flag (defined in demux_parallel_llr.cpp)
 extern bool g_verbose;
@@ -1984,7 +1984,7 @@ void help(int code){
     fprintf(stderr, "\n===== SKIP ASSIGNMENT =====\n");
     fprintf(stderr, "    --skip_assignment -K Write .counts and exit (no assignment)\n");
     fprintf(stderr, "\n===== PILEUP (variant-consistency benchmark) =====\n");
-    fprintf(stderr, "    --dump_pileup PREFIX Emit PREFIX.pileup_sites.tsv.gz and PREFIX.pileup_obs.tsv.gz\n");
+    fprintf(stderr, "    --dump_pileup PREFIX Emit .pileup_sites.tsv.gz, .pileup_obs.tsv.gz, and .pileup_molecules.tsv.gz\n");
     fprintf(stderr, "                         (requires an actual counting pass: --force_recount and --threads > 1;\n");
     fprintf(stderr, "                          supported on the single-panel and dual-panel parallel paths)\n");
     fprintf(stderr, "    --dump_selection_audit  Append maximin-vs-max_llr_comparator columns to .diagnostics.gz\n");

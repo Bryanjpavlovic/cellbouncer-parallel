@@ -96,6 +96,13 @@ short hap_comb_to_idx(short i, short j, short nhaps){
     if (i >= nhaps || j >= nhaps){
         return -1;
     }
+    // The combination index space contains only distinct pairs (i < j).
+    // A repeated donor (A+A) is genotype-equivalent to singlet A for the
+    // CellBouncer allele model. Without this guard, i == j falls through to
+    // the first distinct pair beginning at i and silently becomes A+B.
+    if (i == j){
+        return i;
+    }
     if (i > j){
         // Swap.
         short tmp = j;

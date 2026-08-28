@@ -860,26 +860,23 @@ class contamFinder3{
         // final profile solve, not per-cell contamination fits. Missing values
         // are represented by -DBL_MAX/NaN in the driver output, never by zero.
         //
-        // NOTE ON SCOPE: fit() calls update_amb_prof_mixture() more than once.
-        // The multistart solve (solve_for_c == true, reached via init_params)
-        // is the only call that compares multiple starting points. Every later
-        // call takes the solve_for_c == false path, which performs a single
-        // solve and therefore reports successful=1, near_optimal=1,
-        // second_best=-DBL_MAX, l1_spread=0 by construction. Because those
-        // later calls run after the multistart, the fields below always carry
-        // the single refinement solve's values. They are accurate for what they
-        // describe and cannot describe multistart behavior. Consumers asking
-        // whether the mixture optimum was uniquely determined must read the
-        // multistart_* fields below instead.
+        // NOTE ON SCOPE: ordinary cell-profile refinement uses a single no-c
+        // solve after its initial multistart solve. Bulk empty-droplet mode can
+        // explicitly request deterministic multistart on the no-c path through
+        // set_profile_total_starts(); in that case these fields describe the
+        // selected bulk multistart optimum directly. Consumers should use the
+        // multistart_* fields below to distinguish configured, successful, and
+        // near-optimal starts.
         int profile_successful_starts;
         int profile_near_optimal_count;
         double profile_best_ll;
         double profile_second_best_ll;
         double profile_near_optimal_l1_spread;
 
-        // Ambient-profile MULTISTART diagnostics. Populated only by the
-        // solve_for_c == true path and never overwritten by the refinement
-        // solve, so these retain the comparison across starting points:
+        // Ambient-profile MULTISTART diagnostics. Populated by the
+        // solve_for_c path and by an explicitly requested bulk no-c multistart;
+        // ordinary single-start refinement does not overwrite them. These
+        // retain the comparison across starting points:
         // how many starts were configured, how many returned finite results,
         // how many landed within the near-optimal likelihood tolerance of the
         // best, and the largest L1 distance in mixture space among those

@@ -5,6 +5,7 @@
 #include <set>
 #include <map>
 #include <vector>
+#include <cstdio>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -20,6 +21,7 @@ static volatile sig_atomic_t keep_running = 1;
 
 // Track all created segments for cleanup
 static vector<string> active_segments;
+static string active_ready_file;
 
 void signal_handler(int sig) {
     keep_running = 0;
@@ -94,10 +96,68 @@ bool load_vcf_segment(const string& vcf_file,
 
 // Destroy all active segments
 void cleanup_all_segments() {
+    if (!active_ready_file.empty()) {
+        unlink(active_ready_file.c_str());
+        active_ready_file.clear();
+    }
     for (auto& seg : active_segments) {
         destroy_shared_vcf(seg);
     }
     active_segments.clear();
+}
+
+// Publish readiness only after every requested segment has been fully created.
+// The atomic rename prevents consumers from observing a partially written
+// marker.  The foreground holder removes it during signal cleanup.
+bool write_ready_file(const string& path,
+                      const string& shm_name,
+                      const string& vcf_file,
+                      const string& het_vcf_file,
+                      const string& atac_vcf_file,
+                      const string& atac_het_vcf_file,
+                      const string& species_vcf_file,
+                      const string& bam_file,
+                      int min_vq) {
+    if (path.empty()) return true;
+
+    string tmp = path + ".tmp." + to_string((long long)getpid());
+    ofstream out(tmp.c_str(), ios::out | ios::trunc);
+    if (!out.good()) {
+        fprintf(stderr, "ERROR: cannot create ready-file temporary path: %s\n",
+                tmp.c_str());
+        return false;
+    }
+    out << "status\tREADY\n";
+    out << "pid\t" << getpid() << "\n";
+    out << "base\t" << shm_name << "\n";
+    out << "vcf\t" << vcf_file << "\n";
+    if (!het_vcf_file.empty())
+        out << "het_vcf\t" << het_vcf_file << "\n";
+    if (!atac_vcf_file.empty())
+        out << "atac_vcf\t" << atac_vcf_file << "\n";
+    if (!atac_het_vcf_file.empty())
+        out << "atac_het_vcf\t" << atac_het_vcf_file << "\n";
+    if (!species_vcf_file.empty())
+        out << "species_vcf\t" << species_vcf_file << "\n";
+    out << "bam\t" << bam_file << "\n";
+    out << "qual\t" << min_vq << "\n";
+    for (const auto& segment : active_segments)
+        out << "segment\t" << segment << "\n";
+    out.flush();
+    if (!out.good()) {
+        fprintf(stderr, "ERROR: failed while writing ready-file: %s\n", tmp.c_str());
+        out.close();
+        unlink(tmp.c_str());
+        return false;
+    }
+    out.close();
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        perror("rename ready-file");
+        unlink(tmp.c_str());
+        return false;
+    }
+    active_ready_file = path;
+    return true;
 }
 
 void help(int code) {
@@ -117,6 +177,7 @@ void help(int code) {
     fprintf(stderr, "    --qual -q         Minimum variant quality (default: 50)\n");
     fprintf(stderr, "    --chroms -c       File listing chromosomes to include\n");
     fprintf(stderr, "    --foreground -f   Run in foreground (don't daemonize)\n");
+    fprintf(stderr, "    --ready-file FILE Atomically publish readiness after all requested segments load\n");
     fprintf(stderr, "    --destroy -d      Destroy existing shared memory segment(s) and exit\n");
     fprintf(stderr, "    --help -h         Display this message and exit\n");
     fprintf(stderr, "\n");
@@ -138,6 +199,7 @@ int main(int argc, char* argv[]) {
         {"atac_vcf",       required_argument, 0, 'A'},
         {"atac_het_vcf",   required_argument, 0, 1001},
         {"species_vcf",    required_argument, 0, 1002},
+        {"ready-file",     required_argument, 0, 1003},
         {"bam",            required_argument, 0, 'b'},
         {"name",           required_argument, 0, 'n'},
         {"qual",           required_argument, 0, 'q'},
@@ -156,6 +218,7 @@ int main(int argc, char* argv[]) {
     string bam_file = "";
     string shm_name = "";
     string chroms_file = "";
+    string ready_file = "";
     int min_vq = 50;
     bool foreground = false;
     bool destroy_only = false;
@@ -183,6 +246,9 @@ int main(int argc, char* argv[]) {
                 break;
             case 1002:
                 species_vcf_file = optarg;
+                break;
+            case 1003:
+                ready_file = optarg;
                 break;
             case 'b':
                 bam_file = optarg;
@@ -234,6 +300,7 @@ int main(int argc, char* argv[]) {
         destroy_shared_vcf(shm_atac);
         destroy_shared_vcf(shm_atac_het);
         destroy_shared_vcf(shm_species);
+        if (!ready_file.empty()) unlink(ready_file.c_str());
         return 0;
     }
     
@@ -364,7 +431,17 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "\nTo use with demux_parallel:\n");
         fprintf(stderr, "%s\n", usage_hint.c_str());
     }
-    
+
+    if (!write_ready_file(ready_file, shm_name, vcf_file, het_vcf_file,
+                          atac_vcf_file, atac_het_vcf_file,
+                          species_vcf_file, bam_file, min_vq)) {
+        cleanup_all_segments();
+        exit(1);
+    }
+    if (!ready_file.empty() && foreground) {
+        fprintf(stderr, "Readiness published atomically: %s\n", ready_file.c_str());
+    }
+
     // Keep running until signaled
     while (keep_running) {
         sleep(1);
