@@ -1,5 +1,9 @@
-#ifndef _CELLBOUNCER_VCF_HTS_H
-#define _CELLBOUNCER_VCF_HTS_H
+#ifndef CELLBOUNCER_VCF_HTS_H_INCLUDED
+#define CELLBOUNCER_VCF_HTS_H_INCLUDED
+
+// Sources that use this header check this revision immediately after inclusion.
+// Keep the name outside the implementation-reserved identifier namespace.
+#define CELLBOUNCER_VCF_HTS_INTERFACE_REVISION 21901
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -23,6 +27,7 @@
 #include <zlib.h>
 #include <mutex>
 #include <atomic>
+#include <bitset>
 #include <htslib/sam.h>
 #include <htslib/vcf.h>
 #include <htswrapper/bam.h>
@@ -74,14 +79,18 @@ enum class SupplementaryReadHandling { INCLUDE, EXCLUDE };
 
 struct ReadFilterPolicy {
     uint16_t excluded_flags;
+    uint8_t minimum_mapping_quality;
     SupplementaryReadHandling supplementary;
 
     ReadFilterPolicy(uint16_t flags = 0,
+                     uint8_t min_mapq = 0,
                      SupplementaryReadHandling supp = SupplementaryReadHandling::INCLUDE)
-        : excluded_flags(flags), supplementary(supp) {}
+        : excluded_flags(flags), minimum_mapping_quality(min_mapq), supplementary(supp) {}
 };
 
 const ReadFilterPolicy& default_production_read_filter();
+const ReadFilterPolicy& configured_read_filter();
+void configure_read_filter(uint8_t minimum_mapping_quality, uint16_t excluded_flags);
 bool read_passes_filter(const bam1_t* record, const ReadFilterPolicy& policy);
 
 enum class ReferenceCoordinateState {
@@ -329,7 +338,7 @@ struct var{
  * Used for total counts: cc.total_ref[total_idx] += ref, etc.
  */
 struct SNPTotalTarget {
-    int total_idx;    // = indv * GENOTYPE_STATES + nalt
+    uint32_t total_idx;    // = indv * GENOTYPE_STATES + nalt
 };
 
 /**
@@ -337,7 +346,7 @@ struct SNPTotalTarget {
  * Used for pairwise counts: cc.ref_counts[pair_idx] += ref, etc.
  */
 struct SNPPairTarget {
-    size_t pair_idx;  // = idx1 * state_count + idx2
+    uint32_t pair_idx;  // = idx1 * state_count + idx2
 };
 
 /**
@@ -386,20 +395,46 @@ struct SNPData {
     
     // Call after precompute_genotypes.  state_count = n_samples * GENOTYPE_STATES.
     void precompute_targets(int n_samples) {
-        int state_count = n_samples * GENOTYPE_STATES;
-        total_targets.clear();
-        pair_targets.clear();
-        
+        const uint64_t state_count =
+            (uint64_t)n_samples * (uint64_t)GENOTYPE_STATES;
+        size_t covered = 0;
+        for (int i = 0; i < n_samples; ++i) {
+            if (geno[i] >= 0) ++covered;
+        }
+        if (covered > total_targets.max_size() ||
+            (covered > 1 && covered - 1 >
+                std::numeric_limits<size_t>::max() / covered)) {
+            throw std::length_error("SNP target count exceeds vector capacity");
+        }
+        const size_t pair_count = covered * (covered - 1) / 2;
+        if (pair_count > pair_targets.max_size()) {
+            throw std::length_error("SNP pair target count exceeds vector capacity");
+        }
+        total_targets.resize(covered);
+        pair_targets.resize(pair_count);
+
+        size_t total_cursor = 0;
+        size_t pair_cursor = 0;
         for (int i = 0; i < n_samples; ++i) {
             if (geno[i] < 0) continue;
-            int idx1 = i * GENOTYPE_STATES + geno[i];
-            total_targets.push_back({idx1});
-            
+            const uint64_t idx1 =
+                (uint64_t)i * GENOTYPE_STATES + (uint64_t)geno[i];
+            if (idx1 > std::numeric_limits<uint32_t>::max()) {
+                throw std::overflow_error(
+                    "SNP total target index exceeds uint32_t representation");
+            }
+            total_targets[total_cursor++].total_idx = (uint32_t)idx1;
+
             for (int j = i + 1; j < n_samples; ++j) {
                 if (geno[j] < 0) continue;
-                int idx2 = j * GENOTYPE_STATES + geno[j];
-                size_t flat = (size_t)idx1 * state_count + idx2;
-                pair_targets.push_back({flat});
+                const uint64_t idx2 =
+                    (uint64_t)j * GENOTYPE_STATES + (uint64_t)geno[j];
+                const uint64_t flat = idx1 * state_count + idx2;
+                if (flat > std::numeric_limits<uint32_t>::max()) {
+                    throw std::overflow_error(
+                        "SNP pair target index exceeds uint32_t representation");
+                }
+                pair_targets[pair_cursor++].pair_idx = (uint32_t)flat;
             }
         }
     }
@@ -790,18 +825,26 @@ inline int64_t accepted_site_weight_key(int tid, int pos) {
 }
 
 // Per-SNP native-species weights are kept outside SNPData so the shared-VCF
-// memory layout remains unchanged.  Each qualifying SNP owns one compact,
-// fixed-width weight block:
-//   n_species * 3 singlet genotype bins, followed by
-//   n_species*(n_species-1)/2 * 9 heterotypic-pair genotype bins.
-// site_offsets is aligned one-to-one with ChromSNPs::snps; UINT64_MAX means
-// that no native-species target block is present for that SNP.
+// memory layout remains unchanged. Only nonzero destinations are retained, in
+// the exact historical target order. The high bit distinguishes pair indexes
+// from total indexes; the remaining bits are direct CellCounts destinations.
+constexpr uint32_t NATIVE_SPECIES_PAIR_TARGET = UINT32_C(0x80000000);
+
+struct NativeSpeciesTargetEntry {
+    uint32_t encoded_index;
+    int32_t weight;
+
+    NativeSpeciesTargetEntry(uint32_t index = 0, int32_t scaled_weight = 0)
+        : encoded_index(index), weight(scaled_weight) {}
+};
+
 struct NativeSpeciesChromTargets {
     int n_species = 0;
     int n_pairs = 0;
     uint32_t weights_per_site = 0;
     std::vector<uint64_t> site_offsets;
-    std::vector<int32_t> weights;
+    std::vector<uint32_t> site_target_counts;
+    std::vector<NativeSpeciesTargetEntry> targets;
 };
 
 using NativeSpeciesTargetTable =
@@ -905,6 +948,35 @@ bool count_alleles_parallel(
     int species_native_n_samples = 0,
     const BarcodeRemap* barcode_remap = nullptr,
     BarcodeRemapStats* barcode_remap_stats = nullptr);
+
+/**
+ * Fused production RNA counter.
+ *
+ * The main and species panels remain separate sorted views. STARsolo-filtered
+ * barcodes are preallocated in the existing dense stores, while every other
+ * accepted CB barcode is written to bounded full-barcode partitions, reduced
+ * by one owner, and serialized directly after the BAM traversal.
+ * An empty filtered_barcodes set selects the raw-only recovery form. Supplying
+ * neither raw path selects the filtered native-species-only compatibility form.
+ */
+bool count_alleles_parallel_fused(
+    const std::string& bamfile,
+    const robin_hood::unordered_map<int, ChromSNPs>& main_snpdat,
+    const robin_hood::unordered_map<int, ChromSNPs>& species_snpdat,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& filtered_main_counts,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& filtered_species_counts,
+    const std::set<unsigned long>& filtered_barcodes,
+    int n_samples,
+    const NativeSpeciesTargetTable& species_native_targets,
+    int species_native_n_samples,
+    int n_threads,
+    int htslib_threads,
+    const std::string& raw_counts_path,
+    const std::string& raw_species_counts_path,
+    bool dump_pileup = false,
+    const std::string& pileup_prefix = "",
+    AcceptedSiteWeightMap* accepted_site_weights_main = nullptr,
+    AcceptedSiteWeightMap* accepted_site_weights_species = nullptr);
 
 /**
  * Dual-output parallel counting: routes allele counts to panel0 or panel1
@@ -1067,4 +1139,4 @@ bool count_het_alleles_extended(
     int htslib_threads,
     HetBalanceMethod method);
 
-#endif 
+#endif  // CELLBOUNCER_VCF_HTS_H_INCLUDED

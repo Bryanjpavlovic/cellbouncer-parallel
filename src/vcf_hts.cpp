@@ -6,6 +6,7 @@
 #include <string>
 #include <climits>
 #include <algorithm>
+#include <array>
 #include <vector>
 #include <iterator>
 #include <string.h>
@@ -27,10 +28,13 @@
 #include <zlib.h>
 #include <atomic>
 #include <mutex>
+#include <memory>
 #include <chrono>
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <queue>
+#include <functional>
 #include <omp.h>
 #include <htslib/sam.h>
 #include <htslib/vcf.h>
@@ -40,6 +44,12 @@
 #include <htswrapper/robin_hood/robin_hood.h>
 #include "common.h"
 #include "vcf_hts.h"
+
+#ifndef CELLBOUNCER_VCF_HTS_INTERFACE_REVISION
+#error "vcf_hts.cpp requires the matching src/vcf_hts.h (interface revision 21901)"
+#elif CELLBOUNCER_VCF_HTS_INTERFACE_REVISION != 21901
+#error "vcf_hts.cpp and src/vcf_hts.h are from different CellBouncer source revisions"
+#else
 
 using std::cout;
 using std::endl;
@@ -83,6 +93,36 @@ static std::string format_worker_error(const char* operation, int thread_id, int
     return out.str();
 }
 
+static const std::array<int64_t, 256>& mapq_probability_scaled_table() {
+    static const std::array<int64_t, 256> table = []() {
+        std::array<int64_t, 256> values{};
+        for (size_t mapq = 0; mapq < values.size(); ++mapq) {
+            const float probability_correct = 1.0f - powf(
+                10.0f, -(float)mapq / 10.0f);
+            values[mapq] =
+                (int64_t)(probability_correct * FIXED_POINT_SCALE);
+        }
+        for (size_t mapq = 0; mapq < values.size(); ++mapq) {
+            const float old_probability_correct = 1.0f - powf(
+                10.0f, -(float)mapq / 10.0f);
+            const int64_t old_scaled =
+                (int64_t)(old_probability_correct * FIXED_POINT_SCALE);
+            if (values[mapq] != old_scaled) {
+                fprintf(stderr,
+                    "ERROR: MAPQ lookup validation failed at value %lu\n",
+                    (unsigned long)mapq);
+                abort();
+            }
+        }
+        return values;
+    }();
+    return table;
+}
+
+static inline int64_t mapq_probability_scaled(uint8_t mapq) {
+    return mapq_probability_scaled_table()[(size_t)mapq];
+}
+
 // Molecule-aware identity scoring sidecar.  Corrected UMI plus gene is the
 // preferred RNA molecule key.  A stable query-name key is retained as an
 // explicit fallback for BAMs that do not carry 10x UB/GX (or UB/GN) tags.
@@ -103,6 +143,89 @@ struct PileupMoleculeObservation {
     int64_t alt_scaled = 0;
     uint8_t basis = PILEUP_MOLECULE_QNAME;
 };
+
+using PileupObservationMap = robin_hood::unordered_map<unsigned long,
+    robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > >;
+
+// Pileup evidence used to remain resident until the complete BAM scan ended.
+// Large multiome libraries can produce hundreds of millions of observations,
+// so keep only bounded per-worker chunks and stream those chunks to independent
+// gzip members. The members are concatenated after a successful scan; gzip
+// readers transparently consume concatenated members and downstream scoring
+// already merges duplicate cell/site and molecule/site rows.
+constexpr size_t PILEUP_SITE_CHUNK_ENTRIES = 100000;
+constexpr size_t PILEUP_MOLECULE_CHUNK_ENTRIES = 200000;
+
+// Raw-barcode passes cannot preallocate cell keys. A fixed set of independently
+// locked shards permits concurrent insertion while retaining only one dense
+// matrix per discovered barcode, rather than one copy per barcode per worker.
+// The shard count is deliberately much larger than the worker count so updates
+// to unrelated barcodes rarely contend.
+constexpr size_t RAW_COUNT_SHARDS = 4096;
+static_assert((RAW_COUNT_SHARDS & (RAW_COUNT_SHARDS - 1)) == 0,
+    "RAW_COUNT_SHARDS must remain a power of two");
+
+struct RawCountShard {
+    std::mutex lock;
+    std::unordered_map<unsigned long, CellCounts> panel0;
+    std::unordered_map<unsigned long, CellCounts> panel1;
+    std::unordered_map<unsigned long, CellCounts> native;
+};
+
+static vector<std::unique_ptr<RawCountShard>> make_raw_count_shards(bool enabled) {
+    vector<std::unique_ptr<RawCountShard>> shards;
+    if (!enabled) return shards;
+    shards.reserve(RAW_COUNT_SHARDS);
+    for (size_t i = 0; i < RAW_COUNT_SHARDS; ++i) {
+        shards.emplace_back(new RawCountShard());
+    }
+    return shards;
+}
+
+static size_t raw_count_shard_index(unsigned long barcode) {
+    return std::hash<unsigned long>()(barcode) & (RAW_COUNT_SHARDS - 1);
+}
+
+static void move_sharded_counts(
+        vector<std::unique_ptr<RawCountShard>>& shards,
+        int panel,
+        robin_hood::unordered_map<unsigned long, AlignedCellCounts>& destination) {
+    size_t source_entries = 0;
+    for (const auto& shard_ptr : shards) {
+        if (panel == 0) source_entries += shard_ptr->panel0.size();
+        else if (panel == 1) source_entries += shard_ptr->panel1.size();
+        else source_entries += shard_ptr->native.size();
+    }
+    destination.reserve(destination.size() + source_entries);
+
+    size_t transferred = 0;
+    for (auto& shard_ptr : shards) {
+        std::unordered_map<unsigned long, CellCounts>* source = nullptr;
+        if (panel == 0) source = &shard_ptr->panel0;
+        else if (panel == 1) source = &shard_ptr->panel1;
+        else source = &shard_ptr->native;
+
+        // Reproduce the long-standing, validated merge path: construct the
+        // destination matrix with its final dimensions and merge into it.  Do
+        // not move-assign a CellCounts through an over-aligned map node.  Erase
+        // each source node immediately so the one-time transfer does not hold
+        // duplicate dense matrices and peak memory remains bounded.
+        for (auto source_it = source->begin(); source_it != source->end();) {
+            auto destination_it = destination.find(source_it->first);
+            if (destination_it == destination.end()) {
+                destination.emplace(std::piecewise_construct,
+                    std::forward_as_tuple(source_it->first),
+                    std::forward_as_tuple(source_it->second.n_samples));
+                destination_it = destination.find(source_it->first);
+            }
+            destination_it->second.counts.merge(source_it->second);
+            source_it = source->erase(source_it);
+            ++transferred;
+        }
+    }
+    fprintf(stderr, "Transferred %lu sharded raw count matrices for panel %d\n",
+        (unsigned long)transferred, panel);
+}
 
 static uint64_t pileup_fnv1a_update(uint64_t hash, const char* value) {
     static const uint64_t prime = 1099511628211ULL;
@@ -181,17 +304,148 @@ static long write_collapsed_pileup_molecules(
         }
         const int tid = (int)(observations[begin].site >> 32);
         const int pos = (int)(observations[begin].site & 0xFFFFFFFF);
-        gzprintf(output, "%lu\t%llu\t%s\t%d\t%d\t%f\t%f\n",
+        if (gzprintf(output, "%lu\t%llu\t%s\t%d\t%d\t%f\t%f\n",
             observations[begin].barcode,
             (unsigned long long)observations[begin].molecule_hash,
             pileup_molecule_basis_name(basis), tid, pos,
             (double)ref_scaled / FIXED_POINT_SCALE,
-            (double)alt_scaled / FIXED_POINT_SCALE);
+            (double)alt_scaled / FIXED_POINT_SCALE) <= 0) {
+            observations.clear();
+            return -1;
+        }
         ++rows;
         begin = end;
     }
-    vector<PileupMoleculeObservation>().swap(observations);
+    observations.clear();
     return rows;
+}
+
+static long write_collapsed_pileup_observations(
+        gzFile output, PileupObservationMap& observations) {
+    long rows = 0;
+    for (auto& cell : observations) {
+        const unsigned long barcode = cell.first;
+        for (auto& site : cell.second) {
+            const int tid = (int)(site.first >> 32);
+            const int pos = (int)(site.first & 0xFFFFFFFF);
+            if (gzprintf(output, "%lu\t%d\t%d\t%f\t%f\n",
+                    barcode, tid, pos,
+                    (double)site.second.first / FIXED_POINT_SCALE,
+                    (double)site.second.second / FIXED_POINT_SCALE) <= 0) {
+                observations.clear();
+                return -1;
+            }
+            ++rows;
+        }
+    }
+    observations.clear();
+    return rows;
+}
+
+static std::string pileup_part_path(
+        const std::string& prefix, const char* kind, int worker) {
+    std::ostringstream path;
+    path << prefix << "." << kind << ".part." << getpid() << "." << worker
+         << ".tsv.gz";
+    return path.str();
+}
+
+static void remove_files(const vector<string>& paths) {
+    for (const string& path : paths) unlink(path.c_str());
+}
+
+static bool open_parallel_pileup_parts(
+        const string& prefix,
+        int n_threads,
+        vector<string>& observation_paths,
+        vector<gzFile>& observation_files,
+        vector<string>& molecule_paths,
+        vector<gzFile>& molecule_files,
+        string& error_message) {
+    observation_paths.resize(n_threads);
+    molecule_paths.resize(n_threads);
+    observation_files.assign(n_threads, nullptr);
+    molecule_files.assign(n_threads, nullptr);
+    for (int worker = 0; worker < n_threads; ++worker) {
+        observation_paths[worker] = pileup_part_path(prefix, "pileup_obs", worker);
+        molecule_paths[worker] = pileup_part_path(prefix, "pileup_molecules", worker);
+        observation_files[worker] = gzopen(observation_paths[worker].c_str(), "wb");
+        molecule_files[worker] = gzopen(molecule_paths[worker].c_str(), "wb");
+        if (!observation_files[worker] || !molecule_files[worker]) {
+            error_message = "could not open bounded pileup part files for worker " +
+                std::to_string(worker);
+            for (int i = 0; i <= worker; ++i) {
+                if (observation_files[i]) gzclose(observation_files[i]);
+                if (molecule_files[i]) gzclose(molecule_files[i]);
+            }
+            remove_files(observation_paths);
+            remove_files(molecule_paths);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool close_parallel_pileup_parts(
+        vector<gzFile>& files, string& error_message) {
+    bool ok = true;
+    for (size_t i = 0; i < files.size(); ++i) {
+        if (files[i] && gzclose(files[i]) != Z_OK) {
+            if (ok) {
+                error_message = "failed closing bounded pileup part for worker " +
+                    std::to_string(i);
+            }
+            ok = false;
+        }
+        files[i] = nullptr;
+    }
+    return ok;
+}
+
+static bool publish_concatenated_gzip_members(
+        const vector<string>& part_paths,
+        const string& final_path,
+        string& error_message) {
+    const string staged_path = final_path + ".tmp." +
+        std::to_string((long long)getpid());
+    std::ofstream output(staged_path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error_message = "could not open staged pileup output: " + staged_path;
+        return false;
+    }
+    vector<char> buffer(1 << 20);
+    for (const string& part_path : part_paths) {
+        std::ifstream input(part_path.c_str(), std::ios::binary);
+        if (!input) {
+            error_message = "could not reopen bounded pileup part: " + part_path;
+            output.close();
+            unlink(staged_path.c_str());
+            return false;
+        }
+        while (input) {
+            input.read(buffer.data(), (std::streamsize)buffer.size());
+            const std::streamsize bytes_read = input.gcount();
+            if (bytes_read > 0) output.write(buffer.data(), bytes_read);
+        }
+        if (!input.eof() || !output) {
+            error_message = "failed concatenating bounded pileup part: " + part_path;
+            output.close();
+            unlink(staged_path.c_str());
+            return false;
+        }
+    }
+    output.close();
+    if (!output) {
+        error_message = "failed closing staged pileup output: " + staged_path;
+        unlink(staged_path.c_str());
+        return false;
+    }
+    if (rename(staged_path.c_str(), final_path.c_str()) != 0) {
+        error_message = "failed publishing pileup output: " + final_path;
+        unlink(staged_path.c_str());
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -271,11 +525,57 @@ bool validate_identity_and_allocation_request(
     return true;
 }
 
-const ReadFilterPolicy& default_production_read_filter() {
-    static const ReadFilterPolicy policy(
-        BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP,
-        SupplementaryReadHandling::INCLUDE);
+namespace {
+
+template <typename Policy>
+auto set_policy_min_mapq(Policy& policy, uint8_t min_mapq, int)
+    -> decltype(policy.min_mapq = min_mapq, void()) {
+    policy.min_mapq = min_mapq;
+}
+
+template <typename Policy>
+void set_policy_min_mapq(Policy&, uint8_t, long) {}
+
+template <typename Policy>
+auto get_policy_min_mapq(const Policy& policy, int)
+    -> decltype(static_cast<uint8_t>(policy.min_mapq)) {
+    return static_cast<uint8_t>(policy.min_mapq);
+}
+
+template <typename Policy>
+uint8_t get_policy_min_mapq(const Policy&, long) {
+    return 0;
+}
+
+ReadFilterPolicy& mutable_production_read_filter() {
+    // Construct with defaults and assign the fields shared by both the older
+    // two-argument policy and the current policy that also accepts min_mapq.
+    // The small SFINAE helpers preserve source compatibility with both header
+    // revisions while using min_mapq whenever the current field is available.
+    static ReadFilterPolicy policy = []() {
+        ReadFilterPolicy configured;
+        configured.excluded_flags =
+            BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
+        configured.supplementary = SupplementaryReadHandling::INCLUDE;
+        set_policy_min_mapq(configured, 0, 0);
+        return configured;
+    }();
     return policy;
+}
+
+}  // namespace
+
+const ReadFilterPolicy& default_production_read_filter() {
+    return mutable_production_read_filter();
+}
+
+void configure_read_filter(uint8_t min_mapq, uint16_t excluded_flags) {
+    // demux_parallel v2.17 configures this once before any worker threads are
+    // launched. Keep the effective policy in the object returned by
+    // default_production_read_filter(), which is consumed by every BAM path.
+    ReadFilterPolicy& policy = mutable_production_read_filter();
+    policy.excluded_flags = excluded_flags;
+    set_policy_min_mapq(policy, min_mapq, 0);
 }
 
 bool read_passes_filter(const bam1_t* record, const ReadFilterPolicy& policy) {
@@ -284,7 +584,8 @@ bool read_passes_filter(const bam1_t* record, const ReadFilterPolicy& policy) {
     if (policy.supplementary == SupplementaryReadHandling::EXCLUDE) {
         excluded |= BAM_FSUPPLEMENTARY;
     }
-    return (record->core.flag & excluded) == 0;
+    return (record->core.flag & excluded) == 0 &&
+           record->core.qual >= get_policy_min_mapq(policy, 0);
 }
 
 // ============================================================================
@@ -788,14 +1089,36 @@ void convert_snpdat_to_optimized(
 void precompute_all_genotypes(
     robin_hood::unordered_map<int, ChromSNPs>& snpdat_all,
     int n_samples){
-    
+
+    vector<std::pair<int, ChromSNPs*> > chromosomes;
+    chromosomes.reserve(snpdat_all.size());
     long count = 0;
-    for (auto& kv : snpdat_all){
-        for (auto& snp : kv.second.snps){
-            snp.precompute_genotypes(n_samples);
-            snp.precompute_targets(n_samples);
-            count++;
+    for (auto& kv : snpdat_all) {
+        chromosomes.push_back(std::make_pair(kv.first, &kv.second));
+        count += (long)kv.second.snps.size();
+    }
+    ParallelOperationStatus status;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (size_t chromosome_index = 0;
+            chromosome_index < chromosomes.size(); ++chromosome_index) {
+        if (!status.ok()) continue;
+        try {
+            ChromSNPs& chromosome = *chromosomes[chromosome_index].second;
+            for (SNPData& snp : chromosome.snps) {
+                snp.precompute_genotypes(n_samples);
+                snp.precompute_targets(n_samples);
+            }
+        } catch (const std::exception& error) {
+            std::ostringstream message;
+            message << "genotype/target preparation failed for TID "
+                    << chromosomes[chromosome_index].first << ": "
+                    << error.what();
+            status.fail(message.str());
         }
+    }
+    if (!status.ok()) {
+        fprintf(stderr, "ERROR: %s\n", status.message().c_str());
+        throw std::runtime_error(status.message());
     }
     fprintf(stderr, "Precomputed genotypes and targets for %ld SNPs (%d samples)\n",
         count, n_samples);
@@ -1369,52 +1692,59 @@ static inline int64_t apply_species_target_weight(
     return (value * (int64_t)weight_scaled + half) / FIXED_POINT_SCALE;
 }
 
+static inline bool checked_add_i64(int64_t& destination, int64_t value) {
+    int64_t result = 0;
+    if (__builtin_add_overflow(destination, value, &result)) return false;
+    destination = result;
+    return true;
+}
+
+static inline bool checked_species_multiplicity(
+        int64_t rounded_value, uint64_t multiplicity, int64_t& result) {
+    const __int128 product =
+        (__int128)rounded_value * (__int128)multiplicity;
+    if (product > std::numeric_limits<int64_t>::max() ||
+        product < std::numeric_limits<int64_t>::min()) return false;
+    result = (int64_t)product;
+    return true;
+}
+
 static inline bool accumulate_species_native_targets(
     CellCounts& counts,
     const NativeSpeciesChromTargets& chrom_targets,
     size_t snp_index,
     int64_t ref_add,
-    int64_t alt_add){
+    int64_t alt_add,
+    uint64_t* total_target_updates = nullptr,
+    uint64_t* pair_target_updates = nullptr){
 
     if (snp_index >= chrom_targets.site_offsets.size()) return false;
     const uint64_t offset = chrom_targets.site_offsets[snp_index];
     if (offset == UINT64_MAX) return false;
-    if ((uint64_t)offset + chrom_targets.weights_per_site >
-        (uint64_t)chrom_targets.weights.size()) return false;
+    if (snp_index >= chrom_targets.site_target_counts.size()) return false;
+    const uint64_t count = chrom_targets.site_target_counts[snp_index];
+    if (offset + count > chrom_targets.targets.size()) return false;
+    if ((ref_add == 0) == (alt_add == 0)) return ref_add == 0;
 
-    const int n_species = chrom_targets.n_species;
-    const int state_count = n_species * GENOTYPE_STATES;
-    const int32_t* weights = chrom_targets.weights.data() + offset;
-    size_t cursor = 0;
-
-    for (int sp = 0; sp < n_species; ++sp){
-        for (int g = 0; g < GENOTYPE_STATES; ++g, ++cursor){
-            const int32_t weight = weights[cursor];
-            if (weight == 0) continue;
-            const int total_idx = sp * GENOTYPE_STATES + g;
-            counts.total_ref[total_idx] +=
-                apply_species_target_weight(ref_add, weight);
-            counts.total_alt[total_idx] +=
-                apply_species_target_weight(alt_add, weight);
-        }
-    }
-
-    for (int a = 0; a < n_species; ++a){
-        for (int b = a + 1; b < n_species; ++b){
-            for (int ga = 0; ga < GENOTYPE_STATES; ++ga){
-                const int idx_a = a * GENOTYPE_STATES + ga;
-                for (int gb = 0; gb < GENOTYPE_STATES; ++gb, ++cursor){
-                    const int32_t weight = weights[cursor];
-                    if (weight == 0) continue;
-                    const int idx_b = b * GENOTYPE_STATES + gb;
-                    const size_t pair_idx =
-                        (size_t)idx_a * (size_t)state_count + (size_t)idx_b;
-                    counts.ref_counts[pair_idx] +=
-                        apply_species_target_weight(ref_add, weight);
-                    counts.alt_counts[pair_idx] +=
-                        apply_species_target_weight(alt_add, weight);
-                }
-            }
+    const bool is_ref = ref_add != 0;
+    const int64_t value = is_ref ? ref_add : alt_add;
+    for (uint64_t cursor = offset; cursor < offset + count; ++cursor) {
+        const NativeSpeciesTargetEntry& target =
+            chrom_targets.targets[(size_t)cursor];
+        const int64_t add = apply_species_target_weight(value, target.weight);
+        if ((target.encoded_index & NATIVE_SPECIES_PAIR_TARGET) != 0) {
+            const uint32_t index =
+                target.encoded_index & ~NATIVE_SPECIES_PAIR_TARGET;
+            if (index >= counts.ref_counts.size()) return false;
+            if (is_ref) counts.ref_counts[index] += add;
+            else counts.alt_counts[index] += add;
+            if (pair_target_updates) ++(*pair_target_updates);
+        } else {
+            const uint32_t index = target.encoded_index;
+            if (index >= counts.total_ref.size()) return false;
+            if (is_ref) counts.total_ref[index] += add;
+            else counts.total_alt[index] += add;
+            if (total_target_updates) ++(*total_target_updates);
         }
     }
     return true;
@@ -1727,19 +2057,74 @@ bool count_alleles_parallel(
     atomic<int> units_done(0);
     atomic<long> reads_processed(0);
     
-    // Per-thread cell counts for memory-efficient accumulation
-    // With fixed-point int64 arithmetic, merge order doesn't matter (integer addition is associative)
+    // A whitelist lets workers update the one preallocated matrix per cell under
+    // its existing mutex. Raw-barcode discovery uses independently locked shards
+    // so it can insert unknown keys without replicating matrices per worker.
     omp_set_num_threads(n_threads);
-    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts(n_threads);
-    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_species_native_counts(
-        collect_species_native ? n_threads : 0);
+    vector<std::unique_ptr<RawCountShard>> raw_count_shards =
+        make_raw_count_shards(!has_bc_list);
+
+    std::unordered_map<unsigned long, AlignedCellCounts*> shared_count_lookup;
+    std::unordered_map<unsigned long, AlignedCellCounts*> shared_species_native_lookup;
+    if (has_bc_list) {
+        shared_count_lookup.reserve(valid_barcodes.size());
+        if (collect_species_native) {
+            shared_species_native_lookup.reserve(valid_barcodes.size());
+        }
+        for (unsigned long barcode : valid_barcodes) {
+            auto count_it = cell_counts.find(barcode);
+            if (count_it == cell_counts.end()) {
+                fprintf(stderr, "ERROR: internal filtered-cell pre-allocation failure\n");
+                return false;
+            }
+            shared_count_lookup.emplace(barcode, &count_it->second);
+            if (collect_species_native) {
+                auto native_it = species_native_counts->find(barcode);
+                if (native_it == species_native_counts->end()) {
+                    fprintf(stderr, "ERROR: internal native-species pre-allocation failure\n");
+                    return false;
+                }
+                shared_species_native_lookup.emplace(barcode, &native_it->second);
+            }
+        }
+        fprintf(stderr,
+            "Filtered-cell accumulation uses one shared count matrix per cell; "
+            "per-thread dense matrices are disabled.\n");
+    }
+    else {
+        fprintf(stderr,
+            "Raw-barcode accumulation uses %lu shared count shards; per-thread "
+            "dense matrices are disabled.\n",
+            (unsigned long)RAW_COUNT_SHARDS);
+    }
 
     // --dump_pileup: per-thread per-(cell,SNP) allele evidence (interindividual
     // only).  Inner key packs (tid<<32 | pos); value is (ref_scaled, alt_scaled).
     // Empty and untouched unless dump_pileup is set.
-    vector<robin_hood::unordered_map<unsigned long,
-        robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
+    vector<PileupObservationMap> thread_pileup(n_threads);
     vector<vector<PileupMoleculeObservation> > thread_pileup_molecules(n_threads);
+    vector<size_t> thread_pileup_entries(n_threads, 0);
+    vector<long> thread_pileup_rows(n_threads, 0);
+    vector<long> thread_molecule_rows(n_threads, 0);
+    vector<string> pileup_observation_part_paths;
+    vector<string> pileup_molecule_part_paths;
+    vector<gzFile> pileup_observation_part_files;
+    vector<gzFile> pileup_molecule_part_files;
+    string pileup_stream_error;
+    if (dump_pileup && !open_parallel_pileup_parts(
+            pileup_prefix, n_threads,
+            pileup_observation_part_paths, pileup_observation_part_files,
+            pileup_molecule_part_paths, pileup_molecule_part_files,
+            pileup_stream_error)) {
+        fprintf(stderr, "ERROR: %s\n", pileup_stream_error.c_str());
+        return false;
+    }
+    if (dump_pileup) {
+        fprintf(stderr,
+            "Pileup memory mode: bounded worker chunks (%lu cell/site, %lu molecule/site).\n",
+            (unsigned long)PILEUP_SITE_CHUNK_ENTRIES,
+            (unsigned long)PILEUP_MOLECULE_CHUNK_ENTRIES);
+    }
     vector<AcceptedSiteWeightMap> thread_site_weights(n_threads);
     // Optional ATAC->RNA barcode namespace remap.  Tracking is per-thread so
     // the hot counting loop remains lock-free; unique barcode sets are merged
@@ -1754,9 +2139,6 @@ bool count_alleles_parallel(
     #pragma omp parallel
     {
         int thread_id = omp_get_thread_num();
-        auto& local_counts = thread_counts[thread_id];
-        robin_hood::unordered_map<unsigned long, CellCounts>* local_species_native =
-            collect_species_native ? &thread_species_native_counts[thread_id] : nullptr;
         auto& local_site_weights = thread_site_weights[thread_id];
         auto& local_raw_barcodes = thread_raw_barcodes[thread_id];
         auto& local_direct_barcodes = thread_direct_target_barcodes[thread_id];
@@ -1932,8 +2314,8 @@ bool count_alleles_parallel(
                         }
                         
                         // Get mapping quality probability and scale to fixed-point
-                        float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
-                        int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
+                        int64_t prob_scaled =
+                            mapq_probability_scaled(record->core.qual);
                         
                         // Process all SNPs overlapping this read (within our chunk)
                         for (auto snp_check = snp_iter; 
@@ -1959,42 +2341,77 @@ bool count_alleles_parallel(
                                     local_site_weights[accepted_site_weight_key(tid, snp_check->pos)] +=
                                         ref_add + alt_add;
                                 }
-                                // Accumulate to per-thread storage (no locks needed)
-                                auto it = local_counts.find(bc_key);
-                                if (it == local_counts.end()){
-                                    local_counts.emplace(bc_key, CellCounts(n_samples));
-                                    it = local_counts.find(bc_key);
-                                }
-                                CellCounts& cc = it->second;
-                                
                                 // Precomputed targets: linear traversal, no branches
                                 const auto& ttargets = snp_check->total_targets;
                                 const auto& ptargets = snp_check->pair_targets;
-                                
-                                for (const auto& t : ttargets){
-                                    cc.total_ref[t.total_idx] += ref_add;
-                                    cc.total_alt[t.total_idx] += alt_add;
+                                auto add_precomputed = [&](CellCounts& counts) {
+                                    const bool is_ref = ref_add != 0;
+                                    for (const auto& t : ttargets){
+                                        if (is_ref) counts.total_ref[t.total_idx] += ref_add;
+                                        else counts.total_alt[t.total_idx] += alt_add;
+                                    }
+                                    for (const auto& p : ptargets){
+                                        if (is_ref) counts.ref_counts[p.pair_idx] += ref_add;
+                                        else counts.alt_counts[p.pair_idx] += alt_add;
+                                    }
+                                };
+
+                                if (has_bc_list) {
+                                    auto shared_it = shared_count_lookup.find(bc_key);
+                                    if (shared_it == shared_count_lookup.end()) {
+                                        operation_status.fail(format_worker_error(
+                                            "filtered-cell count lookup", thread_id, tid));
+                                        continue;
+                                    }
+                                    AlignedCellCounts& shared = *shared_it->second;
+                                    std::lock_guard<std::mutex> guard(shared.lock);
+                                    add_precomputed(shared.counts);
                                 }
-                                for (const auto& p : ptargets){
-                                    cc.ref_counts[p.pair_idx] += ref_add;
-                                    cc.alt_counts[p.pair_idx] += alt_add;
+                                else {
+                                    RawCountShard& shard = *raw_count_shards[
+                                        raw_count_shard_index(bc_key)];
+                                    std::lock_guard<std::mutex> guard(shard.lock);
+                                    auto it = shard.panel0.find(bc_key);
+                                    if (it == shard.panel0.end()){
+                                        shard.panel0.emplace(bc_key, CellCounts(n_samples));
+                                        it = shard.panel0.find(bc_key);
+                                    }
+                                    add_precomputed(it->second);
                                 }
 
-                                if (local_species_native != nullptr &&
-                                    native_chrom_targets != nullptr){
+                                if (collect_species_native && native_chrom_targets != nullptr){
                                     const size_t snp_index = (size_t)(
                                         snp_check - chrom_snps.snps.begin());
                                     if (snp_index < native_chrom_targets->site_offsets.size() &&
                                         native_chrom_targets->site_offsets[snp_index] != UINT64_MAX){
-                                        auto native_it = local_species_native->find(bc_key);
-                                        if (native_it == local_species_native->end()){
-                                            local_species_native->emplace(
-                                                bc_key, CellCounts(species_native_n_samples));
-                                            native_it = local_species_native->find(bc_key);
+                                        if (has_bc_list) {
+                                            auto native_it = shared_species_native_lookup.find(bc_key);
+                                            if (native_it == shared_species_native_lookup.end()) {
+                                                operation_status.fail(format_worker_error(
+                                                    "filtered native-species count lookup",
+                                                    thread_id, tid));
+                                                continue;
+                                            }
+                                            AlignedCellCounts& shared_native = *native_it->second;
+                                            std::lock_guard<std::mutex> guard(shared_native.lock);
+                                            accumulate_species_native_targets(
+                                                shared_native.counts, *native_chrom_targets,
+                                                snp_index, ref_add, alt_add);
                                         }
-                                        accumulate_species_native_targets(
-                                            native_it->second, *native_chrom_targets, snp_index,
-                                            ref_add, alt_add);
+                                        else {
+                                            RawCountShard& shard = *raw_count_shards[
+                                                raw_count_shard_index(bc_key)];
+                                            std::lock_guard<std::mutex> guard(shard.lock);
+                                            auto native_it = shard.native.find(bc_key);
+                                            if (native_it == shard.native.end()){
+                                                shard.native.emplace(
+                                                    bc_key, CellCounts(species_native_n_samples));
+                                                native_it = shard.native.find(bc_key);
+                                            }
+                                            accumulate_species_native_targets(
+                                                native_it->second, *native_chrom_targets, snp_index,
+                                                ref_add, alt_add);
+                                        }
                                     }
                                 }
 
@@ -2004,9 +2421,17 @@ bool count_alleles_parallel(
                                 if (dump_pileup && snp_check->panel_id == 0){
                                     int64_t pkey = ((int64_t)tid << 32) |
                                         (int64_t)(uint32_t)snp_check->pos;
-                                    auto& slot = thread_pileup[thread_id][bc_key][pkey];
-                                    slot.first += ref_add;
-                                    slot.second += alt_add;
+                                    auto& cell_sites = thread_pileup[thread_id][bc_key];
+                                    auto site_it = cell_sites.find(pkey);
+                                    if (site_it == cell_sites.end()) {
+                                        cell_sites.emplace(
+                                            pkey, std::make_pair(ref_add, alt_add));
+                                        ++thread_pileup_entries[thread_id];
+                                    }
+                                    else {
+                                        site_it->second.first += ref_add;
+                                        site_it->second.second += alt_add;
+                                    }
                                     PileupMoleculeObservation observation;
                                     observation.barcode = bc_key;
                                     observation.molecule_hash = molecule_key.first;
@@ -2016,6 +2441,29 @@ bool count_alleles_parallel(
                                     observation.basis = molecule_key.second;
                                     thread_pileup_molecules[thread_id].push_back(
                                         observation);
+                                    if (thread_pileup_entries[thread_id] >=
+                                            PILEUP_SITE_CHUNK_ENTRIES) {
+                                        const long written = write_collapsed_pileup_observations(
+                                            pileup_observation_part_files[thread_id],
+                                            thread_pileup[thread_id]);
+                                        thread_pileup_entries[thread_id] = 0;
+                                        if (written < 0) {
+                                            operation_status.fail(format_worker_error(
+                                                "pileup observation write", thread_id, tid));
+                                        }
+                                        else thread_pileup_rows[thread_id] += written;
+                                    }
+                                    if (thread_pileup_molecules[thread_id].size() >=
+                                            PILEUP_MOLECULE_CHUNK_ENTRIES) {
+                                        const long written = write_collapsed_pileup_molecules(
+                                            pileup_molecule_part_files[thread_id],
+                                            thread_pileup_molecules[thread_id]);
+                                        if (written < 0) {
+                                            operation_status.fail(format_worker_error(
+                                                "pileup molecule write", thread_id, tid));
+                                        }
+                                        else thread_molecule_rows[thread_id] += written;
+                                    }
                                 }
                             }
                         }
@@ -2048,57 +2496,50 @@ bool count_alleles_parallel(
         if (idx) hts_idx_destroy(idx);
         if (header) bam_hdr_destroy(header);
         if (bam_fp) hts_close(bam_fp);
+
+        if (dump_pileup && operation_status.ok()) {
+            const long obs_written = write_collapsed_pileup_observations(
+                pileup_observation_part_files[thread_id], thread_pileup[thread_id]);
+            thread_pileup_entries[thread_id] = 0;
+            const long molecule_written = write_collapsed_pileup_molecules(
+                pileup_molecule_part_files[thread_id],
+                thread_pileup_molecules[thread_id]);
+            if (obs_written < 0 || molecule_written < 0) {
+                operation_status.fail(format_worker_error(
+                    "final bounded pileup write", thread_id));
+            }
+            else {
+                thread_pileup_rows[thread_id] += obs_written;
+                thread_molecule_rows[thread_id] += molecule_written;
+            }
+        }
+    }
+
+    if (dump_pileup) {
+        string close_error;
+        const bool obs_closed = close_parallel_pileup_parts(
+            pileup_observation_part_files, close_error);
+        const bool molecule_closed = close_parallel_pileup_parts(
+            pileup_molecule_part_files, close_error);
+        if (!obs_closed || !molecule_closed) operation_status.fail(close_error);
     }
 
     if (!operation_status.ok()){
         fprintf(stderr, "ERROR: parallel allele counting failed: %s\n",
             operation_status.message().c_str());
+        remove_files(pileup_observation_part_paths);
+        remove_files(pileup_molecule_part_paths);
         return false;
     }
     
-    // Merge per-thread counts (order doesn't matter with fixed-point int64 arithmetic)
-    fprintf(stderr, "\nMerging per-thread counts (fixed-point)...\n");
-    
-    // Efficient merge: iterate each thread's map once and merge directly
-    // This is O(total_entries) instead of O(cells * threads) lookups
-    for (int t = 0; t < n_threads; t++){
-        for (auto& kv : thread_counts[t]){
-            unsigned long bc_key = kv.first;
-            auto it = cell_counts.find(bc_key);
-            if (it == cell_counts.end()){
-                cell_counts.emplace(std::piecewise_construct,
-                    std::forward_as_tuple(bc_key),
-                    std::forward_as_tuple(n_samples));
-                it = cell_counts.find(bc_key);
-            }
-            it->second.counts.merge(kv.second);
-        }
-        // Free memory incrementally
-        thread_counts[t].clear();
-        
-        if ((t + 1) % 10 == 0 || t == n_threads - 1){
-            fprintf(stderr, "  Merged thread %d/%d\n", t + 1, n_threads);
-        }
+    if (!has_bc_list) {
+        fprintf(stderr, "\nMoving sharded raw-barcode counts...\n");
+        move_sharded_counts(raw_count_shards, 0, cell_counts);
     }
     
-    if (collect_species_native){
-        fprintf(stderr, "Merging per-thread native species counts...\n");
-        for (int t = 0; t < n_threads; ++t){
-            for (auto& kv : thread_species_native_counts[t]){
-                const unsigned long bc_key = kv.first;
-                auto it = species_native_counts->find(bc_key);
-                if (it == species_native_counts->end()){
-                    species_native_counts->emplace(std::piecewise_construct,
-                        std::forward_as_tuple(bc_key),
-                        std::forward_as_tuple(species_native_n_samples));
-                    it = species_native_counts->find(bc_key);
-                }
-                it->second.counts.merge(kv.second);
-            }
-            thread_species_native_counts[t].clear();
-        }
-        thread_species_native_counts.clear();
-        thread_species_native_counts.shrink_to_fit();
+    if (collect_species_native && !has_bc_list){
+        fprintf(stderr, "Moving sharded native species counts...\n");
+        move_sharded_counts(raw_count_shards, 2, *species_native_counts);
         fprintf(stderr, "Native species counts: %lu cells, %d species\n",
             species_native_counts->size(), species_native_n_samples);
     }
@@ -2135,66 +2576,39 @@ bool count_alleles_parallel(
     thread_mapped_target_barcodes.clear();
     thread_map_entries_used.clear();
 
-    // Final cleanup
-    thread_counts.clear();
-    thread_counts.shrink_to_fit();
+    raw_count_shards.clear();
+    raw_count_shards.shrink_to_fit();
 
-    // --dump_pileup: flush per-thread per-(cell,SNP) observations.  Per-thread
-    // rows are pre-summed; the same (bc,tid,pos) may still appear across threads
-    // and is summed downstream by the producer.  Columns: bc_hash tid pos ref alt
-    // (ref/alt are prob-scaled float evidence, matching the .counts units).
+    // Publish the bounded per-worker gzip members. Rows can be duplicated across
+    // chunks or workers; every downstream consumer merges those exact keys.
     if (dump_pileup){
         string obs_path = pileup_prefix + ".pileup_obs.tsv.gz";
-        gzFile pf = gzopen(obs_path.c_str(), "w");
-        if (!pf){
-            fprintf(stderr, "ERROR: could not open %s for writing\n", obs_path.c_str());
+        if (!publish_concatenated_gzip_members(
+                pileup_observation_part_paths, obs_path, pileup_stream_error)) {
+            fprintf(stderr, "ERROR: %s\n", pileup_stream_error.c_str());
+            remove_files(pileup_observation_part_paths);
+            remove_files(pileup_molecule_part_paths);
             return false;
-        } else {
-            long n_obs_written = 0;
-            for (int t = 0; t < n_threads; t++){
-                for (auto& cell : thread_pileup[t]){
-                    unsigned long bc = cell.first;
-                    for (auto& kv : cell.second){
-                        int tid_o = (int)(kv.first >> 32);
-                        int pos_o = (int)(kv.first & 0xFFFFFFFF);
-                        gzprintf(pf, "%lu\t%d\t%d\t%f\t%f\n", bc, tid_o, pos_o,
-                            (double)kv.second.first / FIXED_POINT_SCALE,
-                            (double)kv.second.second / FIXED_POINT_SCALE);
-                        n_obs_written++;
-                    }
-                }
-                thread_pileup[t].clear();
-            }
-            if (gzclose(pf) != Z_OK){
-                fprintf(stderr, "ERROR: failed while closing %s\n", obs_path.c_str());
-                return false;
-            }
-            fprintf(stderr, "Wrote %ld pileup observations to %s\n", n_obs_written, obs_path.c_str());
         }
-
-        // One row per accepted molecule/SNP overlap.  Downstream scoring
-        // collapses duplicate molecule/site rows, groups all SNPs covered by a
-        // molecule, and can therefore report independent molecule counts and
-        // leave-one-molecule-out influence without treating a long read that
-        // covers several SNPs as several independent molecules.
         string molecule_path = pileup_prefix + ".pileup_molecules.tsv.gz";
-        gzFile mf = gzopen(molecule_path.c_str(), "w");
-        if (!mf){
-            fprintf(stderr, "ERROR: could not open %s for writing\n",
-                molecule_path.c_str());
+        if (!publish_concatenated_gzip_members(
+                pileup_molecule_part_paths, molecule_path, pileup_stream_error)) {
+            fprintf(stderr, "ERROR: %s\n", pileup_stream_error.c_str());
+            remove_files(pileup_observation_part_paths);
+            remove_files(pileup_molecule_part_paths);
             return false;
         }
+        long n_obs_written = 0;
         long n_molecule_rows = 0;
-        for (int t = 0; t < n_threads; ++t){
-            n_molecule_rows += write_collapsed_pileup_molecules(
-                mf, thread_pileup_molecules[t]);
+        for (int t = 0; t < n_threads; ++t) {
+            n_obs_written += thread_pileup_rows[t];
+            n_molecule_rows += thread_molecule_rows[t];
         }
-        if (gzclose(mf) != Z_OK){
-            fprintf(stderr, "ERROR: failed while closing %s\n",
-                molecule_path.c_str());
-            return false;
-        }
-        fprintf(stderr, "Wrote %ld molecule/SNP observations to %s\n",
+        remove_files(pileup_observation_part_paths);
+        remove_files(pileup_molecule_part_paths);
+        fprintf(stderr, "Wrote %ld bounded pileup observation rows to %s\n",
+            n_obs_written, obs_path.c_str());
+        fprintf(stderr, "Wrote %ld bounded molecule/SNP rows to %s\n",
             n_molecule_rows, molecule_path.c_str());
     }
     thread_pileup.clear();
@@ -2205,6 +2619,2390 @@ bool count_alleles_parallel(
     fprintf(stderr, "Completed: %d chromosomes (%lu work units), %ld SNPs, %ld iterator records, %lu cells\n",
         n_chroms, work_units.size(), snps_processed.load(), reads_processed.load(), 
         cell_counts.size());
+    return true;
+}
+
+// ============================================================================
+// FUSED FILTERED/RAW RNA COUNTING
+// ============================================================================
+
+namespace {
+
+struct FusedAlignedObservation {
+    const SNPData* snp = nullptr;
+    size_t snp_index = 0;
+    int64_t ref_scaled = 0;
+    int64_t alt_scaled = 0;
+};
+
+enum FusedObservationPanel : uint8_t {
+    FUSED_MAIN_PANEL = 0,
+    FUSED_SPECIES_PANEL = 1,
+};
+
+struct FusedCountObservation {
+    uint64_t barcode;
+    int64_t probability_scaled;
+    uint32_t snp_index;
+    uint32_t tid_and_flags;
+
+    int tid() const { return (int)(tid_and_flags & UINT32_C(0x3fffffff)); }
+    uint8_t panel() const { return (uint8_t)((tid_and_flags >> 31) & 1U); }
+    uint8_t allele() const { return (uint8_t)((tid_and_flags >> 30) & 1U); }
+};
+
+static_assert(sizeof(FusedCountObservation) == 24,
+    "fused count observations must remain compact");
+
+constexpr size_t FUSED_RAW_PARTITIONS = 256;
+constexpr size_t FUSED_OBSERVATION_BUFFER_RECORDS = 65536;
+constexpr size_t FUSED_SORT_CHUNK_RECORDS = 500000;
+constexpr size_t FUSED_MERGE_FAN_IN = 24;
+static_assert((FUSED_RAW_PARTITIONS & (FUSED_RAW_PARTITIONS - 1)) == 0,
+    "raw partition count must remain a power of two");
+
+static inline uint64_t fused_barcode_hash(uint64_t value) {
+    value += UINT64_C(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static inline size_t fused_raw_partition(uint64_t barcode) {
+    return (size_t)(fused_barcode_hash(barcode) &
+        (FUSED_RAW_PARTITIONS - 1));
+}
+
+static bool fused_observation_less(
+        const FusedCountObservation& left,
+        const FusedCountObservation& right) {
+    if (left.barcode != right.barcode) return left.barcode < right.barcode;
+    if (left.panel() != right.panel()) return left.panel() < right.panel();
+    if (left.tid() != right.tid()) return left.tid() < right.tid();
+    if (left.snp_index != right.snp_index)
+        return left.snp_index < right.snp_index;
+    if (left.allele() != right.allele()) return left.allele() < right.allele();
+    return left.probability_scaled < right.probability_scaled;
+}
+
+struct FusedRawPartitionFile {
+    std::mutex lock;
+    FILE* file = nullptr;
+    string path;
+    uint64_t bytes = 0;
+
+    ~FusedRawPartitionFile() {
+        if (file) fclose(file);
+    }
+};
+
+class FusedTemporaryFiles {
+  public:
+    ~FusedTemporaryFiles() {
+        std::lock_guard<std::mutex> guard(lock_);
+        for (const string& path : paths_) unlink(path.c_str());
+    }
+
+    void add(const string& path) {
+        std::lock_guard<std::mutex> guard(lock_);
+        paths_.push_back(path);
+    }
+
+  private:
+    std::mutex lock_;
+    vector<string> paths_;
+};
+
+struct FusedWorkUnit {
+    int tid = -1;
+    int owner_start = 0;
+    int owner_end = INT_MAX;
+    uint64_t estimated_records = 0;
+};
+
+using FusedPerfClock = std::chrono::steady_clock;
+
+static double fused_perf_seconds(
+        const FusedPerfClock::time_point& start,
+        const FusedPerfClock::time_point& end) {
+    return std::chrono::duration<double>(end - start).count();
+}
+
+static uint64_t fused_perf_nanoseconds(
+        const FusedPerfClock::time_point& start,
+        const FusedPerfClock::time_point& end) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        end - start).count();
+}
+
+static void print_fused_perf_phase(
+        const char* name,
+        const FusedPerfClock::time_point& start,
+        const FusedPerfClock::time_point& end) {
+    fprintf(stderr, "PERF_PHASE name=%s seconds=%.6f\n",
+        name, fused_perf_seconds(start, end));
+}
+
+struct FusedLockSampleCounters {
+    uint64_t applicable_records = 0;
+    uint64_t samples = 0;
+    uint64_t wait_nanoseconds = 0;
+    uint64_t held_nanoseconds = 0;
+};
+
+struct FusedThreadPerfCounters {
+    uint64_t iterator_records = 0;
+    uint64_t records_passing_read_policy = 0;
+    uint64_t cb_tagged_records = 0;
+    uint64_t filtered_cell_records = 0;
+    uint64_t raw_only_records = 0;
+    uint64_t main_allele_observations = 0;
+    uint64_t species_allele_observations = 0;
+    uint64_t main_total_target_updates = 0;
+    uint64_t main_pair_target_updates = 0;
+    uint64_t species_total_target_updates = 0;
+    uint64_t species_pair_target_updates = 0;
+    uint64_t raw_shard_acquisitions = 0;
+    uint64_t raw_partition_bulk_writes = 0;
+    FusedLockSampleCounters filtered_cell_lock;
+    FusedLockSampleCounters raw_shard_lock;
+    FusedLockSampleCounters raw_partition_lock;
+};
+
+struct FusedWorkUnitProfile {
+    uint64_t elapsed_nanoseconds = 0;
+    uint64_t iterator_records = 0;
+    uint64_t records_passing_read_policy = 0;
+    uint64_t cb_tagged_records = 0;
+    uint64_t filtered_cell_records = 0;
+    uint64_t raw_only_records = 0;
+    uint64_t main_allele_observations = 0;
+    uint64_t species_allele_observations = 0;
+};
+
+constexpr uint64_t FUSED_LOCK_SAMPLE_INTERVAL = 4096;
+
+template <typename Operation>
+static inline bool with_fused_sampled_lock(
+        std::mutex& lock,
+        bool sample,
+        FusedLockSampleCounters& counters,
+        bool& sample_recorded,
+        Operation operation) {
+    if (!sample) {
+        std::lock_guard<std::mutex> guard(lock);
+        return operation();
+    }
+
+    const FusedPerfClock::time_point wait_start = FusedPerfClock::now();
+    std::unique_lock<std::mutex> guard(lock);
+    const FusedPerfClock::time_point held_start = FusedPerfClock::now();
+    const bool ok = operation();
+    const FusedPerfClock::time_point held_end = FusedPerfClock::now();
+    counters.wait_nanoseconds += fused_perf_nanoseconds(wait_start, held_start);
+    counters.held_nanoseconds += fused_perf_nanoseconds(held_start, held_end);
+    if (!sample_recorded) {
+        ++counters.samples;
+        sample_recorded = true;
+    }
+    return ok;
+}
+
+#pragma pack(push, 1)
+struct FusedPileupSpoolRecord {
+    uint64_t barcode;
+    uint64_t molecule_hash;
+    uint64_t site;
+    int64_t ref_scaled;
+    int64_t alt_scaled;
+    uint8_t basis;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(FusedPileupSpoolRecord) == 41,
+    "fused pileup spool records must remain compact");
+
+constexpr size_t FUSED_GZIP_BUFFER_BYTES = 1U << 20;
+constexpr size_t FUSED_PILEUP_SORT_RECORDS = 500000;
+
+class FusedGzipWriter {
+  public:
+    FusedGzipWriter() : file_(nullptr), ok_(true) {
+        buffer_.reserve(FUSED_GZIP_BUFFER_BYTES + 4096);
+    }
+
+    ~FusedGzipWriter() {
+        if (file_) gzclose(file_);
+    }
+
+    FusedGzipWriter(const FusedGzipWriter&) = delete;
+    FusedGzipWriter& operator=(const FusedGzipWriter&) = delete;
+
+    bool open(const string& path) {
+        path_ = path;
+        file_ = gzopen(path.c_str(), "wb1");
+        if (!file_) {
+            ok_ = false;
+            return false;
+        }
+        if (gzbuffer(file_, (unsigned int)FUSED_GZIP_BUFFER_BYTES) != 0) {
+            gzclose(file_);
+            file_ = nullptr;
+            ok_ = false;
+            return false;
+        }
+        return true;
+    }
+
+    bool append(const string& text) {
+        if (!ok_ || !file_) return false;
+        if (buffer_.size() + text.size() > FUSED_GZIP_BUFFER_BYTES && !flush()) {
+            return false;
+        }
+        if (text.size() > FUSED_GZIP_BUFFER_BYTES) {
+            const int written = gzwrite(file_, text.data(), (unsigned int)text.size());
+            if (written != (int)text.size()) ok_ = false;
+            return ok_;
+        }
+        buffer_.append(text);
+        return true;
+    }
+
+    bool close() {
+        if (!file_) return ok_;
+        const bool flushed = flush();
+        const int close_status = gzclose(file_);
+        file_ = nullptr;
+        if (!flushed || close_status != Z_OK) ok_ = false;
+        return ok_;
+    }
+
+    const string& path() const { return path_; }
+
+  private:
+    bool flush() {
+        if (!ok_ || !file_) return false;
+        if (buffer_.empty()) return true;
+        const int written = gzwrite(
+            file_, buffer_.data(), (unsigned int)buffer_.size());
+        if (written != (int)buffer_.size()) {
+            ok_ = false;
+            return false;
+        }
+        buffer_.clear();
+        return true;
+    }
+
+    gzFile file_;
+    bool ok_;
+    string path_;
+    string buffer_;
+};
+
+static void append_scaled_decimal(string& line, int64_t value) {
+    const bool negative = value < 0;
+    const uint64_t magnitude = negative
+        ? (uint64_t)(-(value + 1)) + 1ULL
+        : (uint64_t)value;
+    const uint64_t whole = magnitude / (uint64_t)FIXED_POINT_SCALE;
+    const uint64_t fraction = magnitude % (uint64_t)FIXED_POINT_SCALE;
+    char number[96];
+    snprintf(number, sizeof(number), "%s%llu.%06llu",
+        negative ? "-" : "",
+        (unsigned long long)whole,
+        (unsigned long long)fraction);
+    line.append(number);
+}
+
+static bool append_count_row(
+        FusedGzipWriter& writer,
+        string& line,
+        unsigned long barcode,
+        int indv1,
+        int nalt1,
+        int indv2,
+        int nalt2,
+        int64_t ref_scaled,
+        int64_t alt_scaled) {
+    char prefix[160];
+    const int length = snprintf(prefix, sizeof(prefix), "%lu\t%d\t%d\t%d\t%d\t",
+        barcode, indv1, nalt1, indv2, nalt2);
+    if (length < 0 || (size_t)length >= sizeof(prefix)) return false;
+    line.clear();
+    line.append(prefix, (size_t)length);
+    append_scaled_decimal(line, ref_scaled);
+    line.push_back('\t');
+    append_scaled_decimal(line, alt_scaled);
+    line.push_back('\n');
+    return writer.append(line);
+}
+
+static bool append_dense_count_rows(
+        FusedGzipWriter& writer,
+        unsigned long barcode,
+        const CellCounts& counts,
+        int n_samples) {
+    const int state_count = n_samples * GENOTYPE_STATES;
+    string line;
+    line.reserve(256);
+    if (counts.state_count != state_count ||
+        counts.total_ref.size() != (size_t)state_count ||
+        counts.total_alt.size() != (size_t)state_count ||
+        counts.ref_counts.size() != (size_t)state_count * (size_t)state_count ||
+        counts.alt_counts.size() != (size_t)state_count * (size_t)state_count) {
+        return false;
+    }
+    for (int indv = 0; indv < n_samples; ++indv) {
+        for (int nalt = 0; nalt < GENOTYPE_STATES; ++nalt) {
+            const size_t index = (size_t)indv * GENOTYPE_STATES + (size_t)nalt;
+            const int64_t ref = counts.total_ref[index];
+            const int64_t alt = counts.total_alt[index];
+            if (ref == 0 && alt == 0) continue;
+            if (!append_count_row(
+                    writer, line, barcode, indv, nalt, -1, -1, ref, alt)) return false;
+        }
+    }
+    for (int indv1 = 0; indv1 < n_samples; ++indv1) {
+        for (int nalt1 = 0; nalt1 < GENOTYPE_STATES; ++nalt1) {
+            const size_t idx1 =
+                (size_t)indv1 * GENOTYPE_STATES + (size_t)nalt1;
+            for (int indv2 = indv1 + 1; indv2 < n_samples; ++indv2) {
+                for (int nalt2 = 0; nalt2 < GENOTYPE_STATES; ++nalt2) {
+                    const size_t idx2 =
+                        (size_t)indv2 * GENOTYPE_STATES + (size_t)nalt2;
+                    const size_t index = idx1 * (size_t)state_count + idx2;
+                    const int64_t ref = counts.ref_counts[index];
+                    const int64_t alt = counts.alt_counts[index];
+                    if (ref == 0 && alt == 0) continue;
+                    if (!append_count_row(
+                            writer, line, barcode, indv1, nalt1, indv2, nalt2,
+                            ref, alt)) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool add_main_value_dense(
+        CellCounts& counts,
+        const SNPData& snp,
+        bool is_alt,
+        int64_t value,
+        uint64_t multiplicity,
+        vector<uint32_t>* touched_totals,
+        vector<uint32_t>* touched_pairs,
+        uint64_t& total_target_updates,
+        uint64_t& pair_target_updates) {
+    for (const SNPTotalTarget& target : snp.total_targets) {
+        if (target.total_idx >= counts.total_ref.size()) return false;
+        if (touched_totals &&
+            counts.total_ref[target.total_idx] == 0 &&
+            counts.total_alt[target.total_idx] == 0) {
+            touched_totals->push_back(target.total_idx);
+        }
+        int64_t& destination = is_alt
+            ? counts.total_alt[target.total_idx]
+            : counts.total_ref[target.total_idx];
+        if (!checked_add_i64(destination, value)) return false;
+        if (__builtin_add_overflow(
+                total_target_updates, multiplicity,
+                &total_target_updates)) return false;
+    }
+    for (const SNPPairTarget& target : snp.pair_targets) {
+        if (target.pair_idx >= counts.ref_counts.size()) return false;
+        if (touched_pairs &&
+            counts.ref_counts[target.pair_idx] == 0 &&
+            counts.alt_counts[target.pair_idx] == 0) {
+            touched_pairs->push_back(target.pair_idx);
+        }
+        int64_t& destination = is_alt
+            ? counts.alt_counts[target.pair_idx]
+            : counts.ref_counts[target.pair_idx];
+        if (!checked_add_i64(destination, value)) return false;
+        if (__builtin_add_overflow(
+                pair_target_updates, multiplicity,
+                &pair_target_updates)) return false;
+    }
+    return true;
+}
+
+static bool add_species_value_dense(
+        CellCounts& counts,
+        const NativeSpeciesChromTargets& targets,
+        uint32_t snp_index,
+        bool is_alt,
+        int64_t probability_scaled,
+        uint64_t multiplicity,
+        vector<uint32_t>* touched_totals,
+        vector<uint32_t>* touched_pairs,
+        uint64_t& total_target_updates,
+        uint64_t& pair_target_updates) {
+    if (snp_index >= targets.site_offsets.size() ||
+        snp_index >= targets.site_target_counts.size()) return false;
+    const uint64_t offset = targets.site_offsets[snp_index];
+    if (offset == UINT64_MAX) return true;
+    const uint64_t target_count = targets.site_target_counts[snp_index];
+    if (offset + target_count > targets.targets.size()) return false;
+    for (uint64_t cursor = offset; cursor < offset + target_count; ++cursor) {
+        const NativeSpeciesTargetEntry& target = targets.targets[(size_t)cursor];
+        int64_t add = 0;
+        if (!checked_species_multiplicity(
+                apply_species_target_weight(probability_scaled, target.weight),
+                multiplicity, add)) return false;
+        if ((target.encoded_index & NATIVE_SPECIES_PAIR_TARGET) != 0) {
+            const uint32_t index =
+                target.encoded_index & ~NATIVE_SPECIES_PAIR_TARGET;
+            if (index >= counts.ref_counts.size()) return false;
+            if (add != 0 && touched_pairs && counts.ref_counts[index] == 0 &&
+                counts.alt_counts[index] == 0) touched_pairs->push_back(index);
+            int64_t& destination =
+                is_alt ? counts.alt_counts[index] : counts.ref_counts[index];
+            if (!checked_add_i64(destination, add)) return false;
+            if (__builtin_add_overflow(
+                    pair_target_updates, multiplicity,
+                    &pair_target_updates)) return false;
+        } else {
+            const uint32_t index = target.encoded_index;
+            if (index >= counts.total_ref.size()) return false;
+            if (add != 0 && touched_totals && counts.total_ref[index] == 0 &&
+                counts.total_alt[index] == 0) touched_totals->push_back(index);
+            int64_t& destination =
+                is_alt ? counts.total_alt[index] : counts.total_ref[index];
+            if (!checked_add_i64(destination, add)) return false;
+            if (__builtin_add_overflow(
+                    total_target_updates, multiplicity,
+                    &total_target_updates)) return false;
+        }
+    }
+    return true;
+}
+
+static void collect_aligned_block_observations(
+        const bam1_t* record,
+        const ChromSNPs* panel,
+        size_t& cursor,
+        int64_t ref_start,
+        int64_t query_start,
+        int64_t length,
+        int64_t probability_scaled,
+        vector<FusedAlignedObservation>& observations) {
+    if (!panel || length <= 0) return;
+    const int64_t ref_end = ref_start + length;
+    const vector<SNPData>& snps = panel->snps;
+    while (cursor < snps.size() && (int64_t)snps[cursor].pos < ref_start) ++cursor;
+    size_t index = cursor;
+    uint8_t* sequence = bam_get_seq(const_cast<bam1_t*>(record));
+    while (index < snps.size() && (int64_t)snps[index].pos < ref_end) {
+        const int64_t query_index =
+            query_start + ((int64_t)snps[index].pos - ref_start);
+        if (query_index >= 0 && query_index < record->core.l_qseq) {
+            const char allele = seq_nt16_str[bam_seqi(sequence, (int)query_index)];
+            int64_t ref_scaled = 0;
+            int64_t alt_scaled = 0;
+            if (allele == snps[index].data.ref) ref_scaled = probability_scaled;
+            else if (allele == snps[index].data.alt) alt_scaled = probability_scaled;
+            if (ref_scaled != 0 || alt_scaled != 0) {
+                FusedAlignedObservation observation;
+                observation.snp = &snps[index];
+                observation.snp_index = index;
+                observation.ref_scaled = ref_scaled;
+                observation.alt_scaled = alt_scaled;
+                observations.push_back(observation);
+            }
+        }
+        ++index;
+    }
+    cursor = index;
+}
+
+static void collect_fused_alignment_observations(
+        const bam1_t* record,
+        const ChromSNPs* main_panel,
+        const ChromSNPs* species_panel,
+        size_t main_start_cursor,
+        size_t species_start_cursor,
+        int64_t probability_scaled,
+        vector<FusedAlignedObservation>& main_observations,
+        vector<FusedAlignedObservation>& species_observations) {
+    main_observations.clear();
+    species_observations.clear();
+    if (!record || record->core.pos < 0) return;
+
+    uint32_t* cigar = bam_get_cigar(const_cast<bam1_t*>(record));
+    int64_t ref_position = record->core.pos;
+    int64_t query_position = 0;
+    size_t main_cursor = main_start_cursor;
+    size_t species_cursor = species_start_cursor;
+
+    for (uint32_t cigar_index = 0;
+            cigar_index < record->core.n_cigar; ++cigar_index) {
+        const int operation = bam_cigar_op(cigar[cigar_index]);
+        const int64_t length = bam_cigar_oplen(cigar[cigar_index]);
+        if (length < 0) return;
+        switch (operation) {
+            case BAM_CMATCH:
+            case BAM_CEQUAL:
+            case BAM_CDIFF:
+                if (ref_position > INT64_MAX - length ||
+                    query_position > INT64_MAX - length) return;
+                collect_aligned_block_observations(
+                    record, main_panel, main_cursor, ref_position,
+                    query_position, length, probability_scaled,
+                    main_observations);
+                collect_aligned_block_observations(
+                    record, species_panel, species_cursor, ref_position,
+                    query_position, length, probability_scaled,
+                    species_observations);
+                ref_position += length;
+                query_position += length;
+                break;
+            case BAM_CINS:
+            case BAM_CSOFT_CLIP:
+                if (query_position > INT64_MAX - length) return;
+                query_position += length;
+                break;
+            case BAM_CDEL:
+            case BAM_CREF_SKIP:
+                if (ref_position > INT64_MAX - length) return;
+                ref_position += length;
+                break;
+            case BAM_CHARD_CLIP:
+            case BAM_CPAD:
+                break;
+            default:
+                return;
+        }
+        if (query_position < 0 || query_position > record->core.l_qseq) return;
+    }
+}
+
+static const ChromSNPs* find_chrom_panel(
+        const robin_hood::unordered_map<int, ChromSNPs>& panel,
+        int tid) {
+    auto found = panel.find(tid);
+    return found == panel.end() ? nullptr : &found->second;
+}
+
+static bool append_compact_observation(
+        vector<FusedCountObservation>& destination,
+        uint64_t barcode,
+        int tid,
+        uint8_t panel,
+        const FusedAlignedObservation& observation) {
+    if (tid < 0 || (uint64_t)tid > UINT32_C(0x3fffffff) || panel > 1 ||
+        observation.snp_index > std::numeric_limits<uint32_t>::max() ||
+        ((observation.ref_scaled == 0) == (observation.alt_scaled == 0))) {
+        return false;
+    }
+    FusedCountObservation compact;
+    compact.barcode = barcode;
+    compact.snp_index = (uint32_t)observation.snp_index;
+    compact.probability_scaled = observation.ref_scaled != 0
+        ? observation.ref_scaled : observation.alt_scaled;
+    compact.tid_and_flags = (uint32_t)tid |
+        ((uint32_t)panel << 31) |
+        ((uint32_t)(observation.alt_scaled != 0 ? 1 : 0) << 30);
+    destination.push_back(compact);
+    return true;
+}
+
+static bool same_observation_site(
+        const FusedCountObservation& left,
+        const FusedCountObservation& right) {
+    return left.barcode == right.barcode && left.panel() == right.panel() &&
+        left.tid() == right.tid() && left.snp_index == right.snp_index &&
+        left.allele() == right.allele();
+}
+
+static bool same_species_observation(
+        const FusedCountObservation& left,
+        const FusedCountObservation& right) {
+    return same_observation_site(left, right) &&
+        left.probability_scaled == right.probability_scaled;
+}
+
+static bool flush_filtered_observations(
+        vector<FusedCountObservation>& observations,
+        const robin_hood::unordered_map<int, ChromSNPs>& main_snpdat,
+        const NativeSpeciesTargetTable& species_targets,
+        const std::unordered_map<unsigned long, AlignedCellCounts*>& main_cells,
+        const std::unordered_map<unsigned long, AlignedCellCounts*>& species_cells,
+        FusedThreadPerfCounters& perf,
+        string& error_message) {
+    if (observations.empty()) return true;
+    std::sort(observations.begin(), observations.end(), fused_observation_less);
+    size_t begin = 0;
+    while (begin < observations.size()) {
+        const FusedCountObservation& first = observations[begin];
+        size_t end = begin + 1;
+        if (first.panel() == FUSED_MAIN_PANEL) {
+            int64_t sum = first.probability_scaled;
+            uint64_t multiplicity = 1;
+            while (end < observations.size() &&
+                    same_observation_site(first, observations[end])) {
+                if (!checked_add_i64(sum, observations[end].probability_scaled)) {
+                    error_message = "filtered main observation sum overflow";
+                    return false;
+                }
+                ++multiplicity;
+                ++end;
+            }
+            auto chromosome = main_snpdat.find(first.tid());
+            auto cell = main_cells.find((unsigned long)first.barcode);
+            if (chromosome == main_snpdat.end() ||
+                first.snp_index >= chromosome->second.snps.size() ||
+                cell == main_cells.end()) {
+                error_message = "filtered main observation lookup failed";
+                return false;
+            }
+            ++perf.filtered_cell_lock.applicable_records;
+            const bool sample = perf.filtered_cell_lock.applicable_records %
+                FUSED_LOCK_SAMPLE_INTERVAL == 0;
+            bool sampled = false;
+            const bool ok = with_fused_sampled_lock(
+                cell->second->lock, sample, perf.filtered_cell_lock, sampled,
+                [&]() {
+                    return add_main_value_dense(
+                        cell->second->counts,
+                        chromosome->second.snps[first.snp_index],
+                        first.allele() != 0, sum, multiplicity,
+                        nullptr, nullptr,
+                        perf.main_total_target_updates,
+                        perf.main_pair_target_updates);
+                });
+            if (!ok) {
+                error_message = "filtered main target accumulation overflow";
+                return false;
+            }
+        } else {
+            while (end < observations.size() &&
+                    same_species_observation(first, observations[end])) ++end;
+            auto chromosome = species_targets.find(first.tid());
+            auto cell = species_cells.find((unsigned long)first.barcode);
+            if (chromosome == species_targets.end() ||
+                cell == species_cells.end()) {
+                error_message = "filtered species observation lookup failed";
+                return false;
+            }
+            ++perf.filtered_cell_lock.applicable_records;
+            const bool sample = perf.filtered_cell_lock.applicable_records %
+                FUSED_LOCK_SAMPLE_INTERVAL == 0;
+            bool sampled = false;
+            const bool ok = with_fused_sampled_lock(
+                cell->second->lock, sample, perf.filtered_cell_lock, sampled,
+                [&]() {
+                    return add_species_value_dense(
+                        cell->second->counts, chromosome->second,
+                        first.snp_index, first.allele() != 0,
+                        first.probability_scaled, (uint64_t)(end - begin),
+                        nullptr, nullptr,
+                        perf.species_total_target_updates,
+                        perf.species_pair_target_updates);
+                });
+            if (!ok) {
+                error_message = "filtered species target accumulation overflow";
+                return false;
+            }
+        }
+        begin = end;
+    }
+    observations.clear();
+    return true;
+}
+
+static string fused_temporary_base(const string& output_path) {
+    const size_t slash = output_path.find_last_of('/');
+    const string directory = slash == string::npos ? "." :
+        (slash == 0 ? "/" : output_path.substr(0, slash));
+    const long long stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        FusedPerfClock::now().time_since_epoch()).count();
+    const string name = ".demux_raw_partition." +
+        std::to_string((long long)getpid()) + "." + std::to_string(stamp);
+    return directory == "/" ? directory + name : directory + "/" + name;
+}
+
+static bool open_raw_partitions(
+        const string& base,
+        vector<std::unique_ptr<FusedRawPartitionFile>>& partitions,
+        FusedTemporaryFiles& temporary_files,
+        string& error_message) {
+    partitions.reserve(FUSED_RAW_PARTITIONS);
+    for (size_t partition_index = 0;
+            partition_index < FUSED_RAW_PARTITIONS; ++partition_index) {
+        std::unique_ptr<FusedRawPartitionFile> partition(
+            new FusedRawPartitionFile());
+        partition->path = base + "." + std::to_string(partition_index) + ".bin";
+        temporary_files.add(partition->path);
+        partition->file = fopen(partition->path.c_str(), "wb");
+        if (!partition->file) {
+            error_message = "could not open raw observation partition " +
+                partition->path + ": " + strerror(errno);
+            for (auto& opened : partitions) {
+                if (opened->file) fclose(opened->file);
+                opened->file = nullptr;
+            }
+            return false;
+        }
+        setvbuf(partition->file, nullptr, _IOFBF, 1U << 18);
+        partitions.push_back(std::move(partition));
+    }
+    return true;
+}
+
+static bool close_raw_partitions(
+        vector<std::unique_ptr<FusedRawPartitionFile>>& partitions,
+        string& error_message) {
+    bool ok = true;
+    for (auto& partition : partitions) {
+        if (partition->file && fclose(partition->file) != 0) {
+            if (ok) error_message = "failed closing raw observation partition " +
+                partition->path;
+            ok = false;
+        }
+        partition->file = nullptr;
+    }
+    return ok;
+}
+
+static bool spill_raw_observations(
+        vector<FusedCountObservation>& observations,
+        vector<FusedCountObservation>& partition_order,
+        vector<std::unique_ptr<FusedRawPartitionFile>>& partitions,
+        FusedThreadPerfCounters& perf,
+        string& error_message) {
+    if (observations.empty()) return true;
+    std::array<size_t, FUSED_RAW_PARTITIONS> counts{};
+    std::array<size_t, FUSED_RAW_PARTITIONS> offsets{};
+    std::array<size_t, FUSED_RAW_PARTITIONS> cursors{};
+    for (const FusedCountObservation& observation : observations)
+        ++counts[fused_raw_partition(observation.barcode)];
+    size_t prefix = 0;
+    for (size_t i = 0; i < FUSED_RAW_PARTITIONS; ++i) {
+        offsets[i] = prefix;
+        cursors[i] = prefix;
+        prefix += counts[i];
+    }
+    partition_order.resize(observations.size());
+    for (const FusedCountObservation& observation : observations) {
+        const size_t owner = fused_raw_partition(observation.barcode);
+        partition_order[cursors[owner]++] = observation;
+    }
+    for (size_t partition_index = 0;
+            partition_index < FUSED_RAW_PARTITIONS; ++partition_index) {
+        if (counts[partition_index] == 0) continue;
+        const size_t begin = offsets[partition_index];
+        const size_t end = begin + counts[partition_index];
+        FusedRawPartitionFile& partition = *partitions[partition_index];
+        ++perf.raw_partition_lock.applicable_records;
+        const bool sample = perf.raw_partition_lock.applicable_records %
+            FUSED_LOCK_SAMPLE_INTERVAL == 0;
+        bool sampled = false;
+        const bool ok = with_fused_sampled_lock(
+            partition.lock, sample, perf.raw_partition_lock, sampled, [&]() {
+                const size_t count = end - begin;
+                if (fwrite(partition_order.data() + begin,
+                        sizeof(FusedCountObservation), count,
+                        partition.file) != count) return false;
+                partition.bytes +=
+                    (uint64_t)count * sizeof(FusedCountObservation);
+                return true;
+            });
+        if (!ok) {
+            error_message = "failed writing raw observation partition";
+            return false;
+        }
+        ++perf.raw_partition_bulk_writes;
+    }
+    observations.clear();
+    partition_order.clear();
+    return true;
+}
+
+static vector<int> fused_rank_boundaries(
+        const ChromSNPs* main_panel,
+        const ChromSNPs* species_panel,
+        size_t chunks,
+        int64_t chrom_length) {
+    vector<int> boundaries;
+    if (chunks <= 1) return boundaries;
+    const size_t main_size = main_panel ? main_panel->snps.size() : 0;
+    const size_t species_size = species_panel ? species_panel->snps.size() : 0;
+    const size_t total = main_size + species_size;
+    if (total == 0) return boundaries;
+
+    size_t main_index = 0;
+    size_t species_index = 0;
+    size_t rank = 0;
+    size_t boundary_number = 1;
+    size_t target_rank = (total * boundary_number) / chunks;
+    int previous = 0;
+    while ((main_index < main_size || species_index < species_size) &&
+            boundary_number < chunks) {
+        int position = 0;
+        if (species_index >= species_size ||
+            (main_index < main_size &&
+             main_panel->snps[main_index].pos <=
+                species_panel->snps[species_index].pos)) {
+            position = main_panel->snps[main_index++].pos;
+        } else {
+            position = species_panel->snps[species_index++].pos;
+        }
+        if (rank >= target_rank) {
+            if (position > previous && position > 0 && position < chrom_length) {
+                boundaries.push_back(position);
+                previous = position;
+            }
+            ++boundary_number;
+            target_rank = (total * boundary_number) / chunks;
+        }
+        ++rank;
+    }
+    return boundaries;
+}
+
+static vector<int> fused_position_boundaries(size_t chunks, int64_t chrom_length) {
+    vector<int> boundaries;
+    if (chunks <= 1 || chrom_length <= 1) return boundaries;
+    int previous = 0;
+    for (size_t chunk = 1; chunk < chunks; ++chunk) {
+        const int64_t boundary =
+            (chrom_length * (int64_t)chunk) / (int64_t)chunks;
+        if (boundary > previous && boundary > 0 && boundary < chrom_length &&
+            boundary < INT_MAX) {
+            boundaries.push_back((int)boundary);
+            previous = (int)boundary;
+        }
+    }
+    return boundaries;
+}
+
+static bool write_fused_pileup_sites(
+        const string& path,
+        const robin_hood::unordered_map<int, ChromSNPs>& main_snpdat,
+        const vector<string>& chromosome_names,
+        int n_samples) {
+    FusedGzipWriter writer;
+    if (!writer.open(path)) return false;
+    for (const auto& chromosome : main_snpdat) {
+        const int tid = chromosome.first;
+        const string name =
+            tid >= 0 && tid < (int)chromosome_names.size()
+                ? chromosome_names[(size_t)tid] : ".";
+        for (const SNPData& snp : chromosome.second.snps) {
+            if ((int)snp.geno.size() < n_samples) {
+                writer.close();
+                unlink(path.c_str());
+                return false;
+            }
+            char prefix[256];
+            const int length = snprintf(
+                prefix, sizeof(prefix), "%d\t%s\t%d\t%c\t%c",
+                tid, name.c_str(), snp.pos, snp.data.ref, snp.data.alt);
+            if (length < 0 || (size_t)length >= sizeof(prefix)) {
+                writer.close();
+                unlink(path.c_str());
+                return false;
+            }
+            string line(prefix, (size_t)length);
+            for (int sample = 0; sample < n_samples; ++sample) {
+                char genotype[32];
+                const int genotype_length = snprintf(
+                    genotype, sizeof(genotype), "\t%d", (int)snp.geno[sample]);
+                if (genotype_length < 0 ||
+                    (size_t)genotype_length >= sizeof(genotype)) {
+                    writer.close();
+                    unlink(path.c_str());
+                    return false;
+                }
+                line.append(genotype, (size_t)genotype_length);
+            }
+            line.push_back('\n');
+            if (!writer.append(line)) {
+                writer.close();
+                unlink(path.c_str());
+                return false;
+            }
+        }
+    }
+    if (!writer.close()) {
+        unlink(path.c_str());
+        return false;
+    }
+    return true;
+}
+
+static string fused_spool_path(const string& prefix, int worker) {
+    std::ostringstream path;
+    path << prefix << ".pileup_spool." << getpid() << "." << worker << ".bin";
+    return path.str();
+}
+
+static bool open_fused_spools(
+        const string& prefix,
+        int n_threads,
+        vector<string>& paths,
+        vector<FILE*>& files) {
+    paths.resize((size_t)n_threads);
+    files.assign((size_t)n_threads, nullptr);
+    for (int worker = 0; worker < n_threads; ++worker) {
+        paths[(size_t)worker] = fused_spool_path(prefix, worker);
+        files[(size_t)worker] = fopen(paths[(size_t)worker].c_str(), "wb");
+        if (!files[(size_t)worker] ||
+            setvbuf(files[(size_t)worker], nullptr, _IOFBF,
+                FUSED_GZIP_BUFFER_BYTES) != 0) {
+            for (int opened = 0; opened <= worker; ++opened) {
+                if (files[(size_t)opened]) fclose(files[(size_t)opened]);
+                files[(size_t)opened] = nullptr;
+            }
+            remove_files(paths);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool close_fused_spools(vector<FILE*>& files) {
+    bool ok = true;
+    for (FILE*& file : files) {
+        if (file && fclose(file) != 0) ok = false;
+        file = nullptr;
+    }
+    return ok;
+}
+
+static bool append_pileup_observation_row(
+        FusedGzipWriter& writer,
+        const FusedPileupSpoolRecord& key,
+        int64_t ref_scaled,
+        int64_t alt_scaled) {
+    const int tid = (int)(key.site >> 32);
+    const int pos = (int)(key.site & 0xFFFFFFFFULL);
+    char prefix[160];
+    const int length = snprintf(prefix, sizeof(prefix), "%llu\t%d\t%d\t",
+        (unsigned long long)key.barcode, tid, pos);
+    if (length < 0 || (size_t)length >= sizeof(prefix)) return false;
+    string line(prefix, (size_t)length);
+    append_scaled_decimal(line, ref_scaled);
+    line.push_back('\t');
+    append_scaled_decimal(line, alt_scaled);
+    line.push_back('\n');
+    return writer.append(line);
+}
+
+static bool append_pileup_molecule_row(
+        FusedGzipWriter& writer,
+        const FusedPileupSpoolRecord& key,
+        uint8_t basis,
+        int64_t ref_scaled,
+        int64_t alt_scaled) {
+    const int tid = (int)(key.site >> 32);
+    const int pos = (int)(key.site & 0xFFFFFFFFULL);
+    char prefix[256];
+    const int length = snprintf(
+        prefix, sizeof(prefix), "%llu\t%llu\t%s\t%d\t%d\t",
+        (unsigned long long)key.barcode,
+        (unsigned long long)key.molecule_hash,
+        pileup_molecule_basis_name(basis), tid, pos);
+    if (length < 0 || (size_t)length >= sizeof(prefix)) return false;
+    string line(prefix, (size_t)length);
+    append_scaled_decimal(line, ref_scaled);
+    line.push_back('\t');
+    append_scaled_decimal(line, alt_scaled);
+    line.push_back('\n');
+    return writer.append(line);
+}
+
+static bool derive_fused_pileup_outputs(
+        const vector<string>& spool_paths,
+        const string& observation_path,
+        const string& molecule_path) {
+    FusedGzipWriter observation_writer;
+    FusedGzipWriter molecule_writer;
+    if (!observation_writer.open(observation_path) ||
+        !molecule_writer.open(molecule_path)) {
+        observation_writer.close();
+        molecule_writer.close();
+        unlink(observation_path.c_str());
+        unlink(molecule_path.c_str());
+        remove_files(spool_paths);
+        return false;
+    }
+
+    vector<FusedPileupSpoolRecord> records(FUSED_PILEUP_SORT_RECORDS);
+    bool ok = true;
+    for (const string& spool_path : spool_paths) {
+        FILE* input = fopen(spool_path.c_str(), "rb");
+        if (!input) {
+            ok = false;
+            break;
+        }
+        while (ok) {
+            const size_t n_records = fread(
+                records.data(), sizeof(FusedPileupSpoolRecord),
+                records.size(), input);
+            if (n_records == 0) break;
+            std::sort(records.begin(), records.begin() + n_records,
+                [](const FusedPileupSpoolRecord& left,
+                   const FusedPileupSpoolRecord& right) {
+                    if (left.barcode != right.barcode)
+                        return left.barcode < right.barcode;
+                    if (left.site != right.site) return left.site < right.site;
+                    if (left.molecule_hash != right.molecule_hash)
+                        return left.molecule_hash < right.molecule_hash;
+                    return left.basis < right.basis;
+                });
+
+            size_t observation_begin = 0;
+            while (observation_begin < n_records && ok) {
+                size_t observation_end = observation_begin + 1;
+                int64_t observation_ref = records[observation_begin].ref_scaled;
+                int64_t observation_alt = records[observation_begin].alt_scaled;
+                while (observation_end < n_records &&
+                        records[observation_end].barcode ==
+                            records[observation_begin].barcode &&
+                        records[observation_end].site ==
+                            records[observation_begin].site) {
+                    observation_ref += records[observation_end].ref_scaled;
+                    observation_alt += records[observation_end].alt_scaled;
+                    ++observation_end;
+                }
+                ok = append_pileup_observation_row(
+                    observation_writer, records[observation_begin],
+                    observation_ref, observation_alt);
+
+                size_t molecule_begin = observation_begin;
+                while (molecule_begin < observation_end && ok) {
+                    size_t molecule_end = molecule_begin + 1;
+                    int64_t molecule_ref = records[molecule_begin].ref_scaled;
+                    int64_t molecule_alt = records[molecule_begin].alt_scaled;
+                    uint8_t basis = records[molecule_begin].basis;
+                    while (molecule_end < observation_end &&
+                            records[molecule_end].molecule_hash ==
+                                records[molecule_begin].molecule_hash) {
+                        molecule_ref += records[molecule_end].ref_scaled;
+                        molecule_alt += records[molecule_end].alt_scaled;
+                        basis = std::min(basis, records[molecule_end].basis);
+                        ++molecule_end;
+                    }
+                    ok = append_pileup_molecule_row(
+                        molecule_writer, records[molecule_begin], basis,
+                        molecule_ref, molecule_alt);
+                    molecule_begin = molecule_end;
+                }
+                observation_begin = observation_end;
+            }
+        }
+        if (ferror(input)) ok = false;
+        if (fclose(input) != 0) ok = false;
+        if (!ok) break;
+    }
+
+    if (!observation_writer.close()) ok = false;
+    if (!molecule_writer.close()) ok = false;
+    remove_files(spool_paths);
+    if (!ok) {
+        unlink(observation_path.c_str());
+        unlink(molecule_path.c_str());
+    }
+    return ok;
+}
+
+class FusedRawBarcodeAccumulator {
+  public:
+    FusedRawBarcodeAccumulator(
+            int n_samples,
+            int n_species,
+            const robin_hood::unordered_map<int, ChromSNPs>& main_panel,
+            const NativeSpeciesTargetTable& species_targets,
+            FusedGzipWriter& main_writer,
+            FusedGzipWriter& species_writer,
+            FusedThreadPerfCounters& perf,
+            size_t owner_partition)
+        : main_counts_(n_samples), species_counts_(n_species),
+          main_panel_(main_panel), species_targets_(species_targets),
+          main_writer_(main_writer), species_writer_(species_writer), perf_(perf),
+          owner_partition_(owner_partition) {
+        line_.reserve(256);
+    }
+
+    bool consume(const FusedCountObservation& observation) {
+        if (fused_raw_partition(observation.barcode) != owner_partition_ ||
+            observation.panel() > FUSED_SPECIES_PANEL || observation.allele() > 1 ||
+            observation.probability_scaled <= 0) return false;
+        if (!has_pending_) {
+            pending_ = observation;
+            multiplicity_ = 1;
+            has_pending_ = true;
+            return true;
+        }
+        const bool same_group = pending_.panel() == FUSED_MAIN_PANEL
+            ? same_observation_site(pending_, observation)
+            : same_species_observation(pending_, observation);
+        if (same_group) {
+            if (pending_.panel() == FUSED_MAIN_PANEL) {
+                if (!checked_add_i64(
+                        pending_.probability_scaled,
+                        observation.probability_scaled)) return false;
+            }
+            if (multiplicity_ == std::numeric_limits<uint64_t>::max())
+                return false;
+            ++multiplicity_;
+            return true;
+        }
+
+        const uint64_t completed_barcode = pending_.barcode;
+        if (!flush_group()) return false;
+        if (observation.barcode != completed_barcode &&
+            !write_and_reset(completed_barcode)) return false;
+        pending_ = observation;
+        multiplicity_ = 1;
+        has_pending_ = true;
+        return true;
+    }
+
+    bool finish() {
+        if (!has_pending_) return true;
+        const uint64_t barcode = pending_.barcode;
+        if (!flush_group() || !write_and_reset(barcode)) return false;
+        has_pending_ = false;
+        return true;
+    }
+
+    uint64_t barcode_count() const { return barcode_count_; }
+
+  private:
+    bool flush_group() {
+        if (!has_pending_) return true;
+        bool ok = false;
+        if (pending_.panel() == FUSED_MAIN_PANEL) {
+            auto chromosome = main_panel_.find(pending_.tid());
+            if (chromosome == main_panel_.end() ||
+                pending_.snp_index >= chromosome->second.snps.size()) return false;
+            ok = add_main_value_dense(
+                main_counts_, chromosome->second.snps[pending_.snp_index],
+                pending_.allele() != 0, pending_.probability_scaled,
+                multiplicity_, &main_touched_totals_, &main_touched_pairs_,
+                perf_.main_total_target_updates,
+                perf_.main_pair_target_updates);
+        } else {
+            auto chromosome = species_targets_.find(pending_.tid());
+            if (chromosome == species_targets_.end()) return false;
+            ok = add_species_value_dense(
+                species_counts_, chromosome->second, pending_.snp_index,
+                pending_.allele() != 0, pending_.probability_scaled,
+                multiplicity_, &species_touched_totals_,
+                &species_touched_pairs_, perf_.species_total_target_updates,
+                perf_.species_pair_target_updates);
+        }
+        has_pending_ = false;
+        return ok;
+    }
+
+    bool append_touched(
+            FusedGzipWriter& writer,
+            uint64_t barcode,
+            CellCounts& counts,
+            vector<uint32_t>& totals,
+            vector<uint32_t>& pairs) {
+        for (uint32_t index : totals) {
+            if (index >= counts.total_ref.size()) return false;
+            const int64_t ref = counts.total_ref[index];
+            const int64_t alt = counts.total_alt[index];
+            if ((ref != 0 || alt != 0) && !append_count_row(
+                    writer, line_, (unsigned long)barcode,
+                    (int)(index / GENOTYPE_STATES),
+                    (int)(index % GENOTYPE_STATES), -1, -1, ref, alt)) {
+                return false;
+            }
+        }
+        const size_t state_count = (size_t)counts.state_count;
+        for (uint32_t index : pairs) {
+            if (index >= counts.ref_counts.size()) return false;
+            const int64_t ref = counts.ref_counts[index];
+            const int64_t alt = counts.alt_counts[index];
+            if (ref == 0 && alt == 0) continue;
+            const size_t idx1 = index / state_count;
+            const size_t idx2 = index % state_count;
+            if (!append_count_row(
+                    writer, line_, (unsigned long)barcode,
+                    (int)(idx1 / GENOTYPE_STATES),
+                    (int)(idx1 % GENOTYPE_STATES),
+                    (int)(idx2 / GENOTYPE_STATES),
+                    (int)(idx2 % GENOTYPE_STATES), ref, alt)) return false;
+        }
+        return true;
+    }
+
+    static void reset_touched(
+            CellCounts& counts,
+            vector<uint32_t>& totals,
+            vector<uint32_t>& pairs) {
+        for (uint32_t index : totals) {
+            counts.total_ref[index] = 0;
+            counts.total_alt[index] = 0;
+        }
+        for (uint32_t index : pairs) {
+            counts.ref_counts[index] = 0;
+            counts.alt_counts[index] = 0;
+        }
+        totals.clear();
+        pairs.clear();
+    }
+
+    bool write_and_reset(uint64_t barcode) {
+        const bool ok = append_touched(
+                main_writer_, barcode, main_counts_, main_touched_totals_,
+                main_touched_pairs_) &&
+            append_touched(
+                species_writer_, barcode, species_counts_,
+                species_touched_totals_, species_touched_pairs_);
+        if (!ok) return false;
+        reset_touched(
+            main_counts_, main_touched_totals_, main_touched_pairs_);
+        reset_touched(
+            species_counts_, species_touched_totals_, species_touched_pairs_);
+        ++barcode_count_;
+        return true;
+    }
+
+    CellCounts main_counts_;
+    CellCounts species_counts_;
+    vector<uint32_t> main_touched_totals_;
+    vector<uint32_t> main_touched_pairs_;
+    vector<uint32_t> species_touched_totals_;
+    vector<uint32_t> species_touched_pairs_;
+    const robin_hood::unordered_map<int, ChromSNPs>& main_panel_;
+    const NativeSpeciesTargetTable& species_targets_;
+    FusedGzipWriter& main_writer_;
+    FusedGzipWriter& species_writer_;
+    FusedThreadPerfCounters& perf_;
+    size_t owner_partition_;
+    string line_;
+    FusedCountObservation pending_{};
+    uint64_t multiplicity_ = 0;
+    uint64_t barcode_count_ = 0;
+    bool has_pending_ = false;
+};
+
+static bool write_sorted_observation_run(
+        const string& path, vector<FusedCountObservation>& records) {
+    std::sort(records.begin(), records.end(), fused_observation_less);
+    FILE* output = fopen(path.c_str(), "wb");
+    if (!output) return false;
+    const bool ok = records.empty() || fwrite(
+        records.data(), sizeof(FusedCountObservation), records.size(), output) ==
+            records.size();
+    const bool closed = fclose(output) == 0;
+    return ok && closed;
+}
+
+static bool merge_observation_runs(
+        const vector<string>& paths,
+        const string* output_path,
+        FusedRawBarcodeAccumulator* reducer) {
+    struct Cursor { FILE* file = nullptr; FusedCountObservation record{}; };
+    struct HeapItem { FusedCountObservation record; size_t cursor; };
+    struct HeapGreater {
+        bool operator()(const HeapItem& left, const HeapItem& right) const {
+            if (fused_observation_less(right.record, left.record)) return true;
+            if (fused_observation_less(left.record, right.record)) return false;
+            return left.cursor > right.cursor;
+        }
+    };
+    vector<Cursor> cursors(paths.size());
+    std::priority_queue<HeapItem, vector<HeapItem>, HeapGreater> heap;
+    FILE* output = nullptr;
+    bool ok = output_path != nullptr || reducer != nullptr;
+    if (output_path) output = fopen(output_path->c_str(), "wb");
+    if (output_path && !output) ok = false;
+    for (size_t i = 0; i < paths.size() && ok; ++i) {
+        cursors[i].file = fopen(paths[i].c_str(), "rb");
+        if (!cursors[i].file) { ok = false; break; }
+        if (fread(&cursors[i].record, sizeof(FusedCountObservation), 1,
+                cursors[i].file) == 1) {
+            heap.push({cursors[i].record, i});
+        } else if (ferror(cursors[i].file)) { ok = false; break; }
+    }
+    while (ok && !heap.empty()) {
+        const HeapItem item = heap.top();
+        heap.pop();
+        ok = output
+            ? fwrite(&item.record, sizeof(item.record), 1, output) == 1
+            : reducer->consume(item.record);
+        Cursor& cursor = cursors[item.cursor];
+        if (ok && fread(&cursor.record, sizeof(cursor.record), 1,
+                cursor.file) == 1) {
+            heap.push({cursor.record, item.cursor});
+        } else if (ok && ferror(cursor.file)) ok = false;
+    }
+    for (Cursor& cursor : cursors) {
+        if (cursor.file && fclose(cursor.file) != 0) ok = false;
+    }
+    if (output && fclose(output) != 0) ok = false;
+    if (!output && ok) ok = reducer->finish();
+    return ok;
+}
+
+static bool reduce_raw_partition(
+        const FusedRawPartitionFile& partition,
+        size_t partition_index,
+        const string& temporary_base,
+        FusedTemporaryFiles& temporary_files,
+        const robin_hood::unordered_map<int, ChromSNPs>& main_panel,
+        const NativeSpeciesTargetTable& species_targets,
+        int n_samples,
+        int n_species,
+        const string& main_member,
+        const string& species_member,
+        FusedThreadPerfCounters& perf,
+        uint64_t& barcode_count,
+        string& error_message) {
+    FusedGzipWriter main_writer;
+    FusedGzipWriter species_writer;
+    if (!main_writer.open(main_member) || !species_writer.open(species_member)) {
+        main_writer.close(); species_writer.close();
+        error_message = "could not open raw gzip member";
+        return false;
+    }
+    FusedRawBarcodeAccumulator reducer(
+        n_samples, n_species, main_panel, species_targets,
+        main_writer, species_writer, perf, partition_index);
+    FILE* input = fopen(partition.path.c_str(), "rb");
+    if (!input) {
+        error_message = "could not reopen raw observation partition";
+        main_writer.close(); species_writer.close();
+        return false;
+    }
+    if (partition.bytes % sizeof(FusedCountObservation) != 0) {
+        fclose(input);
+        main_writer.close(); species_writer.close();
+        error_message = "raw observation partition has a partial record";
+        return false;
+    }
+    if (partition.bytes <=
+            FUSED_SORT_CHUNK_RECORDS * sizeof(FusedCountObservation)) {
+        vector<FusedCountObservation> in_memory(
+            (size_t)(partition.bytes / sizeof(FusedCountObservation)));
+        bool ok = in_memory.empty() || fread(
+            in_memory.data(), sizeof(FusedCountObservation), in_memory.size(),
+            input) == in_memory.size();
+        if (fclose(input) != 0) ok = false;
+        if (ok) {
+            std::sort(in_memory.begin(), in_memory.end(), fused_observation_less);
+            for (const FusedCountObservation& observation : in_memory) {
+                if (!reducer.consume(observation)) { ok = false; break; }
+            }
+            if (ok) ok = reducer.finish();
+        }
+        if (!main_writer.close()) ok = false;
+        if (!species_writer.close()) ok = false;
+        if (!ok) {
+            error_message = "in-memory raw observation reduction failed";
+            unlink(main_member.c_str()); unlink(species_member.c_str());
+            return false;
+        }
+        barcode_count = reducer.barcode_count();
+        unlink(partition.path.c_str());
+        return true;
+    }
+    vector<string> runs;
+    vector<FusedCountObservation> records(FUSED_SORT_CHUNK_RECORDS);
+    size_t run_index = 0;
+    bool ok = true;
+    while (ok) {
+        const size_t count = fread(
+            records.data(), sizeof(FusedCountObservation), records.size(), input);
+        if (count == 0) { if (ferror(input)) ok = false; break; }
+        records.resize(count);
+        const string run_path = temporary_base + ".p" +
+            std::to_string(partition_index) + ".r" +
+            std::to_string(run_index++) + ".bin";
+        temporary_files.add(run_path);
+        if (!write_sorted_observation_run(run_path, records)) { ok = false; break; }
+        runs.push_back(run_path);
+        records.resize(FUSED_SORT_CHUNK_RECORDS);
+    }
+    if (fclose(input) != 0) ok = false;
+    if (ok) unlink(partition.path.c_str());
+    size_t generation = 0;
+    while (ok && runs.size() > FUSED_MERGE_FAN_IN) {
+        vector<string> merged_runs;
+        for (size_t begin = 0; begin < runs.size();
+                begin += FUSED_MERGE_FAN_IN) {
+            const size_t end = std::min(
+                runs.size(), begin + FUSED_MERGE_FAN_IN);
+            vector<string> batch(runs.begin() + begin, runs.begin() + end);
+            const string merged_path = temporary_base + ".p" +
+                std::to_string(partition_index) + ".g" +
+                std::to_string(generation) + ".m" +
+                std::to_string(merged_runs.size()) + ".bin";
+            temporary_files.add(merged_path);
+            if (!merge_observation_runs(batch, &merged_path, nullptr)) {
+                ok = false; break;
+            }
+            for (const string& path : batch) unlink(path.c_str());
+            merged_runs.push_back(merged_path);
+        }
+        runs.swap(merged_runs);
+        ++generation;
+    }
+    if (ok) ok = runs.empty()
+        ? reducer.finish() : merge_observation_runs(runs, nullptr, &reducer);
+    for (const string& path : runs) unlink(path.c_str());
+    if (!main_writer.close()) ok = false;
+    if (!species_writer.close()) ok = false;
+    if (!ok) {
+        error_message = "raw observation reduction or serialization failed";
+        unlink(main_member.c_str()); unlink(species_member.c_str());
+        return false;
+    }
+    barcode_count = reducer.barcode_count();
+    unlink(partition.path.c_str());
+    return true;
+}
+
+static bool write_fused_raw_counts(
+        const string& main_path,
+        const string& species_path,
+        const robin_hood::unordered_map<unsigned long, AlignedCellCounts>& filtered_main,
+        const robin_hood::unordered_map<unsigned long, AlignedCellCounts>& filtered_species,
+        vector<std::unique_ptr<FusedRawPartitionFile>>& partitions,
+        FusedTemporaryFiles& temporary_files,
+        const string& temporary_base,
+        const robin_hood::unordered_map<int, ChromSNPs>& main_panel,
+        const NativeSpeciesTargetTable& species_targets,
+        int n_samples,
+        int n_species,
+        int n_threads,
+        FusedThreadPerfCounters& reduction_perf,
+        uint64_t& raw_barcode_count) {
+    vector<string> main_members(FUSED_RAW_PARTITIONS + 1);
+    vector<string> species_members(FUSED_RAW_PARTITIONS + 1);
+    main_members[0] = temporary_base + ".filtered.main.gz";
+    species_members[0] = temporary_base + ".filtered.species.gz";
+    temporary_files.add(main_members[0]);
+    temporary_files.add(species_members[0]);
+    FusedGzipWriter filtered_main_writer;
+    FusedGzipWriter filtered_species_writer;
+    bool ok = filtered_main_writer.open(main_members[0]) &&
+        filtered_species_writer.open(species_members[0]);
+    const FusedPerfClock::time_point filtered_main_start = FusedPerfClock::now();
+    if (ok) {
+        for (const auto& cell : filtered_main) {
+            if (!append_dense_count_rows(
+                    filtered_main_writer, cell.first, cell.second.counts,
+                    n_samples)) { ok = false; break; }
+        }
+    }
+    print_fused_perf_phase(
+        "filtered_main_raw_serialization", filtered_main_start,
+        FusedPerfClock::now());
+
+    const FusedPerfClock::time_point filtered_species_start = FusedPerfClock::now();
+    if (ok) {
+        for (const auto& cell : filtered_species) {
+            if (!append_dense_count_rows(
+                    filtered_species_writer, cell.first, cell.second.counts,
+                    n_species)) { ok = false; break; }
+        }
+    }
+    print_fused_perf_phase(
+        "filtered_species_raw_serialization", filtered_species_start,
+        FusedPerfClock::now());
+
+    if (!filtered_main_writer.close()) ok = false;
+    if (!filtered_species_writer.close()) ok = false;
+    if (!ok) {
+        unlink(main_path.c_str()); unlink(species_path.c_str());
+        return false;
+    }
+
+    vector<FusedThreadPerfCounters> partition_perf(FUSED_RAW_PARTITIONS);
+    vector<uint64_t> partition_barcodes(FUSED_RAW_PARTITIONS, 0);
+    vector<string> partition_errors(FUSED_RAW_PARTITIONS);
+    std::atomic<bool> reduction_ok(true);
+    for (size_t partition_index = 0;
+            partition_index < FUSED_RAW_PARTITIONS; ++partition_index) {
+        main_members[partition_index + 1] = temporary_base + ".p" +
+            std::to_string(partition_index) + ".main.gz";
+        species_members[partition_index + 1] = temporary_base + ".p" +
+            std::to_string(partition_index) + ".species.gz";
+        temporary_files.add(main_members[partition_index + 1]);
+        temporary_files.add(species_members[partition_index + 1]);
+    }
+
+    const FusedPerfClock::time_point sparse_raw_start = FusedPerfClock::now();
+    const int reduction_threads = std::max(1, std::min(n_threads, 16));
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(reduction_threads)
+    for (size_t partition_index = 0;
+            partition_index < FUSED_RAW_PARTITIONS; ++partition_index) {
+        if (!reduction_ok.load(std::memory_order_acquire)) continue;
+        bool partition_ok = false;
+        try {
+            partition_ok = reduce_raw_partition(
+                *partitions[partition_index], partition_index, temporary_base,
+                temporary_files, main_panel, species_targets,
+                n_samples, n_species, main_members[partition_index + 1],
+                species_members[partition_index + 1],
+                partition_perf[partition_index],
+                partition_barcodes[partition_index],
+                partition_errors[partition_index]);
+        } catch (const std::exception& error) {
+            partition_errors[partition_index] =
+                string("raw partition worker exception: ") + error.what();
+        }
+        if (!partition_ok) {
+            reduction_ok.store(false, std::memory_order_release);
+        }
+    }
+    print_fused_perf_phase(
+        "sparse_raw_only_main_species_serialization", sparse_raw_start,
+        FusedPerfClock::now());
+    if (!reduction_ok.load(std::memory_order_acquire)) {
+        for (const string& error : partition_errors) {
+            if (!error.empty()) { fprintf(stderr, "ERROR: %s\n", error.c_str()); break; }
+        }
+        unlink(main_path.c_str()); unlink(species_path.c_str());
+        return false;
+    }
+
+    for (size_t i = 0; i < FUSED_RAW_PARTITIONS; ++i) {
+        reduction_perf.main_total_target_updates +=
+            partition_perf[i].main_total_target_updates;
+        reduction_perf.main_pair_target_updates +=
+            partition_perf[i].main_pair_target_updates;
+        reduction_perf.species_total_target_updates +=
+            partition_perf[i].species_total_target_updates;
+        reduction_perf.species_pair_target_updates +=
+            partition_perf[i].species_pair_target_updates;
+        raw_barcode_count += partition_barcodes[i];
+    }
+
+    const FusedPerfClock::time_point gzip_close_start = FusedPerfClock::now();
+    string error;
+    ok = publish_concatenated_gzip_members(main_members, main_path, error) &&
+        publish_concatenated_gzip_members(species_members, species_path, error);
+    print_fused_perf_phase(
+        "gzip_flush_close", gzip_close_start, FusedPerfClock::now());
+    if (!ok) {
+        fprintf(stderr, "ERROR: %s\n", error.c_str());
+        unlink(main_path.c_str()); unlink(species_path.c_str());
+    }
+    return ok;
+}
+
+}  // namespace
+
+bool count_alleles_parallel_fused(
+    const string& bamfile,
+    const robin_hood::unordered_map<int, ChromSNPs>& main_snpdat,
+    const robin_hood::unordered_map<int, ChromSNPs>& species_snpdat,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& filtered_main_counts,
+    robin_hood::unordered_map<unsigned long, AlignedCellCounts>& filtered_species_counts,
+    const set<unsigned long>& filtered_barcodes,
+    int n_samples,
+    const NativeSpeciesTargetTable& species_native_targets,
+    int species_native_n_samples,
+    int n_threads,
+    int htslib_threads,
+    const string& raw_counts_path,
+    const string& raw_species_counts_path,
+    bool dump_pileup,
+    const string& pileup_prefix,
+    AcceptedSiteWeightMap* accepted_site_weights_main,
+    AcceptedSiteWeightMap* accepted_site_weights_species) {
+    string validation_error;
+    size_t main_bytes_per_cell = 0;
+    size_t species_bytes_per_cell = 0;
+    const bool write_raw_outputs =
+        !raw_counts_path.empty() || !raw_species_counts_path.empty();
+    if (!validate_identity_and_allocation_request(
+            n_samples, nullptr, &main_bytes_per_cell, &validation_error)) {
+        fprintf(stderr, "ERROR: invalid fused main identity universe: %s\n",
+            validation_error.c_str());
+        return false;
+    }
+    if (!validate_identity_and_allocation_request(
+            species_native_n_samples, nullptr, &species_bytes_per_cell,
+            &validation_error)) {
+        fprintf(stderr, "ERROR: invalid fused native-species universe: %s\n",
+            validation_error.c_str());
+        return false;
+    }
+    if (n_threads < 1 || htslib_threads < 1 ||
+        (raw_counts_path.empty() != raw_species_counts_path.empty()) ||
+        (!write_raw_outputs && filtered_barcodes.empty())) {
+        fprintf(stderr,
+            "ERROR: fused counting requires positive worker/HTSlib thread counts and either both raw output paths or a filtered barcode set\n");
+        return false;
+    }
+    if (dump_pileup && (pileup_prefix.empty() || main_snpdat.empty())) {
+        fprintf(stderr, "ERROR: fused pileup output requires a non-empty prefix\n");
+        return false;
+    }
+    if (!filtered_main_counts.empty() || !filtered_species_counts.empty()) {
+        fprintf(stderr, "ERROR: fused count destinations must be empty\n");
+        return false;
+    }
+    (void)mapq_probability_scaled_table();
+
+    const FusedPerfClock::time_point dense_allocation_start = FusedPerfClock::now();
+    if (!filtered_barcodes.empty()) {
+        const size_t active_main_bytes = main_snpdat.empty() ? 0 : main_bytes_per_cell;
+        const size_t combined_bytes = active_main_bytes + species_bytes_per_cell;
+        if (combined_bytes < active_main_bytes ||
+            (combined_bytes > 0 && filtered_barcodes.size() >
+                std::numeric_limits<size_t>::max() / combined_bytes)) {
+            fprintf(stderr, "ERROR: fused filtered-cell allocation overflows size_t\n");
+            return false;
+        }
+        fprintf(stderr,
+            "Pre-allocating fused dense main/native-species stores for %lu STARsolo-filtered cells...\n",
+            (unsigned long)filtered_barcodes.size());
+        try {
+            for (unsigned long barcode : filtered_barcodes) {
+                if (!main_snpdat.empty()) {
+                    filtered_main_counts.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(barcode),
+                        std::forward_as_tuple(n_samples));
+                }
+                filtered_species_counts.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(barcode),
+                    std::forward_as_tuple(species_native_n_samples));
+            }
+        } catch (const std::exception& error) {
+            fprintf(stderr, "ERROR: fused dense pre-allocation failed: %s\n",
+                error.what());
+            return false;
+        }
+    }
+    print_fused_perf_phase(
+        "filtered_dense_store_allocation", dense_allocation_start,
+        FusedPerfClock::now());
+
+    const FusedPerfClock::time_point bam_inspection_start = FusedPerfClock::now();
+    htsFile* bam_header_file = hts_open(bamfile.c_str(), "r");
+    if (!bam_header_file) {
+        fprintf(stderr, "ERROR: could not open BAM for fused counting: %s\n",
+            bamfile.c_str());
+        return false;
+    }
+    bam_hdr_t* bam_header = sam_hdr_read(bam_header_file);
+    hts_idx_t* bam_index =
+        bam_header ? sam_index_load(bam_header_file, bamfile.c_str()) : nullptr;
+    if (!bam_header || !bam_index) {
+        fprintf(stderr, "ERROR: could not read BAM header/index for fused counting\n");
+        if (bam_index) hts_idx_destroy(bam_index);
+        if (bam_header) bam_hdr_destroy(bam_header);
+        hts_close(bam_header_file);
+        return false;
+    }
+
+    const int n_chromosomes = bam_header->n_targets;
+    vector<int64_t> chromosome_lengths((size_t)n_chromosomes, 0);
+    vector<uint64_t> chromosome_records((size_t)n_chromosomes, 0);
+    vector<string> chromosome_names((size_t)n_chromosomes);
+    const int n_index_targets = hts_idx_nseq(bam_index);
+    set<int> panel_tids;
+    for (const auto& chromosome : main_snpdat) panel_tids.insert(chromosome.first);
+    for (const auto& chromosome : species_snpdat) panel_tids.insert(chromosome.first);
+    for (int tid : panel_tids) {
+        if (tid < 0 || tid >= n_chromosomes) {
+            fprintf(stderr, "ERROR: fused panel references invalid BAM target id %d\n", tid);
+            hts_idx_destroy(bam_index);
+            bam_hdr_destroy(bam_header);
+            hts_close(bam_header_file);
+            return false;
+        }
+    }
+    for (int tid = 0; tid < n_chromosomes; ++tid) {
+        chromosome_lengths[(size_t)tid] = bam_header->target_len[tid];
+        chromosome_names[(size_t)tid] = bam_header->target_name[tid]
+            ? bam_header->target_name[tid] : std::to_string(tid);
+        uint64_t mapped = 0;
+        uint64_t unmapped = 0;
+        if (tid < n_index_targets &&
+            hts_idx_get_stat(bam_index, tid, &mapped, &unmapped) >= 0) {
+            chromosome_records[(size_t)tid] = mapped;
+        }
+    }
+    print_fused_perf_phase(
+        "bam_header_index_inspection", bam_inspection_start,
+        FusedPerfClock::now());
+
+    if (dump_pileup) {
+        const string site_path = pileup_prefix + ".pileup_sites.tsv.gz";
+        if (!write_fused_pileup_sites(
+                site_path, main_snpdat, chromosome_names, n_samples)) {
+            fprintf(stderr, "ERROR: failed writing fused pileup site table: %s\n",
+                site_path.c_str());
+            hts_idx_destroy(bam_index);
+            bam_hdr_destroy(bam_header);
+            hts_close(bam_header_file);
+            return false;
+        }
+    }
+
+    const FusedPerfClock::time_point work_unit_start = FusedPerfClock::now();
+    const size_t SNP_CHUNK_THRESHOLD = 100000;
+    const uint64_t READ_CHUNK_THRESHOLD = 10000000;
+    vector<FusedWorkUnit> work_units;
+    for (int tid : panel_tids) {
+        const ChromSNPs* main_panel = find_chrom_panel(main_snpdat, tid);
+        const ChromSNPs* species_panel = find_chrom_panel(species_snpdat, tid);
+        const size_t main_sites = main_panel ? main_panel->snps.size() : 0;
+        const size_t species_sites = species_panel ? species_panel->snps.size() : 0;
+        const size_t site_views = main_sites + species_sites;
+        if (site_views == 0) continue;
+
+        const size_t chunks_by_snp = site_views > SNP_CHUNK_THRESHOLD
+            ? (site_views + SNP_CHUNK_THRESHOLD - 1) / SNP_CHUNK_THRESHOLD : 1;
+        size_t chunks_by_reads =
+            chromosome_records[(size_t)tid] > READ_CHUNK_THRESHOLD
+                ? (size_t)((chromosome_records[(size_t)tid] +
+                    READ_CHUNK_THRESHOLD - 1) / READ_CHUNK_THRESHOLD) : 1;
+        chunks_by_reads = std::min(chunks_by_reads, (size_t)20);
+        const size_t requested_chunks = std::max(chunks_by_snp, chunks_by_reads);
+        vector<int> boundaries = chunks_by_snp >= chunks_by_reads
+            ? fused_rank_boundaries(
+                main_panel, species_panel, requested_chunks,
+                chromosome_lengths[(size_t)tid])
+            : fused_position_boundaries(
+                requested_chunks, chromosome_lengths[(size_t)tid]);
+
+        int start = 0;
+        const uint64_t estimate = chromosome_records[(size_t)tid] /
+            (uint64_t)std::max((size_t)1, boundaries.size() + 1);
+        for (int boundary : boundaries) {
+            if (boundary <= start) continue;
+            FusedWorkUnit unit;
+            unit.tid = tid;
+            unit.owner_start = start;
+            unit.owner_end = boundary;
+            unit.estimated_records = estimate;
+            work_units.push_back(unit);
+            start = boundary;
+        }
+        FusedWorkUnit final_unit;
+        final_unit.tid = tid;
+        final_unit.owner_start = start;
+        final_unit.owner_end = INT_MAX;
+        final_unit.estimated_records = estimate;
+        work_units.push_back(final_unit);
+    }
+    std::sort(work_units.begin(), work_units.end(),
+        [](const FusedWorkUnit& left, const FusedWorkUnit& right) {
+            return left.estimated_records > right.estimated_records;
+        });
+    print_fused_perf_phase(
+        "work_unit_construction", work_unit_start, FusedPerfClock::now());
+
+    hts_idx_destroy(bam_index);
+    bam_hdr_destroy(bam_header);
+    hts_close(bam_header_file);
+    if (work_units.empty()) {
+        fprintf(stderr, "ERROR: fused main/species panels contain no schedulable sites\n");
+        return false;
+    }
+    fprintf(stderr,
+        "Starting fused BAM traversal with non-overlapping start ownership and %d readers/workers\n",
+        n_threads);
+
+    const FusedPerfClock::time_point sparse_initialization_start =
+        FusedPerfClock::now();
+    FusedTemporaryFiles raw_temporary_files;
+    const string raw_temporary_base = write_raw_outputs
+        ? fused_temporary_base(raw_counts_path) : string();
+    vector<std::unique_ptr<FusedRawPartitionFile>> raw_partitions;
+    if (write_raw_outputs) {
+        string error;
+        if (!open_raw_partitions(
+                raw_temporary_base, raw_partitions,
+                raw_temporary_files, error)) {
+            fprintf(stderr, "ERROR: %s\n", error.c_str());
+            return false;
+        }
+    }
+
+    std::unordered_map<unsigned long, AlignedCellCounts*> filtered_main_lookup;
+    std::unordered_map<unsigned long, AlignedCellCounts*> filtered_species_lookup;
+    filtered_main_lookup.reserve(filtered_barcodes.size());
+    filtered_species_lookup.reserve(filtered_barcodes.size());
+    for (unsigned long barcode : filtered_barcodes) {
+        auto species_found = filtered_species_counts.find(barcode);
+        if (species_found == filtered_species_counts.end()) {
+            fprintf(stderr, "ERROR: fused filtered-cell lookup initialization failed\n");
+            return false;
+        }
+        if (!main_snpdat.empty()) {
+            auto main_found = filtered_main_counts.find(barcode);
+            if (main_found == filtered_main_counts.end()) {
+                fprintf(stderr, "ERROR: fused filtered-main lookup initialization failed\n");
+                return false;
+            }
+            filtered_main_lookup.emplace(barcode, &main_found->second);
+        }
+        filtered_species_lookup.emplace(barcode, &species_found->second);
+    }
+    print_fused_perf_phase(
+        "sparse_shard_lookup_initialization", sparse_initialization_start,
+        FusedPerfClock::now());
+
+    vector<string> spool_paths;
+    vector<FILE*> spool_files;
+    if (dump_pileup &&
+        !open_fused_spools(pileup_prefix, n_threads, spool_paths, spool_files)) {
+        fprintf(stderr, "ERROR: could not create fused pileup spool files\n");
+        return false;
+    }
+
+    vector<AcceptedSiteWeightMap> thread_main_site_weights((size_t)n_threads);
+    vector<AcceptedSiteWeightMap> thread_species_site_weights((size_t)n_threads);
+    vector<FusedThreadPerfCounters> thread_perf_counters((size_t)n_threads);
+    vector<FusedWorkUnitProfile> work_unit_profiles(work_units.size());
+    ParallelOperationStatus operation_status;
+    std::atomic<bool> hts_thread_warning_emitted(false);
+    const FusedPerfClock::time_point traversal_start = FusedPerfClock::now();
+    omp_set_num_threads(n_threads);
+
+    #pragma omp parallel
+    {
+        const int thread_id = omp_get_thread_num();
+        vector<FusedAlignedObservation> main_observations;
+        vector<FusedAlignedObservation> species_observations;
+        main_observations.reserve(32);
+        species_observations.reserve(32);
+        vector<FusedCountObservation> filtered_observation_buffer;
+        vector<FusedCountObservation> raw_observation_buffer;
+        vector<FusedCountObservation> raw_partition_order_buffer;
+        filtered_observation_buffer.reserve(FUSED_OBSERVATION_BUFFER_RECORDS);
+        raw_observation_buffer.reserve(FUSED_OBSERVATION_BUFFER_RECORDS);
+        raw_partition_order_buffer.reserve(FUSED_OBSERVATION_BUFFER_RECORDS);
+        AcceptedSiteWeightMap& local_main_weights =
+            thread_main_site_weights[(size_t)thread_id];
+        AcceptedSiteWeightMap& local_species_weights =
+            thread_species_site_weights[(size_t)thread_id];
+        FusedThreadPerfCounters local_perf;
+
+        htsFile* bam_file = hts_open(bamfile.c_str(), "r");
+        bam_hdr_t* header = nullptr;
+        hts_idx_t* index = nullptr;
+        bam1_t* record = nullptr;
+        if (!bam_file) {
+            operation_status.fail(format_worker_error("BAM open", thread_id));
+        } else {
+            if (htslib_threads > 1 &&
+                hts_set_threads(bam_file, htslib_threads) < 0) {
+                bool expected = false;
+                if (hts_thread_warning_emitted.compare_exchange_strong(
+                        expected, true)) {
+                    fprintf(stderr,
+                        "WARNING: HTSlib helper-thread setup failed; continuing with synchronous BAM I/O\n");
+                }
+            }
+            header = sam_hdr_read(bam_file);
+            if (!header)
+                operation_status.fail(format_worker_error("BAM header read", thread_id));
+            index = sam_index_load(bam_file, bamfile.c_str());
+            if (!index)
+                operation_status.fail(format_worker_error("BAM index load", thread_id));
+            record = bam_init1();
+            if (!record)
+                operation_status.fail(format_worker_error("BAM record allocation", thread_id));
+        }
+
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t unit_index = 0; unit_index < work_units.size(); ++unit_index) {
+            if (!operation_status.ok() || !bam_file || !header || !index || !record)
+                continue;
+            const FusedWorkUnit& unit = work_units[unit_index];
+            FusedWorkUnitProfile unit_perf;
+            const FusedPerfClock::time_point unit_start = FusedPerfClock::now();
+            if (unit.tid < 0 || unit.tid >= header->n_targets) {
+                operation_status.fail(
+                    format_worker_error("invalid contig", thread_id, unit.tid));
+                continue;
+            }
+            hts_itr_t* iterator = sam_itr_queryi(
+                index, unit.tid, unit.owner_start, unit.owner_end);
+            if (!iterator) {
+                operation_status.fail(
+                    format_worker_error("iterator creation", thread_id, unit.tid));
+                continue;
+            }
+
+            const ChromSNPs* main_panel = find_chrom_panel(main_snpdat, unit.tid);
+            const ChromSNPs* species_panel =
+                find_chrom_panel(species_snpdat, unit.tid);
+            size_t main_start_cursor = 0;
+            size_t species_start_cursor = 0;
+            if (main_panel) {
+                main_start_cursor = (size_t)std::distance(
+                    main_panel->snps.begin(),
+                    std::lower_bound(
+                        main_panel->snps.begin(), main_panel->snps.end(),
+                        unit.owner_start,
+                        [](const SNPData& snp, int position) {
+                            return snp.pos < position;
+                        }));
+            }
+            if (species_panel) {
+                species_start_cursor = (size_t)std::distance(
+                    species_panel->snps.begin(),
+                    std::lower_bound(
+                        species_panel->snps.begin(), species_panel->snps.end(),
+                        unit.owner_start,
+                        [](const SNPData& snp, int position) {
+                            return snp.pos < position;
+                        }));
+            }
+
+            int iterator_result = 0;
+            while (operation_status.ok() &&
+                    (iterator_result = sam_itr_next(
+                        bam_file, iterator, record)) >= 0) {
+                ++local_perf.iterator_records;
+                ++unit_perf.iterator_records;
+                if (!read_passes_filter(
+                        record, default_production_read_filter())) continue;
+                ++local_perf.records_passing_read_policy;
+                ++unit_perf.records_passing_read_policy;
+
+                // Indexed region iterators may return a long alignment on both
+                // sides of a boundary. Alignment start uniquely selects its owner.
+                if (record->core.pos < unit.owner_start ||
+                    (unit.owner_end != INT_MAX &&
+                     record->core.pos >= unit.owner_end)) continue;
+
+                uint8_t* barcode_tag = bam_aux_get(record, "CB");
+                if (!barcode_tag) continue;
+                ++local_perf.cb_tagged_records;
+                ++unit_perf.cb_tagged_records;
+                const char* barcode_string = bam_aux2Z(barcode_tag);
+                if (!barcode_string) continue;
+                bc barcode_bits;
+                str2bc(barcode_string, barcode_bits);
+                const unsigned long barcode = barcode_bits.to_ulong();
+                auto filtered_species_found =
+                    filtered_species_lookup.find(barcode);
+                const bool is_filtered =
+                    filtered_species_found != filtered_species_lookup.end();
+                if (is_filtered) {
+                    ++local_perf.filtered_cell_records;
+                    ++unit_perf.filtered_cell_records;
+                } else {
+                    ++local_perf.raw_only_records;
+                    ++unit_perf.raw_only_records;
+                }
+
+                if (main_panel) {
+                    while (main_start_cursor < main_panel->snps.size() &&
+                            main_panel->snps[main_start_cursor].pos <
+                                record->core.pos) {
+                        ++main_start_cursor;
+                    }
+                }
+                if (species_panel) {
+                    while (species_start_cursor < species_panel->snps.size() &&
+                            species_panel->snps[species_start_cursor].pos <
+                                record->core.pos) {
+                        ++species_start_cursor;
+                    }
+                }
+                const int64_t probability_scaled =
+                    mapq_probability_scaled(record->core.qual);
+                collect_fused_alignment_observations(
+                    record, main_panel, species_panel,
+                    main_start_cursor, species_start_cursor,
+                    probability_scaled,
+                    main_observations, species_observations);
+                local_perf.main_allele_observations += main_observations.size();
+                local_perf.species_allele_observations += species_observations.size();
+                unit_perf.main_allele_observations += main_observations.size();
+                unit_perf.species_allele_observations += species_observations.size();
+                if (main_observations.empty() && species_observations.empty()) continue;
+
+                if (is_filtered) {
+                    for (const FusedAlignedObservation& observation :
+                            main_observations) {
+                        if (accepted_site_weights_main) {
+                            local_main_weights[accepted_site_weight_key(
+                                unit.tid, observation.snp->pos)] +=
+                                observation.ref_scaled + observation.alt_scaled;
+                        }
+                        if (!append_compact_observation(
+                                filtered_observation_buffer, barcode, unit.tid,
+                                FUSED_MAIN_PANEL, observation)) {
+                            operation_status.fail(format_worker_error(
+                                "filtered observation encoding", thread_id,
+                                unit.tid));
+                            break;
+                        }
+                    }
+                    for (const FusedAlignedObservation& observation :
+                            species_observations) {
+                        if (accepted_site_weights_species) {
+                            local_species_weights[accepted_site_weight_key(
+                                unit.tid, observation.snp->pos)] +=
+                                observation.ref_scaled + observation.alt_scaled;
+                        }
+                        if (!append_compact_observation(
+                                filtered_observation_buffer, barcode, unit.tid,
+                                FUSED_SPECIES_PANEL, observation)) {
+                            operation_status.fail(format_worker_error(
+                                "filtered species observation encoding",
+                                thread_id, unit.tid));
+                            break;
+                        }
+                    }
+
+                    if (operation_status.ok() &&
+                        filtered_observation_buffer.size() >=
+                            FUSED_OBSERVATION_BUFFER_RECORDS) {
+                        string error;
+                        if (!flush_filtered_observations(
+                                filtered_observation_buffer, main_snpdat,
+                                species_native_targets, filtered_main_lookup,
+                                filtered_species_lookup, local_perf, error)) {
+                            operation_status.fail(format_worker_error(
+                                error.c_str(), thread_id, unit.tid));
+                        }
+                    }
+
+                    if (dump_pileup && !main_observations.empty()) {
+                        const std::pair<uint64_t, uint8_t> molecule =
+                            pileup_molecule_key(record);
+                        FILE* spool = spool_files[(size_t)thread_id];
+                        for (const FusedAlignedObservation& observation :
+                                main_observations) {
+                            FusedPileupSpoolRecord spool_record;
+                            spool_record.barcode = (uint64_t)barcode;
+                            spool_record.molecule_hash = molecule.first;
+                            spool_record.site =
+                                ((uint64_t)(uint32_t)unit.tid << 32) |
+                                (uint64_t)(uint32_t)observation.snp->pos;
+                            spool_record.ref_scaled = observation.ref_scaled;
+                            spool_record.alt_scaled = observation.alt_scaled;
+                            spool_record.basis = molecule.second;
+                            if (fwrite(&spool_record, sizeof(spool_record), 1,
+                                    spool) != 1) {
+                                operation_status.fail(format_worker_error(
+                                    "pileup spool write", thread_id, unit.tid));
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    if (!write_raw_outputs) continue;
+                    for (const FusedAlignedObservation& observation :
+                            main_observations) {
+                        if (!append_compact_observation(
+                                raw_observation_buffer, barcode, unit.tid,
+                                FUSED_MAIN_PANEL, observation)) {
+                            operation_status.fail(format_worker_error(
+                                "raw main observation encoding", thread_id,
+                                unit.tid));
+                            break;
+                        }
+                    }
+                    for (const FusedAlignedObservation& observation :
+                            species_observations) {
+                        if (!append_compact_observation(
+                                raw_observation_buffer, barcode, unit.tid,
+                                FUSED_SPECIES_PANEL, observation)) {
+                            operation_status.fail(format_worker_error(
+                                "raw species observation encoding", thread_id,
+                                unit.tid));
+                            break;
+                        }
+                    }
+                    if (operation_status.ok() &&
+                        raw_observation_buffer.size() >=
+                            FUSED_OBSERVATION_BUFFER_RECORDS) {
+                        string error;
+                        if (!spill_raw_observations(
+                                raw_observation_buffer,
+                                raw_partition_order_buffer, raw_partitions,
+                                local_perf, error)) {
+                            operation_status.fail(format_worker_error(
+                                error.c_str(), thread_id, unit.tid));
+                        }
+                    }
+                }
+            }
+            if (iterator_result < -1) {
+                operation_status.fail(
+                    format_worker_error("iterator read", thread_id, unit.tid));
+            }
+            hts_itr_destroy(iterator);
+            unit_perf.elapsed_nanoseconds = fused_perf_nanoseconds(
+                unit_start, FusedPerfClock::now());
+            work_unit_profiles[unit_index] = unit_perf;
+        }
+
+        if (operation_status.ok() && !filtered_observation_buffer.empty()) {
+            string error;
+            if (!flush_filtered_observations(
+                    filtered_observation_buffer, main_snpdat,
+                    species_native_targets, filtered_main_lookup,
+                    filtered_species_lookup, local_perf, error)) {
+                operation_status.fail(format_worker_error(
+                    error.c_str(), thread_id));
+            }
+        }
+        if (operation_status.ok() && !raw_observation_buffer.empty()) {
+            string error;
+            if (!spill_raw_observations(
+                    raw_observation_buffer, raw_partition_order_buffer,
+                    raw_partitions,
+                    local_perf, error)) {
+                operation_status.fail(format_worker_error(
+                    error.c_str(), thread_id));
+            }
+        }
+
+        if (record) bam_destroy1(record);
+        if (index) hts_idx_destroy(index);
+        if (header) bam_hdr_destroy(header);
+        if (bam_file) hts_close(bam_file);
+        thread_perf_counters[(size_t)thread_id] = local_perf;
+    }
+    print_fused_perf_phase(
+        "parallel_bam_traversal", traversal_start, FusedPerfClock::now());
+
+    FusedThreadPerfCounters total_perf;
+    for (const FusedThreadPerfCounters& thread_perf : thread_perf_counters) {
+        total_perf.iterator_records += thread_perf.iterator_records;
+        total_perf.records_passing_read_policy +=
+            thread_perf.records_passing_read_policy;
+        total_perf.cb_tagged_records += thread_perf.cb_tagged_records;
+        total_perf.filtered_cell_records += thread_perf.filtered_cell_records;
+        total_perf.raw_only_records += thread_perf.raw_only_records;
+        total_perf.main_allele_observations +=
+            thread_perf.main_allele_observations;
+        total_perf.species_allele_observations +=
+            thread_perf.species_allele_observations;
+        total_perf.main_total_target_updates +=
+            thread_perf.main_total_target_updates;
+        total_perf.main_pair_target_updates +=
+            thread_perf.main_pair_target_updates;
+        total_perf.species_total_target_updates +=
+            thread_perf.species_total_target_updates;
+        total_perf.species_pair_target_updates +=
+            thread_perf.species_pair_target_updates;
+        total_perf.raw_shard_acquisitions +=
+            thread_perf.raw_shard_acquisitions;
+        total_perf.raw_partition_bulk_writes +=
+            thread_perf.raw_partition_bulk_writes;
+        total_perf.filtered_cell_lock.applicable_records +=
+            thread_perf.filtered_cell_lock.applicable_records;
+        total_perf.filtered_cell_lock.samples +=
+            thread_perf.filtered_cell_lock.samples;
+        total_perf.filtered_cell_lock.wait_nanoseconds +=
+            thread_perf.filtered_cell_lock.wait_nanoseconds;
+        total_perf.filtered_cell_lock.held_nanoseconds +=
+            thread_perf.filtered_cell_lock.held_nanoseconds;
+        total_perf.raw_shard_lock.applicable_records +=
+            thread_perf.raw_shard_lock.applicable_records;
+        total_perf.raw_shard_lock.samples +=
+            thread_perf.raw_shard_lock.samples;
+        total_perf.raw_shard_lock.wait_nanoseconds +=
+            thread_perf.raw_shard_lock.wait_nanoseconds;
+        total_perf.raw_shard_lock.held_nanoseconds +=
+            thread_perf.raw_shard_lock.held_nanoseconds;
+        total_perf.raw_partition_lock.applicable_records +=
+            thread_perf.raw_partition_lock.applicable_records;
+        total_perf.raw_partition_lock.samples +=
+            thread_perf.raw_partition_lock.samples;
+        total_perf.raw_partition_lock.wait_nanoseconds +=
+            thread_perf.raw_partition_lock.wait_nanoseconds;
+        total_perf.raw_partition_lock.held_nanoseconds +=
+            thread_perf.raw_partition_lock.held_nanoseconds;
+    }
+
+    uint64_t unique_raw_only_barcodes = 0;
+    uint64_t raw_temporary_bytes = 0;
+    if (write_raw_outputs) {
+        string error;
+        if (!close_raw_partitions(raw_partitions, error)) {
+            operation_status.fail(error);
+        }
+        for (const auto& partition : raw_partitions) {
+            raw_temporary_bytes += partition->bytes;
+        }
+    }
+
+    if (dump_pileup && !close_fused_spools(spool_files)) {
+        operation_status.fail("failed closing fused pileup spool files");
+    }
+    if (!operation_status.ok()) {
+        fprintf(stderr, "\nERROR: fused parallel counting failed: %s\n",
+            operation_status.message().c_str());
+        remove_files(spool_paths);
+        return false;
+    }
+    fprintf(stderr,
+        "PERF_COUNTER name=raw_observation_partitions partitions=%llu temporary_bytes=%llu bulk_writes=%llu\n",
+        (unsigned long long)(write_raw_outputs ? FUSED_RAW_PARTITIONS : 0),
+        (unsigned long long)raw_temporary_bytes,
+        (unsigned long long)total_perf.raw_partition_bulk_writes);
+
+    vector<uint64_t> work_unit_elapsed;
+    work_unit_elapsed.reserve(work_unit_profiles.size());
+    vector<size_t> slowest_work_units;
+    slowest_work_units.reserve(work_unit_profiles.size());
+    for (size_t unit_index = 0; unit_index < work_unit_profiles.size(); ++unit_index) {
+        work_unit_elapsed.push_back(
+            work_unit_profiles[unit_index].elapsed_nanoseconds);
+        slowest_work_units.push_back(unit_index);
+    }
+    std::sort(work_unit_elapsed.begin(), work_unit_elapsed.end());
+    std::sort(slowest_work_units.begin(), slowest_work_units.end(),
+        [&work_unit_profiles](size_t left, size_t right) {
+            if (work_unit_profiles[left].elapsed_nanoseconds !=
+                    work_unit_profiles[right].elapsed_nanoseconds) {
+                return work_unit_profiles[left].elapsed_nanoseconds >
+                    work_unit_profiles[right].elapsed_nanoseconds;
+            }
+            return left < right;
+        });
+    long double median_nanoseconds = 0.0L;
+    if (!work_unit_elapsed.empty()) {
+        const size_t middle = work_unit_elapsed.size() / 2;
+        if (work_unit_elapsed.size() % 2 == 0) {
+            median_nanoseconds =
+                ((long double)work_unit_elapsed[middle - 1] +
+                 (long double)work_unit_elapsed[middle]) / 2.0L;
+        } else {
+            median_nanoseconds = (long double)work_unit_elapsed[middle];
+        }
+    }
+    const uint64_t maximum_nanoseconds = work_unit_elapsed.empty()
+        ? 0 : work_unit_elapsed.back();
+    fprintf(stderr,
+        "PERF_WORKUNIT summary total=%llu median_seconds=%.6f max_seconds=%.6f\n",
+        (unsigned long long)work_unit_profiles.size(),
+        (double)(median_nanoseconds / 1000000000.0L),
+        (double)maximum_nanoseconds / 1000000000.0);
+    const size_t slowest_count = std::min((size_t)20, slowest_work_units.size());
+    for (size_t rank = 0; rank < slowest_count; ++rank) {
+        const size_t unit_index = slowest_work_units[rank];
+        const FusedWorkUnit& unit = work_units[unit_index];
+        const FusedWorkUnitProfile& profile = work_unit_profiles[unit_index];
+        fprintf(stderr,
+            "PERF_WORKUNIT rank=%llu contig=%s tid=%d start=%d end=%d elapsed_seconds=%.6f iterator_records=%llu passing_read_policy=%llu cb_tagged_records=%llu filtered_records=%llu raw_only_records=%llu main_observations=%llu species_observations=%llu\n",
+            (unsigned long long)(rank + 1),
+            chromosome_names[(size_t)unit.tid].c_str(), unit.tid,
+            unit.owner_start, unit.owner_end,
+            (double)profile.elapsed_nanoseconds / 1000000000.0,
+            (unsigned long long)profile.iterator_records,
+            (unsigned long long)profile.records_passing_read_policy,
+            (unsigned long long)profile.cb_tagged_records,
+            (unsigned long long)profile.filtered_cell_records,
+            (unsigned long long)profile.raw_only_records,
+            (unsigned long long)profile.main_allele_observations,
+            (unsigned long long)profile.species_allele_observations);
+    }
+    fprintf(stderr,
+        "PERF_LOCK_SAMPLE store=filtered_cell interval=%llu applicable_records=%llu samples=%llu wait_seconds=%.6f held_seconds=%.6f\n",
+        (unsigned long long)FUSED_LOCK_SAMPLE_INTERVAL,
+        (unsigned long long)total_perf.filtered_cell_lock.applicable_records,
+        (unsigned long long)total_perf.filtered_cell_lock.samples,
+        (double)total_perf.filtered_cell_lock.wait_nanoseconds / 1000000000.0,
+        (double)total_perf.filtered_cell_lock.held_nanoseconds / 1000000000.0);
+    fprintf(stderr,
+        "PERF_LOCK_SAMPLE store=raw_shard interval=%llu applicable_records=%llu samples=%llu wait_seconds=%.6f held_seconds=%.6f\n",
+        (unsigned long long)FUSED_LOCK_SAMPLE_INTERVAL,
+        (unsigned long long)total_perf.raw_shard_lock.applicable_records,
+        (unsigned long long)total_perf.raw_shard_lock.samples,
+        (double)total_perf.raw_shard_lock.wait_nanoseconds / 1000000000.0,
+        (double)total_perf.raw_shard_lock.held_nanoseconds / 1000000000.0);
+    fprintf(stderr,
+        "PERF_LOCK_SAMPLE store=raw_partition interval=%llu applicable_records=%llu samples=%llu wait_seconds=%.6f held_seconds=%.6f\n",
+        (unsigned long long)FUSED_LOCK_SAMPLE_INTERVAL,
+        (unsigned long long)total_perf.raw_partition_lock.applicable_records,
+        (unsigned long long)total_perf.raw_partition_lock.samples,
+        (double)total_perf.raw_partition_lock.wait_nanoseconds / 1000000000.0,
+        (double)total_perf.raw_partition_lock.held_nanoseconds / 1000000000.0);
+
+    auto merge_site_weights = [n_threads](
+            vector<AcceptedSiteWeightMap>& per_thread,
+            AcceptedSiteWeightMap* destination) {
+        if (!destination) return;
+        destination->clear();
+        for (int thread = 0; thread < n_threads; ++thread) {
+            for (const auto& item : per_thread[(size_t)thread]) {
+                (*destination)[item.first] += item.second;
+            }
+        }
+    };
+    const FusedPerfClock::time_point accepted_merge_start = FusedPerfClock::now();
+    merge_site_weights(thread_main_site_weights, accepted_site_weights_main);
+    merge_site_weights(thread_species_site_weights, accepted_site_weights_species);
+    print_fused_perf_phase(
+        "accepted_site_weight_merging", accepted_merge_start,
+        FusedPerfClock::now());
+
+    if (write_raw_outputs) {
+        FusedThreadPerfCounters reduction_perf;
+        if (!write_fused_raw_counts(
+                raw_counts_path, raw_species_counts_path,
+                filtered_main_counts, filtered_species_counts, raw_partitions,
+                raw_temporary_files, raw_temporary_base, main_snpdat,
+                species_native_targets, n_samples, species_native_n_samples,
+                n_threads, reduction_perf, unique_raw_only_barcodes)) {
+            fprintf(stderr, "\nERROR: failed serializing fused raw count products\n");
+            remove_files(spool_paths);
+            return false;
+        }
+        total_perf.main_total_target_updates +=
+            reduction_perf.main_total_target_updates;
+        total_perf.main_pair_target_updates +=
+            reduction_perf.main_pair_target_updates;
+        total_perf.species_total_target_updates +=
+            reduction_perf.species_total_target_updates;
+        total_perf.species_pair_target_updates +=
+            reduction_perf.species_pair_target_updates;
+    } else {
+        fprintf(stderr,
+            "PERF_PHASE name=filtered_main_raw_serialization seconds=0.000000 skipped=1\n");
+        fprintf(stderr,
+            "PERF_PHASE name=filtered_species_raw_serialization seconds=0.000000 skipped=1\n");
+        fprintf(stderr,
+            "PERF_PHASE name=sparse_raw_only_main_species_serialization seconds=0.000000 skipped=1\n");
+        fprintf(stderr,
+            "PERF_PHASE name=gzip_flush_close seconds=0.000000 skipped=1\n");
+    }
+
+    if (dump_pileup) {
+        const string observation_path = pileup_prefix + ".pileup_obs.tsv.gz";
+        const string molecule_path = pileup_prefix + ".pileup_molecules.tsv.gz";
+        if (!derive_fused_pileup_outputs(
+                spool_paths, observation_path, molecule_path)) {
+            fprintf(stderr, "ERROR: failed deriving public pileup views from spool\n");
+            return false;
+        }
+    }
+
+    fprintf(stderr,
+        "PERF_COUNTER name=fused_summary iterator_records=%llu passing_read_policy=%llu cb_tagged_records=%llu filtered_cell_records=%llu raw_only_records=%llu main_allele_observations=%llu species_allele_observations=%llu main_total_target_updates=%llu main_pair_target_updates=%llu species_total_target_updates=%llu species_pair_target_updates=%llu raw_shard_acquisitions=%llu unique_raw_only_barcodes=%llu\n",
+        (unsigned long long)total_perf.iterator_records,
+        (unsigned long long)total_perf.records_passing_read_policy,
+        (unsigned long long)total_perf.cb_tagged_records,
+        (unsigned long long)total_perf.filtered_cell_records,
+        (unsigned long long)total_perf.raw_only_records,
+        (unsigned long long)total_perf.main_allele_observations,
+        (unsigned long long)total_perf.species_allele_observations,
+        (unsigned long long)total_perf.main_total_target_updates,
+        (unsigned long long)total_perf.main_pair_target_updates,
+        (unsigned long long)total_perf.species_total_target_updates,
+        (unsigned long long)total_perf.species_pair_target_updates,
+        (unsigned long long)total_perf.raw_shard_acquisitions,
+        (unsigned long long)unique_raw_only_barcodes);
+    fprintf(stderr, "Fused counting complete\n");
     return true;
 }
 
@@ -3124,20 +5922,79 @@ bool count_alleles_parallel_dual(
     atomic<int> units_done(0);
     atomic<long> reads_processed(0);
     
-    // Per-thread cell counts: separate maps for panel 0 and panel 1
+    // Filtered-barcode runs update one preallocated matrix per cell under the
+    // existing per-cell mutex. Raw-barcode discovery uses independently locked
+    // shards so unknown keys remain unique across workers.
     omp_set_num_threads(n_threads);
-    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts_p0(n_threads);
-    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_counts_p1(n_threads);
-    vector<robin_hood::unordered_map<unsigned long, CellCounts>> thread_species_native_counts(
-        collect_species_native ? n_threads : 0);
+    vector<std::unique_ptr<RawCountShard>> raw_count_shards =
+        make_raw_count_shards(!has_bc_list);
+
+    std::unordered_map<unsigned long, AlignedCellCounts*> shared_count_lookup_p0;
+    std::unordered_map<unsigned long, AlignedCellCounts*> shared_count_lookup_p1;
+    std::unordered_map<unsigned long, AlignedCellCounts*> shared_species_native_lookup;
+    if (has_bc_list) {
+        shared_count_lookup_p0.reserve(valid_barcodes.size());
+        shared_count_lookup_p1.reserve(valid_barcodes.size());
+        if (collect_species_native) {
+            shared_species_native_lookup.reserve(valid_barcodes.size());
+        }
+        for (unsigned long barcode : valid_barcodes) {
+            auto p0_it = counts_panel0.find(barcode);
+            auto p1_it = counts_panel1.find(barcode);
+            if (p0_it == counts_panel0.end() || p1_it == counts_panel1.end()) {
+                fprintf(stderr, "ERROR: internal dual-panel pre-allocation failure\n");
+                return false;
+            }
+            shared_count_lookup_p0.emplace(barcode, &p0_it->second);
+            shared_count_lookup_p1.emplace(barcode, &p1_it->second);
+            if (collect_species_native) {
+                auto native_it = species_native_counts->find(barcode);
+                if (native_it == species_native_counts->end()) {
+                    fprintf(stderr, "ERROR: internal native-species pre-allocation failure\n");
+                    return false;
+                }
+                shared_species_native_lookup.emplace(barcode, &native_it->second);
+            }
+        }
+        fprintf(stderr,
+            "Filtered dual-panel accumulation uses one shared count matrix per "
+            "cell/panel; per-thread dense matrices are disabled.\n");
+    }
+    else {
+        fprintf(stderr,
+            "Raw dual-panel accumulation uses %lu shared count shards; "
+            "per-thread dense matrices are disabled.\n",
+            (unsigned long)RAW_COUNT_SHARDS);
+    }
 
     // --dump_pileup: per-thread per-(cell,SNP) allele evidence (interindividual
     // only).  Inner key packs (tid<<32 | pos); value is (ref_scaled, alt_scaled).
     // Empty and untouched unless dump_pileup is set.  Identical structure and
     // downstream contract to the single-panel path.
-    vector<robin_hood::unordered_map<unsigned long,
-        robin_hood::unordered_map<int64_t, std::pair<int64_t, int64_t> > > > thread_pileup(n_threads);
+    vector<PileupObservationMap> thread_pileup(n_threads);
     vector<vector<PileupMoleculeObservation> > thread_pileup_molecules(n_threads);
+    vector<size_t> thread_pileup_entries(n_threads, 0);
+    vector<long> thread_pileup_rows(n_threads, 0);
+    vector<long> thread_molecule_rows(n_threads, 0);
+    vector<string> pileup_observation_part_paths;
+    vector<string> pileup_molecule_part_paths;
+    vector<gzFile> pileup_observation_part_files;
+    vector<gzFile> pileup_molecule_part_files;
+    string pileup_stream_error;
+    if (dump_pileup && !open_parallel_pileup_parts(
+            pileup_prefix, n_threads,
+            pileup_observation_part_paths, pileup_observation_part_files,
+            pileup_molecule_part_paths, pileup_molecule_part_files,
+            pileup_stream_error)) {
+        fprintf(stderr, "ERROR: %s\n", pileup_stream_error.c_str());
+        return false;
+    }
+    if (dump_pileup) {
+        fprintf(stderr,
+            "Pileup memory mode: bounded worker chunks (%lu cell/site, %lu molecule/site).\n",
+            (unsigned long)PILEUP_SITE_CHUNK_ENTRIES,
+            (unsigned long)PILEUP_MOLECULE_CHUNK_ENTRIES);
+    }
     vector<AcceptedSiteWeightMap> thread_site_weights_p0(n_threads);
     vector<AcceptedSiteWeightMap> thread_site_weights_p1(n_threads);
     vector<SourceObservationMap> thread_source_observations(n_threads);
@@ -3164,10 +6021,6 @@ bool count_alleles_parallel_dual(
     #pragma omp parallel
     {
         int thread_id = omp_get_thread_num();
-        auto& local_p0 = thread_counts_p0[thread_id];
-        auto& local_p1 = thread_counts_p1[thread_id];
-        robin_hood::unordered_map<unsigned long, CellCounts>* local_species_native =
-            collect_species_native ? &thread_species_native_counts[thread_id] : nullptr;
         auto& local_site_weights_p0 = thread_site_weights_p0[thread_id];
         auto& local_site_weights_p1 = thread_site_weights_p1[thread_id];
         auto& local_source_observations = thread_source_observations[thread_id];
@@ -3398,8 +6251,8 @@ bool count_alleles_parallel_dual(
                         }
                         std::set<SourceObservationKey> source_read_keys;
                         
-                        float prob_correct = 1.0f - powf(10.0f, -(float)record->core.qual / 10.0f);
-                        int64_t prob_scaled = (int64_t)(prob_correct * FIXED_POINT_SCALE);
+                        int64_t prob_scaled =
+                            mapq_probability_scaled(record->core.qual);
                         
                         for (auto snp_check = snp_iter; 
                              snp_check != snp_chunk_end && snp_check->pos < read_end; 
@@ -3530,27 +6383,46 @@ bool count_alleles_parallel_dual(
                                         }
                                     }
                                 }
-                                // Route to panel-specific thread-local map based on panel_id
-                                auto& target_counts = (snp_check->panel_id == 0) ? local_p0 : local_p1;
-                                
-                                auto it = target_counts.find(bc_key);
-                                if (it == target_counts.end()){
-                                    target_counts.emplace(bc_key, CellCounts(n_samples));
-                                    it = target_counts.find(bc_key);
-                                }
-                                CellCounts& cc = it->second;
-                                
                                 // Precomputed targets: linear traversal, no branches
                                 const auto& ttargets = snp_check->total_targets;
                                 const auto& ptargets = snp_check->pair_targets;
-                                
-                                for (const auto& t : ttargets){
-                                    cc.total_ref[t.total_idx] += ref_add;
-                                    cc.total_alt[t.total_idx] += alt_add;
+                                auto add_precomputed = [&](CellCounts& counts) {
+                                    const bool is_ref = ref_add != 0;
+                                    for (const auto& t : ttargets){
+                                        if (is_ref) counts.total_ref[t.total_idx] += ref_add;
+                                        else counts.total_alt[t.total_idx] += alt_add;
+                                    }
+                                    for (const auto& p : ptargets){
+                                        if (is_ref) counts.ref_counts[p.pair_idx] += ref_add;
+                                        else counts.alt_counts[p.pair_idx] += alt_add;
+                                    }
+                                };
+
+                                if (has_bc_list) {
+                                    const auto& target_lookup = panel_id == 0 ?
+                                        shared_count_lookup_p0 : shared_count_lookup_p1;
+                                    auto shared_it = target_lookup.find(bc_key);
+                                    if (shared_it == target_lookup.end()) {
+                                        operation_status.fail(format_worker_error(
+                                            "filtered dual-panel count lookup", thread_id, tid));
+                                        continue;
+                                    }
+                                    AlignedCellCounts& shared = *shared_it->second;
+                                    std::lock_guard<std::mutex> guard(shared.lock);
+                                    add_precomputed(shared.counts);
                                 }
-                                for (const auto& p : ptargets){
-                                    cc.ref_counts[p.pair_idx] += ref_add;
-                                    cc.alt_counts[p.pair_idx] += alt_add;
+                                else {
+                                    RawCountShard& shard = *raw_count_shards[
+                                        raw_count_shard_index(bc_key)];
+                                    std::lock_guard<std::mutex> guard(shard.lock);
+                                    auto* target_counts = panel_id == 0 ?
+                                        &shard.panel0 : &shard.panel1;
+                                    auto it = target_counts->find(bc_key);
+                                    if (it == target_counts->end()){
+                                        target_counts->emplace(bc_key, CellCounts(n_samples));
+                                        it = target_counts->find(bc_key);
+                                    }
+                                    add_precomputed(it->second);
                                 }
 
                                 // --dump_pileup: record per-(cell,SNP) evidence for
@@ -3559,9 +6431,17 @@ bool count_alleles_parallel_dual(
                                 if (dump_pileup && snp_check->panel_id == 0){
                                     int64_t pkey = ((int64_t)tid << 32) |
                                         (int64_t)(uint32_t)snp_check->pos;
-                                    auto& slot = thread_pileup[thread_id][bc_key][pkey];
-                                    slot.first += ref_add;
-                                    slot.second += alt_add;
+                                    auto& cell_sites = thread_pileup[thread_id][bc_key];
+                                    auto site_it = cell_sites.find(pkey);
+                                    if (site_it == cell_sites.end()) {
+                                        cell_sites.emplace(
+                                            pkey, std::make_pair(ref_add, alt_add));
+                                        ++thread_pileup_entries[thread_id];
+                                    }
+                                    else {
+                                        site_it->second.first += ref_add;
+                                        site_it->second.second += alt_add;
+                                    }
                                     PileupMoleculeObservation observation;
                                     observation.barcode = bc_key;
                                     observation.molecule_hash = molecule_key.first;
@@ -3571,23 +6451,65 @@ bool count_alleles_parallel_dual(
                                     observation.basis = molecule_key.second;
                                     thread_pileup_molecules[thread_id].push_back(
                                         observation);
+                                    if (thread_pileup_entries[thread_id] >=
+                                            PILEUP_SITE_CHUNK_ENTRIES) {
+                                        const long written = write_collapsed_pileup_observations(
+                                            pileup_observation_part_files[thread_id],
+                                            thread_pileup[thread_id]);
+                                        thread_pileup_entries[thread_id] = 0;
+                                        if (written < 0) {
+                                            operation_status.fail(format_worker_error(
+                                                "pileup observation write", thread_id, tid));
+                                        }
+                                        else thread_pileup_rows[thread_id] += written;
+                                    }
+                                    if (thread_pileup_molecules[thread_id].size() >=
+                                            PILEUP_MOLECULE_CHUNK_ENTRIES) {
+                                        const long written = write_collapsed_pileup_molecules(
+                                            pileup_molecule_part_files[thread_id],
+                                            thread_pileup_molecules[thread_id]);
+                                        if (written < 0) {
+                                            operation_status.fail(format_worker_error(
+                                                "pileup molecule write", thread_id, tid));
+                                        }
+                                        else thread_molecule_rows[thread_id] += written;
+                                    }
                                 }
 
-                                if (local_species_native != nullptr && snp_check->panel_id == 1 &&
+                                if (collect_species_native && panel_id == 1 &&
                                     native_chrom_targets != nullptr){
                                     const size_t snp_index = (size_t)(
                                         snp_check - chrom_snps.snps.begin());
                                     if (snp_index < native_chrom_targets->site_offsets.size() &&
                                         native_chrom_targets->site_offsets[snp_index] != UINT64_MAX){
-                                        auto native_it = local_species_native->find(bc_key);
-                                        if (native_it == local_species_native->end()){
-                                            local_species_native->emplace(
-                                                bc_key, CellCounts(species_native_n_samples));
-                                            native_it = local_species_native->find(bc_key);
+                                        if (has_bc_list) {
+                                            auto native_it = shared_species_native_lookup.find(bc_key);
+                                            if (native_it == shared_species_native_lookup.end()) {
+                                                operation_status.fail(format_worker_error(
+                                                    "filtered native-species count lookup",
+                                                    thread_id, tid));
+                                                continue;
+                                            }
+                                            AlignedCellCounts& shared_native = *native_it->second;
+                                            std::lock_guard<std::mutex> guard(shared_native.lock);
+                                            accumulate_species_native_targets(
+                                                shared_native.counts, *native_chrom_targets,
+                                                snp_index, ref_add, alt_add);
                                         }
-                                        accumulate_species_native_targets(
-                                            native_it->second, *native_chrom_targets, snp_index,
-                                            ref_add, alt_add);
+                                        else {
+                                            RawCountShard& shard = *raw_count_shards[
+                                                raw_count_shard_index(bc_key)];
+                                            std::lock_guard<std::mutex> guard(shard.lock);
+                                            auto native_it = shard.native.find(bc_key);
+                                            if (native_it == shard.native.end()){
+                                                shard.native.emplace(
+                                                    bc_key, CellCounts(species_native_n_samples));
+                                                native_it = shard.native.find(bc_key);
+                                            }
+                                            accumulate_species_native_targets(
+                                                native_it->second, *native_chrom_targets, snp_index,
+                                                ref_add, alt_add);
+                                        }
                                     }
                                 }
                             }
@@ -3625,126 +6547,89 @@ bool count_alleles_parallel_dual(
         if (idx) hts_idx_destroy(idx);
         if (header) bam_hdr_destroy(header);
         if (bam_fp) hts_close(bam_fp);
+
+        if (dump_pileup && operation_status.ok()) {
+            const long obs_written = write_collapsed_pileup_observations(
+                pileup_observation_part_files[thread_id], thread_pileup[thread_id]);
+            thread_pileup_entries[thread_id] = 0;
+            const long molecule_written = write_collapsed_pileup_molecules(
+                pileup_molecule_part_files[thread_id],
+                thread_pileup_molecules[thread_id]);
+            if (obs_written < 0 || molecule_written < 0) {
+                operation_status.fail(format_worker_error(
+                    "final bounded pileup write", thread_id));
+            }
+            else {
+                thread_pileup_rows[thread_id] += obs_written;
+                thread_molecule_rows[thread_id] += molecule_written;
+            }
+        }
+    }
+
+    if (dump_pileup) {
+        string close_error;
+        const bool obs_closed = close_parallel_pileup_parts(
+            pileup_observation_part_files, close_error);
+        const bool molecule_closed = close_parallel_pileup_parts(
+            pileup_molecule_part_files, close_error);
+        if (!obs_closed || !molecule_closed) operation_status.fail(close_error);
     }
 
     if (!operation_status.ok()){
         fprintf(stderr, "ERROR: dual-panel allele counting failed: %s\n",
             operation_status.message().c_str());
+        remove_files(pileup_observation_part_paths);
+        remove_files(pileup_molecule_part_paths);
         return false;
     }
     
-    // Merge per-thread counts for panel 0
-    fprintf(stderr, "\nMerging per-thread counts (panel 0)...\n");
-    for (int t = 0; t < n_threads; t++){
-        for (auto& kv : thread_counts_p0[t]){
-            unsigned long bc_key = kv.first;
-            auto it = counts_panel0.find(bc_key);
-            if (it == counts_panel0.end()){
-                counts_panel0.emplace(std::piecewise_construct,
-                    std::forward_as_tuple(bc_key),
-                    std::forward_as_tuple(n_samples));
-                it = counts_panel0.find(bc_key);
-            }
-            it->second.counts.merge(kv.second);
-        }
-        thread_counts_p0[t].clear();
+    if (!has_bc_list) {
+        fprintf(stderr, "\nMoving sharded raw-barcode counts (panel 0)...\n");
+        move_sharded_counts(raw_count_shards, 0, counts_panel0);
+        fprintf(stderr, "Moving sharded raw-barcode counts (panel 1)...\n");
+        move_sharded_counts(raw_count_shards, 1, counts_panel1);
     }
     
-    // Merge per-thread counts for panel 1
-    fprintf(stderr, "Merging per-thread counts (panel 1)...\n");
-    for (int t = 0; t < n_threads; t++){
-        for (auto& kv : thread_counts_p1[t]){
-            unsigned long bc_key = kv.first;
-            auto it = counts_panel1.find(bc_key);
-            if (it == counts_panel1.end()){
-                counts_panel1.emplace(std::piecewise_construct,
-                    std::forward_as_tuple(bc_key),
-                    std::forward_as_tuple(n_samples));
-                it = counts_panel1.find(bc_key);
-            }
-            it->second.counts.merge(kv.second);
-        }
-        thread_counts_p1[t].clear();
-    }
-    
-    if (collect_species_native){
-        fprintf(stderr, "Merging per-thread native species counts (panel 1)...\n");
-        for (int t = 0; t < n_threads; ++t){
-            for (auto& kv : thread_species_native_counts[t]){
-                const unsigned long bc_key = kv.first;
-                auto it = species_native_counts->find(bc_key);
-                if (it == species_native_counts->end()){
-                    species_native_counts->emplace(std::piecewise_construct,
-                        std::forward_as_tuple(bc_key),
-                        std::forward_as_tuple(species_native_n_samples));
-                    it = species_native_counts->find(bc_key);
-                }
-                it->second.counts.merge(kv.second);
-            }
-            thread_species_native_counts[t].clear();
-        }
-        thread_species_native_counts.clear();
-        thread_species_native_counts.shrink_to_fit();
+    if (collect_species_native && !has_bc_list){
+        fprintf(stderr, "Moving sharded native species counts (panel 1)...\n");
+        move_sharded_counts(raw_count_shards, 2, *species_native_counts);
         fprintf(stderr, "Native species counts (panel 1): %lu cells, %d species\n",
             species_native_counts->size(), species_native_n_samples);
     }
 
-    thread_counts_p0.clear();
-    thread_counts_p0.shrink_to_fit();
-    thread_counts_p1.clear();
-    thread_counts_p1.shrink_to_fit();
+    raw_count_shards.clear();
+    raw_count_shards.shrink_to_fit();
 
-    // --dump_pileup: flush per-thread per-(cell,SNP) observations.  Per-thread
-    // rows are pre-summed; the same (bc,tid,pos) may still appear across threads
-    // and is summed downstream by the producer.  Columns: bc_hash tid pos ref alt
-    // (ref/alt are prob-scaled float evidence, matching the .counts units).
+    // Publish bounded gzip members after the count completes successfully.
     if (dump_pileup){
         string obs_path = pileup_prefix + ".pileup_obs.tsv.gz";
-        gzFile pf = gzopen(obs_path.c_str(), "w");
-        if (!pf){
-            fprintf(stderr, "ERROR: could not open %s for writing\n", obs_path.c_str());
+        if (!publish_concatenated_gzip_members(
+                pileup_observation_part_paths, obs_path, pileup_stream_error)) {
+            fprintf(stderr, "ERROR: %s\n", pileup_stream_error.c_str());
+            remove_files(pileup_observation_part_paths);
+            remove_files(pileup_molecule_part_paths);
             return false;
-        } else {
-            long n_obs_written = 0;
-            for (int t = 0; t < n_threads; t++){
-                for (auto& cell : thread_pileup[t]){
-                    unsigned long bc = cell.first;
-                    for (auto& kv : cell.second){
-                        int tid_o = (int)(kv.first >> 32);
-                        int pos_o = (int)(kv.first & 0xFFFFFFFF);
-                        gzprintf(pf, "%lu\t%d\t%d\t%f\t%f\n", bc, tid_o, pos_o,
-                            (double)kv.second.first / FIXED_POINT_SCALE,
-                            (double)kv.second.second / FIXED_POINT_SCALE);
-                        n_obs_written++;
-                    }
-                }
-                thread_pileup[t].clear();
-            }
-            if (gzclose(pf) != Z_OK){
-                fprintf(stderr, "ERROR: failed while closing %s\n", obs_path.c_str());
-                return false;
-            }
-            fprintf(stderr, "Wrote %ld pileup observations to %s\n", n_obs_written, obs_path.c_str());
         }
 
         string molecule_path = pileup_prefix + ".pileup_molecules.tsv.gz";
-        gzFile mf = gzopen(molecule_path.c_str(), "w");
-        if (!mf){
-            fprintf(stderr, "ERROR: could not open %s for writing\n",
-                molecule_path.c_str());
+        if (!publish_concatenated_gzip_members(
+                pileup_molecule_part_paths, molecule_path, pileup_stream_error)) {
+            fprintf(stderr, "ERROR: %s\n", pileup_stream_error.c_str());
+            remove_files(pileup_observation_part_paths);
+            remove_files(pileup_molecule_part_paths);
             return false;
         }
+        long n_obs_written = 0;
         long n_molecule_rows = 0;
-        for (int t = 0; t < n_threads; ++t){
-            n_molecule_rows += write_collapsed_pileup_molecules(
-                mf, thread_pileup_molecules[t]);
+        for (int t = 0; t < n_threads; ++t) {
+            n_obs_written += thread_pileup_rows[t];
+            n_molecule_rows += thread_molecule_rows[t];
         }
-        if (gzclose(mf) != Z_OK){
-            fprintf(stderr, "ERROR: failed while closing %s\n",
-                molecule_path.c_str());
-            return false;
-        }
-        fprintf(stderr, "Wrote %ld molecule/SNP observations to %s\n",
+        remove_files(pileup_observation_part_paths);
+        remove_files(pileup_molecule_part_paths);
+        fprintf(stderr, "Wrote %ld bounded pileup observation rows to %s\n",
+            n_obs_written, obs_path.c_str());
+        fprintf(stderr, "Wrote %ld bounded molecule/SNP rows to %s\n",
             n_molecule_rows, molecule_path.c_str());
     }
     thread_pileup.clear();
@@ -4078,6 +6963,15 @@ bool attach_shared_vcf(
     }
     
     SharedVCFHeader* header = (SharedVCFHeader*)ptr;
+    const size_t mapped_size = (size_t)sb.st_size;
+    if (mapped_size < sizeof(SharedVCFHeader) || header->total_size > mapped_size ||
+        header->n_chromosomes < 0 || header->n_chromosomes > 8192 ||
+        header->n_samples < 0 || header->n_samples > 512) {
+        fprintf(stderr, "ERROR: malformed shared VCF header\n");
+        munmap(ptr, mapped_size);
+        close(shm_fd);
+        return false;
+    }
     
     fprintf(stderr, "Attached to shared VCF: %s (%d SNPs, %d chromosomes)\n",
         shm_name.c_str(), header->n_snps_total, header->n_chromosomes);
@@ -4089,40 +6983,86 @@ bool attach_shared_vcf(
     }
     fprintf(stderr, "Loaded %lu sample names from shared VCF\n", samples.size());
     
-    // Deserialize
+    // Validate all source ranges before constructing any destination object.
+    set<int> seen_tids;
+    for (int i = 0; i < header->n_chromosomes; ++i) {
+        const size_t offset = header->chrom_offsets[i];
+        const size_t count = header->chrom_snp_counts[i];
+        if (!seen_tids.insert(header->chrom_tids[i]).second ||
+            offset > mapped_size ||
+            count > (mapped_size - offset) / sizeof(SNPData)) {
+            fprintf(stderr,
+                "ERROR: malformed shared VCF chromosome range at index %d\n", i);
+            munmap(ptr, mapped_size);
+            close(shm_fd);
+            return false;
+        }
+    }
+
+    // Pre-create every map destination serially, size each vector exactly once,
+    // then copy independent contigs in parallel without mutating the map.
     snpdat_all.clear();
-    
-    for (int i = 0; i < header->n_chromosomes; i++){
-        int tid = header->chrom_tids[i];
-        size_t n_snps = header->chrom_snp_counts[i];
-        
-        SNPData* snp_ptr = (SNPData*)((char*)ptr + header->chrom_offsets[i]);
-        
-        ChromSNPs& cs = snpdat_all[tid];
-        cs.snps.reserve(n_snps);
-        
-        for (size_t j = 0; j < n_snps; j++){
+    struct SharedCopyTask {
+        const SNPData* source;
+        SNPData* destination;
+        size_t count;
+    };
+    vector<SharedCopyTask> copy_tasks;
+    copy_tasks.reserve((size_t)header->n_chromosomes);
+    try {
+        snpdat_all.reserve((size_t)header->n_chromosomes * 2 + 1);
+        for (int i = 0; i < header->n_chromosomes; ++i) {
+            const int tid = header->chrom_tids[i];
+            const size_t n_snps = header->chrom_snp_counts[i];
+            snpdat_all.emplace(tid, ChromSNPs());
+            ChromSNPs& chromosome = snpdat_all.find(tid)->second;
+            chromosome.snps.resize(n_snps);
+            SharedCopyTask task;
+            task.source = reinterpret_cast<const SNPData*>(
+                (const char*)ptr + header->chrom_offsets[i]);
+            task.destination = chromosome.snps.data();
+            task.count = n_snps;
+            copy_tasks.push_back(task);
+        }
+    } catch (const std::exception& error) {
+        fprintf(stderr, "ERROR: shared VCF destination allocation failed: %s\n",
+            error.what());
+        snpdat_all.clear();
+        munmap(ptr, mapped_size);
+        close(shm_fd);
+        return false;
+    }
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (size_t task_index = 0; task_index < copy_tasks.size(); ++task_index) {
+        const SharedCopyTask& task = copy_tasks[task_index];
+        for (size_t j = 0; j < task.count; ++j) {
             // Cannot use push_back(snp_ptr[j]) because the SNPData in shared
             // memory was written via memcpy, and the var struct contains a
             // std::vector<float> gqs whose internal heap pointer is from the
             // daemon's address space. Copying it would segfault.
             // Instead, construct each SNPData from the safe POD fields only.
-            SNPData sd;
-            sd.pos = snp_ptr[j].pos;
-            sd.panel_id = snp_ptr[j].panel_id;
-            sd.data.ref = snp_ptr[j].data.ref;
-            sd.data.alt = snp_ptr[j].data.alt;
-            sd.data.haps1 = snp_ptr[j].data.haps1;
-            sd.data.haps2 = snp_ptr[j].data.haps2;
-            sd.data.haps_covered = snp_ptr[j].data.haps_covered;
-            sd.data.vq = snp_ptr[j].data.vq;
+            const SNPData& source = task.source[j];
+            SNPData& destination = task.destination[j];
+            destination.pos = source.pos;
+            destination.panel_id = source.panel_id;
+            destination.data.ref = source.data.ref;
+            destination.data.alt = source.data.alt;
+            destination.data.haps1 = source.data.haps1;
+            destination.data.haps2 = source.data.haps2;
+            destination.data.haps_covered = source.data.haps_covered;
+            destination.data.vq = source.data.vq;
             // gqs is left empty (default-constructed); it's not needed
             // for counting or conditional match fraction computation.
-            cs.snps.push_back(std::move(sd));
         }
     }
-    
-    // Note: We keep the mapping active - caller should call detach when done
+
+    if (munmap(ptr, mapped_size) != 0) {
+        perror("munmap shared VCF");
+        snpdat_all.clear();
+        close(shm_fd);
+        return false;
+    }
     close(shm_fd);
     
     return true;
@@ -4614,3 +7554,5 @@ void process_bam_record_bysnp(bam_reader& reader,
         }
     }
 }
+
+#endif  // CELLBOUNCER_VCF_HTS_INTERFACE_REVISION == 21901
