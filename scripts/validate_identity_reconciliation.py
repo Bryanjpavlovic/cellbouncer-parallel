@@ -6,17 +6,35 @@ import argparse
 import json
 import math
 import os
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List
 
 from identity_reconciliation_common import (
-    DEFAULT_IDENTITY_POLICY, POLICY_VERSION, SCHEMA_VERSION, canonical_genotype, clean, donor_components, parse_library_spec, read_assignments,
+    ASSIGNMENT_STATUSES, ASSIGNMENT_STATUS_APPLIED, ASSIGNMENT_STATUS_FINE,
+    ASSIGNMENT_STATUS_REVIEW, DEFAULT_IDENTITY_POLICY,
+    DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS, POLICY_VERSION, SCHEMA_VERSION,
+    THREE_STATE_ASSIGNMENT_FIELDS, canonical_genotype, clean,
+    derive_downstream_safe_assignment, derive_three_state_assignment,
+    donor_components, parse_library_spec, iter_tsv, read_assignments,
     read_tsv, write_tsv,
 )
 
 SUMMARY_FIELDS = ["check", "status", "n_failures", "detail"]
 FAIL_FIELDS = ["check", "library", "barcode", "detail"]
+
+PRIMARY_CHANGE_ACTIONS = {"REASSIGN_GENOTYPE", "RECLASSIFY_PLOIDY"}
+CONTEXT_OR_DIAGNOSTIC_ACTIONS = {
+    "", "KEEP", "KEEP_CURRENT_CONFLICTED",
+    "REVIEW_CELLULAR_ORIGIN", "REVIEW_UNEXPECTED_IDENTITY",
+    "REVIEW_HOMOTET_OCCUPANCY", "UNRESOLVED_INSUFFICIENT_EVIDENCE",
+}
+TRUE_VALUES = {"1", "true", "yes", "y"}
+NONDECISIONAL_MT_TOKEN = (
+    "MITOCHONDRIA_SUPPORT_DISJOINT_CURRENT_LINE_COMPONENT_NONDECISIONAL")
+EXPECTED_FINAL_SCHEMA_VERSION = (
+    "identity_reconciliation_final_v8_production_evidence_split")
 
 
 def semicolon_set(value: str):
@@ -40,6 +58,84 @@ def numeric_int(value):
 
 def enum_value(value):
     return "" if value is None else str(value).strip()
+
+
+def independent_primary_change_question(row):
+    """Interpret the source action without calling production derivation."""
+    current = canonical_genotype(row.get("comparison_current_assignment", ""))
+    proposal = canonical_genotype(row.get("nominated_proposal", ""))
+    if not current or not proposal or current == proposal:
+        return False
+    scope = clean(row.get("review_record_scope", "")).upper()
+    disposition = clean(row.get("review_disposition", "")).upper()
+    if scope == "CELL" and disposition in {
+            "ACCEPT_PROPOSAL", "KEEP_CURRENT", "LEAVE_UNRESOLVED",
+            "PENDING"}:
+        return True
+    action = (
+        clean(row.get("preliminary_reconciliation_action", ""))
+        or clean(row.get("reconciliation_final_action", ""))).upper()
+    if action in PRIMARY_CHANGE_ACTIONS:
+        return True
+    # Compatibility for an older selected change whose action field is absent.
+    preliminary = canonical_genotype(
+        row.get("preliminary_reconciled_assignment", ""))
+    preliminary_applied = clean(
+        row.get("preliminary_action_applied", "")).lower() in TRUE_VALUES
+    return bool(
+        not action and (preliminary_applied
+                        or (preliminary and preliminary != current)))
+
+
+def independent_evidence_blockers(row, evidence_mode):
+    """Return primary evidence blockers without using finalizer helpers."""
+    blockers = []
+    current = canonical_genotype(row.get("comparison_current_assignment", ""))
+    proposal = canonical_genotype(row.get("nominated_proposal", ""))
+    current_components = donor_components(current)
+    proposal_components = donor_components(proposal)
+    donor_change = set(current_components) != set(proposal_components)
+    structure_change = len(current_components) != len(proposal_components)
+    nuclear = clean(row.get("nuclear_reconciliation_status", "")).upper()
+    atac = clean(row.get("atac_evidence_status", "")).upper()
+    mito = clean(row.get("mitochondrial_evidence_status", "")).upper()
+    ploidy = clean(row.get("ploidy_evidence_status", "")).upper()
+    occupancy = clean(row.get("occupancy_evidence_status", "")).upper()
+    technical = clean(row.get("technical_state", "")).upper()
+
+    if donor_change and nuclear != "NUCLEAR_SUPPORTS_PROPOSAL":
+        blockers.append("RNA=" + (nuclear or "MISSING"))
+    if (donor_change and evidence_mode == "rna-atac"
+            and atac != "ATAC_SUPPORTS_ALTERNATIVE"):
+        blockers.append("ATAC=" + (atac or "MISSING"))
+    if structure_change and ploidy != "SUPPORTS_PROPOSAL":
+        blockers.append("PLOIDY=" + (ploidy or "MISSING"))
+    if structure_change and ("UNRESOLVED" in occupancy or "AMBIG" in occupancy):
+        blockers.append("OCCUPANCY=" + occupancy)
+    if structure_change and technical not in {"", "NA", "NOT_APPLICABLE"}:
+        blockers.append("TECHNICAL=" + technical)
+
+    reason_tokens = {
+        clean(token).upper()
+        for source in (
+            row.get("preliminary_decision_reason_codes", ""),
+            row.get("decision_reason_codes", ""))
+        for token in str(source or "").replace(";", ",").split(",")
+        if clean(token)
+    }
+    if (donor_change and mito in {
+            "SUPPORTS_CURRENT", "CONTRADICTS", "CONTRADICTS_ALTERNATIVE",
+            "MITO_SUPPORTS_CURRENT", "MITO_CONTRADICTS"}
+            and NONDECISIONAL_MT_TOKEN not in reason_tokens):
+        blockers.append("MITO=" + mito)
+
+    frozen = numeric_float(row.get("ambient_frozen_proposal_minus_current_c"))
+    refitted = numeric_float(row.get("ambient_assignment_effect_c_minus_b"))
+    if (math.isfinite(frozen) and math.isfinite(refitted)
+            and frozen != 0 and refitted != 0
+            and (frozen < 0) != (refitted < 0)):
+        blockers.append("AMBIENT_DIRECTION_CONFLICT")
+    return blockers
 
 
 def expected_context_from_metadata(metadata):
@@ -170,8 +266,698 @@ def parse_args():
     p.add_argument("--decisions-root", required=True)
     p.add_argument("--reports-root", required=True)
     p.add_argument("--evidence-mode", choices=("rna", "rna-atac"), default="rna")
+    p.add_argument(
+        "--final-root", default="",
+        help=("Optional canonical identity-reconciliation root. When supplied, "
+              "validate the finalized aggregate and downstream assignment "
+              "exports in addition to upstream scientific invariants."))
     p.add_argument("--output-root", required=True)
     return p.parse_args()
+
+
+def _validate_downstream_safe_exports_v3_legacy(
+        final_root, libs, expected_keys=None):
+    failures = []
+    summaries = []
+
+    def fail(check, lib="", bc="", detail=""):
+        failures.append({
+            "check": check, "library": lib, "barcode": bc,
+            "detail": detail,
+        })
+
+    def finish(check, before, detail=""):
+        count = len(failures) - before
+        summaries.append({
+            "check": check,
+            "status": "PASS" if count == 0 else "FAIL",
+            "n_failures": count,
+            "detail": detail,
+        })
+
+    root = Path(final_root)
+    aggregate = root / "aggregate"
+    ledger_path = aggregate / "identity_reconciliation_final_cells.tsv.gz"
+    selected = {f"lib{number}" for number in libs}
+    projected_fields = {
+        "library", "barcode", "comparison_current_assignment",
+        "production_assignment", "downstream_release_status",
+        "downstream_safe_assignment", "downstream_safe_assignment_source",
+        "downstream_safe_change_applied", "downstream_assignment_status",
+        "nuclear_reconciliation_status", "atac_evidence_status",
+        "ploidy_evidence_status", "mitochondrial_evidence_status",
+    }
+    try:
+        rows = []
+        ledger_fields = set()
+        for raw in iter_tsv(str(ledger_path)):
+            if not ledger_fields:
+                ledger_fields = set(raw)
+            if clean(raw.get("library")) in selected:
+                rows.append({field: raw.get(field, "") for field in projected_fields})
+    except Exception as exc:
+        fail("downstream_final_ledger_readable", detail=str(exc))
+        finish("downstream_final_ledger_readable", 0, str(ledger_path))
+        return failures, summaries
+
+    by_key = defaultdict(list)
+    for row in rows:
+        by_key[(clean(row.get("library")), clean(row.get("barcode")))].append(row)
+
+    before = len(failures)
+    for key, linked in by_key.items():
+        if not all(key) or len(linked) != 1:
+            fail(
+                "downstream_unique_library_barcode", key[0], key[1],
+                f"rows={len(linked)}")
+    finish(
+        "downstream_unique_library_barcode", before,
+        f"selected_rows={len(rows)} unique_keys={len(by_key)}")
+
+    if expected_keys is not None:
+        before = len(failures)
+        expected_selected = {
+            key for key in expected_keys if key[0] in selected
+        }
+        if set(by_key) != expected_selected:
+            fail(
+                "downstream_all_input_barcodes_once", detail=(
+                    f"expected={len(expected_selected)} "
+                    f"observed={len(by_key)}"))
+        finish(
+            "downstream_all_input_barcodes_once", before,
+            f"expected={len(expected_selected)} observed={len(by_key)}")
+
+    before = len(failures)
+    missing_fields = sorted(
+        set(DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS) - ledger_fields)
+    if missing_fields:
+        fail(
+            "downstream_safe_fields_present", detail=",".join(missing_fields))
+    finish("downstream_safe_fields_present", before)
+
+    before = len(failures)
+    changed_ready = 0
+    changed_held = 0
+    for row in rows:
+        expected = derive_downstream_safe_assignment(row)
+        for field, value in expected.items():
+            if enum_value(row.get(field)) != value:
+                fail(
+                    "downstream_safe_derivation",
+                    clean(row.get("library")), clean(row.get("barcode")),
+                    f"{field}: observed={enum_value(row.get(field))} expected={value}")
+        current = canonical_genotype(
+            row.get("comparison_current_assignment", ""))
+        production = canonical_genotype(row.get("production_assignment", ""))
+        safe = canonical_genotype(row.get("downstream_safe_assignment", ""))
+        assignment_status = expected["downstream_assignment_status"]
+        if assignment_status == "RECONCILED_CHANGE_READY":
+            changed_ready += 1
+            if safe != production:
+                fail(
+                    "changed_ready_exports_proposal",
+                    clean(row.get("library")), clean(row.get("barcode")),
+                    f"current={current} production={production} safe={safe}")
+        elif assignment_status == "CURRENT_RETAINED_HELD_CHANGE":
+            changed_held += 1
+            if safe != current:
+                fail(
+                    "held_change_never_leaks",
+                    clean(row.get("library")), clean(row.get("barcode")),
+                    f"current={current} production={production} safe={safe}")
+    finish(
+        "downstream_safe_derivation", before,
+        f"changed_ready={changed_ready} changed_held={changed_held}")
+
+    before = len(failures)
+    expected_assignments = {library: {} for library in selected}
+    for row in rows:
+        expected_assignments[clean(row.get("library"))][
+            clean(row.get("barcode"))
+        ] = canonical_genotype(row.get("downstream_safe_assignment", ""))
+    for library in sorted(selected):
+        expected = expected_assignments[library]
+        path = root / "final_assignments" / f"{library}.reconciled.assignments"
+        try:
+            observed = {
+                barcode: canonical_genotype(record.get("assignment", ""))
+                for barcode, record in read_assignments(str(path)).items()
+            }
+        except Exception as exc:
+            fail("final_assignment_matches_safe_ledger", library, detail=str(exc))
+            continue
+        if set(observed) != set(expected):
+            fail(
+                "final_assignment_matches_safe_ledger", library,
+                detail=(f"barcode_sets_differ expected={len(expected)} "
+                        f"observed={len(observed)}"))
+        for barcode in sorted(set(observed) & set(expected)):
+            if observed[barcode] != expected[barcode]:
+                fail(
+                    "final_assignment_matches_safe_ledger", library, barcode,
+                    f"observed={observed[barcode]} expected={expected[barcode]}")
+    finish("final_assignment_matches_safe_ledger", before)
+
+    compact_fields = (
+        "comparison_current_assignment", "production_assignment",
+        "downstream_release_status", "downstream_safe_assignment",
+        "downstream_assignment_status", "downstream_safe_change_applied",
+        "downstream_safe_assignment_source",
+    )
+    before = len(failures)
+    compact_path = aggregate / (
+        "identity_reconciliation_downstream_safe_cells.tsv.gz")
+    try:
+        compact = read_tsv(str(compact_path))
+        compact_selected = [
+            row for row in compact
+            if clean(row.get("library")) in selected
+        ]
+        compact_map = {
+            (clean(row.get("library")), clean(row.get("barcode"))): row
+            for row in compact_selected
+        }
+        if (set(compact_map) != set(by_key)
+                or len(compact_selected) != len(compact_map)):
+            fail(
+                "downstream_compact_matches_ledger",
+                detail=(f"key_sets_differ ledger={len(by_key)} "
+                        f"compact_rows={len(compact_selected)} "
+                        f"compact_keys={len(compact_map)}"))
+        for key in set(compact_map) & set(by_key):
+            ledger = by_key[key][0]
+            for field in compact_fields:
+                if enum_value(compact_map[key].get(field)) != enum_value(
+                        ledger.get(field)):
+                    fail(
+                        "downstream_compact_matches_ledger", key[0], key[1],
+                        field)
+    except Exception as exc:
+        fail("downstream_compact_matches_ledger", detail=str(exc))
+    finish("downstream_compact_matches_ledger", before)
+
+    held = {
+        key for key, linked in by_key.items()
+        for row in linked
+        if (canonical_genotype(row.get("comparison_current_assignment", ""))
+            != canonical_genotype(row.get("production_assignment", ""))
+            and clean(row.get("downstream_release_status")).upper()
+            == "HELD_FOR_REVIEW")
+    }
+    joint = {
+        key for key in held for row in by_key[key]
+        if (clean(row.get("nuclear_reconciliation_status")).upper()
+            == "NUCLEAR_SUPPORTS_PROPOSAL"
+            and clean(row.get("atac_evidence_status")).upper()
+            == "ATAC_SUPPORTS_ALTERNATIVE"
+            and clean(row.get("ploidy_evidence_status")).upper()
+            != "SUPPORTS_CURRENT"
+            and clean(row.get("mitochondrial_evidence_status")).upper()
+            != "SUPPORTS_CURRENT")
+    }
+    joint_ploidy_not_applicable = {
+        key for key in joint for row in by_key[key]
+        if clean(row.get("ploidy_evidence_status")).upper()
+        == "NOT_APPLICABLE"
+    }
+    summaries.append({
+        "check": "joint_supported_held_subset_counts",
+        "status": "PASS",
+        "n_failures": 0,
+        "detail": (
+            f"joint_supported_held={len(joint)} "
+            "ploidy_not_applicable_and_mito_not_current="
+            f"{len(joint_ploidy_not_applicable)}"),
+    })
+
+    before = len(failures)
+    try:
+        held_keys = set()
+        held_selected_count = 0
+        for row in iter_tsv(str(
+                aggregate /
+                "identity_reconciliation_held_changed_audit.tsv.gz")):
+            if clean(row.get("library")) not in selected:
+                continue
+            held_selected_count += 1
+            held_keys.add((
+                clean(row.get("library")), clean(row.get("barcode"))))
+        if held_keys != held or held_selected_count != len(held_keys):
+            fail(
+                "held_changed_audit_exact", detail=(
+                    f"expected={len(held)} observed_rows={held_selected_count} "
+                    f"observed_keys={len(held_keys)}"))
+    except Exception as exc:
+        fail("held_changed_audit_exact", detail=str(exc))
+    finish("held_changed_audit_exact", before)
+
+    def expected_transitions(keys):
+        counts = Counter()
+        for key in keys:
+            row = by_key[key][0]
+            counts[(
+                canonical_genotype(row.get("comparison_current_assignment", "")),
+                canonical_genotype(row.get("production_assignment", "")),
+            )] += 1
+        return counts
+
+    for check, filename, keys in (
+            ("held_transition_summary_exact",
+             "identity_reconciliation_held_changed_transition_summary.tsv",
+             held),
+            ("joint_supported_held_transition_summary_exact",
+             "identity_reconciliation_joint_supported_held_transitions.tsv",
+             joint)):
+        before = len(failures)
+        try:
+            transition_rows = read_tsv(str(aggregate / filename))
+            observed = Counter()
+            observed_fractions = {}
+            for row in transition_rows:
+                pair = (
+                    canonical_genotype(
+                        row.get("comparison_current_assignment", "")),
+                    canonical_genotype(row.get("production_assignment", "")),
+                )
+                if pair in observed:
+                    fail(check, detail=f"duplicate transition row: {pair}")
+                observed[pair] += numeric_int(row.get("n_cells"))
+                observed_fractions[pair] = numeric_float(
+                    row.get("fraction_of_subset"))
+            expected = expected_transitions(keys)
+            if observed != expected:
+                fail(
+                    check,
+                    detail=(f"expected_cells={sum(expected.values())} "
+                            f"observed_cells={sum(observed.values())}"))
+            for pair, count in expected.items():
+                expected_fraction = count / len(keys) if keys else 0.0
+                observed_fraction = observed_fractions.get(pair, math.nan)
+                if (not math.isfinite(observed_fraction)
+                        or not math.isclose(
+                            observed_fraction, expected_fraction,
+                            rel_tol=1e-9, abs_tol=1e-12)):
+                    fail(
+                        check,
+                        detail=(f"fraction mismatch {pair}: "
+                                f"observed={observed_fraction} "
+                                f"expected={expected_fraction}"))
+        except Exception as exc:
+            fail(check, detail=str(exc))
+        finish(check, before, f"subset_cells={len(keys)}")
+
+    before = len(failures)
+    plot = root / "plots" / (
+        "identity_reconciliation_joint_supported_held_transitions.png")
+    if not plot.is_file() or plot.stat().st_size == 0:
+        fail("joint_supported_held_transition_plot_present", detail=str(plot))
+    finish("joint_supported_held_transition_plot_present", before)
+    return failures, summaries
+
+
+def validate_downstream_safe_exports(
+        final_root, libs, expected_keys=None, evidence_mode="rna"):
+    """Report the three-state contract without adding a new release gate."""
+    summaries = []
+    warnings = []
+    root = Path(final_root)
+    aggregate = root / "aggregate"
+    selected = {f"lib{number}" for number in libs}
+    ledger_path = aggregate / "identity_reconciliation_final_cells.tsv.gz"
+    required_fields = {
+        "library", "barcode", *THREE_STATE_ASSIGNMENT_FIELDS,
+        "comparison_current_assignment", "nominated_proposal",
+        "preliminary_reconciliation_action", "preliminary_action_applied",
+        "preliminary_reconciled_assignment",
+        "preliminary_decision_reason_codes", "review_record_scope",
+        "review_disposition", "nuclear_reconciliation_status",
+        "atac_evidence_status", "mitochondrial_evidence_status",
+        "ploidy_evidence_status", "occupancy_evidence_status",
+        "technical_state", "ambient_frozen_proposal_minus_current_c",
+        "ambient_assignment_effect_c_minus_b", "production_assignment",
+        "downstream_release_status", "final_schema_version",
+        *DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS,
+    }
+    expected_by_library = {library: {} for library in selected}
+    primary_by_key = {}
+    safe_alias_by_key = {}
+    status_counts = defaultdict(Counter)
+    applied_transition_counts = Counter()
+    review_transition_counts = Counter()
+    real_change_questions = 0
+    resolved_real_change_questions = 0
+    unknown_action_questions = 0
+
+    def warn(check, library="", barcode="", detail=""):
+        warnings.append({
+            "check": check, "library": library, "barcode": barcode,
+            "detail": detail,
+        })
+
+    def summarize(check, before, detail=""):
+        count = len(warnings) - before
+        summaries.append({
+            "check": check,
+            "status": "PASS" if count == 0 else "WARN",
+            "n_failures": count,
+            "detail": detail,
+        })
+
+    before = len(warnings)
+    seen = set()
+    ledger_fields = set()
+    try:
+        for row_number, row in enumerate(iter_tsv(str(ledger_path)), 1):
+            if row_number == 1:
+                ledger_fields = set(row)
+                missing = sorted(required_fields - ledger_fields)
+                if missing:
+                    warn("three_state_fields_present", detail=",".join(missing))
+            library = clean(row.get("library"))
+            barcode = clean(row.get("barcode"))
+            key = (library, barcode)
+            if library not in selected or not barcode or key in seen:
+                warn("three_state_unique_library_barcode", library, barcode,
+                     "unselected library, blank barcode, or duplicate key")
+                continue
+            seen.add(key)
+            if clean(row.get("final_schema_version")) != EXPECTED_FINAL_SCHEMA_VERSION:
+                warn(
+                    "three_state_schema_version", library, barcode,
+                    f"observed={row.get('final_schema_version')} "
+                    f"expected={EXPECTED_FINAL_SCHEMA_VERSION}")
+            status = clean(row.get("assignment_status")).upper()
+            current = canonical_genotype(row.get("current_assignment", ""))
+            proposal = canonical_genotype(row.get("proposed_assignment", ""))
+            source_current = canonical_genotype(
+                row.get("comparison_current_assignment", ""))
+            source_proposal = canonical_genotype(
+                row.get("nominated_proposal", ""))
+            final = canonical_genotype(row.get("final_assignment", ""))
+            action = (
+                clean(row.get("preliminary_reconciliation_action", ""))
+                or clean(row.get("reconciliation_final_action", ""))).upper()
+            known_action = (
+                action in PRIMARY_CHANGE_ACTIONS
+                or action in CONTEXT_OR_DIAGNOSTIC_ACTIONS)
+            real_change_proposal = independent_primary_change_question(row)
+            scope = clean(row.get("review_record_scope", "")).upper()
+            disposition = clean(row.get("review_disposition", "")).upper()
+            cell_disposition = disposition if scope == "CELL" else ""
+            blockers = independent_evidence_blockers(row, evidence_mode)
+            if real_change_proposal:
+                real_change_questions += 1
+                if status == ASSIGNMENT_STATUS_FINE:
+                    resolved_real_change_questions += 1
+            elif not known_action:
+                unknown_action_questions += 1
+            elif status != ASSIGNMENT_STATUS_FINE:
+                warn("no_change_or_context_cell_is_fine", library, barcode,
+                     f"action={action or 'MISSING'} current={source_current} "
+                     f"nomination={source_proposal}")
+
+            if not known_action:
+                independently_expected_status = ASSIGNMENT_STATUS_REVIEW
+            elif cell_disposition == "KEEP_CURRENT":
+                independently_expected_status = ASSIGNMENT_STATUS_FINE
+            elif cell_disposition == "ACCEPT_PROPOSAL":
+                independently_expected_status = ASSIGNMENT_STATUS_APPLIED
+            elif cell_disposition == "LEAVE_UNRESOLVED":
+                independently_expected_status = ASSIGNMENT_STATUS_REVIEW
+            elif cell_disposition == "PENDING":
+                independently_expected_status = ASSIGNMENT_STATUS_REVIEW
+            elif not real_change_proposal:
+                independently_expected_status = ASSIGNMENT_STATUS_FINE
+            elif blockers:
+                independently_expected_status = ASSIGNMENT_STATUS_REVIEW
+            else:
+                independently_expected_status = ASSIGNMENT_STATUS_APPLIED
+            if status != independently_expected_status:
+                warn(
+                    "independent_three_state_semantics", library, barcode,
+                    f"observed={status} expected={independently_expected_status} "
+                    f"action={action or 'MISSING'} blockers="
+                    f"{';'.join(blockers) or 'NONE'}")
+
+            preliminary = canonical_genotype(
+                row.get("preliminary_reconciled_assignment", ""))
+            preliminary_applied = clean(
+                row.get("preliminary_action_applied", "")).lower() in TRUE_VALUES
+            if (preliminary_applied and source_proposal
+                    and preliminary != source_proposal):
+                warn(
+                    "preliminary_selected_proposal_consistent", library,
+                    barcode,
+                    f"preliminary={preliminary} nomination={source_proposal}")
+            if (status == ASSIGNMENT_STATUS_APPLIED
+                    and cell_disposition != "ACCEPT_PROPOSAL" and blockers):
+                warn(
+                    "applied_has_required_evidence", library, barcode,
+                    ";".join(blockers))
+            if (status == ASSIGNMENT_STATUS_REVIEW
+                    and cell_disposition not in {"LEAVE_UNRESOLVED", "PENDING"}
+                    and real_change_proposal and not blockers):
+                warn(
+                    "review_has_independent_blocker", library, barcode,
+                    "no primary RNA/ATAC/structure/MT/ambient blocker")
+            if status not in ASSIGNMENT_STATUSES:
+                warn("three_state_allowed_status", library, barcode, status)
+            if current != source_current:
+                warn("primary_current_matches_source", library, barcode,
+                     f"primary={current} source={source_current}")
+            if (status != ASSIGNMENT_STATUS_FINE
+                    and proposal != source_proposal):
+                warn("primary_proposal_matches_source", library, barcode,
+                     f"primary={proposal} source={source_proposal}")
+            if not final:
+                warn("three_state_final_assignment_present", library, barcode)
+            if status == ASSIGNMENT_STATUS_FINE and final != current:
+                warn("fine_no_change_keeps_current", library, barcode,
+                     f"current={current} final={final}")
+            if status == ASSIGNMENT_STATUS_FINE and proposal:
+                warn("fine_no_change_has_blank_primary_proposal", library,
+                     barcode, f"proposed_assignment={proposal}")
+            if status == ASSIGNMENT_STATUS_APPLIED and (
+                    not proposal or proposal == current or final != proposal):
+                warn("change_applied_uses_distinct_proposal", library, barcode,
+                     f"current={current} proposal={proposal} final={final}")
+            if status == ASSIGNMENT_STATUS_REVIEW and final != current:
+                warn("review_needed_keeps_current", library, barcode,
+                     f"current={current} final={final}")
+            expected_change = (
+                f"{current} -> {proposal}"
+                if status in {ASSIGNMENT_STATUS_APPLIED,
+                              ASSIGNMENT_STATUS_REVIEW} else "NONE")
+            if enum_value(row.get("assignment_change")) != expected_change:
+                warn("assignment_change_exact", library, barcode,
+                     f"observed={row.get('assignment_change')} expected={expected_change}")
+
+            expected = derive_three_state_assignment(row, evidence_mode)
+            for field in (*THREE_STATE_ASSIGNMENT_FIELDS,
+                          "production_assignment",
+                          "downstream_release_status", "review_required"):
+                if str(row.get(field, "")).strip() != expected[field]:
+                    warn("three_state_derivation", library, barcode,
+                         f"{field}: observed={row.get(field)} expected={expected[field]}")
+            safe_expected = derive_downstream_safe_assignment(row)
+            for field, value in safe_expected.items():
+                if str(row.get(field, "")).strip() != value:
+                    warn("deprecated_alias_derivation", library, barcode,
+                         f"{field}: observed={row.get(field)} expected={value}")
+
+            primary_by_key[key] = tuple(
+                str(row.get(field, "")).strip()
+                for field in THREE_STATE_ASSIGNMENT_FIELDS)
+            safe_alias_by_key[key] = tuple(
+                str(row.get(field, "")).strip()
+                for field in (
+                    "production_assignment", "downstream_release_status",
+                    *DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS,
+                    "downstream_exclusion_reason", "review_required"))
+            expected_by_library[library][barcode] = final
+            status_counts[library][status] += 1
+            status_counts["ALL"][status] += 1
+            if status == ASSIGNMENT_STATUS_APPLIED:
+                applied_transition_counts[(library, current, final)] += 1
+                applied_transition_counts[("ALL", current, final)] += 1
+            elif status == ASSIGNMENT_STATUS_REVIEW:
+                review_transition_counts[(library, current, proposal)] += 1
+                review_transition_counts[("ALL", current, proposal)] += 1
+    except Exception as exc:
+        warn("three_state_ledger_readable", detail=str(exc))
+    summarize(
+        "three_state_ledger_contract", before,
+        f"rows={len(seen)} real_change_questions={real_change_questions} "
+        f"resolved_to_current={resolved_real_change_questions} "
+        f"unknown_actions={unknown_action_questions} "
+        "statuses=" + ";".join(
+            f"{status}:{status_counts['ALL'][status]}"
+            for status in ASSIGNMENT_STATUSES))
+
+    before = len(warnings)
+    nonfine = (
+        status_counts["ALL"][ASSIGNMENT_STATUS_APPLIED]
+        + status_counts["ALL"][ASSIGNMENT_STATUS_REVIEW])
+    expected_nonfine = (
+        real_change_questions - resolved_real_change_questions
+        + unknown_action_questions)
+    if nonfine != expected_nonfine:
+        warn("nonfine_equals_real_change_questions", detail=(
+            f"nonfine={nonfine} expected={expected_nonfine} "
+            f"real_change_questions={real_change_questions} "
+            f"unknown_actions={unknown_action_questions}"))
+    summarize("nonfine_equals_real_change_questions", before)
+
+    before = len(warnings)
+    if expected_keys is not None:
+        expected_selected = {key for key in expected_keys if key[0] in selected}
+        if seen != expected_selected:
+            warn("three_state_all_input_barcodes_once", detail=(
+                f"expected={len(expected_selected)} observed={len(seen)}"))
+    summarize("three_state_all_input_barcodes_once", before)
+
+    before = len(warnings)
+    compact_seen = set()
+    compact_path = aggregate / "identity_assignments.tsv.gz"
+    try:
+        for row in iter_tsv(str(compact_path)):
+            key = (clean(row.get("library")), clean(row.get("barcode")))
+            if key in compact_seen or key not in primary_by_key:
+                warn("compact_assignment_unique_and_complete", key[0], key[1])
+                continue
+            compact_seen.add(key)
+            observed = tuple(
+                str(row.get(field, "")).strip()
+                for field in THREE_STATE_ASSIGNMENT_FIELDS)
+            if observed != primary_by_key[key]:
+                warn("compact_assignment_matches_ledger", key[0], key[1])
+        if compact_seen != set(primary_by_key):
+            warn("compact_assignment_unique_and_complete", detail=(
+                f"ledger={len(primary_by_key)} compact={len(compact_seen)}"))
+    except Exception as exc:
+        warn("compact_assignment_readable", detail=str(exc))
+    summarize("compact_assignment_matches_ledger", before)
+
+    before = len(warnings)
+    try:
+        observed_summary = Counter()
+        for row in read_tsv(str(
+                aggregate / "identity_assignment_status_summary.tsv")):
+            library = clean(row.get("library"))
+            status = clean(row.get("assignment_status")).upper()
+            observed_summary[(library, status)] = numeric_int(row.get("n_cells"))
+        for library in ["ALL"] + sorted(selected):
+            for status in ASSIGNMENT_STATUSES:
+                if observed_summary[(library, status)] != status_counts[library][status]:
+                    warn("three_state_summary_counts", library, detail=(
+                        f"{status}: observed={observed_summary[(library, status)]} "
+                        f"expected={status_counts[library][status]}"))
+    except Exception as exc:
+        warn("three_state_summary_readable", detail=str(exc))
+    summarize("three_state_summary_counts", before)
+
+    before = len(warnings)
+    try:
+        observed = Counter()
+        for row in read_tsv(str(aggregate / "identity_applied_changes.tsv")):
+            observed[(
+                clean(row.get("library")),
+                canonical_genotype(row.get("current_assignment", "")),
+                canonical_genotype(row.get("final_assignment", "")),
+            )] += numeric_int(row.get("n_cells"))
+        if observed != applied_transition_counts:
+            warn("applied_transition_summary_exact", detail=(
+                f"expected_groups={len(applied_transition_counts)} "
+                f"observed_groups={len(observed)}"))
+    except Exception as exc:
+        warn("applied_transition_summary_readable", detail=str(exc))
+    summarize("applied_transition_summary_exact", before)
+
+    before = len(warnings)
+    try:
+        observed = Counter()
+        for row in read_tsv(str(
+                aggregate / "identity_review_transition_summary.tsv")):
+            observed[(
+                clean(row.get("library")),
+                canonical_genotype(row.get("current_assignment", "")),
+                canonical_genotype(row.get("proposed_assignment", "")),
+            )] += numeric_int(row.get("n_cells"))
+        if observed != review_transition_counts:
+            warn("review_transition_summary_exact", detail=(
+                f"expected_groups={len(review_transition_counts)} "
+                f"observed_groups={len(observed)}"))
+    except Exception as exc:
+        warn("review_transition_summary_readable", detail=str(exc))
+    summarize("review_transition_summary_exact", before)
+
+    before = len(warnings)
+    try:
+        observed = {}
+        alias_fields = (
+            "production_assignment", "downstream_release_status",
+            *DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS,
+            "downstream_exclusion_reason", "review_required")
+        for row in iter_tsv(str(
+                aggregate /
+                "identity_reconciliation_downstream_safe_cells.tsv.gz")):
+            key = (clean(row.get("library")), clean(row.get("barcode")))
+            if key in observed:
+                warn("downstream_alias_unique", key[0], key[1])
+            observed[key] = tuple(
+                str(row.get(field, "")).strip() for field in alias_fields)
+        if observed != safe_alias_by_key:
+            warn("downstream_alias_matches_ledger", detail=(
+                f"expected={len(safe_alias_by_key)} observed={len(observed)}"))
+    except Exception as exc:
+        warn("downstream_alias_readable", detail=str(exc))
+    summarize("downstream_alias_matches_ledger", before)
+
+    before = len(warnings)
+    for library in sorted(selected):
+        path = root / "final_assignments" / f"{library}.reconciled.assignments"
+        try:
+            observed = {
+                barcode: canonical_genotype(record.get("assignment", ""))
+                for barcode, record in read_assignments(str(path)).items()
+            }
+            expected = expected_by_library[library]
+            if observed != expected:
+                warn("final_assignment_matches_three_state", library, detail=(
+                    f"expected={len(expected)} observed={len(observed)}"))
+        except Exception as exc:
+            warn("final_assignment_matches_three_state", library, detail=str(exc))
+    summarize("final_assignment_matches_three_state", before)
+
+    before = len(warnings)
+    try:
+        review_keys = {
+            (clean(row.get("library")), clean(row.get("barcode")))
+            for row in iter_tsv(str(
+                aggregate / "identity_review_needed.tsv.gz"))
+        }
+        expected_review = {
+            key for key, values in primary_by_key.items()
+            if values[0] == ASSIGNMENT_STATUS_REVIEW
+        }
+        if review_keys != expected_review:
+            warn("review_file_exact", detail=(
+                f"expected={len(expected_review)} observed={len(review_keys)}"))
+    except Exception as exc:
+        warn("review_file_readable", detail=str(exc))
+    summarize("review_file_exact", before)
+
+    if warnings:
+        print(
+            f"WARNING: three-state validation reported {len(warnings)} issue(s); "
+            "assignments remain safe by construction.", file=sys.stderr)
+        for item in warnings[:20]:
+            print(
+                "WARNING: " + " ".join(filter(None, (
+                    item["check"], item["library"], item["barcode"],
+                    item["detail"]))), file=sys.stderr)
+    return [], summaries
 
 
 def main():
@@ -920,6 +1706,18 @@ def main():
     except Exception as exc:
         fail("manifest_readable", "", "", str(exc))
     finish("manifest_invariants", b)
+
+    if args.final_root:
+        expected_final_keys = {
+            (clean(row.get("library")), clean(row.get("barcode")))
+            for row in all_rows
+        }
+        downstream_failures, downstream_summaries = (
+            validate_downstream_safe_exports(
+                args.final_root, libs, expected_final_keys,
+                args.evidence_mode))
+        failures.extend(downstream_failures)
+        summaries.extend(downstream_summaries)
 
     out = Path(args.output_root); out.mkdir(parents=True, exist_ok=True)
     write_tsv(str(out / "validation_summary.tsv"), summaries, SUMMARY_FIELDS)

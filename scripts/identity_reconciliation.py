@@ -17,16 +17,24 @@ import sys
 
 import argparse
 import csv
+import gzip
 import json
 import os
 import re
 from collections import defaultdict
+from contextlib import ExitStack
+from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 from identity_reconciliation_common import (
-    SCHEMA_VERSION, canonical_genotype, canonical_uid_set, clean, json_dump_atomic,
-    natural_key, sha256_file, write_tsv,
+    ASSIGNMENT_STATUSES, ASSIGNMENT_STATUS_APPLIED, ASSIGNMENT_STATUS_FINE,
+    ASSIGNMENT_STATUS_REVIEW, DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS,
+    SCHEMA_VERSION, THREE_STATE_ASSIGNMENT_FIELDS, canonical_genotype,
+    canonical_uid_set, clean, derive_downstream_safe_assignment,
+    derive_three_state_assignment, format_value, iter_tsv, json_dump_atomic,
+    natural_key, reconciliation_action_class, sha256_file, write_tsv,
 )
 
 EXPECTED_FIELDS = [
@@ -4408,7 +4416,15 @@ def candidate_axis_pairs_main():
 # finalize
 # -----------------------------------------------------------------------------
 
-FINAL_SCHEMA_VERSION = "identity_reconciliation_final_v2_phase3_dispositions"
+FINAL_SCHEMA_VERSION = (
+    "identity_reconciliation_final_v8_production_evidence_split")
+FINAL_RESUMABLE_SCHEMA_VERSIONS = {
+    # v7 is the completed all-40 checkpoint being reinterpreted.  Earlier
+    # ledgers are intentionally not accepted because they are not guaranteed to
+    # contain every evidence field used by the corrected production split.
+    "identity_reconciliation_final_v7_production_change_boundary",
+    FINAL_SCHEMA_VERSION,
+}
 FINAL_REVIEW_DISPOSITIONS = {
     "ACCEPT_PROPOSAL", "KEEP_CURRENT", "LEAVE_UNRESOLVED",
 }
@@ -4478,10 +4494,13 @@ FINAL_CELL_FIELDS = [
     "preliminary_reconciled_assignment", "preliminary_decision_confidence",
     "preliminary_decision_reason_codes", "interpreted_identity",
     "scientific_recommendation", "recommendation_basis", "review_required",
-    "review_reasons", "review_disposition", "review_rationale",
+    "review_reasons", "legacy_review_reasons", "review_disposition",
+    "review_rationale",
     "review_record_scope", "review_record_target",
     "application_state", "application_reason", "production_assignment",
-    "production_assignment_source", "candidate_roster_relationship",
+    "production_assignment_source", *THREE_STATE_ASSIGNMENT_FIELDS,
+    *DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS,
+    "candidate_roster_relationship",
     "proposal_kind", "proposal_components", "axis_candidate_a_assignment",
     "axis_candidate_b_assignment",
     "axis_pair_relationship_to_current_proposal", "candidate_axis_scope_status",
@@ -4501,6 +4520,53 @@ FINAL_CELL_FIELDS = [
     "policy_version", "run_id", "final_schema_version",
 ]
 
+FINAL_DOWNSTREAM_SAFE_FIELDS = [
+    "library", "barcode", "comparison_current_assignment",
+    *THREE_STATE_ASSIGNMENT_FIELDS,
+    "production_assignment", "downstream_release_status",
+    "downstream_safe_assignment", "downstream_assignment_status",
+    "downstream_safe_change_applied", "downstream_safe_assignment_source",
+    "downstream_exclusion_reason", "review_required", "review_reasons",
+    "event_id", "metadata_event_status", "library_exchange_status",
+]
+FINAL_PRIMARY_ASSIGNMENT_FIELDS = [
+    "library", "barcode", "assignment_status", "current_assignment",
+    "proposed_assignment", "final_assignment", "assignment_change",
+    "review_reason", "evidence_summary",
+]
+FINAL_STATUS_SUMMARY_FIELDS = [
+    "library", "assignment_status", "n_cells", "percentage",
+]
+FINAL_APPLIED_CHANGE_FIELDS = [
+    "library", "current_assignment", "final_assignment", "n_cells",
+]
+FINAL_REVIEW_TRANSITION_FIELDS = [
+    "library", "current_assignment", "proposed_assignment",
+    "assignment_change", "n_cells",
+]
+FINAL_REVIEW_NEEDED_FIELDS = [
+    "library", "barcode", "current_assignment", "proposed_assignment",
+    "assignment_change", "review_reason", "evidence_summary",
+    "nuclear_reconciliation_status", "candidate_axis_scope_status",
+    "candidate_axis_fold_direction_stability_status",
+    "atac_evidence_status", "mitochondrial_evidence_status",
+    "ploidy_evidence_status", "occupancy_evidence_status",
+    "technical_state", "ambient_frozen_proposal_minus_current_c",
+    "ambient_assignment_effect_c_minus_b",
+]
+FINAL_TRANSITION_FIELDS = [
+    "comparison_current_assignment", "production_assignment", "n_cells",
+    "fraction_of_subset", "n_libraries", "libraries_and_counts",
+    "n_events", "events_and_counts", "event_class_counts",
+    "event_confidence_counts", "downstream_exclusion_reason_counts",
+    "review_reason_counts", "metadata_event_status_counts",
+    "library_exchange_status_counts", "ploidy_evidence_status_counts",
+    "mitochondrial_evidence_status_counts",
+]
+FINAL_PREWRITE_MANIFEST_FIELDS = [
+    "path", "size_bytes", "modification_time_utc", "sha256",
+]
+
 
 def finalize_parse_args():
     p = argparse.ArgumentParser(
@@ -4516,6 +4582,10 @@ def finalize_parse_args():
     p.add_argument("--review-input", default="")
     p.add_argument("--evidence-mode", choices=("rna", "rna-atac"), default="rna")
     p.add_argument("--run-id", default="")
+    p.add_argument(
+        "--checkpoint-only", action="store_true",
+        help=("reinterpret the completed final-cell checkpoint and rewrite "
+              "assignment products without rebuilding evidence joins"))
     p.add_argument("--output-root", required=True)
     return p.parse_args()
 
@@ -4543,6 +4613,980 @@ def _final_float(value):
 def _final_counter(values):
     counts = Counter(_final_na(value) for value in values)
     return ";".join(f"{key}:{counts[key]}" for key in sorted(counts, key=natural_key)) or "NONE"
+
+
+def _final_multi_values(value):
+    return [
+        item for item in (clean(part) for part in clean(value).split(";"))
+        if item and item.upper() not in {"NA", "NONE"}
+    ] or ["NONE"]
+
+
+def _final_changed(row):
+    return clean(row.get("assignment_status")).upper() in {
+        ASSIGNMENT_STATUS_APPLIED, ASSIGNMENT_STATUS_REVIEW}
+
+
+def _final_changed_held(row):
+    return clean(row.get("assignment_status")).upper() == ASSIGNMENT_STATUS_REVIEW
+
+
+def _final_joint_supported_held(row):
+    return (
+        _final_changed_held(row)
+        and clean(row.get("nuclear_reconciliation_status")).upper()
+        == "NUCLEAR_SUPPORTS_PROPOSAL"
+        and clean(row.get("atac_evidence_status")).upper()
+        == "ATAC_SUPPORTS_ALTERNATIVE"
+        and clean(row.get("ploidy_evidence_status")).upper()
+        != "SUPPORTS_CURRENT"
+        and clean(row.get("mitochondrial_evidence_status")).upper()
+        != "SUPPORTS_CURRENT"
+    )
+
+
+def _final_transition_summary(rows, event_by_key):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(
+            canonical_genotype(row.get("current_assignment", "")
+                               or row.get("comparison_current_assignment", "")),
+            canonical_genotype(row.get("proposed_assignment", "")
+                               or row.get("nominated_proposal", "")),
+        )].append(row)
+    total = len(rows)
+    out = []
+    for (current, production), linked in grouped.items():
+        event_keys = {
+            (row["library"], clean(row.get("event_id")) or "NA")
+            for row in linked
+        }
+        event_rows = [
+            event_by_key.get(
+                (row["library"], clean(row.get("event_id")) or "NA"), {})
+            for row in linked
+        ]
+        out.append({
+            "comparison_current_assignment": current or "NA",
+            "production_assignment": production or "NA",
+            "n_cells": len(linked),
+            "fraction_of_subset": len(linked) / total if total else 0.0,
+            "n_libraries": len({row["library"] for row in linked}),
+            "libraries_and_counts": _final_counter(
+                row["library"] for row in linked),
+            "n_events": len(event_keys),
+            "events_and_counts": _final_counter(
+                f"{row['library']}/{clean(row.get('event_id')) or 'NA'}"
+                for row in linked),
+            "event_class_counts": _final_counter(
+                event.get("event_class") for event in event_rows),
+            "event_confidence_counts": _final_counter(
+                event.get("event_confidence") for event in event_rows),
+            "downstream_exclusion_reason_counts": _final_counter(
+                value for row in linked
+                for value in _final_multi_values(
+                    row.get("downstream_exclusion_reason"))),
+            "review_reason_counts": _final_counter(
+                value for row in linked
+                for value in _final_multi_values(row.get("review_reasons"))),
+            "metadata_event_status_counts": _final_counter(
+                row.get("metadata_event_status") for row in linked),
+            "library_exchange_status_counts": _final_counter(
+                value for row in linked
+                for value in _final_multi_values(
+                    row.get("library_exchange_status"))),
+            "ploidy_evidence_status_counts": _final_counter(
+                row.get("ploidy_evidence_status") for row in linked),
+            "mitochondrial_evidence_status_counts": _final_counter(
+                row.get("mitochondrial_evidence_status") for row in linked),
+        })
+    out.sort(key=lambda row: (
+        -row["n_cells"],
+        natural_key(row["comparison_current_assignment"]),
+        natural_key(row["production_assignment"]),
+    ))
+    return out
+
+
+def _final_write_transition_plot(path, transition_rows, subset_size):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    displayed = transition_rows[:30]
+    labels = [
+        f"{row['comparison_current_assignment']} -> "
+        f"{row['production_assignment']}"
+        for row in displayed
+    ]
+    counts = [int(row["n_cells"]) for row in displayed]
+    height = max(4.5, 0.34 * max(1, len(displayed)) + 2.2)
+    figure, axis = plt.subplots(figsize=(14, height))
+    if displayed:
+        positions = list(range(len(displayed)))
+        axis.barh(positions, counts, color="#356A9A")
+        axis.set_yticks(positions)
+        axis.set_yticklabels(labels)
+        axis.invert_yaxis()
+        axis.set_xlabel("Held cells")
+        axis.grid(axis="x", alpha=0.25)
+        for position, count in zip(positions, counts):
+            axis.text(count, position, f" {count:,}", va="center", fontsize=8)
+    else:
+        axis.text(
+            0.5, 0.5, "No matching transitions", ha="center", va="center",
+            transform=axis.transAxes)
+        axis.set_axis_off()
+    figure.suptitle(
+        "Joint-supported held current-to-proposed identity transitions",
+        fontsize=13, fontweight="bold")
+    figure.text(
+        0.5, 0.965,
+        f"{subset_size:,} cells; displaying {len(displayed)} of "
+        f"{len(transition_rows)} exact transitions",
+        ha="center", va="top", fontsize=9)
+    figure.tight_layout(rect=(0, 0, 1, 0.94))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(path) + ".tmp")
+    figure.savefig(temporary, format="png", dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    os.replace(temporary, path)
+
+
+def _final_apply_three_state(row, evidence_mode, unknown_actions=None):
+    """Apply the primary decision before translating any legacy aliases."""
+    action = (
+        clean(row.get("preliminary_reconciliation_action"))
+        or clean(row.get("reconciliation_final_action"))).upper()
+    if reconciliation_action_class(action) == "UNKNOWN" and unknown_actions is not None:
+        unknown_actions[action or "MISSING"] += 1
+    row.update(derive_three_state_assignment(row, evidence_mode))
+    status = row["assignment_status"]
+    row["legacy_review_reasons"] = (
+        clean(row.get("legacy_review_reasons"))
+        or clean(row.get("review_reasons")) or "NONE")
+    row["review_reasons"] = (
+        row["review_reason"]
+        if status == ASSIGNMENT_STATUS_REVIEW else "NONE")
+    row["production_assignment_source"] = "THREE_STATE_FINAL_ASSIGNMENT"
+    row["downstream_exclusion_reason"] = (
+        row["review_reason"] if status == ASSIGNMENT_STATUS_REVIEW else "NONE")
+    row["application_state"] = (
+        "APPLIED" if status == ASSIGNMENT_STATUS_APPLIED else
+        "HELD_FOR_REVIEW" if status == ASSIGNMENT_STATUS_REVIEW else
+        "NOT_APPLIED")
+    row["application_reason"] = (
+        row["review_reason"] if status == ASSIGNMENT_STATUS_REVIEW else
+        "THREE_STATE_CHANGE_APPLIED" if status == ASSIGNMENT_STATUS_APPLIED else
+        "FINE_NO_CHANGE")
+    row["interpreted_identity"] = row["final_assignment"]
+    row["scientific_recommendation"] = (
+        "USE_PROPOSAL" if status == ASSIGNMENT_STATUS_APPLIED else
+        "UNRESOLVED" if status == ASSIGNMENT_STATUS_REVIEW else
+        "USE_CURRENT")
+    row["recommendation_basis"] = "THREE_STATE_ASSIGNMENT_CONTRACT"
+    review_scope = clean(row.get("review_record_scope")).upper()
+    if review_scope not in {"CELL", "EVENT"}:
+        row["review_disposition"] = (
+            "PENDING" if status == ASSIGNMENT_STATUS_REVIEW else "NONE")
+    row["final_schema_version"] = FINAL_SCHEMA_VERSION
+    return row
+
+
+def _final_status_summary_rows(counts, libraries):
+    rows = []
+    for library in ["ALL"] + list(libraries):
+        total = sum(counts[library].values())
+        for status in ASSIGNMENT_STATUSES:
+            n_cells = counts[library][status]
+            rows.append({
+                "library": library,
+                "assignment_status": status,
+                "n_cells": n_cells,
+                "percentage": 100.0 * n_cells / total if total else 0.0,
+            })
+    return rows
+
+
+def _final_exact_transition_rows(counter, target_field):
+    rows = []
+    for (library, current, target), n_cells in counter.items():
+        row = {
+            "library": library,
+            "current_assignment": current,
+            target_field: target,
+            "n_cells": n_cells,
+        }
+        if target_field == "proposed_assignment":
+            row["assignment_change"] = f"{current} -> {target}"
+        rows.append(row)
+    rows.sort(key=lambda row: (
+        0 if row["library"] == "ALL" else 1,
+        natural_key(row["library"]), -row["n_cells"],
+        natural_key(row["current_assignment"]),
+        natural_key(row[target_field]),
+    ))
+    return rows
+
+
+def _final_write_assignment_status_plot(path, status_rows):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    all_rows = {row["assignment_status"]: row for row in status_rows
+                if row["library"] == "ALL"}
+    counts = [int(all_rows.get(status, {}).get("n_cells", 0))
+              for status in ASSIGNMENT_STATUSES]
+    percentages = [float(all_rows.get(status, {}).get("percentage", 0.0))
+                   for status in ASSIGNMENT_STATUSES]
+    colors = ["#4C956C", "#2C7FB8", "#D98E32"]
+    figure, axis = plt.subplots(figsize=(10, 6))
+    positions = list(range(len(ASSIGNMENT_STATUSES)))
+    axis.bar(positions, counts, color=colors)
+    axis.set_xticks(positions)
+    axis.set_xticklabels(ASSIGNMENT_STATUSES)
+    axis.set_ylabel("Cells")
+    axis.set_title("Identity assignment status")
+    axis.grid(axis="y", alpha=0.25)
+    for position, count, percentage in zip(positions, counts, percentages):
+        axis.text(position, count, f"{count:,}\n{percentage:.2f}%",
+                  ha="center", va="bottom")
+    figure.tight_layout()
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(path) + ".tmp")
+    figure.savefig(temporary, format="png", dpi=180, bbox_inches="tight")
+    plt.close(figure); os.replace(temporary, path)
+
+
+def _final_write_line_changes_plot(path, applied_rows, review_rows):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    combined = []
+    for status, rows, target in (
+            (ASSIGNMENT_STATUS_APPLIED, applied_rows, "final_assignment"),
+            (ASSIGNMENT_STATUS_REVIEW, review_rows, "proposed_assignment")):
+        for row in rows:
+            if row["library"] != "ALL":
+                continue
+            combined.append({
+                "status": status,
+                "label": f"{row['current_assignment']} -> {row[target]}",
+                "n_cells": int(row["n_cells"]),
+            })
+    combined.sort(key=lambda row: (-row["n_cells"], row["status"], row["label"]))
+    displayed = combined[:30]
+    height = max(5.0, 0.38 * max(1, len(displayed)) + 2.0)
+    figure, axis = plt.subplots(figsize=(14, height))
+    if displayed:
+        positions = list(range(len(displayed)))
+        axis.barh(
+            positions, [row["n_cells"] for row in displayed],
+            color=["#2C7FB8" if row["status"] == ASSIGNMENT_STATUS_APPLIED
+                   else "#D98E32" for row in displayed])
+        axis.set_yticks(positions)
+        axis.set_yticklabels([row["label"] for row in displayed])
+        axis.invert_yaxis(); axis.set_xlabel("Cells")
+        axis.grid(axis="x", alpha=0.25)
+        for position, row in zip(positions, displayed):
+            axis.text(row["n_cells"], position,
+                      f" {row['n_cells']:,}  {row['status']}",
+                      va="center", fontsize=8)
+    else:
+        axis.text(0.5, 0.5, "No applied or review transitions",
+                  ha="center", va="center", transform=axis.transAxes)
+        axis.set_axis_off()
+    figure.suptitle("Exact identity line changes", fontsize=13,
+                    fontweight="bold")
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(path) + ".tmp")
+    figure.savefig(temporary, format="png", dpi=180, bbox_inches="tight")
+    plt.close(figure); os.replace(temporary, path)
+
+
+def _final_tsv_writer(stack, path, fields):
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(path) + ".tmp")
+    handle = stack.enter_context(
+        gzip.open(temporary, "wt", newline="") if str(path).endswith(".gz")
+        else open(temporary, "w", encoding="utf-8", newline=""))
+    writer = csv.DictWriter(
+        handle, fieldnames=list(fields), delimiter="\t", lineterminator="\n",
+        extrasaction="ignore")
+    writer.writeheader()
+    return writer, temporary, path
+
+
+def _final_write_three_state_products(
+        rows, ledger_fields, output_root, assignments_root, libraries,
+        demux_by_library):
+    """Write all primary products and assignments in one streaming pass."""
+    output_root = Path(output_root)
+    assignments_root = Path(assignments_root)
+    status_counts = defaultdict(Counter)
+    applied_counts = Counter()
+    review_counts = Counter()
+    joint_review_counts = Counter()
+    joint_review_ploidy_not_applicable = Counter()
+    primary_review_reason_counts = defaultdict(Counter)
+    preliminary_to_final_changes = Counter()
+    seen = {library: set() for library in libraries}
+    unknown_actions = Counter()
+    replacements = []
+
+    with ExitStack() as stack:
+        primary, tmp, path = _final_tsv_writer(
+            stack, output_root / "identity_assignments.tsv.gz",
+            FINAL_PRIMARY_ASSIGNMENT_FIELDS)
+        replacements.append((tmp, path))
+        review, tmp, path = _final_tsv_writer(
+            stack, output_root / "identity_review_needed.tsv.gz",
+            FINAL_REVIEW_NEEDED_FIELDS)
+        replacements.append((tmp, path))
+        review_queue, tmp, path = _final_tsv_writer(
+            stack,
+            output_root / "identity_reconciliation_review_queue.tsv.gz",
+            ledger_fields)
+        replacements.append((tmp, path))
+        legacy, tmp, path = _final_tsv_writer(
+            stack,
+            output_root / "identity_reconciliation_downstream_safe_cells.tsv.gz",
+            FINAL_DOWNSTREAM_SAFE_FIELDS)
+        replacements.append((tmp, path))
+        held, tmp, path = _final_tsv_writer(
+            stack,
+            output_root / "identity_reconciliation_held_changed_audit.tsv.gz",
+            ledger_fields)
+        replacements.append((tmp, path))
+        assignment_handles = {}
+        for library in libraries:
+            path = assignments_root / f"{library}.reconciled.assignments"
+            temporary = Path(str(path) + ".tmp")
+            assignment_handles[library] = stack.enter_context(
+                open(temporary, "w", encoding="utf-8", newline=""))
+            replacements.append((temporary, path))
+
+        n_rows = 0
+        for row in rows:
+            n_rows += 1
+            library = _final_library(row.get("library"))
+            barcode = clean(row.get("barcode"))
+            if library not in seen or not barcode:
+                raise ValueError(
+                    "three-state ledger has an unselected library or blank "
+                    f"barcode: {library}/{barcode or 'NA'}")
+            if barcode in seen[library]:
+                raise ValueError(
+                    f"three-state ledger has duplicate key: {library}/{barcode}")
+            seen[library].add(barcode)
+            if reconciliation_action_class(
+                    row.get("preliminary_reconciliation_action")) == "UNKNOWN":
+                unknown_actions[
+                    clean(row.get("preliminary_reconciliation_action")).upper()
+                    or "MISSING"] += 1
+
+            status = clean(row.get("assignment_status")).upper()
+            if status not in ASSIGNMENT_STATUSES:
+                raise ValueError(
+                    f"invalid assignment status: {library}/{barcode}/{status}")
+            current = canonical_genotype(row.get("current_assignment", ""))
+            proposal = canonical_genotype(row.get("proposed_assignment", ""))
+            final = canonical_genotype(row.get("final_assignment", ""))
+            if not current or not final:
+                raise ValueError(
+                    f"missing current/final assignment: {library}/{barcode}")
+
+            primary.writerow({field: format_value(row.get(field, ""))
+                              for field in FINAL_PRIMARY_ASSIGNMENT_FIELDS})
+            legacy.writerow({field: format_value(row.get(field, ""))
+                             for field in FINAL_DOWNSTREAM_SAFE_FIELDS})
+            status_counts[library][status] += 1
+            status_counts["ALL"][status] += 1
+            preliminary = canonical_genotype(
+                row.get("preliminary_reconciled_assignment", ""))
+            if preliminary and preliminary != final:
+                preliminary_to_final_changes[library] += 1
+                preliminary_to_final_changes["ALL"] += 1
+            if status == ASSIGNMENT_STATUS_APPLIED:
+                applied_counts[(library, current, final)] += 1
+                applied_counts[("ALL", current, final)] += 1
+            elif status == ASSIGNMENT_STATUS_REVIEW:
+                reason = clean(row.get("review_reason")) or "Unspecified review"
+                primary_review_reason_counts[library][reason] += 1
+                primary_review_reason_counts["ALL"][reason] += 1
+                review.writerow({field: format_value(row.get(field, ""))
+                                 for field in FINAL_REVIEW_NEEDED_FIELDS})
+                review_queue.writerow({field: format_value(row.get(field, ""))
+                                       for field in ledger_fields})
+                held.writerow({field: format_value(row.get(field, ""))
+                               for field in ledger_fields})
+                review_counts[(library, current, proposal)] += 1
+                review_counts[("ALL", current, proposal)] += 1
+                if _final_joint_supported_held(row):
+                    joint_review_counts[(library, current, proposal)] += 1
+                    joint_review_counts[("ALL", current, proposal)] += 1
+                    if (clean(row.get("ploidy_evidence_status")).upper()
+                            == "NOT_APPLICABLE"):
+                        joint_review_ploidy_not_applicable[library] += 1
+                        joint_review_ploidy_not_applicable["ALL"] += 1
+
+            demux = demux_by_library[library]
+            if barcode not in demux:
+                raise ValueError(
+                    f"three-state barcode is absent from demux: {library}/{barcode}")
+            assignment_type = (
+                "D" if final.startswith("M{")
+                or len(donor_components(final)) >= 2 else "S")
+            score = clean(demux[barcode].get("score")) or "NA"
+            assignment_handles[library].write("\t".join((
+                format_value(barcode), format_value(final),
+                format_value(assignment_type), format_value(score),
+            )) + "\n")
+
+        if not n_rows:
+            raise ValueError("three-state final-cell ledger is empty")
+        for library in libraries:
+            expected = set(demux_by_library[library])
+            if seen[library] != expected:
+                raise ValueError(
+                    f"three-state/demux barcode mismatch for {library}: "
+                    f"ledger={len(seen[library])} demux={len(expected)}")
+
+    for temporary, path in replacements:
+        os.replace(temporary, path)
+
+    status_rows = _final_status_summary_rows(status_counts, libraries)
+    applied_rows = _final_exact_transition_rows(
+        applied_counts, "final_assignment")
+    review_rows = _final_exact_transition_rows(
+        review_counts, "proposed_assignment")
+    write_tsv(
+        str(output_root / "identity_assignment_status_summary.tsv"),
+        status_rows, FINAL_STATUS_SUMMARY_FIELDS)
+    write_tsv(
+        str(output_root / "identity_applied_changes.tsv"),
+        applied_rows, FINAL_APPLIED_CHANGE_FIELDS)
+    write_tsv(
+        str(output_root / "identity_review_transition_summary.tsv"),
+        review_rows, FINAL_REVIEW_TRANSITION_FIELDS)
+
+    def legacy_transition_rows(counter):
+        total = sum(
+            count for (library, _, _), count in counter.items()
+            if library == "ALL")
+        legacy_rows = []
+        for (library, current, proposal), count in counter.items():
+            if library != "ALL":
+                continue
+            library_counts = {
+                lib: counter[(lib, current, proposal)] for lib in libraries
+                if counter[(lib, current, proposal)]
+            }
+            legacy_rows.append({
+                "comparison_current_assignment": current,
+                "production_assignment": proposal,
+                "n_cells": count,
+                "fraction_of_subset": count / total if total else 0.0,
+                "n_libraries": len(library_counts),
+                "libraries_and_counts": ";".join(
+                    f"{lib}:{library_counts[lib]}"
+                    for lib in sorted(library_counts, key=natural_key)) or "NONE",
+                "n_events": 0,
+                "events_and_counts": "NONE",
+                "event_class_counts": "NONE",
+                "event_confidence_counts": "NONE",
+                "downstream_exclusion_reason_counts": "NONE",
+                "review_reason_counts": "NONE",
+                "metadata_event_status_counts": "NONE",
+                "library_exchange_status_counts": "NONE",
+                "ploidy_evidence_status_counts": "NONE",
+                "mitochondrial_evidence_status_counts": "NONE",
+            })
+        legacy_rows.sort(key=lambda row: (
+            -row["n_cells"],
+            natural_key(row["comparison_current_assignment"]),
+            natural_key(row["production_assignment"])))
+        return legacy_rows, total
+
+    held_legacy, held_total = legacy_transition_rows(review_counts)
+    joint_legacy, joint_total = legacy_transition_rows(joint_review_counts)
+    write_tsv(
+        str(output_root /
+            "identity_reconciliation_held_changed_transition_summary.tsv"),
+        held_legacy, FINAL_TRANSITION_FIELDS)
+    write_tsv(
+        str(output_root /
+            "identity_reconciliation_joint_supported_held_transitions.tsv"),
+        joint_legacy, FINAL_TRANSITION_FIELDS)
+    _final_write_transition_plot(
+        output_root.parent / "plots" /
+        "identity_reconciliation_joint_supported_held_transitions.png",
+        joint_legacy, joint_total)
+    _final_write_assignment_status_plot(
+        output_root.parent / "plots" / "identity_assignment_status.png",
+        status_rows)
+    _final_write_line_changes_plot(
+        output_root.parent / "plots" / "identity_line_changes.png",
+        applied_rows, review_rows)
+    return {
+        "n_rows": n_rows,
+        "status_counts": status_counts,
+        "applied_counts": applied_counts,
+        "review_counts": review_counts,
+        "joint_review_counts": joint_review_counts,
+        "joint_review_ploidy_not_applicable":
+            joint_review_ploidy_not_applicable,
+        "primary_review_reason_counts": primary_review_reason_counts,
+        "preliminary_to_final_changes": preliminary_to_final_changes,
+        "unknown_actions": unknown_actions,
+    }
+
+
+def _final_preserve_prewrite_manifest(output_root, assignments_root, libraries):
+    manifest = output_root / "identity_reconciliation_pre_repair_manifest.tsv"
+    if manifest.exists():
+        return
+    names = [
+        "identity_reconciliation_final_cells.tsv.gz",
+        "identity_assignments.tsv.gz",
+        "identity_assignment_status_summary.tsv",
+        "identity_applied_changes.tsv",
+        "identity_review_needed.tsv.gz",
+        "identity_review_transition_summary.tsv",
+        "identity_reconciliation_candidate_audit.tsv.gz",
+        "identity_reconciliation_final_events.tsv",
+        "identity_reconciliation_review_queue.tsv.gz",
+        "identity_reconciliation_run_summary.tsv",
+        "identity_reconciliation_downstream_safe_cells.tsv.gz",
+        "identity_reconciliation_held_changed_audit.tsv.gz",
+        "identity_reconciliation_held_changed_transition_summary.tsv",
+        "identity_reconciliation_joint_supported_held_transitions.tsv",
+    ]
+    paths = [output_root / name for name in names]
+    paths.extend(
+        assignments_root / f"{library}.reconciled.assignments"
+        for library in libraries
+    )
+    paths.extend(
+        output_root.parent / "plots" / name
+        for name in (
+            "identity_reconciliation_joint_supported_held_transitions.png",
+            "identity_assignment_status.png", "identity_line_changes.png")
+    )
+    rows = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        rows.append({
+            "path": str(path.resolve()),
+            "size_bytes": stat.st_size,
+            "modification_time_utc": datetime.fromtimestamp(
+                stat.st_mtime, tz=timezone.utc).isoformat(),
+            "sha256": sha256_file(str(path)),
+        })
+    write_tsv(str(manifest), rows, FINAL_PREWRITE_MANIFEST_FIELDS)
+
+
+def _final_compatibility_assignments(library, rows, demux):
+    assignments = []
+    for row in rows:
+        identity = canonical_genotype(
+            row.get("final_assignment", "")
+            or row.get("downstream_safe_assignment", ""))
+        if not identity:
+            raise ValueError(
+                f"{library}/{row.get('barcode', 'NA')} has no "
+                "downstream-safe assignment")
+        assignment_type = (
+            "D" if identity.startswith("M{")
+            or len(donor_components(identity)) >= 2 else "S")
+        barcode = clean(row.get("barcode"))
+        if barcode not in demux:
+            raise ValueError(
+                f"{library}/{barcode} missing from source assignments")
+        score = clean(demux[barcode].get("score")) or "NA"
+        assignments.append((barcode, identity, assignment_type, score))
+    if len(assignments) != len(demux):
+        raise ValueError(f"{library} compatibility assignment accounting failed")
+    return assignments
+
+
+def _final_resume_checkpoint_available_v3_legacy(
+        output_root, assignments_root, libraries):
+    ledger = output_root / "identity_reconciliation_final_cells.tsv.gz"
+    checkpoint_products = (
+        output_root / "identity_reconciliation_downstream_safe_cells.tsv.gz",
+        output_root / "identity_reconciliation_held_changed_audit.tsv.gz",
+        output_root /
+        "identity_reconciliation_held_changed_transition_summary.tsv",
+        output_root /
+        "identity_reconciliation_joint_supported_held_transitions.tsv",
+        output_root / "identity_reconciliation_run_summary.tsv",
+    )
+    if not ledger.is_file() or not all(path.is_file() for path in checkpoint_products):
+        return False
+    ledger_mtime = ledger.stat().st_mtime
+    completion_products = [
+        output_root.parent / "plots" /
+        "identity_reconciliation_joint_supported_held_transitions.png",
+        output_root.parent / "validation" / "validation_summary.tsv",
+    ]
+    completion_products.extend(
+        assignments_root / f"{library}.reconciled.assignments"
+        for library in libraries
+    )
+    return any(
+        not path.is_file() or path.stat().st_mtime < ledger_mtime
+        for path in completion_products
+    )
+
+
+def _final_resume_from_checkpoint_v3_legacy(
+        args, library_numbers, libraries, output_root, assignments_root):
+    ledger = output_root / "identity_reconciliation_final_cells.tsv.gz"
+    selected = set(libraries)
+    demux_by_library = {}
+    for number, library in zip(library_numbers, libraries):
+        demux_by_library[library] = read_assignments(
+            demux_prefix(args.demux_root, number) + ".assignments")
+
+    temporary_paths = {
+        library: assignments_root /
+        f"{library}.reconciled.assignments.resume.tmp"
+        for library in libraries
+    }
+    handles = {}
+    seen = {library: set() for library in libraries}
+    counts = {library: Counter() for library in libraries}
+    required_fields = {
+        "library", "barcode", "comparison_current_assignment",
+        "production_assignment", "downstream_release_status",
+        "downstream_safe_assignment", "downstream_safe_assignment_source",
+        "downstream_safe_change_applied", "downstream_assignment_status",
+        "nuclear_reconciliation_status", "atac_evidence_status",
+        "ploidy_evidence_status", "mitochondrial_evidence_status",
+        "final_schema_version",
+    }
+    try:
+        for library, path in temporary_paths.items():
+            handles[library] = open(path, "w", encoding="utf-8", newline="")
+        n_rows = 0
+        for row in iter_tsv(str(ledger)):
+            n_rows += 1
+            if n_rows == 1:
+                missing = sorted(required_fields - set(row))
+                if missing:
+                    raise ValueError(
+                        "checkpoint ledger lacks downstream-safe fields: "
+                        + ", ".join(missing))
+            library = _final_library(row.get("library"))
+            barcode = clean(row.get("barcode"))
+            if library not in selected or not barcode:
+                raise ValueError(
+                    "checkpoint ledger contains an unselected library or "
+                    f"blank barcode: {library}/{barcode or 'NA'}")
+            if barcode in seen[library]:
+                raise ValueError(
+                    f"checkpoint ledger has duplicate key: {library}/{barcode}")
+            seen[library].add(barcode)
+            if clean(row.get("final_schema_version")) != FINAL_SCHEMA_VERSION:
+                raise ValueError(
+                    f"checkpoint ledger schema is not resumable: "
+                    f"{library}/{barcode}={row.get('final_schema_version')}")
+            expected = derive_downstream_safe_assignment(row)
+            for field, value in expected.items():
+                if str(row.get(field, "")).strip() != value:
+                    raise ValueError(
+                        "checkpoint downstream-safe derivation mismatch: "
+                        f"{library}/{barcode}/{field}")
+            demux = demux_by_library[library]
+            if barcode not in demux:
+                raise ValueError(
+                    f"checkpoint barcode is absent from demux: "
+                    f"{library}/{barcode}")
+            identity = canonical_genotype(row["downstream_safe_assignment"])
+            if not identity:
+                raise ValueError(
+                    f"checkpoint has no downstream-safe assignment: "
+                    f"{library}/{barcode}")
+            assignment_type = (
+                "D" if identity.startswith("M{")
+                or len(donor_components(identity)) >= 2 else "S")
+            score = clean(demux[barcode].get("score")) or "NA"
+            handles[library].write("\t".join((
+                format_value(barcode), format_value(identity),
+                format_value(assignment_type), format_value(score),
+            )) + "\n")
+
+            metric = counts[library]
+            if row["downstream_safe_change_applied"] == "TRUE":
+                metric["downstream_safe_changes_applied"] += 1
+            if _final_changed_held(row):
+                metric["held_changed_cells"] += 1
+            if _final_joint_supported_held(row):
+                metric["joint_supported_held_cells"] += 1
+                if (clean(row.get("ploidy_evidence_status")).upper()
+                        == "NOT_APPLICABLE"):
+                    metric[
+                        "joint_supported_held_ploidy_not_applicable_cells"
+                    ] += 1
+        if not n_rows:
+            raise ValueError("checkpoint final-cell ledger is empty")
+        for library in libraries:
+            expected_barcodes = set(demux_by_library[library])
+            if seen[library] != expected_barcodes:
+                raise ValueError(
+                    f"checkpoint/demux barcode mismatch for {library}: "
+                    f"checkpoint={len(seen[library])} "
+                    f"demux={len(expected_barcodes)}")
+        for handle in handles.values():
+            handle.close()
+        handles.clear()
+        for library in libraries:
+            os.replace(
+                temporary_paths[library],
+                assignments_root / f"{library}.reconciled.assignments")
+    finally:
+        for handle in handles.values():
+            handle.close()
+        for path in temporary_paths.values():
+            if path.exists():
+                path.unlink()
+
+    run_summary_path = output_root / "identity_reconciliation_run_summary.tsv"
+    run_summary = read_tsv(str(run_summary_path))
+    if not run_summary:
+        raise ValueError("checkpoint run summary is empty")
+    summary_fields = list(run_summary[0])
+    metric_fields = (
+        "downstream_safe_changes_applied", "held_changed_cells",
+        "joint_supported_held_cells",
+        "joint_supported_held_ploidy_not_applicable_cells",
+    )
+    for field in metric_fields:
+        if field not in summary_fields:
+            summary_fields.append(field)
+    all_counts = Counter()
+    for values in counts.values():
+        all_counts.update(values)
+    represented = set()
+    for row in run_summary:
+        library = _final_library(row.get("library"))
+        if clean(row.get("library")).upper() == "ALL":
+            values = all_counts
+            represented.add("ALL")
+        elif library in selected:
+            values = counts[library]
+            represented.add(library)
+        else:
+            continue
+        for field in metric_fields:
+            row[field] = values[field]
+        row["final_schema_version"] = FINAL_SCHEMA_VERSION
+    if represented != selected | {"ALL"}:
+        raise ValueError(
+            "checkpoint run summary does not represent all selected libraries")
+    write_tsv(str(run_summary_path), run_summary, summary_fields)
+
+    transition_rows = read_tsv(str(
+        output_root /
+        "identity_reconciliation_joint_supported_held_transitions.tsv"))
+    _final_write_transition_plot(
+        output_root.parent / "plots" /
+        "identity_reconciliation_joint_supported_held_transitions.png",
+        transition_rows, all_counts["joint_supported_held_cells"])
+    print(
+        "IDENTITY_FINALIZE: resumed from the completed downstream-safe "
+        f"final-cell checkpoint; streamed {sum(len(value) for value in seen.values())} "
+        "rows without recomputing evidence joins")
+    return 0
+
+
+def _final_resume_checkpoint_available(
+        output_root, assignments_root, libraries, force_replay=False):
+    """Use the final-cell ledger as the finalization-only evidence checkpoint."""
+    ledger = output_root / "identity_reconciliation_final_cells.tsv.gz"
+    if not ledger.is_file():
+        return False
+    try:
+        first = next(iter_tsv(str(ledger)))
+    except (StopIteration, OSError, ValueError, csv.Error):
+        return False
+    schema = clean(first.get("final_schema_version"))
+    if schema not in FINAL_RESUMABLE_SCHEMA_VERSIONS:
+        return False
+    if force_replay:
+        return True
+    if schema != FINAL_SCHEMA_VERSION:
+        return True
+    required = (
+        output_root / "identity_assignments.tsv.gz",
+        output_root / "identity_assignment_status_summary.tsv",
+        output_root / "identity_applied_changes.tsv",
+        output_root / "identity_review_needed.tsv.gz",
+        output_root / "identity_review_transition_summary.tsv",
+        output_root.parent / "plots" / "identity_assignment_status.png",
+        output_root.parent / "plots" / "identity_line_changes.png",
+    )
+    if schema != FINAL_SCHEMA_VERSION or any(not path.is_file() for path in required):
+        return True
+    ledger_mtime = ledger.stat().st_mtime
+    completion = list(required) + [
+        assignments_root / f"{library}.reconciled.assignments"
+        for library in libraries
+    ]
+    return any(
+        not path.is_file() or path.stat().st_mtime < ledger_mtime
+        for path in completion)
+
+
+def _final_upgrade_checkpoint_ledger(
+        ledger, evidence_mode, run_id="", destination=None):
+    iterator = iter_tsv(str(ledger))
+    try:
+        first = next(iterator)
+    except StopIteration:
+        raise ValueError("checkpoint final-cell ledger is empty")
+    required = {
+        "library", "barcode", "comparison_current_assignment",
+        "nominated_proposal", "preliminary_reconciliation_action",
+        "preliminary_action_applied", "preliminary_reconciled_assignment",
+        "preliminary_decision_reason_codes", "review_record_scope",
+        "review_disposition", "nuclear_reconciliation_status",
+        "atac_evidence_status", "mitochondrial_evidence_status",
+        "ploidy_evidence_status", "occupancy_evidence_status",
+        "technical_state", "ambient_frozen_proposal_minus_current_c",
+        "ambient_assignment_effect_c_minus_b", "review_reasons",
+        "final_schema_version",
+    }
+    missing = sorted(required - set(first))
+    if missing:
+        raise ValueError(
+            "checkpoint ledger lacks three-state evidence fields: "
+            + ", ".join(missing))
+    fields = list(first)
+    for field in (
+            *THREE_STATE_ASSIGNMENT_FIELDS,
+            "production_assignment", "downstream_release_status",
+            *DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS, "review_required",
+            "production_assignment_source", "downstream_exclusion_reason",
+            "application_state", "application_reason",
+            "interpreted_identity", "scientific_recommendation",
+            "recommendation_basis", "legacy_review_reasons", "run_id",
+            "final_schema_version"):
+        if field not in fields:
+            fields.append(field)
+    unknown_actions = Counter()
+
+    def transformed():
+        for row in chain((first,), iterator):
+            schema = clean(row.get("final_schema_version"))
+            if schema not in FINAL_RESUMABLE_SCHEMA_VERSIONS:
+                raise ValueError(
+                    "checkpoint ledger schema is not resumable: "
+                    f"{row.get('library')}/{row.get('barcode')}={schema}")
+            updated = _final_apply_three_state(
+                row, evidence_mode, unknown_actions)
+            if run_id:
+                updated["run_id"] = run_id
+            yield updated
+
+    write_tsv(str(destination or ledger), transformed(), fields)
+    if unknown_actions:
+        print(
+            "WARNING: unknown reconciliation actions were safely retained for "
+            "review: " + ";".join(
+                f"{action}={unknown_actions[action]}"
+                for action in sorted(unknown_actions, key=natural_key)),
+            file=sys.stderr)
+    return fields
+
+
+def _final_resume_from_checkpoint(
+        args, library_numbers, libraries, output_root, assignments_root):
+    ledger = output_root / "identity_reconciliation_final_cells.tsv.gz"
+    staged_ledger = output_root / (
+        ".identity_reconciliation_final_cells.v8_replay.tsv.gz")
+    demux_by_library = {
+        library: read_assignments(
+            demux_prefix(args.demux_root, number) + ".assignments")
+        for number, library in zip(library_numbers, libraries)
+    }
+    ledger_fields = _final_upgrade_checkpoint_ledger(
+        ledger, args.evidence_mode, args.run_id, staged_ledger)
+    metrics = _final_write_three_state_products(
+        iter_tsv(str(staged_ledger)), ledger_fields, output_root,
+        assignments_root,
+        libraries, demux_by_library)
+
+    run_summary_path = output_root / "identity_reconciliation_run_summary.tsv"
+    run_summary = read_tsv(str(run_summary_path))
+    if not run_summary:
+        raise ValueError("checkpoint run summary is empty")
+    summary_fields = list(run_summary[0])
+    new_fields = (
+        "fine_no_change_cells", "change_applied_cells",
+        "review_needed_cells", "three_state_status_counts",
+        "review_required_cells", "review_reason_counts",
+        "changes_preliminary_to_final_production",
+        "downstream_safe_changes_applied", "held_changed_cells",
+        "joint_supported_held_cells",
+        "joint_supported_held_ploidy_not_applicable_cells",
+        "final_schema_version",
+    )
+    for field in new_fields:
+        if field not in summary_fields:
+            summary_fields.append(field)
+    represented = set()
+    for row in run_summary:
+        raw = clean(row.get("library"))
+        library = "ALL" if raw.upper() == "ALL" else _final_library(raw)
+        if library != "ALL" and library not in libraries:
+            continue
+        represented.add(library)
+        counts = metrics["status_counts"][library]
+        row["fine_no_change_cells"] = counts[ASSIGNMENT_STATUS_FINE]
+        row["change_applied_cells"] = counts[ASSIGNMENT_STATUS_APPLIED]
+        row["review_needed_cells"] = counts[ASSIGNMENT_STATUS_REVIEW]
+        row["three_state_status_counts"] = ";".join(
+            f"{status}:{counts[status]}" for status in ASSIGNMENT_STATUSES)
+        row["review_required_cells"] = counts[ASSIGNMENT_STATUS_REVIEW]
+        reason_counts = metrics["primary_review_reason_counts"][library]
+        row["review_reason_counts"] = ";".join(
+            f"{reason}:{reason_counts[reason]}"
+            for reason in sorted(reason_counts, key=natural_key)) or "NONE"
+        row["changes_preliminary_to_final_production"] = metrics[
+            "preliminary_to_final_changes"][library]
+        row["downstream_safe_changes_applied"] = counts[
+            ASSIGNMENT_STATUS_APPLIED]
+        row["held_changed_cells"] = counts[ASSIGNMENT_STATUS_REVIEW]
+        row["joint_supported_held_cells"] = sum(
+            count for (scope, _, _), count
+            in metrics["joint_review_counts"].items() if scope == library)
+        row["joint_supported_held_ploidy_not_applicable_cells"] = (
+            metrics["joint_review_ploidy_not_applicable"][library])
+        row["final_schema_version"] = FINAL_SCHEMA_VERSION
+    if represented != set(libraries) | {"ALL"}:
+        raise ValueError(
+            "checkpoint run summary does not represent all selected libraries")
+    write_tsv(str(run_summary_path), run_summary, summary_fields)
+    # Commit the authoritative ledger last.  If product generation is
+    # interrupted, the completed v7/v8 source remains available for a clean
+    # checkpoint-only replay on the next run.
+    os.replace(staged_ledger, ledger)
+
+    counts = metrics["status_counts"]["ALL"]
+    print(
+        "IDENTITY_FINALIZE: resumed from the completed final-cell evidence "
+        f"checkpoint; streamed {metrics['n_rows']} rows without recomputing "
+        "evidence joins; " + ", ".join(
+            f"{status}={counts[status]}" for status in ASSIGNMENT_STATUSES))
+    return 0
 
 
 def _final_set(values):
@@ -5376,6 +6420,39 @@ def finalize_main():
     libraries = [f"lib{number}" for number in library_numbers]
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    assignments_root = output_root.parent / "final_assignments"
+    assignments_root.mkdir(parents=True, exist_ok=True)
+    if args.checkpoint_only and args.review_input:
+        raise ValueError(
+            "--checkpoint-only reuses review decisions already embedded in "
+            "the completed ledger and cannot ingest a new --review-input")
+    resumable = (
+        False if args.review_input else
+        _final_resume_checkpoint_available(
+            output_root, assignments_root, libraries,
+            force_replay=args.checkpoint_only))
+    if args.checkpoint_only and not resumable:
+        raise ValueError(
+            "--checkpoint-only requires a compatible completed v7/v8 "
+            "final-cell ledger; evidence joins were not started")
+    _final_preserve_prewrite_manifest(
+        output_root, assignments_root, libraries)
+    if resumable:
+        try:
+            return _final_resume_from_checkpoint(
+                args, library_numbers, libraries, output_root,
+                assignments_root)
+        except ValueError as exc:
+            if args.checkpoint_only:
+                raise ValueError(
+                    "checkpoint-only finalization could not safely replay the "
+                    f"completed ledger; evidence joins were not started: {exc}") \
+                    from exc
+            print(
+                "WARNING: existing partial finalization is not safely "
+                f"resumable; rebuilding finalization: {exc}",
+                file=sys.stderr,
+            )
 
     decisions_root = Path(args.decisions_root)
     candidate_root = Path(args.candidate_root)
@@ -5566,7 +6643,10 @@ def finalize_main():
             prelim_applied = _final_bool(preliminary.get("reassignment_applied"))
             prelim_production = canonical_genotype(
                 preliminary.get("reconciled_donor_genotype", "")) or current
-            active_proposal = bool(proposal and proposal != current)
+            action_class = reconciliation_action_class(action)
+            active_proposal = bool(
+                proposal and proposal != current
+                and action_class in {"CHANGE", "REVIEW", "UNKNOWN"})
 
             available_axis = axis_by_cell.get((library, barcode), [])
             matching_axis = [
@@ -5892,6 +6972,7 @@ def finalize_main():
                 "run_id": args.run_id or "NA",
                 "final_schema_version": FINAL_SCHEMA_VERSION,
             }
+            _final_apply_three_state(row, args.evidence_mode)
             for field in axis_fields:
                 if field not in row:
                     row[field] = axis.get(field, "NA") if axis else "NA"
@@ -5912,6 +6993,22 @@ def finalize_main():
     }
     if len(final_cell_index) != len(final_cells):
         raise ValueError("canonical final-cell ledger contains duplicate keys")
+    invalid_safe_statuses = Counter(
+        row["downstream_assignment_status"] for row in final_cells
+        if row["downstream_assignment_status"] in {
+            "CURRENT_RETAINED_INVALID_PROPOSAL",
+            "NO_VALID_CURRENT_ASSIGNMENT",
+        }
+    )
+    if invalid_safe_statuses:
+        print(
+            "WARNING: downstream-safe assignment fallback states: "
+            + ";".join(
+                f"{status}={invalid_safe_statuses[status]}"
+                for status in sorted(invalid_safe_statuses)
+            ),
+            file=sys.stderr,
+        )
 
     audit_by_cell = defaultdict(list)
     for row in all_candidate_audit:
@@ -5928,7 +7025,11 @@ def finalize_main():
             preliminary.get("current_refined_assignment", "")
             or preliminary.get("original_demux_assignment", ""))
         proposal = canonical_genotype(preliminary.get("proposed_donor_genotype", ""))
-        active = bool(proposal and proposal != current)
+        active = bool(
+            proposal and proposal != current
+            and reconciliation_action_class(
+                preliminary.get("final_action"))
+            in {"CHANGE", "REVIEW", "UNKNOWN"})
         axis = selected_axis.get(key, {})
         exclusion = selected_exclusion.get(key, {})
         endpoints = {
@@ -6222,6 +7323,26 @@ def finalize_main():
             "NO_IMMEDIATE_REVIEW"
         )
 
+    held_changed_cells = [
+        row for row in final_cells if _final_changed_held(row)
+    ]
+    joint_supported_held_cells = [
+        row for row in held_changed_cells if _final_joint_supported_held(row)
+    ]
+    joint_supported_held_ploidy_not_applicable = [
+        row for row in joint_supported_held_cells
+        if clean(row.get("ploidy_evidence_status")).upper()
+        == "NOT_APPLICABLE"
+    ]
+    event_by_key = {
+        (_final_library(row.get("library")), clean(row.get("event_id"))): row
+        for row in final_events
+    }
+    held_changed_transitions = _final_transition_summary(
+        held_changed_cells, event_by_key)
+    joint_supported_held_transitions = _final_transition_summary(
+        joint_supported_held_cells, event_by_key)
+
     run_summary_fields = [
         "library", "input_barcodes", "output_ledger_rows", "event_count",
         "candidate_axis_planned", "candidate_axis_scored",
@@ -6237,6 +7358,9 @@ def finalize_main():
         "review_records_present", "review_records_applied",
         "changes_demux_to_refined", "changes_current_to_preliminary_production",
         "changes_preliminary_to_final_production", "zero_event_status",
+        "downstream_safe_changes_applied", "held_changed_cells",
+        "joint_supported_held_cells",
+        "joint_supported_held_ploidy_not_applicable_cells",
         "atac_evidence_mode", "accounting_status", "warnings",
         "final_schema_version",
     ]
@@ -6343,6 +7467,18 @@ def finalize_main():
             "changes_preliminary_to_final_production": sum(
                 row["production_assignment"] !=
                 row["preliminary_reconciled_assignment"] for row in rows),
+            "downstream_safe_changes_applied": sum(
+                row["downstream_safe_change_applied"] == "TRUE"
+                for row in rows),
+            "held_changed_cells": sum(
+                _final_changed_held(row) for row in rows),
+            "joint_supported_held_cells": sum(
+                _final_joint_supported_held(row) for row in rows),
+            "joint_supported_held_ploidy_not_applicable_cells": sum(
+                _final_joint_supported_held(row)
+                and clean(row.get("ploidy_evidence_status")).upper()
+                == "NOT_APPLICABLE"
+                for row in rows),
             "zero_event_status": (
                 "NOT_APPLICABLE_ZERO_EVENT_SUCCESS" if library not in event_bearing
                 else "EVENT_BEARING"),
@@ -6402,6 +7538,13 @@ def finalize_main():
             int(row["changes_current_to_preliminary_production"]) for row in run_summary),
         "changes_preliminary_to_final_production": sum(
             int(row["changes_preliminary_to_final_production"]) for row in run_summary),
+        "downstream_safe_changes_applied": sum(
+            int(row["downstream_safe_changes_applied"])
+            for row in run_summary),
+        "held_changed_cells": len(held_changed_cells),
+        "joint_supported_held_cells": len(joint_supported_held_cells),
+        "joint_supported_held_ploidy_not_applicable_cells": len(
+            joint_supported_held_ploidy_not_applicable),
         "zero_event_status": f"ZERO_EVENT_LIBRARIES={sum(row['zero_event_status'].startswith('NOT_APPLICABLE') for row in run_summary)}",
         "atac_evidence_mode": (
             "ATAC_NOT_REQUESTED" if args.evidence_mode == "rna" else "RNA_ATAC"),
@@ -6416,26 +7559,10 @@ def finalize_main():
     final_events.sort(key=lambda row: (
         natural_key(_final_library(row.get("library"))),
         natural_key(clean(row.get("event_id")))))
-    phase3_assignment_changes = [
-        row for row in final_cells
-        if row["production_assignment"] != row["preliminary_reconciled_assignment"]
-    ]
-    if not review_input and phase3_assignment_changes:
-        raise ValueError(
-            "production assignments changed without an explicit review record")
-    untraceable_changes = [
-        row for row in phase3_assignment_changes
-        if row["review_record_scope"] not in {"CELL", "EVENT"}
-    ]
-    if untraceable_changes:
-        raise ValueError(
-            "production assignment change is not traceable to an explicit "
-            "review record: "
-            + ", ".join(
-                f"{row['library']}/{row['barcode']}"
-                for row in untraceable_changes[:10]
-            )
-        )
+    # The three-state evidence classifier may safely retain current for a
+    # preliminary proposal without a manual review record.  Such changes are
+    # traceable through assignment_status/review_reason and the frozen evidence
+    # columns; explicit CELL review records remain the only manual overrides.
 
     review_queue = [row for row in final_cells if row["review_required"] == "TRUE"]
     event_dispositions = []
@@ -6553,6 +7680,17 @@ def finalize_main():
     write_tsv(
         str(output_root / "identity_reconciliation_final_cells.tsv.gz"),
         final_cells, final_cell_fields)
+    three_state_metrics = _final_write_three_state_products(
+        iter(final_cells), final_cell_fields, output_root, assignments_root,
+        libraries, demux_by_library)
+    if three_state_metrics["unknown_actions"]:
+        print(
+            "WARNING: unknown reconciliation actions were safely retained for "
+            "review: " + ";".join(
+                f"{action}={three_state_metrics['unknown_actions'][action]}"
+                for action in sorted(
+                    three_state_metrics["unknown_actions"], key=natural_key)),
+            file=sys.stderr)
     write_tsv(
         str(output_root / "identity_reconciliation_candidate_audit.tsv.gz"),
         all_candidate_audit, candidate_fields)
@@ -6562,6 +7700,45 @@ def finalize_main():
     write_tsv(
         str(output_root / "identity_reconciliation_review_queue.tsv.gz"),
         review_queue, final_cell_fields)
+    for field in (
+            "fine_no_change_cells", "change_applied_cells",
+            "review_needed_cells", "three_state_status_counts",
+            "review_required_cells", "review_reason_counts",
+            "changes_preliminary_to_final_production",
+            "downstream_safe_changes_applied", "held_changed_cells",
+            "joint_supported_held_cells",
+            "joint_supported_held_ploidy_not_applicable_cells",
+            "final_schema_version"):
+        if field not in run_summary_fields:
+            run_summary_fields.append(field)
+    for row in run_summary:
+        raw = clean(row.get("library"))
+        library = "ALL" if raw.upper() == "ALL" else _final_library(raw)
+        counts = three_state_metrics["status_counts"][library]
+        row["fine_no_change_cells"] = counts[ASSIGNMENT_STATUS_FINE]
+        row["change_applied_cells"] = counts[ASSIGNMENT_STATUS_APPLIED]
+        row["review_needed_cells"] = counts[ASSIGNMENT_STATUS_REVIEW]
+        row["three_state_status_counts"] = ";".join(
+            f"{status}:{counts[status]}" for status in ASSIGNMENT_STATUSES)
+        row["review_required_cells"] = counts[ASSIGNMENT_STATUS_REVIEW]
+        reason_counts = three_state_metrics[
+            "primary_review_reason_counts"][library]
+        row["review_reason_counts"] = ";".join(
+            f"{reason}:{reason_counts[reason]}"
+            for reason in sorted(reason_counts, key=natural_key)) or "NONE"
+        row["changes_preliminary_to_final_production"] = (
+            three_state_metrics["preliminary_to_final_changes"][library])
+        row["downstream_safe_changes_applied"] = counts[
+            ASSIGNMENT_STATUS_APPLIED]
+        row["held_changed_cells"] = counts[ASSIGNMENT_STATUS_REVIEW]
+        row["joint_supported_held_cells"] = sum(
+            count for (scope, _, _), count
+            in three_state_metrics["joint_review_counts"].items()
+            if scope == library)
+        row["joint_supported_held_ploidy_not_applicable_cells"] = (
+            three_state_metrics[
+                "joint_review_ploidy_not_applicable"][library])
+        row["final_schema_version"] = FINAL_SCHEMA_VERSION
     write_tsv(
         str(output_root / "identity_reconciliation_run_summary.tsv"),
         run_summary, run_summary_fields)
@@ -6580,31 +7757,14 @@ def finalize_main():
         encoding="utf-8",
     )
 
-    assignments_root = output_root.parent / "final_assignments"
-    assignments_root.mkdir(parents=True, exist_ok=True)
-    for library in libraries:
-        rows = [row for row in final_cells if row["library"] == library]
-        demux = demux_by_library[library]
-        assignments = []
-        for row in rows:
-            identity = canonical_genotype(row["production_assignment"])
-            if not identity:
-                raise ValueError(
-                    f"{library}/{row['barcode']} has no production assignment")
-            assignment_type = (
-                "D" if identity.startswith("M{")
-                or len(donor_components(identity)) >= 2 else "S")
-            score = clean(demux[row["barcode"]].get("score")) or "NA"
-            assignments.append((row["barcode"], identity, assignment_type, score))
-        if len(assignments) != len(demux):
-            raise ValueError(f"{library} compatibility assignment accounting failed")
-        write_headerless_tsv(
-            str(assignments_root / f"{library}.reconciled.assignments"),
-            assignments)
+    status_counts = three_state_metrics["status_counts"]["ALL"]
     print(
         f"Finalized {len(final_cells)} cells, {len(final_events)} events, "
         f"{len(actionable_review)} actionable Phase 3 review rows, and "
-        f"{len(review_queue)} legacy pending review rows")
+        f"{len(review_queue)} legacy pending review rows; "
+        + ", ".join(
+            f"{status}={status_counts[status]}"
+            for status in ASSIGNMENT_STATUSES))
     return 0
 
 

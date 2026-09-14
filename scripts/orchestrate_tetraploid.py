@@ -6,6 +6,10 @@ contamination estimation, ploidy/refinement, post-hoc audit,
 identity reconciliation, and mitochondrial analysis.  Outputs now live with
 their source libraries under ``mapping_output/Tet_2025_Multiome-RNA_N``;
 cross-library products live under ``mapping_output/aggregate_library_analysis``.
+An alternate mapped-library tree can be selected with
+``--mapping-input-root``.  Pair it with ``--analysis-output-root`` to place the
+complete generated analysis namespace outside both the selected mapping tree
+and the production mapping tree.
 
 ``AMBIENT_PLOTS`` is a plot-only stage for one to eight selected contamination
 conditions.  It creates descriptive cross-library plots and the installed
@@ -87,8 +91,10 @@ from pathlib import Path
 # AMBIENT_PLOTS uses only standard-library imports during orchestration.  The
 # numerical plotting stack is loaded inside its compute-node worker.
 AMBIENT_PLOT_DEFAULT_CONDITION = "IND_CK_RF_SX0_GATED_RFREE_PFIT"
-ORCHESTRATOR_RELEASE = "2026-08-27-identity-reconciliation-round1"
+ORCHESTRATOR_RELEASE = "2026-09-14-three-state-production-evidence-repair-v1"
 CANDIDATE_AXIS_STAGE = "IDENTITY_CANDIDATE_AXIS"
+IDENTITY_READINESS_STAGE = "IDENTITY_RECONCILIATION_READINESS"
+IDENTITY_FILL_MISSING_STAGE = "IDENTITY_RECONCILIATION_FILL_MISSING"
 CANDIDATE_AXIS_MIN_EVIDENCE = 10
 CANDIDATE_AXIS_MIN_EVIDENCE_SOURCE = (
     "AUDITED_TETRA_SCORE_CALLS_V3_DEFAULT_10"
@@ -145,6 +151,7 @@ AMBIENT_VALIDATION_PLAN_VERSION = "fixed_profile_identity_validation_V1"
 AMBIENT_VALIDATION_PROFILE_MAX_EMPTY = 50000
 AMBIENT_VALIDATION_PROFILE_SEED = 42
 AMBIENT_VALIDATION_PROFILE_STARTS = 2
+AMBIENT_VALIDATION_PROFILE_MIN_SUCCESSFUL_STARTS = 1
 AMBIENT_VALIDATION_FIXED_ARMS = {
     "demux_fixed_empty": {
         "arm": "E",
@@ -198,7 +205,8 @@ AMBIENT_SWAP_TEST_ARMS = {
 # =============================================================================
 
 PROJECT_ROOT = "/mnt/beegfs/tetmultiome_rna_mapped"
-BEEGFS_ROOT = os.path.join(PROJECT_ROOT, "mapping_output")
+PRODUCTION_MAPPING_ROOT = os.path.join(PROJECT_ROOT, "mapping_output")
+BEEGFS_ROOT = PRODUCTION_MAPPING_ROOT
 AGGREGATE_ROOT = os.path.join(BEEGFS_ROOT, "aggregate_library_analysis")
 CONDITION_INDEX_ROOT = os.path.join(AGGREGATE_ROOT, "condition_index")
 CONDF_DIR = os.path.join(AGGREGATE_ROOT, "condf")
@@ -224,9 +232,15 @@ MT_FUSION_ROOT = os.path.join(AGGREGATE_ROOT, "mitochondrial")
 AMBIENT_PLOT_ROOT = os.path.join(AGGREGATE_ROOT, "ambient_rna")
 GEX_AMBIENT_ROOT = os.path.join(AGGREGATE_ROOT, "gex_ambient")
 FIGURE_ROOT = os.path.join(AGGREGATE_ROOT, "figures")
+DEFAULT_AGGREGATE_ROOT = AGGREGATE_ROOT
+DEFAULT_CONDITION_INDEX_ROOT = CONDITION_INDEX_ROOT
+DEFAULT_CONDF_DIR = CONDF_DIR
 DEFAULT_AUDIT_ROOT = AUDIT_ROOT
 DEFAULT_HYBRID_ROOT = HYBRID_ROOT
 DEFAULT_MT_FUSION_ROOT = MT_FUSION_ROOT
+DEFAULT_AMBIENT_PLOT_ROOT = AMBIENT_PLOT_ROOT
+DEFAULT_GEX_AMBIENT_ROOT = GEX_AMBIENT_ROOT
+DEFAULT_FIGURE_ROOT = FIGURE_ROOT
 
 # Production NoMito panel family. CONDF/DEMUX consume the nuclear panels through
 # vcf_loader_daemon shared-memory segments, while MT_FUSION reads its compact
@@ -258,12 +272,20 @@ IDENTITY_RECONCILIATION_ROOT = os.path.join(
     AGGREGATE_ROOT, "identity_reconciliation")
 TETRA_REFINE_ROOT = os.path.join(AGGREGATE_ROOT, "tetra_refine")
 PLOIDY_CALLS_ROOT = os.path.join(AGGREGATE_ROOT, "ploidy")
+DEFAULT_IDENTITY_RECONCILIATION_ROOT = IDENTITY_RECONCILIATION_ROOT
 DEFAULT_TETRA_REFINE_ROOT = TETRA_REFINE_ROOT
+DEFAULT_PLOIDY_CALLS_ROOT = PLOIDY_CALLS_ROOT
 PLOIDY_NN_H5AD = os.path.join(BEEGFS_ROOT, "h5a5_outs", "unfiltered_normed_tetmultiome_rna.h5ad")
 PLOIDY_NN_WEIGHTS = os.path.join(PLOIDY_MODEL_ROOT, "model", "ploidy_nn_weights.pt")
 PLOIDY_NN_MODULE = "ploidy-inference/latest"
 IDENTITY_AUDIT_ROOT = AUDIT_ROOT
 ATAC_MAPPING_ROOT = "/mnt/beegfs/tetmultiome_atac/mapping_output"
+DEFAULT_ATAC_DEMUX_OUTPUT_ROOT = os.path.join(
+    AGGREGATE_ROOT, "atac_demux")
+ATAC_DEMUX_REQUIRED_SUFFIXES = (
+    ".counts", ".samples", ".assignments", ".summary",
+    ".diagnostics.gz", ".runner_ups.gz",
+)
 REFINE_CONTAM_CONDITION = "IND_CK_RF_SX0_GATED_RFREE_PFIT"
 REFINE_EXTERNAL_PLOIDY_MIN_PROB = 0.90
 PROCESS_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -313,6 +335,7 @@ MANAGED_VCF_READY_FILE = None
 
 MODULES = [
     "miniforge/3",
+    "genomics-base/latest",
     "htslib/1.20",
     "cellbouncer/dev",
 ]
@@ -714,6 +737,187 @@ def resolve_condition_set(name):
 # =============================================================================
 # Path helpers
 # =============================================================================
+
+def _path_contains(parent, child):
+    """Return whether child is the same path as parent or is below it."""
+    parent = os.path.realpath(os.path.abspath(parent))
+    child = os.path.realpath(os.path.abspath(child))
+    try:
+        return os.path.commonpath((parent, child)) == parent
+    except ValueError:
+        return False
+
+
+def configure_runtime_roots(args):
+    """Apply CLI-selected mapping inputs and an isolated analysis namespace.
+
+    ``--mapping-input-root`` changes the library tree read by BAM/MEX helpers.
+    ``--analysis-output-root`` mirrors the normal per-library/aggregate layout
+    beneath a separate root and rebases every default output destination.  An
+    explicitly supplied specialized output root remains an advanced override.
+    Established metadata, panels, models, and existing ploidy calls remain
+    read-only inputs unless their own producing stage is selected.
+    """
+    global BEEGFS_ROOT, AGGREGATE_ROOT, CONDITION_INDEX_ROOT, CONDF_DIR
+    global AUDIT_ROOT, HYBRID_ROOT, MT_FUSION_ROOT, AMBIENT_PLOT_ROOT
+    global GEX_AMBIENT_ROOT, FIGURE_ROOT, IDENTITY_RECONCILIATION_ROOT
+    global IDENTITY_AUDIT_ROOT, TETRA_REFINE_ROOT, PLOIDY_CALLS_ROOT
+    global VCF_DAEMON_STATE_ROOT, DEMUX_OUTPUT_ROOT, CONDF_PATHS
+
+    mapping_root_value = getattr(
+        args, "mapping_input_root", PRODUCTION_MAPPING_ROOT)
+    analysis_root_value = getattr(args, "analysis_output_root", None)
+    if not os.path.isabs(mapping_root_value):
+        raise ValueError("--mapping-input-root must be an absolute path")
+    mapping_root = os.path.abspath(mapping_root_value)
+    if not os.path.isdir(mapping_root):
+        raise ValueError(
+            f"--mapping-input-root is not an existing directory: {mapping_root}")
+    analysis_root = (
+        os.path.abspath(analysis_root_value)
+        if analysis_root_value else None)
+    writes_ploidy_calls = False
+
+    if mapping_root != os.path.abspath(PRODUCTION_MAPPING_ROOT) and not analysis_root:
+        raise ValueError(
+            "a non-production --mapping-input-root requires "
+            "--analysis-output-root so generated files cannot mix with the "
+            "production analysis tree")
+    if analysis_root_value and not os.path.isabs(analysis_root_value):
+        raise ValueError("--analysis-output-root must be an absolute path")
+    if analysis_root:
+        if (_path_contains(mapping_root, analysis_root) or
+                _path_contains(analysis_root, mapping_root)):
+            raise ValueError(
+                "--analysis-output-root and --mapping-input-root must be "
+                "separate, non-nested directories")
+        if (_path_contains(PRODUCTION_MAPPING_ROOT, analysis_root) or
+                _path_contains(analysis_root, PRODUCTION_MAPPING_ROOT)):
+            raise ValueError(
+                "--analysis-output-root must be separate from the production "
+                f"mapping tree: {PRODUCTION_MAPPING_ROOT}")
+
+        aggregate_root = os.path.join(
+            analysis_root, "aggregate_library_analysis")
+        derived = {
+            "condf_dir": os.path.join(aggregate_root, "condf"),
+            "audit_root": os.path.join(aggregate_root, "posthoc"),
+            "hybrid_root": os.path.join(aggregate_root, "hybrid"),
+            "mt_output_root": os.path.join(
+                aggregate_root, "mitochondrial"),
+            "ambient_plot_root": os.path.join(
+                aggregate_root, "ambient_rna"),
+            "gex_ambient_root": os.path.join(
+                aggregate_root, "gex_ambient"),
+            "identity_reconciliation_root": os.path.join(
+                aggregate_root, "identity_reconciliation"),
+            "refined_assignments_root": os.path.join(
+                aggregate_root, "tetra_refine"),
+        }
+        defaults = {
+            "condf_dir": DEFAULT_CONDF_DIR,
+            "audit_root": DEFAULT_AUDIT_ROOT,
+            "hybrid_root": DEFAULT_HYBRID_ROOT,
+            "mt_output_root": DEFAULT_MT_FUSION_ROOT,
+            "ambient_plot_root": DEFAULT_AMBIENT_PLOT_ROOT,
+            "gex_ambient_root": DEFAULT_GEX_AMBIENT_ROOT,
+            "identity_reconciliation_root":
+                DEFAULT_IDENTITY_RECONCILIATION_ROOT,
+            "refined_assignments_root": DEFAULT_TETRA_REFINE_ROOT,
+        }
+        for name, default in defaults.items():
+            if getattr(args, name) == default:
+                setattr(args, name, derived[name])
+
+        if args.identity_audit_root == DEFAULT_AUDIT_ROOT:
+            args.identity_audit_root = args.audit_root
+        if args.identity_score_ambient_root == DEFAULT_AMBIENT_PLOT_ROOT:
+            args.identity_score_ambient_root = args.ambient_plot_root
+
+        requested_stages = {
+            value.strip().upper()
+            for value in str(args.stage or "").split(",")
+            if value.strip()
+        }
+        writes_ploidy_calls = bool(
+            "PLOIDY_NN" in requested_stages or args.with_ploidy_nn or
+            args.lib19_full_test)
+        if (writes_ploidy_calls and
+                args.ploidy_calls_root == DEFAULT_PLOIDY_CALLS_ROOT):
+            args.ploidy_calls_root = os.path.join(aggregate_root, "ploidy")
+
+        if args.demux_output_root:
+            requested_demux_root = os.path.abspath(args.demux_output_root)
+            if requested_demux_root != analysis_root:
+                raise ValueError(
+                    "--demux-output-root must match --analysis-output-root "
+                    "when both are supplied")
+        else:
+            args.demux_output_root = analysis_root
+        args.analysis_output_root = analysis_root
+    else:
+        aggregate_root = DEFAULT_AGGREGATE_ROOT
+
+    output_paths = {
+        "--demux-output-root": args.demux_output_root,
+        "--condf-dir": args.condf_dir,
+        "--audit-root": args.audit_root,
+        "--hybrid-root": args.hybrid_root,
+        "--mt-output-root": args.mt_output_root,
+        "--ambient-plot-root": args.ambient_plot_root,
+        "--gex-ambient-root": args.gex_ambient_root,
+        "--identity-reconciliation-root":
+            args.identity_reconciliation_root,
+        "--identity-audit-root": args.identity_audit_root,
+        "--refined-assignments-root": args.refined_assignments_root,
+        "--identity-score-output-root": args.identity_score_output_root,
+        "--identity-candidate-axis-output-root":
+            args.identity_candidate_axis_output_root,
+        "--mt-population-prefix": args.mt_population_prefix,
+    }
+    if analysis_root and writes_ploidy_calls:
+        output_paths["--ploidy-calls-root"] = args.ploidy_calls_root
+    if analysis_root:
+        for option, value in output_paths.items():
+            if value and _path_contains(PRODUCTION_MAPPING_ROOT, value):
+                raise ValueError(
+                    f"{option} still points inside the production mapping "
+                    f"tree while --analysis-output-root is active: {value}")
+            if value and _path_contains(mapping_root, value):
+                raise ValueError(
+                    f"{option} points inside --mapping-input-root while "
+                    f"--analysis-output-root is active: {value}")
+
+    BEEGFS_ROOT = mapping_root
+    AGGREGATE_ROOT = aggregate_root
+    CONDITION_INDEX_ROOT = os.path.join(AGGREGATE_ROOT, "condition_index")
+    FIGURE_ROOT = os.path.join(AGGREGATE_ROOT, "figures")
+    VCF_DAEMON_STATE_ROOT = os.path.join(
+        AGGREGATE_ROOT, "vcf_daemon_state")
+
+    DEMUX_OUTPUT_ROOT = (
+        os.path.abspath(args.demux_output_root)
+        if args.demux_output_root else None)
+    CONDF_DIR = os.path.abspath(args.condf_dir)
+    AUDIT_ROOT = os.path.abspath(args.audit_root)
+    HYBRID_ROOT = os.path.abspath(args.hybrid_root)
+    MT_FUSION_ROOT = os.path.abspath(args.mt_output_root)
+    AMBIENT_PLOT_ROOT = os.path.abspath(args.ambient_plot_root)
+    GEX_AMBIENT_ROOT = os.path.abspath(args.gex_ambient_root)
+    IDENTITY_RECONCILIATION_ROOT = os.path.abspath(
+        args.identity_reconciliation_root)
+    IDENTITY_AUDIT_ROOT = os.path.abspath(args.identity_audit_root)
+    TETRA_REFINE_ROOT = os.path.abspath(args.refined_assignments_root)
+    PLOIDY_CALLS_ROOT = os.path.abspath(args.ploidy_calls_root)
+    CONDF_PATHS = {
+        "interindiv_20M": os.path.join(
+            CONDF_DIR, "demux_input_20M.condf"),
+        "interindiv_het_10M": os.path.join(
+            CONDF_DIR, "demux_input_HET_10M.condf"),
+        "species_20M": os.path.join(
+            CONDF_DIR, "demux_input_species_20M.condf"),
+    }
+
 
 def get_lib_dir(lib_num):
     """Return the base directory for a library under BEEGFS_ROOT."""
@@ -2671,7 +2875,7 @@ def get_script_dir():
     return os.path.join(AGGREGATE_ROOT, "slurm_scripts")
 
 
-def publish_figure_shortcut(analysis, target):
+def publish_figure_shortcut(analysis, target, active_aggregate_root=None):
     """Atomically publish one stable aggregate figure-directory shortcut."""
     names = {
         "ambient_plots": "ambient_plots",
@@ -2681,17 +2885,39 @@ def publish_figure_shortcut(analysis, target):
     analysis = str(analysis).strip().lower()
     if analysis not in names:
         raise ValueError(f"unknown figure analysis: {analysis}")
-    aggregate_root = Path(AGGREGATE_ROOT).resolve()
-    figure_root = Path(FIGURE_ROOT)
     target = Path(target)
     if not target.is_dir() or target.is_symlink():
         raise RuntimeError(f"figure target is not a real directory: {target}")
     target = target.resolve()
+    if active_aggregate_root is None:
+        candidates = [
+            candidate for candidate in (target, *target.parents)
+            if candidate.name == "aggregate_library_analysis"
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "could not uniquely infer aggregate_library_analysis "
+                f"from figure target: {target}")
+        aggregate_root = candidates[0]
+    else:
+        requested_root = Path(active_aggregate_root)
+        if not requested_root.is_absolute():
+            raise RuntimeError(
+                f"active aggregate root is not absolute: {requested_root}")
+        if requested_root.is_symlink() or not requested_root.is_dir():
+            raise RuntimeError(
+                f"active aggregate root is not a real directory: {requested_root}")
+        aggregate_root = requested_root.resolve()
+    if aggregate_root.name != "aggregate_library_analysis":
+        raise RuntimeError(
+            "active aggregate root must resolve to a directory named "
+            f"aggregate_library_analysis: {aggregate_root}")
     try:
         target.relative_to(aggregate_root)
     except ValueError as exc:
         raise RuntimeError(
             f"figure target escaped aggregate_library_analysis: {target}") from exc
+    figure_root = aggregate_root / "figures"
     figure_root.mkdir(parents=True, exist_ok=True)
     if figure_root.is_symlink() or not figure_root.is_dir():
         raise RuntimeError(f"unsafe central figure root: {figure_root}")
@@ -2922,7 +3148,8 @@ echo "Managed VCF daemon ready on $(hostname): {', '.join(required)}"'''
 fi'''
 
 
-def generate_vcf_daemon_holder_script(node, reference_bam, run_id):
+def generate_vcf_daemon_holder_script(
+        node, reference_bam, run_id, include_het=True):
     """Generate one node-pinned foreground VCF daemon holder.
 
     The holder owns run-scoped shm names, retains the daemon as its child, and
@@ -2947,6 +3174,24 @@ def generate_vcf_daemon_holder_script(node, reference_bam, run_id):
     species_seg = f"/dev/shm/{SHARED_VCF['species_20M'].lstrip('/')}"
     sentinel = os.path.join(state_dir, "TEARDOWN")
     node_state = os.path.join(state_dir, f"{safe_node}.holder.tsv")
+    daemon_source_paths = [
+        VCF_SOURCE_PATHS["interindiv_20M"],
+        VCF_SOURCE_PATHS["species_20M"],
+        reference_bam,
+    ]
+    daemon_segment_paths = [main_seg, species_seg]
+    daemon_het_arg = ""
+    het_description = "disabled"
+    if include_het:
+        daemon_source_paths.insert(1, VCF_SOURCE_PATHS["interindiv_het_10M"])
+        daemon_segment_paths.insert(1, het_seg)
+        daemon_het_arg = (
+            f'    --het_vcf "{VCF_SOURCE_PATHS["interindiv_het_10M"]}" \\\n')
+        het_description = VCF_SOURCE_PATHS["interindiv_het_10M"]
+    quoted_daemon_sources = " ".join(
+        f'"{path}"' for path in daemon_source_paths)
+    quoted_daemon_segments = " ".join(
+        f'"{path}"' for path in daemon_segment_paths)
 
     script = f'''#!/bin/bash
 #SBATCH --job-name=tetvcf_{safe_run[-24:]}_{safe_node}
@@ -3009,19 +3254,19 @@ echo "  Node: $(hostname)"
 echo "  Base segment: $BASE"
 echo "  Ready marker: $READY"
 echo "  Main BCF: {VCF_SOURCE_PATHS['interindiv_20M']}"
-echo "  HET BCF: {VCF_SOURCE_PATHS['interindiv_het_10M']}"
+echo "  HET BCF: {het_description}"
 echo "  Species BCF: {VCF_SOURCE_PATHS['species_20M']}"
 echo "  Reference BAM: {reference_bam}"
 echo "================================================================"
 
-for path in "$DAEMON" "{VCF_SOURCE_PATHS['interindiv_20M']}" "{VCF_SOURCE_PATHS['interindiv_het_10M']}" "{VCF_SOURCE_PATHS['species_20M']}" "{reference_bam}"; do
+for path in "$DAEMON" {quoted_daemon_sources}; do
     [[ -s "$path" ]] || {{ echo "ERROR: required daemon input missing or empty: $path" >&2; exit 1; }}
 done
 if [[ -f "$SENTINEL" ]]; then
     echo "Teardown was requested before this holder started; no VCF segments will be created"
     exit 0
 fi
-for path in "{main_seg}" "{het_seg}" "{species_seg}" "$READY"; do
+for path in {quoted_daemon_segments} "$READY"; do
     if [[ -e "$path" ]]; then
         echo "ERROR: run-scoped VCF artifact already exists before holder start: $path" >&2
         exit 1
@@ -3031,8 +3276,7 @@ done
 OWNS_SEGMENTS=1
 "$DAEMON" \
     --vcf "{VCF_SOURCE_PATHS['interindiv_20M']}" \
-    --het_vcf "{VCF_SOURCE_PATHS['interindiv_het_10M']}" \
-    --species_vcf "{VCF_SOURCE_PATHS['species_20M']}" \
+{daemon_het_arg}    --species_vcf "{VCF_SOURCE_PATHS['species_20M']}" \
     --bam "{reference_bam}" \
     --name "$BASE" \
     --qual 50 \
@@ -3054,7 +3298,7 @@ while [[ ! -s "$READY" ]]; do
     sleep 2
 done
 
-for path in "{main_seg}" "{het_seg}" "{species_seg}"; do
+for path in {quoted_daemon_segments}; do
     [[ -s "$path" ]] || {{ echo "ERROR: readiness marker exists but segment is missing/empty: $path" >&2; exit 1; }}
 done
 printf 'node\t%s\nholder_jobid\t%s\ndaemon_pid\t%s\nready_file\t%s\n' \
@@ -3333,7 +3577,8 @@ def identity_validation_summary_passes(path):
         return False, f"unreadable: {exc}"
 
 
-def demux_outputs_complete(lib_num, individual_only=False):
+def demux_outputs_complete(
+        lib_num, individual_only=False, require_pileup=False):
     """Return whether the complete selected DEMUX bundle is nonempty."""
     prefix = get_demux_prefix(lib_num)
     required = [prefix + suffix for suffix in (
@@ -3343,11 +3588,46 @@ def demux_outputs_complete(lib_num, individual_only=False):
         raw_prefix = os.path.join(get_demux_dir(lib_num), f"lib{lib_num}_raw")
         required.extend(prefix + suffix for suffix in (
             ".condf", ".species_counts", ".species_condf",
-            ".species_samples", ".species_assignments"))
+            ".species_condf_basis.tsv", ".species_samples",
+            ".species_assignments"))
         required.extend(raw_prefix + suffix for suffix in (
             ".counts", ".samples", ".condf", ".species_counts",
-            ".species_condf", ".species_samples"))
+            ".species_condf", ".species_condf_basis.tsv",
+            ".species_samples"))
+    if require_pileup:
+        required.extend(prefix + suffix for suffix in (
+            ".pileup_sites.tsv.gz", ".pileup_obs.tsv.gz",
+            ".pileup_molecules.tsv.gz"))
     return all(check_file_exists(path) for path in required)
+
+
+def demux_filtered_bundle_paths(lib_num, require_pileup=False):
+    """Return the filtered products used by fused/recovery checks."""
+    prefix = get_demux_prefix(lib_num)
+    required = [prefix + suffix for suffix in (
+        ".counts", ".assignments", ".summary", ".diagnostics.gz",
+        ".runner_ups.gz", ".samples", ".condf", ".species_counts",
+        ".species_condf", ".species_condf_basis.tsv", ".species_samples",
+        ".species_assignments")]
+    if require_pileup:
+        required.extend(prefix + suffix for suffix in (
+            ".pileup_sites.tsv.gz", ".pileup_obs.tsv.gz",
+            ".pileup_molecules.tsv.gz"))
+    return required
+
+
+def demux_raw_bundle_paths(lib_num):
+    """Return the self-contained raw products required by empty-drop estimation."""
+    prefix = os.path.join(get_demux_dir(lib_num), f"lib{lib_num}_raw")
+    return [prefix + suffix for suffix in (
+        ".counts", ".samples", ".condf", ".species_counts",
+        ".species_condf", ".species_condf_basis.tsv",
+        ".species_samples")]
+
+
+def shell_nonempty_files_test(paths):
+    """Build a shell predicate that is true only for a complete file bundle."""
+    return " && ".join(f'[[ -s "{path}" ]]' for path in paths)
 
 
 def tetra_refine_outputs_complete(lib_num):
@@ -3652,110 +3932,92 @@ echo "Finished: $(date)"
 # Stage 2 DEMUX: Demux (per library)
 # =============================================================================
 
-def generate_demux_script(lib_num, condf_job_ids=None, force=False, use_het_vcf=True, individual_only=False):
-    """Generate sbatch script for demux of one library.
+def generate_demux_script(
+        lib_num, condf_job_ids=None, force=False, het_enabled=False,
+        individual_only=False, filtered_threads=80,
+        resume_failed_raw=False, require_pileup=False):
+    """Generate one-library DEMUX work.
 
-    Two passes within a single job:
-      Pass 1: filtered barcodes, 80 threads (produces .counts, .assignments, etc.)
-      Pass 2: raw barcodes, 32 threads, --skip_assignment (produces raw .counts for empties)
-
-    Returns script_path.
+    Normal production uses one fused ``demux_parallel`` invocation and one BAM
+    traversal for filtered assignments plus raw empty-drop counts. The explicit
+    recovery option uses one raw-only traversal only when the complete required
+    filtered bundle already exists; otherwise it falls back to the fused recount.
     """
     job_name = f"demux_lib{lib_num}"
     log_dir = get_log_dir()
     script_dir = get_script_dir()
-
     binary = os.path.join(SOFTWARE_BIN, "demux_parallel")
-    daemon = os.path.join(SOFTWARE_BIN, "vcf_loader_daemon")
     bam = get_bam_path(lib_num)
     out_dir = get_demux_dir(lib_num)
     prefix_filtered = get_demux_prefix(lib_num)
     prefix_raw = os.path.join(out_dir, f"lib{lib_num}_raw")
-    daemon_ready_block = vcf_segment_wait_block(
-        [SHARED_VCF["interindiv_20M"]]
-        if individual_only else [
-            SHARED_VCF["interindiv_20M"],
-            *([SHARED_VCF["interindiv_het_10M"]] if use_het_vcf else []),
-            SHARED_VCF["species_20M"],
-        ])
-    demux_exclusive_line = (
-        "" if MANAGED_VCF_READY_FILE else "#SBATCH --exclusive")
-
     filtered_bc = get_filtered_barcodes(lib_num)
     el = get_expected_lines(lib_num)
+    demux_exclusive_line = (
+        "" if MANAGED_VCF_READY_FILE else "#SBATCH --exclusive")
+    daemon_node_line = (
+        f"#SBATCH --nodelist={DAEMON_NODELIST}" if DAEMON_NODELIST else "")
+    dep_line = ""
+    if condf_job_ids:
+        dep_line = "#SBATCH --dependency=afterok:" + ":".join(
+            str(job_id) for job_id in condf_job_ids)
+
+    daemon_segments = [SHARED_VCF["interindiv_20M"]]
+    if not individual_only:
+        if het_enabled:
+            daemon_segments.append(SHARED_VCF["interindiv_het_10M"])
+        daemon_segments.append(SHARED_VCF["species_20M"])
+    daemon_ready_block = vcf_segment_wait_block(daemon_segments)
 
     if individual_only:
-        # Focused panel-causality mode: preserve the standard filtered-barcode
-        # individual assignment command and omit all optional/secondary work.
-        dep_line = ""
-        if condf_job_ids:
-            dep_ids = ":".join(str(j) for j in condf_job_ids)
-            dep_line = f"#SBATCH --dependency=afterok:{dep_ids}"
-
         val_lines = []
-        for vf in [bam, filtered_bc, el]:
+        for required_file in [bam, filtered_bc, el]:
             val_lines.append(
-                f'if [[ ! -s "{vf}" ]]; then\n'
-                f'    echo "ERROR: Required file missing or empty: {vf}"\n'
+                f'if [[ ! -s "{required_file}" ]]; then\n'
+                f'    echo "ERROR: Required file missing or empty: {required_file}"\n'
                 f'    exit 1\n'
                 f'fi')
         validation_block = "\n".join(val_lines)
-
+        expected = [prefix_filtered + suffix for suffix in (
+            ".counts", ".assignments", ".summary", ".diagnostics.gz",
+            ".runner_ups.gz", ".samples")]
+        if require_pileup:
+            expected.extend(prefix_filtered + suffix for suffix in (
+                ".pileup_sites.tsv.gz", ".pileup_obs.tsv.gz",
+                ".pileup_molecules.tsv.gz"))
         skip_block = ""
         if not force:
-            skip_block = (
-                f'if [[ -s "{prefix_filtered}.counts" ]] && '
-                f'[[ -s "{prefix_filtered}.assignments" ]] && '
-                f'[[ -s "{prefix_filtered}.summary" ]] && '
-                f'[[ -s "{prefix_filtered}.diagnostics.gz" ]] && '
-                f'[[ -s "{prefix_filtered}.runner_ups.gz" ]] && '
-                f'[[ -s "{prefix_filtered}.samples" ]]; then\n'
-                f'    echo "Complete individual-only demux outputs already exist for lib{lib_num}"\n'
-                f'    echo "Skipping (use --force to rerun)"\n'
-                f'    exit 0\n'
-                f'fi\n'
-            )
-
-        count_policy = "--force_recount" if force else "--reuse_counts"
-        shm_interindiv = SHARED_VCF["interindiv_20M"]
-        pass1_cmd = (
+            skip_block = f'''if {shell_nonempty_files_test(expected)}; then
+    echo "Complete individual-only demux outputs already exist for lib{lib_num}"
+    echo "Skipping (use --force to rerun)"
+    exit 0
+fi
+'''
+        count_policy = (
+            "--force_recount" if (force or require_pileup)
+            else "--reuse_counts")
+        pileup_argument = (
+            f'--dump_pileup "{prefix_filtered}" '
+            if require_pileup else "")
+        command = (
             f'{binary} -b "{bam}" -o "{prefix_filtered}" '
-            f'--shared_vcf {shm_interindiv} -f '
-            f'--barcodes "{filtered_bc}" '
-            f'-I "{el}" '
-            f'--dump_selection_audit '
-            f'{count_policy} '
-            f'-t 80'
-        )
-
-        expected = [
-            f"{prefix_filtered}.counts",
-            f"{prefix_filtered}.assignments",
-            f"{prefix_filtered}.summary",
-            f"{prefix_filtered}.diagnostics.gz",
-            f"{prefix_filtered}.runner_ups.gz",
-            f"{prefix_filtered}.samples",
-        ]
-        out_check_lines = []
-        for ef in expected:
-            out_check_lines.append(
-                f'if [[ ! -s "{ef}" ]]; then\n'
-                f'    echo "ERROR: Expected output missing or empty: {ef}"\n'
-                f'    MISSING=$((MISSING + 1))\n'
-                f'fi')
-        out_check_block = "\n".join(out_check_lines)
-
+            f'--shared_vcf {SHARED_VCF["interindiv_20M"]} -f '
+            f'--barcodes "{filtered_bc}" -I "{el}" '
+            f'--dump_selection_audit {pileup_argument}'
+            f'{count_policy} -t {filtered_threads}')
+        checks = "\n".join(
+            f'if [[ ! -s "{path}" ]]; then\n'
+            f'    echo "ERROR: Expected output missing or empty: {path}"\n'
+            f'    MISSING=$((MISSING + 1))\n'
+            f'fi'
+            for path in expected)
         info = LIB_INFO.get(lib_num, {})
-        daemon_node_line = (
-            f"#SBATCH --nodelist={DAEMON_NODELIST}" if DAEMON_NODELIST else ""
-        )
-
         script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --output={log_dir}/{job_name}_%j.out
 #SBATCH --error={log_dir}/{job_name}_%j.err
 #SBATCH --time={SLURM_TIME}
-#SBATCH --cpus-per-task=90
+#SBATCH --cpus-per-task={max(16, filtered_threads)}
 #SBATCH --mem=1000G
 #SBATCH --partition={SLURM_PARTITION}
 #SBATCH --nodes=1
@@ -3775,235 +4037,145 @@ echo "  Node: $(hostname)"
 echo "  Main individual panel: enabled"
 echo "  HET panel: disabled"
 echo "  Species panel: disabled"
-echo "  Raw-barcode pass: disabled"
-echo "  Pileup sidecars: disabled"
+echo "  Raw output: disabled"
+echo "  Pileup sidecars: {'required by selected identity stage' if require_pileup else 'not requested'}"
 echo "  Selection audit: enabled"
 echo "================================================================"
-echo ""
 
 mkdir -p "{out_dir}"
-
 {daemon_ready_block}
-
 {validation_block}
+{skip_block}echo "=== FILTERED INDIVIDUAL DEMUX ({filtered_threads} threads) ==="
+echo "Running: {command}"
+{command}
 
-{skip_block}echo "=== FILTERED INDIVIDUAL DEMUX (80 threads) ==="
-echo "Running: {pass1_cmd}"
-echo ""
-
-{pass1_cmd}
-
-echo ""
 echo "=== OUTPUT VALIDATION ==="
 MISSING=0
-{out_check_block}
+{checks}
 if [[ "${{MISSING}}" -gt 0 ]]; then
     echo "ERROR: lib{lib_num} individual-only demux failed: ${{MISSING}} output files missing"
     exit 1
 fi
-
 echo "lib{lib_num} individual-only demux completed successfully"
 echo "Finished: $(date)"
 """
-
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(script_dir, exist_ok=True)
         script_path = os.path.join(script_dir, f"{job_name}.sbatch")
-        with open(script_path, "w") as f:
-            f.write(script)
+        with open(script_path, "w") as handle:
+            handle.write(script)
         os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP |
                  stat.S_IROTH | stat.S_IXOTH)
         return script_path
 
-    # SLURM dependency line
-    dep_line = ""
-    if condf_job_ids:
-        dep_ids = ":".join(str(j) for j in condf_job_ids)
-        dep_line = f"#SBATCH --dependency=afterok:{dep_ids}"
-
-    # Validation block. expected_lines is REQUIRED for demux assignment so the
-    # demuxer constrains its candidate identity set to the legal pool. Without
-    # -i/-I, demux_parallel picks from all 28*28 combo identities and frequently
-    # assigns cells to out-of-pool combos, which downstream causes the contam
-    # estimator to attribute residual signal from misassigned cells to JOS3C1
-    # (or other singletons) as phantom ambient mass.
     local_condf_interindiv = get_local_condf_path(lib_num, "interindiv_20M")
     condf_interindiv_source = (
         local_condf_interindiv
-        if os.path.isfile(local_condf_interindiv) and os.path.getsize(local_condf_interindiv) > 0
-        else CONDF_PATHS["interindiv_20M"]
-    )
+        if check_file_exists(local_condf_interindiv)
+        else CONDF_PATHS["interindiv_20M"])
     val_files = [bam, filtered_bc, el, PANEL_METADATA, condf_interindiv_source]
-    val_lines = []
-    for vf in val_files:
-        val_lines.append(
-            f'if [[ ! -s "{vf}" ]]; then\n'
-            f'    echo "❌ ERROR: Required file missing or empty: {vf}"\n'
-            f'    exit 1\n'
-            f'fi')
-    validation_block = "\n".join(val_lines)
+    validation_block = "\n".join(
+        f'if [[ ! -s "{path}" ]]; then\n'
+        f'    echo "ERROR: Required file missing or empty: {path}"\n'
+        f'    exit 1\n'
+        f'fi'
+        for path in val_files)
 
-    # Skip check. A partial bundle is never treated as complete.
+    filtered_paths = demux_filtered_bundle_paths(
+        lib_num, require_pileup=require_pileup)
+    raw_paths = demux_raw_bundle_paths(lib_num)
+    complete_paths = filtered_paths + raw_paths
+    filtered_test = shell_nonempty_files_test(filtered_paths)
+    complete_test = shell_nonempty_files_test(complete_paths)
+    recovery_active = bool(resume_failed_raw and not force)
     skip_block = ""
-    if not force:
-        skip_block = (
-            f'if [[ -s "{prefix_filtered}.counts" ]] && '
-            f'[[ -s "{prefix_filtered}.assignments" ]] && '
-            f'[[ -s "{prefix_filtered}.summary" ]] && '
-            f'[[ -s "{prefix_filtered}.diagnostics.gz" ]] && '
-            f'[[ -s "{prefix_filtered}.runner_ups.gz" ]] && '
-            f'[[ -s "{prefix_filtered}.samples" ]] && '
-            f'[[ -s "{prefix_filtered}.condf" ]] && '
-            f'[[ -s "{prefix_filtered}.species_counts" ]] && '
-            f'[[ -s "{prefix_filtered}.species_condf" ]] && '
-            f'[[ -s "{prefix_filtered}.species_samples" ]] && '
-            f'[[ -s "{prefix_filtered}.species_assignments" ]] && '
-            f'[[ -s "{prefix_raw}.counts" ]] && '
-            f'[[ -s "{prefix_raw}.samples" ]] && '
-            f'[[ -s "{prefix_raw}.condf" ]] && '
-            f'[[ -s "{prefix_raw}.species_counts" ]] && '
-            f'[[ -s "{prefix_raw}.species_condf" ]] && '
-            f'[[ -s "{prefix_raw}.species_samples" ]]; then\n'
-            f'    echo "✅ Complete demux outputs already exist for lib{lib_num}"\n'
-            f'    echo "Skipping (use --force to rerun)"\n'
-            f'    exit 0\n'
-            f'fi\n'
-        )
+    if not force and not recovery_active:
+        skip_block = f'''if {complete_test}; then
+    echo "Complete fused DEMUX bundle already exists for lib{lib_num}"
+    echo "Skipping (use --force to rerun)"
+    exit 0
+fi
+'''
 
     shm_interindiv = SHARED_VCF["interindiv_20M"]
-    shm_het = SHARED_VCF["interindiv_het_10M"]
     shm_species = SHARED_VCF["species_20M"]
-    het_vcf_arg = f"--shared_het_vcf {shm_het} " if use_het_vcf else ""
-    count_policy = "--force_recount" if force else "--reuse_counts"
-
-    # Pass 1 always requests the five-column selection audit used downstream.
-    # Nuclear identity scoring consumes the pileup sidecars. They can only be
-    # produced during a real BAM counting pass, so request them on forced full
-    # recounts;
-    # demux_parallel v2.13 refuses --dump_pileup on the reuse path fail-closed.
-    pileup_arg = f'--dump_pileup "{prefix_filtered}" ' if force else ""
-
-    # Pass 1: filtered barcodes with species output and heterozygous-site
-    # diagnostics (uses shared memory VCF daemon)
-    # -f (--disable_conditional): skip .condf computation since Stage 1 CONDF
-    # already generated them; .condf files are used downstream by tet_contam_estimate
-    # and tet_ambient_profile, not by demux_parallel during counting.
-    # -I expected_lines: restrict identity candidates to the library's expected
-    # pool. parse_idfile in demux_parallel parses singlet rows (bare identity
-    # names) and combo rows (A+B) from the same file, so one -I covers both.
-    # -I (idfile_doublet_given) also triggers a post-round filter_identities
-    # step that drops first-round assignments to singlet identities that were
-    # not explicitly listed in the file. Without this restriction,
-    # demux_parallel considers all 28*28=784 combo identities, frequently
-    # produces out-of-pool assignments, and corrupts downstream ambient
-    # profile estimation.
-    pass1_cmd = (
+    het_argument = (
+        f'--shared_het_vcf {SHARED_VCF["interindiv_het_10M"]} '
+        if het_enabled else "")
+    pileup_argument = (
+        f'--dump_pileup "{prefix_filtered}" '
+        if require_pileup else "")
+    fused_command = (
         f'{binary} -b "{bam}" -o "{prefix_filtered}" '
+        f'--raw_output_prefix "{prefix_raw}" '
         f'--shared_vcf {shm_interindiv} '
-        f'{het_vcf_arg}-f '
-        f'--barcodes "{filtered_bc}" '
-        f'-I "{el}" '
+        f'--barcodes "{filtered_bc}" -I "{el}" '
         f'--species_shared_vcf {shm_species} '
-        f'--species_counts_output '
-        f'--species_assignment_output '
+        f'--species_counts_output --species_assignment_output '
         f'--panel_metadata "{PANEL_METADATA}" '
-        f'--species_panel_mode count_only '
-        f'--dump_selection_audit '
-        f'{pileup_arg}'
-        f'{count_policy} '
-        f'-t 80'
-    )
-
-    # Pass 2: raw barcodes, skip assignment (uses shared memory VCF daemon)
-    # Species counts with count_only mode are needed for empty-drops estimation
-    # downstream.  Even though --skip_assignment suppresses assignment writing,
-    # keep -I on this demux_parallel invocation so every demux/counting command
-    # receives the same legal-pool restriction and future changes cannot silently
-    # re-enable an unrestricted raw assignment path.
-    # Thread count kept low (8) because dual-panel counting (interindividual +
-    # species) allocates per-thread count structures for both panels; 32 threads
-    # exceeds 1TB on high-read libraries. 8 threads keeps peak memory under 500GB.
-    pass2_cmd = (
+        f'--species_panel_mode count_only --dump_selection_audit '
+        f'{het_argument}{pileup_argument}-f --force_recount '
+        f'-t {filtered_threads}')
+    raw_recovery_command = (
         f'{binary} -b "{bam}" -o "{prefix_raw}" '
-        f'--shared_vcf {shm_interindiv} -f '
-        f'-I "{el}" '
+        f'--shared_vcf {shm_interindiv} -I "{el}" '
         f'--species_shared_vcf {shm_species} '
         f'--species_counts_output '
         f'--panel_metadata "{PANEL_METADATA}" '
-        f'--species_panel_mode count_only '
-        f'--skip_assignment '
-        f'{count_policy} '
-        f'-t 8'
-    )
+        f'--species_panel_mode count_only --skip_assignment '
+        f'-f --force_recount -t {filtered_threads}')
 
-    # Keep the production demux directory self-contained. Stage 1 may still
-    # generate library-independent CONDF files in CONDF_DIR, but after DEMUX
-    # each selected panel-family CONDF is copied into the library's demux_nomito
-    # directory. The filtered/raw .condf links are relative local links, so
-    # moving or retiring the shared generation directory cannot break them.
-    condf_interindiv = condf_interindiv_source
-    local_condf_interindiv = get_local_condf_path(lib_num, "interindiv_20M")
+    if force:
+        count_block = f'''echo "=== FUSED FILTERED + RAW DEMUX ({filtered_threads} threads) ==="
+echo "Running: {fused_command}"
+{fused_command}'''
+    elif recovery_active:
+        count_block = f'''if {filtered_test}; then
+    echo "=== RAW-ONLY DEMUX RECOVERY ({filtered_threads} threads) ==="
+    echo "Complete required filtered bundle found; preserving it"
+    echo "Running: {raw_recovery_command}"
+    {raw_recovery_command}
+else
+    echo "Required filtered bundle is incomplete; running one normal fused recount"
+    echo "Running: {fused_command}"
+    {fused_command}
+fi'''
+    else:
+        count_block = f'''echo "=== FUSED FILTERED + RAW DEMUX ({filtered_threads} threads) ==="
+echo "Running: {fused_command}"
+{fused_command}'''
+
     local_condf_het = get_local_condf_path(lib_num, "interindiv_het_10M")
     local_condf_species = get_local_condf_path(lib_num, "species_20M")
-    shared_condf_het = CONDF_PATHS["interindiv_het_10M"]
-    shared_condf_species = CONDF_PATHS["species_20M"]
+    het_condf_copy = (
+        f'if [[ -s "{CONDF_PATHS["interindiv_het_10M"]}" && ! -s "{local_condf_het}" ]]; then cp -p "{CONDF_PATHS["interindiv_het_10M"]}" "{local_condf_het}"; fi\n'
+        if het_enabled else "")
     symlink_block = (
-        f'echo "=== POST-DEMUX LOCAL CONDF BUNDLE ==="\n'
-        f'if [[ ! -s "{local_condf_interindiv}" ]]; then cp -p "{condf_interindiv}" "{local_condf_interindiv}"; fi\n'
-        f'if [[ -s "{shared_condf_het}" && ! -s "{local_condf_het}" ]]; then cp -p "{shared_condf_het}" "{local_condf_het}"; fi\n'
-        f'if [[ -s "{shared_condf_species}" && ! -s "{local_condf_species}" ]]; then cp -p "{shared_condf_species}" "{local_condf_species}"; fi\n'
+        f'echo "=== POST-DEMUX SELF-CONTAINED LINKS ==="\n'
+        f'if [[ ! -s "{local_condf_interindiv}" ]]; then cp -p "{condf_interindiv_source}" "{local_condf_interindiv}"; fi\n'
+        f'{het_condf_copy}'
+        f'if [[ -s "{CONDF_PATHS["species_20M"]}" && ! -s "{local_condf_species}" ]]; then cp -p "{CONDF_PATHS["species_20M"]}" "{local_condf_species}"; fi\n'
         f'ln -sfn "demux_input_20M.condf" "{prefix_filtered}.condf"\n'
         f'ln -sfn "demux_input_20M.condf" "{prefix_raw}.condf"\n'
         f'ln -sfn "$(basename \"{prefix_filtered}.samples\")" "{prefix_raw}.samples"\n'
-        f'if [[ -s "{prefix_filtered}.species_samples" && ! -e "{prefix_raw}.species_samples" ]]; then ln -sfn "$(basename \"{prefix_filtered}.species_samples\")" "{prefix_raw}.species_samples"; fi\n'
-        f'echo "Local CONDF copies and relative prefix links are ready"'
-    )
+        f'ln -sfn "$(basename \"{prefix_filtered}.species_samples\")" "{prefix_raw}.species_samples"\n'
+        f'ln -sfn "$(basename \"{prefix_filtered}.species_condf\")" "{prefix_raw}.species_condf"\n'
+        f'ln -sfn "$(basename \"{prefix_filtered}.species_condf_basis.tsv\")" "{prefix_raw}.species_condf_basis.tsv"\n'
+        f'echo "Local CONDF copies and relative prefix links are ready"')
 
-    # Output validation
-    expected = [
-        f"{prefix_filtered}.counts",
-        f"{prefix_filtered}.assignments",
-        f"{prefix_filtered}.summary",
-        f"{prefix_filtered}.diagnostics.gz",
-        f"{prefix_filtered}.runner_ups.gz",
-        f"{prefix_filtered}.samples",
-        f"{prefix_filtered}.condf",
-        f"{prefix_filtered}.species_counts",
-        f"{prefix_filtered}.species_condf",
-        f"{prefix_filtered}.species_samples",
-        f"{prefix_filtered}.species_assignments",
-        f"{prefix_raw}.counts",
-        f"{prefix_raw}.samples",
-        f"{prefix_raw}.condf",
-        f"{prefix_raw}.species_counts",
-        f"{prefix_raw}.species_condf",
-        f"{prefix_raw}.species_samples",
-    ]
-    # Forced full recounts must publish the pileup sidecars required by nuclear
-    # identity scoring; their absence is a job failure, not a warning.
-    if force:
-        expected.append(f"{prefix_filtered}.pileup_sites.tsv.gz")
-        expected.append(f"{prefix_filtered}.pileup_obs.tsv.gz")
-        expected.append(f"{prefix_filtered}.pileup_molecules.tsv.gz")
-    out_check_lines = []
-    for ef in expected:
-        out_check_lines.append(
-            f'if [[ ! -s "{ef}" ]]; then\n'
-            f'    echo "❌ ERROR: Expected output missing or empty: {ef}"\n'
-            f'    MISSING=$((MISSING + 1))\n'
-            f'fi')
-    out_check_block = "\n".join(out_check_lines)
-
+    out_check_block = "\n".join(
+        f'if [[ ! -s "{path}" ]]; then\n'
+        f'    echo "ERROR: Expected output missing or empty: {path}"\n'
+        f'    MISSING=$((MISSING + 1))\n'
+        f'fi'
+        for path in complete_paths)
     info = LIB_INFO.get(lib_num, {})
-
-    daemon_node_line = f"#SBATCH --nodelist={DAEMON_NODELIST}" if DAEMON_NODELIST else ""
-
     script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --output={log_dir}/{job_name}_%j.out
 #SBATCH --error={log_dir}/{job_name}_%j.err
 #SBATCH --time={SLURM_TIME}
-#SBATCH --cpus-per-task=90
+#SBATCH --cpus-per-task={max(16, filtered_threads)}
 #SBATCH --mem=1000G
 #SBATCH --partition={SLURM_PARTITION}
 #SBATCH --nodes=1
@@ -4020,58 +4192,387 @@ echo "  Batch: {info.get('batch', '?')}  Type: {info.get('lib_type', '?')}"
 echo "  Tets: {info.get('tets', '?')}  Dips: {info.get('dips', '?')}"
 echo "  Started: $(date)"
 echo "  Node: $(hostname)"
-echo "  HET VCF panel: {'enabled' if use_het_vcf else 'disabled'}"
+echo "  HET VCF panel: {'enabled by explicit opt-in' if het_enabled else 'disabled'}"
+echo "  DEMUX threads: {filtered_threads}"
+echo "  Normal counting: one fused filtered/raw traversal"
+echo "  Raw-only recovery: {'enabled when the filtered bundle is complete' if recovery_active else 'disabled'}"
 echo "  Selection audit: enabled"
-echo "  Pileup sidecars: {'enabled (forced recount)' if force else 'disabled (reuse path)'}"
+echo "  Pileup sidecars: {'required by selected identity stage' if require_pileup else 'not requested'}"
 echo "================================================================"
-echo ""
 
 mkdir -p "{out_dir}"
-
 {daemon_ready_block}
-
-# Validate inputs
 {validation_block}
+{skip_block}{count_block}
 
-# Skip if outputs exist
-{skip_block}
-echo "=== PASS 1: Filtered barcodes (80 threads) ==="
-echo "Running: {pass1_cmd}"
-echo ""
-
-{pass1_cmd}
-
-echo ""
-echo "=== PASS 2: Raw barcodes (8 threads, skip_assignment) ==="
-echo "Running: {pass2_cmd}"
-echo ""
-
-{pass2_cmd}
-
-echo ""
 {symlink_block}
 
-echo ""
 echo "=== OUTPUT VALIDATION ==="
 MISSING=0
 {out_check_block}
 if [[ "${{MISSING}}" -gt 0 ]]; then
-    echo "❌ ERROR: lib{lib_num} demux failed: ${{MISSING}} output files missing"
+    echo "ERROR: lib{lib_num} demux failed: ${{MISSING}} output files missing"
     exit 1
 fi
-
-echo "✅ lib{lib_num} demux completed successfully"
+echo "lib{lib_num} demux completed successfully"
 echo "Finished: $(date)"
 """
 
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(script_dir, exist_ok=True)
     script_path = os.path.join(script_dir, f"{job_name}.sbatch")
-    with open(script_path, "w") as f:
-        f.write(script)
+    with open(script_path, "w") as handle:
+        handle.write(script)
     os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP |
              stat.S_IROTH | stat.S_IXOTH)
     return script_path
+
+
+# =============================================================================
+# ATAC_DEMUX: direct-BCF demux (per library)
+# =============================================================================
+
+def get_atac_demux_bam(lib_num, args):
+    """Return the configured ATAC BAM for one selected library."""
+    return os.path.join(
+        os.path.abspath(args.atac_demux_atac_root),
+        f"Tet_2025_Multiome-ATAC_{lib_num}", "atac.bam")
+
+
+def get_atac_demux_whitelist(lib_num, args):
+    """Return the configured final called-cell whitelist for one library."""
+    root = args.atac_demux_rna_barcode_root or BEEGFS_ROOT
+    return os.path.join(
+        os.path.abspath(root), f"{LIB_PREFIX}{lib_num}",
+        "filtered", "barcodes.tsv.gz")
+
+
+def get_atac_demux_dir(lib_num, args):
+    """Return the ATAC demux output directory for one selected library."""
+    return os.path.join(
+        os.path.abspath(args.atac_demux_output_root), f"lib{lib_num}")
+
+
+def get_atac_demux_prefix(lib_num, args):
+    """Return the ATAC demux output prefix for one selected library."""
+    return os.path.join(
+        get_atac_demux_dir(lib_num, args), f"lib{lib_num}_atac_demuxed")
+
+
+def get_atac_demux_roster(lib_num, args):
+    """Render the selected library's legal identity roster from pool metadata."""
+    metadata = os.path.abspath(EXPECTED_POOL_METADATA)
+    matches = []
+    with open(metadata, "r", encoding="utf-8-sig", newline="") as handle:
+        for line_number, row in enumerate(
+                csv.reader(handle, delimiter="\t"), 1):
+            if not row or not any(value.strip() for value in row):
+                continue
+            library_text = row[0].strip()
+            if library_text == "library_id":
+                continue
+            if not re.fullmatch(r"[0-9]+", library_text):
+                continue
+            if int(library_text) != lib_num:
+                continue
+            if len(row) != 2:
+                raise ValueError(
+                    f"{metadata}:{line_number}: selected library requires "
+                    "exactly two tab-delimited fields")
+            matches.append((line_number, row[1].strip()))
+    if not matches:
+        raise ValueError(
+            f"pool metadata has no identity roster for lib{lib_num}: {metadata}")
+    if len(matches) != 1:
+        raise ValueError(
+            f"pool metadata has duplicate identity rosters for lib{lib_num}: {metadata}")
+    line_number, identities_text = matches[0]
+    identities = identities_text.split(",")
+    if (not identities_text or any(not identity for identity in identities)
+            or any(identity != identity.strip() for identity in identities)
+            or len(identities) != len(set(identities))):
+        raise ValueError(
+            f"{metadata}:{line_number}: identities must be nonempty, unique, "
+            "and comma-delimited")
+    roster = os.path.join(
+        os.path.abspath(args.atac_demux_output_root),
+        "expected_lines", f"lib{lib_num}_expected_lines.txt")
+    return _write_if_changed(roster, "".join(
+        f"{identity}\n" for identity in identities))
+
+
+def resolve_atac_demux_inputs(lib_num, args):
+    """Resolve only the files consumed by the direct-BCF ATAC command."""
+    bam = get_atac_demux_bam(lib_num, args)
+    main_vcf = os.path.abspath(args.atac_demux_main_vcf)
+    return {
+        "demux_parallel": os.path.join(SOFTWARE_BIN, "demux_parallel"),
+        "bam": bam,
+        "bai": bam + ".bai",
+        "whitelist": get_atac_demux_whitelist(lib_num, args),
+        "main_vcf": main_vcf,
+        "main_csi": main_vcf + ".csi",
+        "roster": get_atac_demux_roster(lib_num, args),
+    }
+
+
+def atac_demux_outputs_complete(lib_num, args):
+    """Return whether the complete ATAC demux output bundle is nonempty."""
+    prefix = get_atac_demux_prefix(lib_num, args)
+    return all(check_file_exists(prefix + suffix)
+               for suffix in ATAC_DEMUX_REQUIRED_SUFFIXES)
+
+
+def _atac_demux_option_errors(args):
+    """Return operational configuration errors for the integrated stage."""
+    errors = []
+    path_options = (
+        ("--atac-demux-output-root", args.atac_demux_output_root),
+        ("--atac-demux-atac-root", args.atac_demux_atac_root),
+        ("--atac-demux-main-vcf", args.atac_demux_main_vcf),
+    )
+    if args.atac_demux_rna_barcode_root:
+        path_options += ((
+            "--atac-demux-rna-barcode-root",
+            args.atac_demux_rna_barcode_root),)
+    for option, value in path_options:
+        if not value:
+            errors.append(f"{option} is required for ATAC_DEMUX")
+        elif not os.path.isabs(value):
+            errors.append(f"{option} must be an absolute path: {value}")
+    if not 0 <= args.atac_demux_min_mapq <= 255:
+        errors.append("--atac-demux-min-mapq must be in [0,255]")
+    if not 0 <= args.atac_demux_exclude_flags <= 0xFFFF:
+        errors.append("--atac-demux-exclude-flags must be in [0,0xFFFF]")
+    if args.atac_demux_threads < 1:
+        errors.append("--atac-demux-threads must be positive")
+    if args.atac_demux_cpus < args.atac_demux_threads:
+        errors.append("--atac-demux-cpus must be at least --atac-demux-threads")
+    if not 0 <= args.atac_demux_variant_qual <= 255:
+        errors.append("--atac-demux-variant-qual must be in [0,255]")
+    if not 0.0 <= args.atac_demux_doublet_rate <= 1.0:
+        errors.append("--atac-demux-doublet-rate must be in [0,1]")
+    if not (0.0 <= args.atac_demux_error_ref <= 1.0
+            and 0.0 <= args.atac_demux_error_alt <= 1.0
+            and args.atac_demux_error_sigma > 0.0):
+        errors.append(
+            "ATAC demux error rates must be in [0,1] and sigma must be positive")
+    if args.atac_demux_runner_ups < 1:
+        errors.append("--atac-demux-runner-ups must be positive")
+    if args.atac_demux_close_threshold <= 0.0:
+        errors.append("--atac-demux-close-threshold must be positive")
+    if not re.fullmatch(r"[0-9]+[KMGTP]", args.atac_demux_memory):
+        errors.append(
+            "--atac-demux-memory must be a SLURM memory token such as 1000G")
+    if not re.fullmatch(
+            r"(?:[0-9]+-[0-9]{2}:[0-9]{2}:[0-9]{2}|"
+            r"[0-9]+:[0-9]{2}:[0-9]{2})", args.atac_demux_time):
+        errors.append(
+            "--atac-demux-time must be a SLURM duration such as 7-00:00:00")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.atac_demux_partition):
+        errors.append("--atac-demux-partition contains unsafe characters")
+    return errors
+
+
+def _atac_demux_input_errors(inputs):
+    """Return missing or unreadable direct demux inputs."""
+    errors = []
+    binary = inputs["demux_parallel"]
+    if (not os.path.isfile(binary) or os.path.getsize(binary) == 0
+            or not os.access(binary, os.X_OK)):
+        errors.append(f"demux_parallel missing, empty, or not executable: {binary}")
+    for label in ("bam", "bai", "whitelist", "main_vcf", "main_csi", "roster"):
+        path = inputs[label]
+        if (not os.path.isfile(path) or os.path.getsize(path) == 0
+                or not os.access(path, os.R_OK)):
+            errors.append(f"{label} missing, empty, or unreadable: {path}")
+    return errors
+
+
+def generate_atac_demux_script(lib_num, args, inputs=None):
+    """Generate one unpinned direct-BCF ATAC demux worker."""
+    inputs = inputs or resolve_atac_demux_inputs(lib_num, args)
+    output_root = os.path.abspath(args.atac_demux_output_root)
+    output_dir = get_atac_demux_dir(lib_num, args)
+    prefix = get_atac_demux_prefix(lib_num, args)
+    log_dir = os.path.join(output_root, "logs")
+    script_dir = os.path.join(output_root, "slurm_scripts")
+    job_name = f"atac_demux_lib{lib_num}"
+    expected = [prefix + suffix for suffix in ATAC_DEMUX_REQUIRED_SUFFIXES]
+
+    input_checks = [
+        (inputs["demux_parallel"], "-x"),
+        *((inputs[label], "-r") for label in (
+            "bam", "bai", "whitelist", "main_vcf", "main_csi", "roster")),
+    ]
+    validation_block = "\n".join(
+        f'if [[ ! -s {shlex.quote(path)} || ! {test_op} {shlex.quote(path)} ]]; then\n'
+        f'    echo "ERROR: Required ATAC demux input missing, empty, or unreadable: {path}" >&2\n'
+        f'    exit 1\n'
+        f'fi'
+        for path, test_op in input_checks)
+    skip_block = ""
+    if not args.force:
+        conditions = " && ".join(
+            f"[[ -s {shlex.quote(path)} ]]" for path in expected)
+        skip_block = (
+            f"if {conditions}; then\n"
+            f'    echo "Complete ATAC demux outputs already exist for lib{lib_num}"\n'
+            f'    echo "Skipping (use --force to rerun)"\n'
+            f"    exit 0\n"
+            f"fi\n")
+
+    command = [
+        inputs["demux_parallel"],
+        "-b", inputs["bam"],
+        "-o", prefix,
+        "-v", inputs["main_vcf"],
+        "--barcodes", inputs["whitelist"],
+        "-I", inputs["roster"],
+        "--qual", str(args.atac_demux_variant_qual),
+        "--doublet_rate", str(args.atac_demux_doublet_rate),
+        "--error_ref", str(args.atac_demux_error_ref),
+        "--error_alt", str(args.atac_demux_error_alt),
+        "--error_sigma", str(args.atac_demux_error_sigma),
+        "--min-mapq", str(args.atac_demux_min_mapq),
+        "--exclude-flags", f"0x{args.atac_demux_exclude_flags:X}",
+        "--n_runner_ups", str(args.atac_demux_runner_ups),
+        "--close_threshold", str(args.atac_demux_close_threshold),
+        "--diagnostics",
+        "--dump_selection_audit",
+        "--disable_conditional",
+        "--force_recount",
+        "--threads", str(args.atac_demux_threads),
+    ]
+    rendered_command = shlex.join(command)
+    output_checks = "\n".join(
+        f'if [[ ! -s {shlex.quote(path)} ]]; then\n'
+        f'    echo "ERROR: Expected ATAC demux output missing or empty: {path}" >&2\n'
+        f'    MISSING=$((MISSING + 1))\n'
+        f'fi'
+        for path in expected)
+
+    script = f'''#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --output={log_dir}/{job_name}_%j.out
+#SBATCH --error={log_dir}/{job_name}_%j.err
+#SBATCH --time={args.atac_demux_time}
+#SBATCH --cpus-per-task={args.atac_demux_cpus}
+#SBATCH --mem={args.atac_demux_memory}
+#SBATCH --partition={args.atac_demux_partition}
+#SBATCH --nodes=1
+
+set -euo pipefail
+{module_block()}
+
+echo "================================================================"
+echo "ATAC_DEMUX: direct-BCF demux lib{lib_num}"
+echo "  BAM: {inputs['bam']}"
+echo "  Whitelist: {inputs['whitelist']}"
+echo "  Roster: {inputs['roster']}"
+echo "  Main BCF: {inputs['main_vcf']}"
+echo "  Output: {prefix}"
+echo "  Started: $(date)"
+echo "  Node: $(hostname)"
+echo "================================================================"
+echo ""
+
+mkdir -p {shlex.quote(output_dir)}
+
+{validation_block}
+
+{skip_block}{rendered_command}
+
+echo ""
+echo "=== OUTPUT VALIDATION ==="
+MISSING=0
+{output_checks}
+if [[ "${{MISSING}}" -gt 0 ]]; then
+    echo "ERROR: lib{lib_num} ATAC demux failed: ${{MISSING}} output files missing or empty" >&2
+    exit 1
+fi
+
+echo "lib{lib_num} ATAC demux completed successfully"
+echo "Finished: $(date)"
+'''
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = os.path.join(script_dir, f"{job_name}.sbatch")
+    _write_if_changed(script_path, script)
+    os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP |
+             stat.S_IROTH | stat.S_IXOTH)
+    return script_path
+
+
+def run_atac_demux(args, lib_nums):
+    """Render and optionally submit one independent worker per selected library."""
+    if (getattr(args, "analysis_output_root", None)
+            and args.atac_demux_output_root == DEFAULT_ATAC_DEMUX_OUTPUT_ROOT):
+        args.atac_demux_output_root = os.path.join(
+            AGGREGATE_ROOT, "atac_demux")
+    option_errors = _atac_demux_option_errors(args)
+    if option_errors:
+        for detail in option_errors:
+            print(f"  ERROR: {detail}")
+        return 1
+
+    output_root = os.path.abspath(args.atac_demux_output_root)
+    try:
+        os.makedirs(output_root, exist_ok=True)
+    except OSError as exc:
+        print(f"  ERROR: cannot create ATAC demux output root {output_root}: {exc}")
+        return 1
+
+    print("=" * 72)
+    print("ATAC_DEMUX")
+    print(f"  Release: {ORCHESTRATOR_RELEASE}")
+    print("  Libraries: " + " ".join(f"lib{lib}" for lib in lib_nums))
+    print(f"  Main BCF: {args.atac_demux_main_vcf}")
+    print(f"  Output root: {output_root}")
+    print(f"  Submit: {'YES' if args.submit else 'NO'}")
+    print("=" * 72)
+
+    generated = []
+    failed_libraries = set()
+    for lib_num in lib_nums:
+        if atac_demux_outputs_complete(lib_num, args) and not args.force:
+            print(f"  lib{lib_num}: complete outputs exist, skipping")
+            continue
+        try:
+            inputs = resolve_atac_demux_inputs(lib_num, args)
+        except (OSError, UnicodeError, ValueError) as exc:
+            failed_libraries.add(lib_num)
+            print(f"  ERROR lib{lib_num}: {exc}")
+            continue
+        if not args.skip_validation:
+            input_errors = _atac_demux_input_errors(inputs)
+            if input_errors:
+                failed_libraries.add(lib_num)
+                for detail in input_errors:
+                    print(f"  ERROR lib{lib_num}: {detail}")
+                continue
+        try:
+            script_path = generate_atac_demux_script(
+                lib_num, args, inputs=inputs)
+        except (OSError, UnicodeError, ValueError) as exc:
+            failed_libraries.add(lib_num)
+            print(f"  ERROR lib{lib_num}: could not render worker: {exc}")
+            continue
+        generated.append(script_path)
+        print(f"  Rendered lib{lib_num}: {script_path}")
+        if args.submit:
+            try:
+                job_id = submit_job(script_path)
+            except (OSError, RuntimeError, ValueError) as exc:
+                failed_libraries.add(lib_num)
+                print(f"  ERROR lib{lib_num}: submission failed: {exc}")
+                continue
+            print(f"  Submitted lib{lib_num}: job {job_id}")
+
+    print(
+        f"ATAC_DEMUX summary: {len(generated)} worker(s) rendered, "
+        f"{len(failed_libraries)} library failure(s)")
+    return 1 if failed_libraries else 0
 
 
 # =============================================================================
@@ -4082,7 +4583,7 @@ def generate_empty_drops_script(lib_num, demux_job_id=None, force=False):
     """Generate sbatch script for empty drops estimation on one library.
 
     Runs tet_ambient_profile twice: --interindividual then --interspecies.
-    Uses the RAW barcode counts (from DEMUX Pass 2) so that empty droplets
+    Uses the RAW barcode counts (from the fused DEMUX traversal) so that empty droplets
     are present in the .counts file. The tool partitions barcodes into
     "cell" (in filtered list) and "empty" (not in filtered list).
 
@@ -4149,7 +4650,7 @@ def generate_empty_drops_script(lib_num, demux_job_id=None, force=False):
         f'fi'
     )
 
-    # Validation block: check raw prefix files (produced by DEMUX Pass 2 + symlinks)
+    # Validation block: check raw prefix files (produced by fused DEMUX + symlinks)
     val_files = [
         raw_prefix + ".counts",
         raw_prefix + ".condf",
@@ -6903,6 +7404,232 @@ def _candidate_axis_frozen_parameters(args, lib_num, has_finalized_event=None):
     }
 
 
+IDENTITY_READINESS_FIELDS = (
+    "library", "core_demux_complete", "ploidy_nn_complete",
+    "posthoc_audit_complete", "production_ambient_complete",
+    "candidate_bundle_complete", "nuclear_evidence_complete",
+    "mt_evidence_complete", "doublet_context_complete",
+    "decision_table_complete", "reconciled_assignment_complete",
+    "final_assignment_complete", "aggregate_ledger_membership",
+    "downstream_safe_output_complete",
+    "upstream_ready",
+    "reconciliation_evidence_complete", "canonical_output_complete",
+    "overall_status", "required_action", "missing_items",
+)
+
+
+def _identity_readiness_paths(lib_num, args):
+    prefix = get_demux_prefix(lib_num)
+    candidate_root = get_identity_subdir(args, "candidates")
+    audit_root = os.path.join(args.identity_audit_root, f"lib{lib_num}")
+    final_root = os.path.abspath(args.identity_reconciliation_root)
+    return {
+        "demux counts": prefix + ".counts",
+        "demux samples": prefix + ".samples",
+        "demux assignments": prefix + ".assignments",
+        "demux diagnostics": prefix + ".diagnostics.gz",
+        "pileup sites": prefix + ".pileup_sites.tsv.gz",
+        "pileup observations": prefix + ".pileup_obs.tsv.gz",
+        "ploidy NN": get_ploidy_calls_path(lib_num),
+        "posthoc call QC": os.path.join(
+            audit_root, f"lib{lib_num}.call_qc.tsv.gz"),
+        "posthoc swap report": os.path.join(
+            audit_root, f"lib{lib_num}.swap_report.tsv"),
+        "candidate table": get_identity_candidate_path(lib_num, args),
+        "candidate event summary": os.path.join(
+            candidate_root, ".per_library", f"lib{lib_num}",
+            "all_libraries.identity_events_candidates.tsv"),
+        "nuclear scores": get_identity_nuclear_score_path(lib_num, args),
+        "nuclear fold scores": os.path.join(
+            get_identity_subdir(args, "nuclear"),
+            f"lib{lib_num}.identity_site_fold_scores.tsv.gz"),
+        "MT identity scores": get_mt_identity_score_path(lib_num, args),
+        "doublet context": os.path.join(
+            get_identity_subdir(args, "doublet_context"),
+            f"lib{lib_num}.doublet_dragon_summary.tsv"),
+        "decision table": get_reconciled_cells_path(lib_num),
+        "reconciled assignment": get_reconciled_assignments_path(lib_num),
+        "final assignment": os.path.join(
+            final_root,
+            "final_assignments", f"lib{lib_num}.reconciled.assignments"),
+        "downstream-safe aggregate": os.path.join(
+            final_root, "aggregate",
+            "identity_reconciliation_downstream_safe_cells.tsv.gz"),
+        "three-state assignments": os.path.join(
+            final_root, "aggregate", "identity_assignments.tsv.gz"),
+        "three-state status summary": os.path.join(
+            final_root, "aggregate",
+            "identity_assignment_status_summary.tsv"),
+        "three-state applied changes": os.path.join(
+            final_root, "aggregate", "identity_applied_changes.tsv"),
+        "three-state review cells": os.path.join(
+            final_root, "aggregate", "identity_review_needed.tsv.gz"),
+        "three-state review transitions": os.path.join(
+            final_root, "aggregate",
+            "identity_review_transition_summary.tsv"),
+        "held-change audit": os.path.join(
+            final_root, "aggregate",
+            "identity_reconciliation_held_changed_audit.tsv.gz"),
+        "held-change transitions": os.path.join(
+            final_root, "aggregate",
+            "identity_reconciliation_held_changed_transition_summary.tsv"),
+        "joint-supported held transitions": os.path.join(
+            final_root, "aggregate",
+            "identity_reconciliation_joint_supported_held_transitions.tsv"),
+        "joint-supported held transition plot": os.path.join(
+            final_root, "plots",
+            "identity_reconciliation_joint_supported_held_transitions.png"),
+    }
+
+
+def identity_reconciliation_readiness(lib_nums, args, write_report=True):
+    """Audit the exact per-library contract needed for an all-library refresh."""
+    condition = COND_BY_ABBREV[AMBIENT_PLOT_DEFAULT_CONDITION]
+    aggregate_ledger = os.path.join(
+        os.path.abspath(args.identity_reconciliation_root), "aggregate",
+        "identity_reconciliation_final_cells.tsv.gz")
+    aggregate_libraries = set()
+    if check_file_exists(aggregate_ledger):
+        try:
+            with _candidate_axis_open_tsv(aggregate_ledger) as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                for record in reader:
+                    raw = str(record.get("library", "")).strip()
+                    match = re.fullmatch(r"(?:lib)?(\d+)", raw, flags=re.I)
+                    if match:
+                        aggregate_libraries.add(int(match.group(1)))
+        except (OSError, ValueError, csv.Error):
+            aggregate_libraries = set()
+    rows = []
+    for lib_num in lib_nums:
+        paths = _identity_readiness_paths(lib_num, args)
+        core_labels = (
+            "demux counts", "demux samples", "demux assignments",
+            "demux diagnostics", "pileup sites", "pileup observations",
+        )
+        posthoc_labels = ("posthoc call QC", "posthoc swap report")
+        candidate_labels = ("candidate table", "candidate event summary")
+        nuclear_labels = ("nuclear scores", "nuclear fold scores")
+        core_ok = all(check_file_exists(paths[label]) for label in core_labels)
+        ploidy_ok = check_file_exists(paths["ploidy NN"])
+        posthoc_ok = all(
+            check_file_exists(paths[label]) for label in posthoc_labels)
+        ambient_ok = check_output_exists(
+            lib_num, condition["abbrev"], "demux")
+        candidate_ok = all(
+            check_file_exists(paths[label]) for label in candidate_labels)
+        nuclear_ok = all(
+            check_file_exists(paths[label]) for label in nuclear_labels)
+        mt_ok = check_file_exists(paths["MT identity scores"])
+        doublet_ok = check_file_exists(paths["doublet context"])
+        decision_ok = check_file_exists(paths["decision table"])
+        reconciled_ok = check_file_exists(paths["reconciled assignment"])
+        final_ok = check_file_exists(paths["final assignment"])
+        aggregate_ok = lib_num in aggregate_libraries
+        downstream_safe_ok = all(check_file_exists(paths[label]) for label in (
+            "downstream-safe aggregate", "three-state assignments",
+            "three-state status summary", "three-state applied changes",
+            "three-state review cells", "three-state review transitions",
+            "held-change audit",
+            "held-change transitions", "joint-supported held transitions",
+            "joint-supported held transition plot",
+        ))
+        upstream_ok = core_ok and ploidy_ok and posthoc_ok
+        evidence_ok = candidate_ok and nuclear_ok and mt_ok and doublet_ok
+        canonical_ok = (
+            decision_ok and reconciled_ok and final_ok and aggregate_ok
+            and downstream_safe_ok)
+
+        missing = [
+            f"{label}={path}" for label, path in paths.items()
+            if not check_file_exists(path)
+        ]
+        if not ambient_ok:
+            missing.append(
+                "production ambient=" + get_contam_prefix(
+                    lib_num, condition["abbrev"], "demux"))
+        if not aggregate_ok:
+            missing.append(
+                f"aggregate ledger lacks lib{lib_num}={aggregate_ledger}")
+        actions = []
+        if not upstream_ok:
+            actions.append("BLOCKED_UPSTREAM")
+        if not ambient_ok:
+            actions.append("RUN_PRODUCTION_AMBIENT")
+        if not evidence_ok:
+            actions.append("RUN_FULL_LIBRARY_RECONCILIATION_EVIDENCE")
+        if not canonical_ok:
+            actions.append("REBUILD_ALL_LIBRARY_DECISIONS_AND_FINAL_LEDGER")
+        if not actions:
+            actions.append("READY")
+        rows.append({
+            "library": f"lib{lib_num}",
+            "core_demux_complete": int(core_ok),
+            "ploidy_nn_complete": int(ploidy_ok),
+            "posthoc_audit_complete": int(posthoc_ok),
+            "production_ambient_complete": int(ambient_ok),
+            "candidate_bundle_complete": int(candidate_ok),
+            "nuclear_evidence_complete": int(nuclear_ok),
+            "mt_evidence_complete": int(mt_ok),
+            "doublet_context_complete": int(doublet_ok),
+            "decision_table_complete": int(decision_ok),
+            "reconciled_assignment_complete": int(reconciled_ok),
+            "final_assignment_complete": int(final_ok),
+            "aggregate_ledger_membership": int(aggregate_ok),
+            "downstream_safe_output_complete": int(downstream_safe_ok),
+            "upstream_ready": int(upstream_ok),
+            "reconciliation_evidence_complete": int(evidence_ok),
+            "canonical_output_complete": int(canonical_ok),
+            "overall_status": (
+                "READY" if upstream_ok and ambient_ok and evidence_ok
+                and canonical_ok else "INCOMPLETE"),
+            "required_action": ";".join(actions),
+            "missing_items": ";".join(missing) or "NONE",
+        })
+
+    if write_report:
+        report_dir = os.path.join(
+            os.path.abspath(args.identity_reconciliation_root), "readiness")
+        os.makedirs(report_dir, exist_ok=True)
+        report = os.path.join(
+            report_dir, "identity_reconciliation_readiness.tsv")
+        tmp = report + f".tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=IDENTITY_READINESS_FIELDS,
+                delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp, report)
+        print(f"IDENTITY_RECONCILIATION readiness report: {report}")
+
+    ready = [row["library"] for row in rows if row["overall_status"] == "READY"]
+    incomplete = [
+        row["library"] for row in rows if row["overall_status"] != "READY"]
+    ambient_missing = [
+        row["library"] for row in rows
+        if not int(row["production_ambient_complete"])]
+    evidence_missing = [
+        row["library"] for row in rows
+        if not int(row["reconciliation_evidence_complete"])]
+    blocked = [
+        row["library"] for row in rows if not int(row["upstream_ready"])]
+    print(
+        "IDENTITY_RECONCILIATION readiness: "
+        f"ready={len(ready)} incomplete={len(incomplete)} "
+        f"ambient_missing={len(ambient_missing)} "
+        f"evidence_missing={len(evidence_missing)} blocked={len(blocked)}")
+    if incomplete:
+        print("  incomplete: " + " ".join(incomplete))
+    if ambient_missing:
+        print("  production ambient missing: " + " ".join(ambient_missing))
+    if evidence_missing:
+        print("  reconciliation evidence missing: " + " ".join(evidence_missing))
+    if blocked:
+        print("  blocked upstream: " + " ".join(blocked))
+    return rows
+
+
 def _identity_deps(dep_job_ids):
     deps = [str(x) for x in (dep_job_ids or []) if x]
     return f"#SBATCH --dependency=afterok:{':'.join(deps)}" if deps else ""
@@ -6971,6 +7698,17 @@ test -s "{distinguishability}"
 '''
     return _write_identity_sbatch(
         "identity_metadata", body, dep_job_ids, cpus=1, mem="4G")
+
+
+def identity_metadata_outputs_complete(args):
+    """Return whether the shared identity metadata contract is complete."""
+    metadata = get_identity_subdir(args, "metadata")
+    return all(check_file_exists(path) for path in (
+        os.path.join(metadata, "library_expected_genotypes.tsv"),
+        os.path.join(metadata, "global_biological_lines.tsv"),
+        os.path.join(metadata, "global_donors.tsv"),
+        os.path.join(metadata, "nuclear_panel_distinguishability.tsv"),
+    ))
 
 
 def generate_identity_candidates_script(lib_num, args, dep_job_ids=None):
@@ -7480,7 +8218,9 @@ echo "MT_IDENTITY_SCORE lib{lib_num}: one RNA chrM pass; ambient RNA is not an i
 {cmd}
 test -s "{score}"
 '''
-    return _write_identity_sbatch(f"identity_mt_lib{lib_num}", body, dep_job_ids, cpus=4, mem="64G", time="1-00:00:00")
+    return _write_identity_sbatch(
+        f"identity_mt_lib{lib_num}", body, dep_job_ids,
+        cpus=4, mem=args.identity_mt_memory, time="1-00:00:00")
 
 
 def _identity_expand_path(template, lib_num):
@@ -7542,14 +8282,14 @@ python3 "{optional}" optional-status --candidate-manifest "{cand}" --modality at
     exit 0
 fi
 if ! {base_cmd} --atac_barcode_map "{explicit_map}"; then
-    python3 "{optional}" optional-status --candidate-manifest "{cand}" --modality atac --status ATAC_UNAVAILABLE --output "{final_score}"
-    exit 0
+    echo "ERROR: demux_parallel failed while counting requested ATAC evidence for lib{lib_num}" >&2
+    exit 1
 fi'''
     elif auto_map:
         final_map_arg = f'--barcode-map "{auto_map}"'
         direct_or_mapped = f'''# Auto mode: try the expected direct RNA barcode namespace first. If that
 # overlap is inadequate, deterministically construct the paired-whitelist map
-# and retry in mapped mode. Either failure remains optional evidence.
+# and retry in mapped mode. A final counting failure is a failed job.
 if ! {base_cmd}; then
     rm -f "{count_prefix}.atac.counts" "{qc}"
     if [[ ! -s "{rna_w}" || ! -s "{atac_w}" ]] || \\
@@ -7558,14 +8298,14 @@ if ! {base_cmd}; then
         exit 0
     fi
     if ! {base_cmd} --atac_barcode_map "{auto_map}"; then
-        python3 "{optional}" optional-status --candidate-manifest "{cand}" --modality atac --status ATAC_UNAVAILABLE --output "{final_score}"
-        exit 0
+        echo "ERROR: demux_parallel failed while counting mapped ATAC evidence for lib{lib_num}" >&2
+        exit 1
     fi
 fi'''
     else:
         direct_or_mapped = f'''if ! {base_cmd}; then
-    python3 "{optional}" optional-status --candidate-manifest "{cand}" --modality atac --status ATAC_UNAVAILABLE --output "{final_score}"
-    exit 0
+    echo "ERROR: demux_parallel failed while counting requested ATAC evidence for lib{lib_num}" >&2
+    exit 1
 fi'''
 
     body = f'''mkdir -p "{outdir}"
@@ -7622,13 +8362,17 @@ python3 "{helper}" --libraries {libs} --demux-root "{get_demux_mapping_root()}" 
 
 def generate_identity_finalize_script(
         lib_nums, args, candidate_axis_root="", frozen_ambient_root="",
-        four_arm_root="", dep_job_ids=None):
+        four_arm_root="", dep_job_ids=None, checkpoint_only=False):
     helper = _identity_helper("identity_reconciliation.py")
+    validator = _identity_helper("validate_identity_reconciliation.py")
     libraries = " ".join(str(value) for value in lib_nums)
-    aggregate = os.path.join(
-        os.path.abspath(args.identity_reconciliation_root), "aggregate")
-    final_assignments = os.path.join(
-        os.path.abspath(args.identity_reconciliation_root), "final_assignments")
+    final_root = os.path.abspath(args.identity_reconciliation_root)
+    aggregate = os.path.join(final_root, "aggregate")
+    final_assignments = os.path.join(final_root, "final_assignments")
+    validation = get_identity_subdir(args, "validation")
+    atac_root = (
+        get_identity_subdir(args, "atac")
+        if args.identity_evidence_mode == "rna-atac" else "")
     optional = ""
     for option, value in (
             ("candidate-axis-root", candidate_axis_root),
@@ -7637,11 +8381,17 @@ def generate_identity_finalize_script(
             ("review-input", args.identity_review_input)):
         if value:
             optional += f" --{option} {shlex.quote(os.path.abspath(value))}"
+    if checkpoint_only:
+        optional += " --checkpoint-only"
     assignment_tests = "\n".join(
         f'test -s {shlex.quote(os.path.join(final_assignments, f"lib{value}.reconciled.assignments"))}'
         for value in lib_nums)
-    body = f'''mkdir -p {shlex.quote(aggregate)} {shlex.quote(final_assignments)}
-echo "IDENTITY_FINALIZE: assignment-noninterfering evidence joins and canonical ledgers"
+    body = f'''export MPLCONFIGDIR="${{SLURM_TMPDIR:-/tmp}}/matplotlib-${{SLURM_JOB_ID:-$$}}"
+mkdir -p "$MPLCONFIGDIR" {shlex.quote(aggregate)} {shlex.quote(final_assignments)}
+python3 - <<'PY'
+import matplotlib
+PY
+echo "IDENTITY_FINALIZE: three-state assignment contract and canonical exports"
 python3 -B {shlex.quote(helper)} finalize \\
   --libraries {libraries} \\
   --demux-root {shlex.quote(get_demux_mapping_root())} \\
@@ -7652,6 +8402,15 @@ python3 -B {shlex.quote(helper)} finalize \\
   --output-root {shlex.quote(aggregate)}{optional}
 for output in \\
   identity_reconciliation_final_cells.tsv.gz \\
+  identity_assignments.tsv.gz \\
+  identity_assignment_status_summary.tsv \\
+  identity_applied_changes.tsv \\
+  identity_review_needed.tsv.gz \\
+  identity_review_transition_summary.tsv \\
+  identity_reconciliation_downstream_safe_cells.tsv.gz \\
+  identity_reconciliation_held_changed_audit.tsv.gz \\
+  identity_reconciliation_held_changed_transition_summary.tsv \\
+  identity_reconciliation_joint_supported_held_transitions.tsv \\
   identity_reconciliation_candidate_audit.tsv.gz \\
   identity_reconciliation_final_events.tsv \\
   identity_reconciliation_review_queue.tsv.gz \\
@@ -7659,10 +8418,28 @@ for output in \\
   test -s {shlex.quote(aggregate)}/"$output"
 done
 {assignment_tests}
+test -s {shlex.quote(os.path.join(final_root, "plots", "identity_reconciliation_joint_supported_held_transitions.png"))}
+test -s {shlex.quote(os.path.join(final_root, "plots", "identity_assignment_status.png"))}
+test -s {shlex.quote(os.path.join(final_root, "plots", "identity_line_changes.png"))}
+echo "IDENTITY_FINALIZE_VALIDATE: verify three-state derivation and canonical exports"
+python3 -B {shlex.quote(validator)} \\
+  --libraries {libraries} \\
+  --demux-root {shlex.quote(get_demux_mapping_root())} \\
+  --metadata-root {shlex.quote(get_identity_subdir(args, "metadata"))} \\
+  --candidate-root {shlex.quote(get_identity_subdir(args, "candidates"))} \\
+  --doublet-context-root {shlex.quote(get_identity_subdir(args, "doublet_context"))} \\
+  --nuclear-root {shlex.quote(get_identity_subdir(args, "nuclear"))} \\
+  --mt-root {shlex.quote(get_identity_subdir(args, "mt"))} \\
+  --atac-root {shlex.quote(atac_root)} \\
+  --decisions-root {shlex.quote(get_identity_subdir(args, "decisions"))} \\
+  --reports-root {shlex.quote(get_identity_subdir(args, "reports"))} \\
+  --evidence-mode {shlex.quote(args.identity_evidence_mode)} \\
+  --final-root {shlex.quote(final_root)} \\
+  --output-root {shlex.quote(validation)}
 '''
     return _write_identity_sbatch(
         "identity_finalize", body, dep_job_ids, cpus=1, mem="64G",
-        modules=("miniforge/3",),
+        modules=("miniforge/3", "genomics-base/latest"),
         commands=("python3",))
 
 
@@ -7729,12 +8506,67 @@ def _identity_candidate_axis_outputs_complete(args, eligible_libraries):
     return bool(expected_keys) and expected_keys <= represented_keys
 
 
+def _identity_candidate_axis_library_outputs_complete(lib_num, args):
+    """Return whether one library has reusable, current candidate-axis work."""
+    paths = _candidate_axis_paths(args)
+    pair_files = (
+        os.path.join(
+            paths["pairs"],
+            f"lib{lib_num}.candidate_axis_pair_source_audit.tsv"),
+        os.path.join(
+            paths["pairs"], f"lib{lib_num}.candidate_axis_pairs.tsv.gz"),
+        os.path.join(
+            paths["pairs"],
+            f"lib{lib_num}.candidate_axis_pair_exclusions.tsv.gz"),
+        os.path.join(
+            paths["pairs"],
+            f"lib{lib_num}.candidate_axis_pair_summary.tsv"),
+    )
+    score_files = (
+        os.path.join(
+            paths["scorer"], f"lib{lib_num}.candidate_axis_scores.tsv.gz"),
+        os.path.join(
+            paths["scorer"],
+            f"lib{lib_num}.candidate_axis_score_provenance.tsv"),
+    )
+    if not all(check_file_exists(path) for path in pair_files + score_files):
+        return False
+
+    expected_keys = _candidate_axis_finalized_event_keys(lib_num, args)
+    represented_keys = set()
+    for path in (pair_files[1], pair_files[2]):
+        try:
+            with _candidate_axis_open_tsv(path) as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                required_fields = {
+                    "library", "selected_supported_event_id",
+                    "selected_supported_event_proposal",
+                }
+                if not required_fields <= set(reader.fieldnames or ()):
+                    return False
+                for row in reader:
+                    match = re.fullmatch(
+                        r"(?:lib)?(\d+)",
+                        str(row.get("library", "")).strip(), flags=re.I)
+                    event_id = str(
+                        row.get("selected_supported_event_id", "")).strip()
+                    proposal = _canonical_identity(
+                        row.get("selected_supported_event_proposal", ""))
+                    if match and event_id and proposal:
+                        represented_keys.add((
+                            f"lib{int(match.group(1))}", event_id, proposal))
+        except (OSError, ValueError, csv.Error):
+            return False
+    return bool(expected_keys) and expected_keys <= represented_keys
+
+
 def _identity_worker_configure(args):
     global AUDIT_ROOT, HYBRID_ROOT, MT_FUSION_ROOT
     global IDENTITY_RECONCILIATION_ROOT, TETRA_REFINE_ROOT, PLOIDY_CALLS_ROOT
     global EXPECTED_POOL_METADATA, ALLOWED_IDENTITIES, PANEL_METADATA
     global DEMUX_OUTPUT_ROOT, CONDF_DIR, CONDF_PATHS
     global IDENTITY_AMBIENT_CANDIDATE_SET
+    configure_runtime_roots(args)
     AUDIT_ROOT = args.audit_root
     HYBRID_ROOT = args.hybrid_root
     MT_FUSION_ROOT = os.path.abspath(args.mt_output_root)
@@ -8034,6 +8866,18 @@ def identity_final_evidence_worker(payload):
     if data.get("reuse_only"):
         return identity_final_evidence_only_worker(args, lib_nums)
     condition = COND_BY_ABBREV[AMBIENT_PLOT_DEFAULT_CONDITION]
+    fill_missing = bool(data.get("fill_missing"))
+    fill_scope = {
+        int(value) for value in data.get("fill_scope_libraries", ())}
+    if fill_missing and not fill_scope:
+        raise ValueError(
+            "IDENTITY_RECONCILIATION_FILL_MISSING final-evidence planner "
+            "lacks its frozen repair-library scope")
+    out_of_scope = {}
+
+    def require_in_scope(lib_num, reason):
+        if fill_missing and int(lib_num) not in fill_scope:
+            out_of_scope.setdefault(int(lib_num), []).append(reason)
 
     eligible_axis = [
         lib_num for lib_num in lib_nums
@@ -8044,28 +8888,24 @@ def identity_final_evidence_worker(payload):
     completed_axis = (
         _identity_candidate_axis_outputs_complete(args, eligible_axis)
         if eligible_axis else False)
+    axis_libraries = []
     if eligible_axis and not completed_axis:
-        if os.path.lexists(candidate_axis_root):
+        if os.path.lexists(candidate_axis_root) and not fill_missing:
             raise ValueError(
                 "candidate-axis root exists but is incomplete or does not "
                 "contain every current finalized event/proposal key; use a "
                 "new empty --identity-candidate-axis-output-root instead of "
                 f"overwriting frozen evidence: {candidate_axis_root}")
-        score_jobs = []
-        for lib_num in eligible_axis:
-            pair_script = generate_identity_candidate_axis_pairs_script(
-                lib_num, args)
-            pair_job = submit_job(pair_script)
-            score_script = generate_identity_candidate_axis_score_script(
-                lib_num, args, [pair_job])
-            score_jobs.append(submit_job(score_script))
-        aggregate_script = generate_identity_candidate_axis_aggregate_script(
-            eligible_axis, args, score_jobs)
-        candidate_axis_aggregate_job = submit_job(aggregate_script)
-        print(
-            "IDENTITY_FINAL_EVIDENCE: candidate axis submitted for "
-            f"{len(eligible_axis)} event-bearing eligible libraries; "
-            f"aggregate job {candidate_axis_aggregate_job}")
+        axis_libraries = (
+            [
+                lib_num for lib_num in eligible_axis
+                if not _identity_candidate_axis_library_outputs_complete(
+                    lib_num, args)
+            ]
+            if fill_missing else eligible_axis
+        )
+        for lib_num in axis_libraries:
+            require_in_scope(lib_num, "candidate-axis scoring")
     elif eligible_axis:
         print(
             "IDENTITY_FINAL_EVIDENCE: reusing compatible completed candidate "
@@ -8078,8 +8918,10 @@ def identity_final_evidence_worker(payload):
 
     four_arm_root = ""
     four_arm_aggregate_job = None
+    four_arm_missing = {}
+    four_arm_bundle = None
+    four_arm_plot_missing = set()
     if event_libraries:
-        arm_jobs = []
         for lib_num in sorted(event_libraries):
             context = prepare_identity_ambient_comparison(
                 lib_num, candidate_set="applied")
@@ -8087,12 +8929,101 @@ def identity_final_evidence_worker(payload):
                 if (arm_key == "reconciled_replacement" and
                         not context["replacement_arm_eligible"]):
                     continue
-                if (not args.force and check_output_exists(
+                if (args.force or not check_output_exists(
                         lib_num, condition["abbrev"], arm_key)):
-                    print(
-                        "IDENTITY_FINAL_EVIDENCE: reusing compatible "
-                        f"four-arm output {arm_key}/lib{lib_num}")
-                    continue
+                    four_arm_missing.setdefault(lib_num, []).append(arm_key)
+                    require_in_scope(
+                        lib_num, f"four-arm ambient output {arm_key}")
+        four_arm_root = get_ambient_plot_run_dir(args, [condition])
+        bundle = ambient_generate_plot_job_bundle(
+            orchestrator_path=os.path.abspath(__file__),
+            mapping_root=get_demux_mapping_root(),
+            aggregate_root=AGGREGATE_ROOT,
+            plot_root=four_arm_root,
+            libraries=sorted(event_libraries),
+            conditions=[condition["abbrev"]],
+            assignment_sources=IDENTITY_AMBIENT_ARM_ORDER,
+            script_dir=get_script_dir(),
+            log_dir=os.path.join(
+                get_log_dir(), "IDENTITY_RECONCILIATION", "four_arm"),
+            partition=SLURM_PARTITION,
+            identity_ambient_candidate_set="applied",
+        )
+        four_arm_bundle = bundle
+        four_arm_plot_missing = _identity_four_arm_plot_outputs_missing(bundle)
+        four_arm_plot_missing.update(four_arm_missing)
+        for lib_num in four_arm_plot_missing:
+            require_in_scope(lib_num, "four-arm contam.R plots")
+    else:
+        print("IDENTITY_FINAL_EVIDENCE: all selected libraries are zero-event")
+
+    frozen_ambient_root = ""
+    frozen_ambient_aggregate_job = None
+    discovery = None
+    plans = {}
+    swap_profile_missing = set()
+    swap_arm_missing = set()
+    try:
+        discovery = discover_ambient_swap_events(args)
+    except ValueError as exc:
+        if "no supported exact-identity" not in str(exc):
+            raise
+        discovery = None
+    if discovery is not None:
+        for lib_num in lib_nums:
+            plan = prepare_ambient_swap_test_plan(
+                lib_num, args, discovery=discovery)
+            plans[lib_num] = plan
+            if not plan.get("applicable"):
+                continue
+            profile_complete = (
+                not args.force and
+                ambient_validation_profile_outputs_complete(plan))
+            arms_complete = (
+                profile_complete and not args.force and
+                ambient_swap_arm_outputs_complete(
+                    lib_num, condition, plan))
+            if not profile_complete:
+                swap_profile_missing.add(lib_num)
+                require_in_scope(lib_num, "controlled ambient profile")
+            if not arms_complete:
+                swap_arm_missing.add(lib_num)
+                require_in_scope(lib_num, "controlled ambient arms")
+
+    if out_of_scope:
+        detail = "; ".join(
+            f"lib{lib_num} ({', '.join(dict.fromkeys(reasons))})"
+            for lib_num, reasons in sorted(out_of_scope.items()))
+        scope_text = " ".join(f"lib{x}" for x in sorted(fill_scope))
+        raise ValueError(
+            "IDENTITY_RECONCILIATION_FILL_MISSING refused to expand beyond "
+            f"its frozen repair scope ({scope_text}). Current downstream "
+            "evidence is missing or incompatible for: " + detail + ". "
+            "Use the explicit IDENTITY_FINAL_EVIDENCE stage for an "
+            "intentional all-library evidence refresh.")
+
+    if eligible_axis and not completed_axis:
+        score_jobs = []
+        for lib_num in axis_libraries:
+            pair_script = generate_identity_candidate_axis_pairs_script(
+                lib_num, args)
+            pair_job = submit_job(pair_script)
+            score_script = generate_identity_candidate_axis_score_script(
+                lib_num, args, [pair_job])
+            score_jobs.append(submit_job(score_script))
+        aggregate_script = generate_identity_candidate_axis_aggregate_script(
+            eligible_axis, args, score_jobs)
+        candidate_axis_aggregate_job = submit_job(aggregate_script)
+        print(
+            "IDENTITY_FINAL_EVIDENCE: candidate axis submitted for "
+            f"{len(axis_libraries)} incomplete of {len(eligible_axis)} "
+            "event-bearing eligible libraries; "
+            f"aggregate job {candidate_axis_aggregate_job}")
+
+    if four_arm_bundle is not None:
+        four_arm_jobs = []
+        for lib_num, arm_keys in sorted(four_arm_missing.items()):
+            for arm_key in arm_keys:
                 out_prefix = get_contam_prefix(
                     lib_num, condition["abbrev"], arm_key)
                 stale_arm_output = any(
@@ -8110,83 +9041,58 @@ def identity_final_evidence_worker(payload):
                     lib_num, condition,
                     force=(args.force or stale_arm_output),
                     assignment_source=arm_key)
-                arm_jobs.append(submit_job(script))
-        four_arm_root = get_ambient_plot_run_dir(args, [condition])
-        bundle = ambient_generate_plot_job_bundle(
-            orchestrator_path=os.path.abspath(__file__),
-            mapping_root=get_demux_mapping_root(),
-            aggregate_root=AGGREGATE_ROOT,
-            plot_root=four_arm_root,
-            libraries=sorted(event_libraries),
-            conditions=[condition["abbrev"]],
-            assignment_sources=IDENTITY_AMBIENT_ARM_ORDER,
-            script_dir=get_script_dir(),
-            log_dir=os.path.join(
-                get_log_dir(), "IDENTITY_RECONCILIATION", "four_arm"),
-            partition=SLURM_PARTITION,
-            identity_ambient_candidate_set="applied",
-        )
-        submitted = ambient_submit_plot_job_bundle(
-            bundle, upstream_job_ids=arm_jobs, submit=True)
-        four_arm_aggregate_job = submitted["aggregate_job_id"]
+                four_arm_jobs.append(submit_job(script))
+        if four_arm_plot_missing:
+            four_arm_bundle = ambient_generate_plot_job_bundle(
+                orchestrator_path=os.path.abspath(__file__),
+                mapping_root=get_demux_mapping_root(),
+                aggregate_root=AGGREGATE_ROOT,
+                plot_root=four_arm_root,
+                libraries=sorted(event_libraries),
+                r_libraries=sorted(four_arm_plot_missing),
+                conditions=[condition["abbrev"]],
+                assignment_sources=IDENTITY_AMBIENT_ARM_ORDER,
+                script_dir=get_script_dir(),
+                log_dir=os.path.join(
+                    get_log_dir(), "IDENTITY_RECONCILIATION", "four_arm"),
+                partition=SLURM_PARTITION,
+                identity_ambient_candidate_set="applied",
+            )
+            four_arm_r_job = _ambient_submit_sbatch(
+                four_arm_bundle["r_sbatch"], four_arm_jobs)
+            four_arm_aggregate_job = _ambient_submit_sbatch(
+                four_arm_bundle["aggregate_sbatch"], [four_arm_r_job])
+        else:
+            four_arm_aggregate_job = _ambient_submit_sbatch(
+                four_arm_bundle["aggregate_sbatch"], four_arm_jobs)
         print(
-            "IDENTITY_FINAL_EVIDENCE: A/B/C and applicable D ambient work "
-            f"submitted for {len(event_libraries)} event-bearing libraries; "
+            "IDENTITY_FINAL_EVIDENCE: four-arm estimator jobs="
+            f"{len(four_arm_jobs)} plot_libraries="
+            f"{len(four_arm_plot_missing)} of {len(event_libraries)}; "
             f"aggregate job {four_arm_aggregate_job}")
-    else:
-        print("IDENTITY_FINAL_EVIDENCE: all selected libraries are zero-event")
 
-    frozen_ambient_root = ""
-    frozen_ambient_aggregate_job = None
-    try:
-        discovery = discover_ambient_swap_events(args)
-    except ValueError as exc:
-        if "no supported exact-identity" not in str(exc):
-            raise
-        discovery = None
-    if discovery is not None:
-        plans = {}
+    if discovery is not None and any(
+            plan.get("applicable") for plan in plans.values()):
         profile_jobs = {}
-        arm_jobs = []
-        for lib_num in lib_nums:
-            plan = prepare_ambient_swap_test_plan(
-                lib_num, args, discovery=discovery)
-            plans[lib_num] = plan
-            if not plan.get("applicable"):
-                continue
-            if (not args.force and
-                    ambient_validation_profile_outputs_complete(plan)):
-                print(
-                    "IDENTITY_FINAL_EVIDENCE: reusing compatible "
-                    f"ambient-swap profile lib{lib_num}")
-            else:
-                profile_script = generate_ambient_swap_profile_script(
-                    lib_num, plan, force=args.force)
-                profile_jobs[lib_num] = submit_job(profile_script)
-        for lib_num, plan in plans.items():
-            if not plan.get("applicable"):
-                continue
-            if (not args.force and
-                    ambient_validation_profile_outputs_complete(plan) and
-                    ambient_swap_arm_outputs_complete(
-                        lib_num, condition, plan)):
-                print(
-                    "IDENTITY_FINAL_EVIDENCE: reusing compatible "
-                    f"ambient-swap arms lib{lib_num}")
-                continue
+        for lib_num in sorted(swap_profile_missing):
+            profile_script = generate_ambient_swap_profile_script(
+                lib_num, plans[lib_num], force=args.force)
+            profile_jobs[lib_num] = submit_job(profile_script)
+        swap_arm_jobs = []
+        for lib_num in sorted(swap_arm_missing):
             arm_script = generate_ambient_swap_arm_script(
-                lib_num, condition, plan,
+                lib_num, condition, plans[lib_num],
                 dep_job_id=profile_jobs.get(lib_num), force=args.force)
-            arm_jobs.append(submit_job(arm_script))
-        if any(plan.get("applicable") for plan in plans.values()):
-            bundle = generate_ambient_swap_aggregate_script(
-                args, [condition], plans, discovery, arm_job_ids=arm_jobs)
-            frozen_ambient_root = bundle["output_root"]
-            frozen_ambient_aggregate_job = submit_job(bundle["script"])
-            print(
-                "IDENTITY_FINAL_EVIDENCE: controlled same-profile current/"
-                "proposal ambient work submitted; aggregate job "
-                f"{frozen_ambient_aggregate_job}")
+            swap_arm_jobs.append(submit_job(arm_script))
+        bundle = generate_ambient_swap_aggregate_script(
+            args, [condition], plans, discovery,
+            arm_job_ids=swap_arm_jobs)
+        frozen_ambient_root = bundle["output_root"]
+        frozen_ambient_aggregate_job = submit_job(bundle["script"])
+        print(
+            "IDENTITY_FINAL_EVIDENCE: controlled ambient profile jobs="
+            f"{len(profile_jobs)} arm jobs={len(swap_arm_jobs)}; "
+            f"aggregate job {frozen_ambient_aggregate_job}")
 
     dependencies = [
         job for job in (
@@ -8204,7 +9110,8 @@ def identity_final_evidence_worker(payload):
 
 
 def generate_identity_final_evidence_planner_script(
-        lib_nums, args, dep_job_ids=None, reuse_only=False):
+        lib_nums, args, dep_job_ids=None, reuse_only=False,
+        fill_missing=False, fill_scope_libraries=None):
     worker_args = dict(vars(args))
     if args.identity_evidence_mode == "rna":
         for field in (
@@ -8216,6 +9123,9 @@ def generate_identity_final_evidence_planner_script(
         "libraries": list(lib_nums),
         "args": worker_args,
         "reuse_only": bool(reuse_only),
+        "fill_missing": bool(fill_missing),
+        "fill_scope_libraries": [
+            int(value) for value in (fill_scope_libraries or ())],
     }, sort_keys=True, separators=(",", ":"))
     stage_name = (
         "IDENTITY_FINAL_EVIDENCE_ONLY" if reuse_only
@@ -9053,7 +9963,8 @@ def ambient_validation_profile_outputs_complete(plan):
     except (OSError, TypeError, ValueError):
         return False
     return (
-        successful_starts >= AMBIENT_VALIDATION_PROFILE_STARTS and
+        successful_starts >=
+        AMBIENT_VALIDATION_PROFILE_MIN_SUCCESSFUL_STARTS and
         metrics.get("bulk_log_likelihood_valid", "").lower() == "true"
     )
 
@@ -9175,8 +10086,17 @@ awk '
 
 test -s "{plan['fixed_profile']}"
 test -s "{plan['fixed_diagnostics']}"
-awk -F '\t' '$1 == "profile_starts_successful" && $2 >= {AMBIENT_VALIDATION_PROFILE_STARTS} {{ok=1}} END {{exit !ok}}' \
-  "{plan['fixed_diagnostics']}"
+profile_starts_successful=$(awk -F '\t' \
+  '$1 == "profile_starts_successful" {{print int($2); exit}}' \
+  "{plan['fixed_diagnostics']}")
+if [[ -z "$profile_starts_successful" ]] || \
+   (( profile_starts_successful < {AMBIENT_VALIDATION_PROFILE_MIN_SUCCESSFUL_STARTS} )); then
+    echo "ERROR: no successful ambient-profile optimization start was recorded" >&2
+    exit 1
+fi
+if (( profile_starts_successful < {AMBIENT_VALIDATION_PROFILE_STARTS} )); then
+    echo "WARNING: ambient profile completed with $profile_starts_successful of {AMBIENT_VALIDATION_PROFILE_STARTS} requested starts; using the best successful fit" >&2
+fi
 echo "AMBIENT_VALIDATE fixed profile complete for lib{lib_num}"
 '''
     _ambient_write_text(script_path, script, executable=True)
@@ -9663,7 +10583,8 @@ python3 "{os.path.abspath(__file__)}" --_ambient-plots-worker "{spec_path}"
 test -s "{os.path.join(output_root, 'fixed_profile_validation_summary.json')}"
 test -d "{os.path.join(output_root, 'figures')}"
 python3 "{os.path.abspath(__file__)}" --_publish-figure-shortcut \
-  ambient_validation "{os.path.join(output_root, 'figures')}"
+  ambient_validation "{os.path.join(output_root, 'figures')}" \
+  "{os.path.abspath(AGGREGATE_ROOT)}"
 '''
     os.makedirs(log_dir, exist_ok=True)
     _ambient_write_text(script_path, script, executable=True)
@@ -9752,8 +10673,17 @@ awk '
 
 test -s "{plan['fixed_profile']}"
 test -s "{plan['fixed_diagnostics']}"
-awk -F '\t' '$1 == "profile_starts_successful" && $2 >= {AMBIENT_VALIDATION_PROFILE_STARTS} {{ok=1}} END {{exit !ok}}' \
-  "{plan['fixed_diagnostics']}"
+profile_starts_successful=$(awk -F '\t' \
+  '$1 == "profile_starts_successful" {{print int($2); exit}}' \
+  "{plan['fixed_diagnostics']}")
+if [[ -z "$profile_starts_successful" ]] || \
+   (( profile_starts_successful < {AMBIENT_VALIDATION_PROFILE_MIN_SUCCESSFUL_STARTS} )); then
+    echo "ERROR: no successful ambient-profile optimization start was recorded" >&2
+    exit 1
+fi
+if (( profile_starts_successful < {AMBIENT_VALIDATION_PROFILE_STARTS} )); then
+    echo "WARNING: ambient profile completed with $profile_starts_successful of {AMBIENT_VALIDATION_PROFILE_STARTS} requested starts; using the best successful fit" >&2
+fi
 echo "AMBIENT_SWAP_TEST fixed profile complete for lib{lib_num}"
 '''
     _ambient_write_text(script_path, script, executable=True)
@@ -10095,7 +11025,7 @@ PY
 test -s "{output_root}/ambient_swap_figure_summary.json"
 test -s "{output_root}/data/ambient_swap_figure_manifest.tsv"
 python3 "{os.path.abspath(__file__)}" --_publish-figure-shortcut \
-  ambient_swap_test "{output_root}"
+  ambient_swap_test "{output_root}" "{os.path.abspath(AGGREGATE_ROOT)}"
 '''
     os.makedirs(log_dir, exist_ok=True)
     _ambient_write_text(script_path, script, executable=True)
@@ -10134,7 +11064,7 @@ def _cleanup_profile_rank(generation):
                         metrics[row[0]] = row[1]
             valid_profile = (
                 int(float(metrics.get("profile_starts_successful", "0"))) >=
-                AMBIENT_VALIDATION_PROFILE_STARTS and
+                AMBIENT_VALIDATION_PROFILE_MIN_SUCCESSFUL_STARTS and
                 metrics.get("bulk_log_likelihood_valid", "").lower() ==
                 "true")
         except (OSError, TypeError, ValueError):
@@ -11296,6 +12226,8 @@ def gex_run_cluster_intersection_worker(spec_path):
     mex_barcodes = set(mex_barcode_list)
 
     valid_rates = set()
+    seen_rate_barcodes = set()
+    boundary_rate_rows = 0
     invalid_rate_rows = 0
     duplicate_rate_rows = 0
     with open(spec["contam_rate"], "r", encoding="utf-8",
@@ -11311,12 +12243,22 @@ def gex_run_cluster_intersection_worker(spec_path):
             except ValueError:
                 invalid_rate_rows += 1
                 continue
-            if not math.isfinite(rate) or not 0.0 <= rate < 1.0:
+            if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
                 invalid_rate_rows += 1
                 continue
             barcode = canonical(fields[0])
-            if barcode in valid_rates:
+            if barcode in seen_rate_barcodes:
                 duplicate_rate_rows += 1
+                continue
+            seen_rate_barcodes.add(barcode)
+            if rate == 1.0:
+                # A supported upper-boundary contamination fit has no
+                # endogenous RNA contribution. It is valid estimator output,
+                # but cannot inform cluster-specific expression. Exclude the
+                # cell from the exact GEX MEX subset and retain the exclusion
+                # count in input QC rather than aborting the whole library.
+                boundary_rate_rows += 1
+                continue
             valid_rates.add(barcode)
 
     source_clusters = {}
@@ -11345,7 +12287,7 @@ def gex_run_cluster_intersection_worker(spec_path):
     if invalid_rate_rows or duplicate_rate_rows:
         raise RuntimeError(
             "contamination-rate input must contain unique barcodes and finite "
-            f"rates in [0,1); invalid={invalid_rate_rows}, "
+            f"rates in [0,1]; invalid={invalid_rate_rows}, "
             f"duplicates={duplicate_rate_rows}")
 
     eligible = {
@@ -11503,6 +12445,8 @@ def gex_run_cluster_intersection_worker(spec_path):
              "value": sum(barcode not in mex_barcodes for barcode in source_clusters)},
             {"metric": "source_clusters_missing_valid_contam_rate",
              "value": sum(barcode not in valid_rates for barcode in source_clusters)},
+            {"metric": "boundary_contam_rate_rows_excluded",
+             "value": boundary_rate_rows},
             {"metric": "invalid_contam_rate_rows", "value": invalid_rate_rows},
             {"metric": "duplicate_contam_rate_rows", "value": duplicate_rate_rows},
         ] + [
@@ -11909,8 +12853,8 @@ def ambient_add_internal_worker_argument(parser):
     )
     parser.add_argument(
         "--_publish-figure-shortcut",
-        nargs=2,
-        metavar=("ANALYSIS", "TARGET"),
+        nargs="+",
+        metavar="ARG",
         default=None,
         help=argparse.SUPPRESS,
     )
@@ -11920,6 +12864,10 @@ def ambient_maybe_run_internal_worker(args):
     """Run the hidden worker and return True when normal main must stop."""
     publish_request = getattr(args, "_publish_figure_shortcut", None)
     if publish_request:
+        if len(publish_request) not in (2, 3):
+            raise ValueError(
+                "--_publish-figure-shortcut requires ANALYSIS TARGET "
+                "[ACTIVE_AGGREGATE_ROOT]")
         publish_figure_shortcut(*publish_request)
         return True
     cleanup_spec = getattr(args, "_cleanup_results_worker", None)
@@ -12023,6 +12971,7 @@ def ambient_generate_plot_job_bundle(
     aggregate_root,
     plot_root=None,
     libraries,
+    r_libraries=None,
     conditions=None,
     assignment_sources=("demux",),
     script_dir,
@@ -12050,12 +12999,21 @@ def ambient_generate_plot_job_bundle(
     and ``aggregate_sbatch``.  It does not submit anything.
     """
     libraries = _ambient_unique(int(x) for x in libraries)
+    r_libraries = _ambient_unique(
+        int(x) for x in (libraries if r_libraries is None else r_libraries))
     conditions = _ambient_unique(
         str(x) for x in (conditions or [AMBIENT_PLOT_DEFAULT_CONDITION])
     )
     assignment_sources = _ambient_unique(str(x) for x in assignment_sources)
     if not libraries:
         raise ValueError("AMBIENT_PLOTS needs at least one library")
+    if not r_libraries:
+        raise ValueError("AMBIENT_PLOTS needs at least one R-task library")
+    unknown_r_libraries = sorted(set(r_libraries) - set(libraries))
+    if unknown_r_libraries:
+        raise ValueError(
+            "AMBIENT_PLOTS R-task libraries must be a subset of aggregate "
+            f"libraries, got {unknown_r_libraries}")
     if not conditions:
         raise ValueError("AMBIENT_PLOTS needs at least one condition")
     valid_assignment_sources = set(CONTAM_ASSIGNMENT_SOURCES) | set(
@@ -12199,7 +13157,7 @@ def ambient_generate_plot_job_bundle(
         "\tcondition_slug\tprimary_prefix"
         "\tcompat_prefix\tdemux_prefix\toutput_prefix"
     ]
-    for library in libraries:
+    for library in r_libraries:
         for item in series:
             condition = item["condition"]
             assignment_source = item["assignment_source"]
@@ -12482,7 +13440,8 @@ test -s {_ambient_shell(os.path.join(plot_root, 'kde', f'kde_all_libraries.{vali
 ] if four_arm_mode else []))}
 test -s {_ambient_shell(os.path.join(data_dir, 'plot_manifest.tsv'))}
 python3 {_ambient_shell(orchestrator_path)} --_publish-figure-shortcut \
-  ambient_plots {_ambient_shell(plot_root)}
+  ambient_plots {_ambient_shell(plot_root)} \
+  {_ambient_shell(os.path.abspath(aggregate_root))}
 echo "AMBIENT_PLOTS aggregate outputs validated: {plot_root}"
 '''
     _ambient_write_text(aggregate_script_path, aggregate_script, executable=True)
@@ -15486,7 +16445,7 @@ def ambient_run_python_plot_worker(spec_path):
 # Diagnostics
 # =============================================================================
 
-def diagnose(libs, cond_list, condition_selection_label):
+def diagnose(libs, cond_list, condition_selection_label, het_enabled=False):
     """Print per-library status report for all requested conditions.
 
     Shows which upstream files exist and which conditions are ready/done/blocked.
@@ -15502,6 +16461,9 @@ def diagnose(libs, cond_list, condition_selection_label):
     # CONDF stage: check condf files
     print("--- Stage 1 CONDF: .condf files ---")
     for key, path in CONDF_PATHS.items():
+        if key == "interindiv_het_10M" and not het_enabled:
+            print(f"  ↪ {key}: disabled (default; use --with-het-vcf)")
+            continue
         status = "✅" if check_file_exists(path) else "❌"
         print(f"  {status} {key}: {path}")
     print()
@@ -15638,6 +16600,25 @@ def parse_library_range(spec):
         else:
             libs.append(int(item))
     return sorted(set(libs))
+
+
+def parse_demux_thread_overrides(spec):
+    """Parse repeated LIB:THREADS values into an explicit per-library map."""
+    overrides = {}
+    for raw in spec or []:
+        match = re.fullmatch(r"([0-9]+):([0-9]+)", raw.strip())
+        if not match:
+            raise ValueError(
+                f"invalid DEMUX thread override {raw!r}; expected LIB:THREADS")
+        library = int(match.group(1))
+        threads = int(match.group(2))
+        if library not in LIB_INFO:
+            raise ValueError(f"unknown library in DEMUX thread override: {library}")
+        if threads < 2:
+            raise ValueError(
+                f"DEMUX thread override for lib{library} must be at least 2")
+        overrides[library] = threads
+    return overrides
 
 
 def _candidate_axis_preflight(lib_nums, args):
@@ -15797,6 +16778,11 @@ def preflight_validate(lib_nums, cond_list, stages, args=None):
 
     Returns (ok, failures) where failures is a list of strings.
     """
+    if set(stages) == {IDENTITY_READINESS_STAGE}:
+        return True, []
+    if set(stages) == {IDENTITY_FILL_MISSING_STAGE}:
+        return preflight_validate(
+            lib_nums, cond_list, {"IDENTITY_RECONCILIATION"}, args=args)
     if set(stages) == {CANDIDATE_AXIS_STAGE}:
         return _candidate_axis_preflight(lib_nums, args)
     failures = []
@@ -15911,7 +16897,7 @@ def preflight_validate(lib_nums, cond_list, stages, args=None):
                 if ".pileup_molecules.tsv.gz" not in help_text:
                     failures.append(
                         "Molecule-aware identity scoring after DEMUX requires "
-                        "the supplied demux_parallel v2.15 build")
+                        "a demux_parallel build with molecule-sidecar support")
             except (OSError, subprocess.SubprocessError) as exc:
                 failures.append(
                     "could not verify demux_parallel molecule-sidecar "
@@ -16073,7 +17059,11 @@ def preflight_validate(lib_nums, cond_list, stages, args=None):
             except (OSError, subprocess.SubprocessError) as exc:
                 failures.append(
                     f"Could not verify managed vcf_loader_daemon capabilities: {exc}")
-        for key, path in VCF_SOURCE_PATHS.items():
+        required_daemon_sources = {
+            key: path for key, path in VCF_SOURCE_PATHS.items()
+            if key != "interindiv_het_10M" or args.het_enabled
+        }
+        for key, path in required_daemon_sources.items():
             if not check_file_exists(path):
                 failures.append(f"Managed VCF daemon source missing ({key}): {path}")
         if not get_vcf_daemon_nodes():
@@ -16133,7 +17123,8 @@ def preflight_validate(lib_nums, cond_list, stages, args=None):
             else "IDENTITY_FINAL_EVIDENCE_ONLY")
         for helper_name in (
                 "identity_reconciliation.py",
-                "identity_reconciliation_common.py"):
+                "identity_reconciliation_common.py",
+                "validate_identity_reconciliation.py"):
             helper = resolve_process_script(helper_name)
             if not os.path.isfile(helper):
                 failures.append(
@@ -16635,20 +17626,22 @@ def preflight_validate(lib_nums, cond_list, stages, args=None):
                 if "IDENTITY_FINAL_EVIDENCE" in stages else
                 "IDENTITY_SCORE")
             prefix = get_demux_prefix(lib_num)
-            for ext in (".counts", ".samples", ".assignments"):
-                path = prefix + ext
-                if not check_file_exists(path):
-                    failures.append(
-                        f"lib{lib_num}: {identity_stage_label} core demux input missing: {path}")
+            demux_core_generated_upstream = "DEMUX" in stages
+            if not demux_core_generated_upstream:
+                for ext in (".counts", ".samples", ".assignments"):
+                    path = prefix + ext
+                    if not check_file_exists(path):
+                        failures.append(
+                            f"lib{lib_num}: {identity_stage_label} core demux input missing: {path}")
             for ext in (".pileup_sites.tsv.gz", ".pileup_obs.tsv.gz"):
                 path = prefix + ext
-                produced_by_forced_demux = (
-                    "DEMUX" in stages and args.force and
+                produced_by_selected_demux = (
+                    "DEMUX" in stages and
                     not args.individual_only_demux)
-                if not produced_by_forced_demux and not check_file_exists(path):
+                if not produced_by_selected_demux and not check_file_exists(path):
                     failures.append(
                         f"lib{lib_num}: {identity_stage_label} nuclear pileup missing: "
-                        f"{path} (generate with forced full DEMUX)")
+                        f"{path} (generate with full DEMUX)")
 
         if "IDENTITY_FINAL_EVIDENCE_ONLY" in stages:
             selected_inputs = {
@@ -16687,7 +17680,10 @@ def preflight_validate(lib_nums, cond_list, stages, args=None):
         if "IDENTITY_RECONCILIATION" in stages:
             prefix = get_demux_prefix(lib_num)
             diagnostics = prefix + ".diagnostics.gz"
-            if not check_file_exists(diagnostics):
+            diagnostics_generated_upstream = (
+                "DEMUX" in stages and not args.individual_only_demux)
+            if (not diagnostics_generated_upstream and
+                    not check_file_exists(diagnostics)):
                 failures.append(
                     f"lib{lib_num}: IDENTITY_RECONCILIATION demux diagnostics missing: "
                     f"{diagnostics}")
@@ -16863,6 +17859,11 @@ def run(args):
     global MANAGE_VCF_DAEMONS, MANAGED_VCF_RUN_ID, MANAGED_VCF_READY_FILE
     global CONDF_DIR, CONDF_PATHS, PANEL_METADATA, DEMUX_OUTPUT_ROOT
     global IDENTITY_AMBIENT_CANDIDATE_SET
+    try:
+        configure_runtime_roots(args)
+    except ValueError as exc:
+        print(f"❌ Invalid mapping/analysis root configuration: {exc}")
+        sys.exit(1)
     AUDIT_ROOT = args.audit_root
     HYBRID_ROOT = args.hybrid_root
     MT_FUSION_ROOT = os.path.abspath(args.mt_output_root)
@@ -16890,6 +17891,8 @@ def run(args):
     SHARED_VCF["interindiv_het_10M"] = args.shared_het_segment
     DAEMON_NODELIST = args.daemon_nodes.strip()
     MANAGE_VCF_DAEMONS = bool(args.manage_vcf_daemons)
+    het_enabled = bool(args.with_het_vcf and not args.individual_only_demux)
+    args.het_enabled = het_enabled
     if args.refine_contam_condition == "":
         args.refine_contam_condition = None
     if args.ploidy_nn_module == "":
@@ -16922,6 +17925,33 @@ def run(args):
     if bad_libs:
         print(f"❌ Unknown library numbers: {bad_libs}")
         print(f"   Valid range: 1-40")
+        sys.exit(1)
+
+    try:
+        demux_thread_overrides = parse_demux_thread_overrides(
+            args.demux_thread_override)
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        sys.exit(1)
+    try:
+        resume_failed_demux_libs = set(parse_library_range(
+            args.resume_failed_demux_libraries))
+    except (TypeError, ValueError) as exc:
+        print(f"❌ Invalid --resume-failed-demux-libraries value: {exc}")
+        sys.exit(1)
+    unselected_resume_libraries = sorted(
+        resume_failed_demux_libs - set(lib_nums))
+    if unselected_resume_libraries:
+        print(
+            "❌ Raw DEMUX recovery requested for an unselected library: "
+            + ", ".join(
+                f"lib{library}" for library in unselected_resume_libraries))
+        sys.exit(1)
+    unselected_thread_overrides = sorted(set(demux_thread_overrides) - set(lib_nums))
+    if unselected_thread_overrides:
+        print(
+            "❌ DEMUX thread override supplied for an unselected library: "
+            + ", ".join(f"lib{library}" for library in unselected_thread_overrides))
         sys.exit(1)
 
     # Resolve conditions. Explicit --conditions wins. Otherwise use the named
@@ -16978,7 +18008,7 @@ def run(args):
     # Resolve stages
     if args.stage:
         stages = {stage.strip() for stage in args.stage.upper().split(",") if stage.strip()}
-        valid_stages = {"CLEANUP_RESULTS", "CONDF", "DEMUX", "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"}
+        valid_stages = {"CLEANUP_RESULTS", "CONDF", "DEMUX", "ATAC_DEMUX", "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, IDENTITY_READINESS_STAGE, IDENTITY_FILL_MISSING_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"}
         bad_stages = stages - valid_stages
         if bad_stages:
             print(f"❌ Unknown stages: {bad_stages}. Valid: {', '.join(sorted(valid_stages))}")
@@ -16988,8 +18018,23 @@ def run(args):
         if any(c.get("needs_empty_drops") for c in cond_list):
             stages.add("EMPTY_DROPS")
 
+    if "ATAC_DEMUX" in stages:
+        if stages != {"ATAC_DEMUX"}:
+            print("❌ ATAC_DEMUX is an isolated standalone stage.")
+            sys.exit(1)
+        return run_atac_demux(args, lib_nums)
+
     if args.skip_demux:
         stages.discard("DEMUX")
+
+    if resume_failed_demux_libs and "DEMUX" not in stages:
+        print(
+            "❌ --resume-failed-demux-libraries requires DEMUX in --stage")
+        sys.exit(1)
+
+    if args.demux_filtered_threads < 2:
+        print("❌ --demux-threads must be at least 2")
+        sys.exit(1)
 
     # A dedicated CONDF refresh must not force downstream stages.  It simply
     # ensures Stage 1 is included and rebuilds all central CONDF artifacts.
@@ -17031,6 +18076,16 @@ def run(args):
             stages = {"IDENTITY_RECONCILE_ONLY"}
     if "IDENTITY_RECONCILE_ONLY" in stages:
         stages.discard("IDENTITY_RECONCILIATION")
+    if IDENTITY_READINESS_STAGE in stages and stages != {IDENTITY_READINESS_STAGE}:
+        print(f"❌ {IDENTITY_READINESS_STAGE} is a standalone audit stage.")
+        sys.exit(1)
+    if IDENTITY_FILL_MISSING_STAGE in stages and stages != {IDENTITY_FILL_MISSING_STAGE}:
+        print(f"❌ {IDENTITY_FILL_MISSING_STAGE} is a standalone repair stage.")
+        sys.exit(1)
+    if IDENTITY_FILL_MISSING_STAGE in stages and not args.identity_candidate_axis_output_root:
+        args.identity_candidate_axis_output_root = os.path.join(
+            os.path.abspath(args.identity_reconciliation_root),
+            "candidate_axis")
     if "IDENTITY_RECONCILIATION" in stages:
         # The routine reconciliation graph owns its frozen candidate-axis and
         # ambient evidence tail. Legacy probability scoring remains explicit.
@@ -17196,6 +18251,13 @@ def run(args):
             sys.exit(1)
         stages.add("IDENTITY_RECONCILIATION")
 
+    # These are the only resolved stages in this orchestrator that generate
+    # commands consuming the nuclear DEMUX pileup sidecars. Force controls
+    # recounting but is deliberately not itself a pileup request.
+    demux_pileup_required = bool(
+        {"IDENTITY_SCORE", "IDENTITY_RECONCILIATION"} & stages)
+    args.demux_pileup_required = demux_pileup_required
+
     daemon_stages_selected = bool({"CONDF", "DEMUX"} & stages)
     if MANAGE_VCF_DAEMONS and daemon_stages_selected:
         try:
@@ -17227,7 +18289,9 @@ def run(args):
 
     # Diagnose-only mode
     if args.diagnose_only:
-        diagnose(lib_nums, cond_list, condition_selection_label)
+        diagnose(
+            lib_nums, cond_list, condition_selection_label,
+            het_enabled=het_enabled)
         return
 
     # Pre-flight validation (runs by default, skip with --skip-validation)
@@ -17299,21 +18363,47 @@ def run(args):
             "H proposed/fixed-profile, J original/joint-profile, "
             "K proposed/joint-profile")
         print(f"  Candidate discovery: {get_identity_event_path(args)}")
-    stage_order = ["CONDF", "DEMUX", "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"]
+    stage_order = ["CONDF", "DEMUX", "ATAC_DEMUX", "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, IDENTITY_READINESS_STAGE, IDENTITY_FILL_MISSING_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"]
     stages_display = [s for s in stage_order if s in stages]
     print(f"  Stages: {', '.join(stages_display)}")
-    print(f"  Submit: {'YES' if args.submit else 'DRY RUN'}")
+    if IDENTITY_READINESS_STAGE in stages:
+        print("  Submit: NOT APPLICABLE (readiness audit)")
+    else:
+        print(f"  Submit: {'YES' if args.submit else 'DRY RUN'}")
     print(f"  Force all selected stages: {'YES' if args.force else 'no'}")
     print(f"  Regenerate CONDF: {'YES' if args.regenerate_condf else 'no'}")
     print(f"  Individual-only DEMUX: {'enabled' if args.individual_only_demux else 'disabled'}")
+    if resume_failed_demux_libs:
+        print(
+            "  Raw DEMUX recovery libraries: "
+            + ", ".join(
+                f"lib{library}"
+                for library in sorted(resume_failed_demux_libs)))
     print(
         "  HET VCF panel in DEMUX: "
-        + ("disabled" if (args.skip_het_vcf or args.individual_only_demux) else "enabled")
+        + ("enabled (explicit opt-in)" if het_enabled else "disabled")
     )
+    if "DEMUX" in stages:
+        print(
+            "  Default DEMUX threads: "
+            f"{args.demux_filtered_threads} (fused dense/sparse mode)"
+        )
+        if demux_thread_overrides:
+            print(
+                "  Per-library DEMUX thread overrides: "
+                + ", ".join(
+                    f"lib{library}:{threads}"
+                    for library, threads in sorted(demux_thread_overrides.items())))
     print(
-        "  Species/raw/pileup DEMUX extras: "
-        + ("disabled" if args.individual_only_demux else "normal production behavior")
-    )
+        "  DEMUX pileup sidecars: "
+        + ("required by selected identity stage" if demux_pileup_required else
+           "not requested"))
+    print(f"  Mapping input root: {BEEGFS_ROOT}")
+    print(
+        "  Analysis output root: "
+        + (args.analysis_output_root if args.analysis_output_root else
+           "production/default layout"))
+    print(f"  Aggregate analysis root: {AGGREGATE_ROOT}")
     print(
         "  DEMUX output root: "
         + (DEMUX_OUTPUT_ROOT if DEMUX_OUTPUT_ROOT else
@@ -17322,17 +18412,24 @@ def run(args):
     print(f"  CONDF directory: {CONDF_DIR}")
     print(f"  Panel metadata: {PANEL_METADATA}")
     print(f"  NoMito individual VCF source: {VCF_SOURCE_PATHS['interindiv_20M']}")
-    print(f"  NoMito HET VCF source: {VCF_SOURCE_PATHS['interindiv_het_10M']}")
+    print(
+        "  NoMito HET VCF source: "
+        + (VCF_SOURCE_PATHS["interindiv_het_10M"] if het_enabled else
+           "disabled"))
     print(f"  NoMito species VCF source: {VCF_SOURCE_PATHS['species_20M']}")
     if daemon_stages_selected:
         if MANAGE_VCF_DAEMONS:
             print(f"  VCF daemon lifecycle: orchestrator-managed run {MANAGED_VCF_RUN_ID}")
             print(f"  Managed main segment: {SHARED_VCF['interindiv_20M']}")
-            print(f"  Managed HET segment: {SHARED_VCF['interindiv_het_10M']}")
+            print(
+                "  Managed HET segment: "
+                + (SHARED_VCF["interindiv_het_10M"] if het_enabled else
+                   "disabled"))
             print(f"  Managed species segment: {SHARED_VCF['species_20M']}")
         else:
             print("  VCF daemon lifecycle: externally managed")
     if ({"IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", "IDENTITY_RECONCILIATION",
+         IDENTITY_READINESS_STAGE, IDENTITY_FILL_MISSING_STAGE,
          "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY",
          "IDENTITY_FINALIZE_ONLY",
          "IDENTITY_RECONCILE_ONLY"} & stages):
@@ -17351,6 +18448,13 @@ def run(args):
             print(
                 "  Final evidence: frozen candidate axis plus controlled and "
                 "four-arm ambient comparisons")
+        if IDENTITY_READINESS_STAGE in stages:
+            print("  Readiness audit: all required per-library inputs, evidence, ambient output, and canonical products")
+        if IDENTITY_FILL_MISSING_STAGE in stages:
+            print("  Fill-missing: run absent production ambient/evidence, then rebuild the complete selected-library ledger")
+            print(
+                "  Completion candidate axis: "
+                f"{args.identity_candidate_axis_output_root}")
         if "IDENTITY_FINAL_EVIDENCE" in stages:
             print(
                 "  Final-evidence resume: reuse completed reconciliation and "
@@ -17579,14 +18683,19 @@ def run(args):
         print()
 
     condf_force = args.force or args.regenerate_condf
+    active_condf_keys = [
+        key for key in CONDF_PATHS
+        if key != "interindiv_het_10M" or het_enabled]
     condf_work_planned = (
         "CONDF" in stages and any(
-            condf_force or not check_file_exists(path)
-            for path in CONDF_PATHS.values()))
+            condf_force or not check_file_exists(CONDF_PATHS[key])
+            for key in active_condf_keys))
     demux_work_planned = (
         "DEMUX" in stages and any(
-            (args.force or not demux_outputs_complete(
-                lib_num, individual_only=args.individual_only_demux)) and
+            (args.force or lib_num in resume_failed_demux_libs or
+             not demux_outputs_complete(
+                lib_num, individual_only=args.individual_only_demux,
+                require_pileup=demux_pileup_required)) and
             check_file_exists(get_bam_path(lib_num))
             for lib_num in lib_nums))
     vcf_service_needed = bool(
@@ -17605,7 +18714,8 @@ def run(args):
             os.unlink(sentinel)
         for node in get_vcf_daemon_nodes():
             holder_script = generate_vcf_daemon_holder_script(
-                node, reference_bam, MANAGED_VCF_RUN_ID)
+                node, reference_bam, MANAGED_VCF_RUN_ID,
+                include_het=het_enabled)
             generated.append(("VCF_DAEMON_HOLDER", node, holder_script))
             print(f"  Generated holder: {node}")
             if args.submit:
@@ -17635,6 +18745,11 @@ def run(args):
     if "CONDF" in stages:
         print("--- Stage 1 CONDF: .condf generation ---")
         for vcf_key in CONDF_PATHS:
+            if vcf_key == "interindiv_het_10M" and not het_enabled:
+                print(
+                    "  ↪ interindiv_het_10M: disabled "
+                    "(default; use --with-het-vcf)")
+                continue
             if check_file_exists(CONDF_PATHS[vcf_key]) and not condf_force:
                 print(f"  ✅ {vcf_key}: already exists, skipping")
                 continue
@@ -17658,8 +18773,10 @@ def run(args):
             # Match the generated job's complete bundle contract so a partial
             # run cannot be skipped on the login node.
             demux_done = demux_outputs_complete(
-                lib_num, individual_only=args.individual_only_demux)
-            if demux_done and not args.force:
+                lib_num, individual_only=args.individual_only_demux,
+                require_pileup=demux_pileup_required)
+            resume_failed_raw = lib_num in resume_failed_demux_libs
+            if demux_done and not args.force and not resume_failed_raw:
                 print(f"  ✅ lib{lib_num}: demux outputs exist, skipping")
                 continue
 
@@ -17670,10 +18787,15 @@ def run(args):
                 continue
 
             dep_ids = condf_job_ids if condf_job_ids else None
+            demux_threads = demux_thread_overrides.get(
+                lib_num, args.demux_filtered_threads)
             script_path = generate_demux_script(
                 lib_num, condf_job_ids=dep_ids, force=args.force,
-                use_het_vcf=not args.skip_het_vcf,
-                individual_only=args.individual_only_demux)
+                het_enabled=het_enabled,
+                individual_only=args.individual_only_demux,
+                filtered_threads=demux_threads,
+                resume_failed_raw=resume_failed_raw,
+                require_pileup=demux_pileup_required)
             generated.append(("DEMUX", f"lib{lib_num}", script_path))
             print(f"  Generated: lib{lib_num}")
 
@@ -18447,14 +19569,198 @@ def run(args):
                 f"{identity_probability_aggregate_job_id}")
         print()
 
+    # ---- Stage 8f IDENTITY_RECONCILIATION_READINESS: all-library audit ----
+    if IDENTITY_READINESS_STAGE in stages:
+        print("--- IDENTITY_RECONCILIATION_READINESS: audit selected libraries ---")
+        identity_reconciliation_readiness(lib_nums, args, write_report=True)
+        print()
+
+    # ---- Stage 8g IDENTITY_RECONCILIATION_FILL_MISSING: incremental repair ----
+    if IDENTITY_FILL_MISSING_STAGE in stages:
+        print("--- IDENTITY_RECONCILIATION_FILL_MISSING: repair incomplete libraries and rebuild selected-library ledger ---")
+        readiness_rows = identity_reconciliation_readiness(
+            lib_nums, args, write_report=True)
+        blocked_rows = [
+            row for row in readiness_rows if not int(row["upstream_ready"])]
+        if blocked_rows:
+            detail = "; ".join(
+                f"{row['library']} ({row['missing_items']})"
+                for row in blocked_rows)
+            raise ValueError(
+                "IDENTITY_RECONCILIATION_FILL_MISSING cannot repair missing "
+                "demux/ploidy/posthoc prerequisites: " + detail)
+
+        incomplete_rows = [
+            row for row in readiness_rows
+            if row["overall_status"] != "READY"]
+        if not incomplete_rows:
+            print(
+                "  All selected libraries already satisfy the complete "
+                "reconciliation contract; no jobs submitted.")
+        else:
+            ambient_libs = [
+                int(row["library"].removeprefix("lib"))
+                for row in readiness_rows
+                if not int(row["production_ambient_complete"])]
+            evidence_libs = [
+                int(row["library"].removeprefix("lib"))
+                for row in readiness_rows
+                if not int(row["reconciliation_evidence_complete"])]
+            print(
+                "  Production ambient repair libraries: " +
+                (" ".join(f"lib{x}" for x in ambient_libs) or "NONE"))
+            print(
+                "  Full reconciliation-evidence libraries: " +
+                (" ".join(f"lib{x}" for x in evidence_libs) or "NONE"))
+
+            condition = COND_BY_ABBREV[AMBIENT_PLOT_DEFAULT_CONDITION]
+            ambient_repair_jobs = []
+            for lib_num in ambient_libs:
+                prefix = get_contam_prefix(
+                    lib_num, condition["abbrev"], "demux")
+                stale = any(os.path.lexists(prefix + suffix) for suffix in (
+                    ".contam_rate", ".contam_prof", ".allele_ratio",
+                    ".contam_diagnostics.tsv", ".profile_fit_diagnostics.tsv",
+                    ".condf_coverage.tsv", ".run_contract.json",
+                    ".geometry_gate_audit.tsv"))
+                contam_script = generate_contam_script(
+                    lib_num, condition, force=stale,
+                    assignment_source="demux")
+                generated.append((
+                    "CONTAM_REPAIR",
+                    f"{condition['abbrev']}/demux/lib{lib_num}",
+                    contam_script))
+                if args.submit:
+                    jid = submit_job(contam_script)
+                    if jid:
+                        ambient_repair_jobs.append(jid)
+                        print(
+                            f"  lib{lib_num}: production ambient repair job "
+                            f"{jid}{' (replace partial output)' if stale else ''}")
+
+            metadata_script = generate_identity_metadata_script(lib_nums, args)
+            generated.append((
+                "IDENTITY_METADATA", "selected_libraries", metadata_script))
+            metadata_job = submit_job(metadata_script) if args.submit else None
+            if metadata_job:
+                print(f"  IDENTITY_METADATA: job {metadata_job}")
+
+            fill_candidate_jobs = {}
+            fill_score_jobs = []
+            for lib_num in evidence_libs:
+                candidate_script = generate_identity_candidates_script(
+                    lib_num, args,
+                    dep_job_ids=[metadata_job] if metadata_job else None)
+                generated.append((
+                    "IDENTITY_CANDIDATES_FILL", f"lib{lib_num}",
+                    candidate_script))
+                candidate_job = submit_job(candidate_script) if args.submit else None
+                if candidate_job:
+                    fill_candidate_jobs[lib_num] = candidate_job
+                    print(
+                        f"  lib{lib_num}: full candidate regeneration job "
+                        f"{candidate_job}")
+
+                score_deps = [candidate_job] if candidate_job else None
+                nuclear_script = generate_identity_nuclear_script(
+                    lib_num, args, dep_job_ids=score_deps)
+                mt_script = generate_identity_mt_script(
+                    lib_num, args, dep_job_ids=score_deps)
+                generated.append((
+                    "NUCLEAR_IDENTITY_SCORE_FILL", f"lib{lib_num}",
+                    nuclear_script))
+                generated.append((
+                    "MT_IDENTITY_SCORE_FILL", f"lib{lib_num}", mt_script))
+                if args.submit:
+                    for script in (nuclear_script, mt_script):
+                        jid = submit_job(script)
+                        if jid:
+                            fill_score_jobs.append(jid)
+                    print(
+                        f"  lib{lib_num}: full nuclear/MT evidence jobs "
+                        + ",".join(fill_score_jobs[-2:]))
+
+            candidate_aggregate_script = generate_identity_candidates_aggregate_script(
+                lib_nums, args,
+                dep_job_ids=list(fill_candidate_jobs.values())
+                if args.submit else None)
+            generated.append((
+                "IDENTITY_CANDIDATES_AGGREGATE", "selected_libraries",
+                candidate_aggregate_script))
+            candidate_aggregate_job = (
+                submit_job(candidate_aggregate_script) if args.submit else None)
+            if candidate_aggregate_job:
+                print(
+                    "  IDENTITY_CANDIDATES_AGGREGATE: job "
+                    f"{candidate_aggregate_job}")
+
+            doublet_job = None
+            if evidence_libs:
+                doublet_script = generate_identity_doublet_context_script(
+                    evidence_libs, args,
+                    dep_job_ids=[metadata_job] if metadata_job else None)
+                generated.append((
+                    "IDENTITY_DOUBLET_CONTEXT", "incomplete_libraries",
+                    doublet_script))
+                doublet_job = (
+                    submit_job(doublet_script) if args.submit else None)
+                if doublet_job:
+                    print(
+                        "  IDENTITY_DOUBLET_CONTEXT incomplete libraries: "
+                        f"job {doublet_job}")
+
+            reconcile_deps = list(ambient_repair_jobs) + list(fill_score_jobs)
+            reconcile_deps.extend(
+                jid for jid in (candidate_aggregate_job, doublet_job) if jid)
+            reconcile_script = generate_identity_reconcile_script(
+                lib_nums, args,
+                dep_job_ids=reconcile_deps if args.submit else None)
+            generated.append((
+                "IDENTITY_RECONCILE", "selected_libraries",
+                reconcile_script))
+            reconcile_job = submit_job(reconcile_script) if args.submit else None
+            if reconcile_job:
+                print(f"  IDENTITY_RECONCILE all selected libraries: job {reconcile_job}")
+
+            validate_script = generate_identity_validate_script(
+                lib_nums, args,
+                dep_job_ids=[reconcile_job] if reconcile_job else None)
+            generated.append((
+                "IDENTITY_VALIDATE", "selected_libraries", validate_script))
+            validate_job = submit_job(validate_script) if args.submit else None
+            if validate_job:
+                print(f"  IDENTITY_VALIDATE all selected libraries: job {validate_job}")
+
+            final_evidence_script = generate_identity_final_evidence_planner_script(
+                lib_nums, args,
+                dep_job_ids=[validate_job] if validate_job else None,
+                fill_missing=True,
+                fill_scope_libraries=[
+                    int(row["library"].removeprefix("lib"))
+                    for row in incomplete_rows])
+            generated.append((
+                "IDENTITY_FINAL_EVIDENCE", "selected_libraries",
+                final_evidence_script))
+            final_evidence_job = (
+                submit_job(final_evidence_script) if args.submit else None)
+            if final_evidence_job:
+                print(
+                    "  IDENTITY_FINAL_EVIDENCE all selected libraries: job "
+                    f"{final_evidence_job}")
+        print()
+
     # ---- Stage 9 IDENTITY_RECONCILIATION: canonical identity framework ----
     if "IDENTITY_RECONCILIATION" in stages:
         print("--- Stage 9 IDENTITY_RECONCILIATION: preliminary reconciliation -> frozen candidate axis + ambient evidence -> canonical finalization ---")
-        metadata_script = generate_identity_metadata_script(lib_nums, args)
-        generated.append(("IDENTITY_METADATA", "selected_libraries", metadata_script))
-        if args.submit:
-            identity_metadata_job_id = submit_job(metadata_script)
-            print(f"  IDENTITY_METADATA: job {identity_metadata_job_id}")
+        if identity_metadata_outputs_complete(args) and not args.force:
+            print("  ✅ IDENTITY_METADATA outputs exist, skipping")
+        else:
+            metadata_script = generate_identity_metadata_script(lib_nums, args)
+            generated.append((
+                "IDENTITY_METADATA", "selected_libraries", metadata_script))
+            if args.submit:
+                identity_metadata_job_id = submit_job(metadata_script)
+                print(f"  IDENTITY_METADATA: job {identity_metadata_job_id}")
 
         # Candidate construction is independent by library once the shared
         # metadata contract exists.  Each candidate job depends only on shared
@@ -18495,7 +19801,15 @@ def run(args):
                 f"  IDENTITY_CANDIDATES_AGGREGATE: job "
                 f"{identity_candidates_aggregate_job_id}")
 
-        doublet_deps = [identity_metadata_job_id] if identity_metadata_job_id else []
+        # Doublet context reads the complete selected-library DEMUX tree.  In a
+        # composite first run, wait for every newly submitted DEMUX job as well
+        # as the independent metadata contract before opening that tree.
+        doublet_deps = [
+            job_id for job_id in (
+                [identity_metadata_job_id]
+                + list(demux_job_ids.values()))
+            if job_id
+        ]
         doublet_script = generate_identity_doublet_context_script(
             lib_nums, args, dep_job_ids=doublet_deps)
         generated.append(("IDENTITY_DOUBLET_CONTEXT", "selected_libraries", doublet_script))
@@ -18610,7 +19924,7 @@ def run(args):
             candidate_axis_root=evidence_roots["candidate_axis_root"],
             frozen_ambient_root=evidence_roots["frozen_ambient_root"],
             four_arm_root=evidence_roots["four_arm_root"],
-            dep_job_ids=None)
+            dep_job_ids=None, checkpoint_only=True)
         generated.append((
             "IDENTITY_FINALIZE", "selected_libraries", finalizer_script))
         if args.submit:
@@ -18723,7 +20037,7 @@ def run(args):
     for stage, label, _ in generated:
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
 
-    for stage in ["CLEANUP_RESULTS", "VCF_DAEMON_HOLDER", "CONDF", "DEMUX", "VCF_DAEMON_CLEANUP", "EMPTY_DROPS", "CONTAM", "GEX_AUTO_CLUSTERS", "GEX_AMBIENT", "GEX_AMBIENT_SUMMARY", "AMBIENT_PLOTS_R", "AMBIENT_PLOTS", "AMBIENT_VALIDATE_PROFILE", "AMBIENT_VALIDATE_FIXED", "AMBIENT_VALIDATE", "AMBIENT_SWAP_PROFILE", "AMBIENT_SWAP_ARMS", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_AGG", "POSTHOC_SUMMARY", "POSTHOC_SUMMARY_AGG", "UNEXPECTED_COMPONENT_NN", "UNEXPECTED_COMPONENT_NN_AGG", "HYBRID", "IDENTITY_METADATA", "IDENTITY_CANDIDATES", "IDENTITY_CANDIDATES_AGGREGATE", "IDENTITY_DOUBLET_CONTEXT", "IDENTITY_SCORE_PAIRS", "IDENTITY_PROBABILITY_SCORE", "NUCLEAR_IDENTITY_SCORE", "MT_IDENTITY_SCORE", "ATAC_IDENTITY_SCORE", "IDENTITY_RECONCILE", "IDENTITY_VALIDATE", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE", "IDENTITY_PROBABILITY_AGGREGATE", "MT_FUSION", "MT_POPULATION"]:
+    for stage in ["CLEANUP_RESULTS", "VCF_DAEMON_HOLDER", "CONDF", "DEMUX", "VCF_DAEMON_CLEANUP", "EMPTY_DROPS", "CONTAM", "CONTAM_REPAIR", "GEX_AUTO_CLUSTERS", "GEX_AMBIENT", "GEX_AMBIENT_SUMMARY", "AMBIENT_PLOTS_R", "AMBIENT_PLOTS", "AMBIENT_VALIDATE_PROFILE", "AMBIENT_VALIDATE_FIXED", "AMBIENT_VALIDATE", "AMBIENT_SWAP_PROFILE", "AMBIENT_SWAP_ARMS", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_AGG", "POSTHOC_SUMMARY", "POSTHOC_SUMMARY_AGG", "UNEXPECTED_COMPONENT_NN", "UNEXPECTED_COMPONENT_NN_AGG", "HYBRID", "IDENTITY_METADATA", "IDENTITY_CANDIDATES", "IDENTITY_CANDIDATES_FILL", "IDENTITY_CANDIDATES_AGGREGATE", "IDENTITY_DOUBLET_CONTEXT", "IDENTITY_SCORE_PAIRS", "IDENTITY_PROBABILITY_SCORE", "NUCLEAR_IDENTITY_SCORE", "NUCLEAR_IDENTITY_SCORE_FILL", "MT_IDENTITY_SCORE", "MT_IDENTITY_SCORE_FILL", "ATAC_IDENTITY_SCORE", "IDENTITY_RECONCILE", "IDENTITY_VALIDATE", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE", "IDENTITY_PROBABILITY_AGGREGATE", "MT_FUSION", "MT_POPULATION"]:
         if stage in stage_counts:
             script_label = (
                 "script" if stage_counts[stage] == 1 else "scripts")
@@ -18733,7 +20047,9 @@ def run(args):
     total_label = "script" if len(generated) == 1 else "scripts"
     print(f"  Total: {len(generated)} {total_label}")
 
-    if args.submit:
+    if IDENTITY_READINESS_STAGE in stages:
+        print("  Readiness audit complete; no jobs are submitted by this stage.")
+    elif args.submit:
         # Count generated/submitted scripts by stage. Dependency-held jobs are
         # still valid submissions. This is a bookkeeping summary only; sbatch
         # job IDs printed above remain the source of truth.
@@ -18752,6 +20068,20 @@ def run(args):
 # =============================================================================
 # CLI
 # =============================================================================
+
+def parse_atac_demux_mask(value):
+    """Parse a decimal or base-prefixed BAM flag mask."""
+    text = str(value).strip()
+    if not re.fullmatch(
+            r"(?:0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|[0-9]+)",
+            text):
+        raise argparse.ArgumentTypeError(
+            "must be a decimal or base-prefixed integer in [0,0xFFFF]")
+    parsed = int(text, 0)
+    if not 0 <= parsed <= 0xFFFF:
+        raise argparse.ArgumentTypeError("must be in [0,0xFFFF]")
+    return parsed
+
 
 def parse_args():
     """Parse command-line arguments."""
@@ -18772,11 +20102,15 @@ Examples:
   orchestrate_tetraploid.py --condition-set ck-minimal --stage CONTAM,AMBIENT_PLOTS --submit
   orchestrate_tetraploid.py --condition-set all --stage CONTAM --submit
   orchestrate_tetraploid.py --stage DEMUX --libraries 1 2 --submit
+  orchestrate_tetraploid.py --stage ATAC_DEMUX --libraries 7 19 --atac-demux-main-vcf /absolute/panel.bcf --submit
+  orchestrate_tetraploid.py --libraries 1-40 --mapping-input-root /absolute/new/mapping_output --analysis-output-root /absolute/new/analysis --stage CONDF,DEMUX,EMPTY_DROPS,CONTAM,TETRA_REFINE,POSTHOC,IDENTITY_RECONCILIATION --submit
   orchestrate_tetraploid.py --stage MT_FUSION --libraries 19 --submit
   orchestrate_tetraploid.py --stage IDENTITY_SCORE --libraries 1-40 --submit
   orchestrate_tetraploid.py --stage IDENTITY_SCORE_AGGREGATE_ONLY --libraries 19 --identity-score-output-root /path/to/new_v6_1_summary --submit
   orchestrate_tetraploid.py --stage IDENTITY_CANDIDATE_AXIS --libraries 1 8 19 --identity-candidate-axis-output-root /absolute/candidate_axis_round2 --submit
   orchestrate_tetraploid.py --stage IDENTITY_CANDIDATE_AXIS --libraries 19 --identity-candidate-axis-event-id EVENT --identity-candidate-axis-proposal C40210+H27322 --identity-candidate-axis-output-root /absolute/candidate_axis_targeted --submit
+  orchestrate_tetraploid.py --stage IDENTITY_RECONCILIATION_READINESS --libraries 1-40 --identity-reconciliation-root /absolute/identity_run
+  orchestrate_tetraploid.py --stage IDENTITY_RECONCILIATION_FILL_MISSING --libraries 1-40 --identity-reconciliation-root /absolute/identity_run --submit
   orchestrate_tetraploid.py --stage IDENTITY_FINAL_EVIDENCE --libraries 7 11 12 19 36 --identity-reconciliation-root /absolute/identity_run --submit
   orchestrate_tetraploid.py --stage IDENTITY_FINAL_EVIDENCE_ONLY --libraries 1-37 39 --identity-reconciliation-root /absolute/identity_run --submit
   orchestrate_tetraploid.py --stage IDENTITY_FINALIZE_ONLY --libraries 1-37 39 --identity-reconciliation-root /absolute/identity_run --submit
@@ -18786,6 +20120,7 @@ Stages (run in order):
   CLEANUP_RESULTS = standalone cleanup retaining newest completed generated results
   CONDF       = .condf generation (3 jobs total, library-independent)
   DEMUX       = demux (1 job per library; managed VCF holders coexist by reservation)
+  ATAC_DEMUX  = selected-library ATAC-primary workers using a configured BCF directly
   EMPTY_DROPS = empty drops ambient profile (1 job per library)
   CONTAM      = contamination estimation (1 job per condition x library)
   GEX_AMBIENT = infer ambient gene profiles with RNA-Leiden, H5AD-column, or manual clusters
@@ -18801,6 +20136,8 @@ Stages (run in order):
   IDENTITY_SCORE = post-reconciliation original-vs-nominated-swap probabilities and aggregation
   IDENTITY_SCORE_AGGREGATE_ONLY = reuse frozen pair/probability files; run QC-scoped aggregation only
   IDENTITY_CANDIDATE_AXIS = standalone finalized-event fixed-pair geometric diagnostic
+  IDENTITY_RECONCILIATION_READINESS = audit the all-library prerequisite/evidence/final-output contract
+  IDENTITY_RECONCILIATION_FILL_MISSING = repair missing ambient/evidence and rebuild the complete selected-library ledger
   IDENTITY_RECONCILIATION = preliminary reconciliation, frozen axis/ambient evidence, and canonical finalization
   IDENTITY_FINAL_EVIDENCE = resume validated reconciliation at its evidence/finalization tail
   IDENTITY_FINAL_EVIDENCE_ONLY = reuse completed evidence; rerun selected-library aggregates and finalization only
@@ -18884,22 +20221,115 @@ Named condition sets:
                         help="Ignore existing outputs, rerun every selected stage")
     parser.add_argument("--regenerate-condf", action="store_true",
                         help="Rebuild all central CONDF files and include the CONDF stage without forcing downstream stages")
-    parser.add_argument("--skip-het-vcf", action="store_true",
-                        help="Disable --shared_het_vcf for DEMUX Pass 1; run only the individual and species VCF panels")
+    het_group = parser.add_mutually_exclusive_group()
+    het_group.add_argument(
+        "--with-het-vcf", action="store_true",
+        help=("Explicitly enable HET diagnostics end-to-end: generate the HET "
+              "CONDF, load its managed-daemon segment, and pass the HET panel "
+              "to DEMUX. Disabled by default."))
+    het_group.add_argument(
+        "--skip-het-vcf", action="store_true",
+        help=("Explicit-off compatibility spelling. HET diagnostics are already "
+              "disabled by default."))
+    parser.add_argument(
+        "--resume-failed-demux-libraries", nargs="+", default=[],
+        metavar="LIBRARY",
+        help=("Run one raw-only recovery recount for these libraries when the "
+              "required filtered bundle is complete, preserving that bundle and retaining normal "
+              "output-exists skipping for every other selected stage. Accepts "
+              "the same values as --libraries, for example 1-12 19 27."))
+    parser.add_argument(
+        "--demux-threads", "--demux-filtered-threads",
+        dest="demux_filtered_threads", type=int, default=80,
+        help=("Worker threads for the fused filtered/raw dual-panel BAM traversal. "
+              "Default: 80. Filtered count matrices are dense and shared; raw-only "
+              "barcodes are sparse and lock-sharded "
+              "and pileup evidence is streamed in bounded chunks, so worker "
+              "count no longer multiplies the dominant memory structures. The "
+              "older --demux-filtered-threads spelling remains an alias."))
+    parser.add_argument(
+        "--demux-thread-override", action="append", default=[],
+        metavar="LIB:THREADS",
+        help=("Override DEMUX workers for one selected library without slowing "
+              "the rest, for example --demux-thread-override 19:64. Repeat for "
+              "additional libraries."))
     parser.add_argument(
         "--individual-only-demux", action="store_true",
         help=("Run only the filtered-barcode interindividual DEMUX pass. "
               "Disables HET, species-panel work, the raw-barcode pass, pileup "
-              "sidecars, and DEMUX CONDF symlinks while retaining the normal "
+              "sidecars unless a selected identity stage requires them, and "
+              "DEMUX CONDF symlinks while retaining the normal "
               "expected-lines restriction, selection audit, resources, daemon "
               "node placement, force/reuse behavior, and output-root layout."))
+    atac_group = parser.add_argument_group("integrated ATAC_DEMUX")
+    atac_group.add_argument(
+        "--atac-demux-output-root", default=DEFAULT_ATAC_DEMUX_OUTPUT_ROOT,
+        help=("Absolute ATAC demux output root. With --analysis-output-root, "
+              "the default is rebased below its aggregate_library_analysis."))
+    atac_group.add_argument(
+        "--atac-demux-atac-root", default=ATAC_MAPPING_ROOT,
+        help="Root containing Tet_2025_Multiome-ATAC_<N>/atac.bam")
+    atac_group.add_argument(
+        "--atac-demux-rna-barcode-root", default=None,
+        help=("Optional root containing final called-cell whitelists under "
+              "Tet_2025_Multiome-RNA_<N>/filtered/barcodes.tsv.gz. "
+              "Default: --mapping-input-root."))
+    atac_group.add_argument(
+        "--atac-demux-main-vcf", default=None,
+        help="Absolute main genotype BCF for direct-BCF ATAC demux (required)")
+    atac_group.add_argument(
+        "--atac-demux-min-mapq", type=int, default=30,
+        help="Minimum ATAC BAM mapping quality")
+    atac_group.add_argument(
+        "--atac-demux-exclude-flags", type=parse_atac_demux_mask,
+        default=0xF04,
+        help="Base-0 BAM flag exclusion mask")
+    atac_group.add_argument(
+        "--atac-demux-variant-qual", type=int, default=50)
+    atac_group.add_argument(
+        "--atac-demux-doublet-rate", type=float, default=0.5)
+    atac_group.add_argument(
+        "--atac-demux-error-ref", type=float, default=0.005)
+    atac_group.add_argument(
+        "--atac-demux-error-alt", type=float, default=0.005)
+    atac_group.add_argument(
+        "--atac-demux-error-sigma", type=float, default=0.1)
+    atac_group.add_argument(
+        "--atac-demux-runner-ups", type=int, default=8)
+    atac_group.add_argument(
+        "--atac-demux-close-threshold", type=float, default=20.0)
+    atac_group.add_argument(
+        "--atac-demux-threads", type=int, default=80)
+    atac_group.add_argument(
+        "--atac-demux-cpus", type=int, default=90)
+    atac_group.add_argument(
+        "--atac-demux-memory", default="1000G")
+    atac_group.add_argument(
+        "--atac-demux-time", default="7-00:00:00")
+    atac_group.add_argument(
+        "--atac-demux-partition", default=SLURM_PARTITION)
+    parser.add_argument(
+        "--mapping-input-root", default=PRODUCTION_MAPPING_ROOT,
+        help=("Absolute mapping-output root containing "
+              "Tet_2025_Multiome-RNA_<N>/gex.bam and the corresponding MEX "
+              "directories. A non-production value requires "
+              "--analysis-output-root."))
+    parser.add_argument(
+        "--analysis-output-root", default=None,
+        help=("Absolute isolated root for the complete generated analysis "
+              "namespace. Per-library DEMUX products are written under "
+              "<root>/Tet_2025_Multiome-RNA_<N>/demux_nomito and all shared "
+              "CONDF, logs, scripts, audits, refinement, reconciliation, "
+              "figures, and daemon state under "
+              "<root>/aggregate_library_analysis. Existing panel, metadata, "
+              "model, and non-produced ploidy-call inputs remain read-only."))
     parser.add_argument(
         "--demux-output-root",
         dest="demux_output_root", default=None,
-        help=("Optional alternate root for DEMUX outputs. Inputs still come from "
-              "the normal mapping_output tree; outputs are written under "
+        help=("Optional legacy alternate root for DEMUX outputs only. Inputs "
+              "come from --mapping-input-root; outputs are written under "
               "<root>/Tet_2025_Multiome-RNA_<N>/demux_nomito/. "
-              "Use a different root for each A/B/C arm."))
+              "When --analysis-output-root is present, both roots must match."))
     parser.add_argument("--condf-dir", default=CONDF_DIR,
                         help=("Optional shared CONDF generation/staging directory used by CONDF/DEMUX. "
                               "Current production EMPTY_DROPS/CONTAM read the self-contained "
@@ -18912,7 +20342,7 @@ Named condition sets:
     parser.add_argument("--shared-species-segment", default=SHARED_VCF["species_20M"],
                         help="Shared-memory segment for the species panel")
     parser.add_argument("--shared-het-segment", default=SHARED_VCF["interindiv_het_10M"],
-                        help="Shared-memory segment for the HET panel; ignored with --skip-het-vcf")
+                        help="Shared-memory segment for the HET panel; used only with --with-het-vcf")
     parser.add_argument("--daemon-nodes", default=DAEMON_NODELIST,
                         help=("Comma-separated SLURM node list for CONDF and DEMUX, "
                               "which consume node-local shared-memory panels. "
@@ -19150,6 +20580,10 @@ Named condition sets:
                         help="Optional explicit ATAC BAM template supporting {lib}")
     parser.add_argument("--identity-require-mt", action="store_true",
                         help="Make missing/failed mt identity evidence fatal")
+    parser.add_argument(
+        "--identity-mt-memory", default="128G",
+        help=("SLURM memory allocation for each MT identity-score job "
+              "(default 128G)"))
     parser.add_argument("--identity-auto-apply", dest="identity_auto_apply", action="store_true", default=True,
                         help="Apply DECISIVE policy-supported identity changes (default)")
     parser.add_argument("--identity-no-auto-apply", dest="identity_auto_apply", action="store_false",
@@ -19261,8 +20695,8 @@ def main():
         identity_final_evidence_worker(
             args._identity_final_evidence_worker)
         return
-    run(args)
+    return run(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

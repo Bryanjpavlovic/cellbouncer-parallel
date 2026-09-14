@@ -19,6 +19,59 @@ SCHEMA_VERSION = "identity_reconciliation_v1"
 POLICY_VERSION = "identity_reconciliation_policy_v11_component_singlets_and_library_exchange"
 NA_TOKENS = {"", ".", "na", "nan", "none", "null", "unavailable"}
 
+DOWNSTREAM_SAFE_ASSIGNMENT_FIELDS = (
+    "downstream_safe_assignment",
+    "downstream_safe_assignment_source",
+    "downstream_safe_change_applied",
+    "downstream_assignment_status",
+)
+DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_CURRENT = "CURRENT_ASSIGNMENT"
+DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_APPROVED = "APPROVED_RECONCILIATION"
+DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_UNAVAILABLE = "UNAVAILABLE"
+DOWNSTREAM_ASSIGNMENT_READY = "RECONCILED_CHANGE_READY"
+DOWNSTREAM_ASSIGNMENT_HELD = "CURRENT_RETAINED_HELD_CHANGE"
+DOWNSTREAM_ASSIGNMENT_NO_CHANGE = "CURRENT_RETAINED_NO_CHANGE"
+DOWNSTREAM_ASSIGNMENT_INVALID_PROPOSAL = "CURRENT_RETAINED_INVALID_PROPOSAL"
+DOWNSTREAM_ASSIGNMENT_NO_CURRENT = "NO_VALID_CURRENT_ASSIGNMENT"
+
+ASSIGNMENT_STATUS_FINE = "FINE_NO_CHANGE"
+ASSIGNMENT_STATUS_APPLIED = "CHANGE_APPLIED"
+ASSIGNMENT_STATUS_REVIEW = "REVIEW_NEEDED"
+ASSIGNMENT_STATUSES = (
+    ASSIGNMENT_STATUS_FINE,
+    ASSIGNMENT_STATUS_APPLIED,
+    ASSIGNMENT_STATUS_REVIEW,
+)
+THREE_STATE_ASSIGNMENT_FIELDS = (
+    "assignment_status",
+    "current_assignment",
+    "proposed_assignment",
+    "final_assignment",
+    "assignment_change",
+    "review_reason",
+    "evidence_summary",
+)
+
+# One explicit interpretation point for every action emitted by reconciliation.
+# These classes describe the upstream diagnostic action; they do not by
+# themselves define the primary three-state identity question.  In particular,
+# REVIEW actions may describe ploidy, occupancy, event, or other context while
+# the production identity remains unchanged.  A primary identity question is
+# established separately from the preliminary production assignment below.
+RECONCILIATION_ACTION_CLASS = {
+    # Blank/NA is the normal state for cells that never entered a cell-level
+    # reconciliation decision because no identity change was proposed.
+    "": "NO_CHANGE",
+    "KEEP": "NO_CHANGE",
+    "REASSIGN_GENOTYPE": "CHANGE",
+    "RECLASSIFY_PLOIDY": "CHANGE",
+    "REVIEW_CELLULAR_ORIGIN": "REVIEW",
+    "REVIEW_UNEXPECTED_IDENTITY": "REVIEW",
+    "REVIEW_HOMOTET_OCCUPANCY": "REVIEW",
+    "KEEP_CURRENT_CONFLICTED": "REVIEW",
+    "UNRESOLVED_INSUFFICIENT_EVIDENCE": "REVIEW",
+}
+
 DEFAULT_IDENTITY_POLICY = {
     "policy_version": POLICY_VERSION,
     "schema_version": SCHEMA_VERSION,
@@ -116,6 +169,349 @@ def donor_components(genotype: str) -> List[str]:
     if not g or g.startswith("M{"):
         return []
     return [x for x in g.split("+") if x]
+
+
+def reconciliation_action_class(value: object) -> str:
+    """Return NO_CHANGE, CHANGE, REVIEW, or UNKNOWN for a cell action."""
+    return RECONCILIATION_ACTION_CLASS.get(clean(value).upper(), "UNKNOWN")
+
+
+def _first_canonical_genotype(*values: object) -> str:
+    for value in values:
+        genotype = canonical_genotype(value)
+        if genotype:
+            return genotype
+    return ""
+
+
+def has_real_cell_change_proposal(row: Mapping[str, object]) -> bool:
+    """Return whether a distinct primary production change was proposed.
+
+    Candidate nominations and diagnostic action names are not sufficient.  The
+    cell must have a change-producing action, a legacy selected production
+    change when the action is absent, or an explicit cell-scoped review
+    decision.  Event-scoped review metadata never creates a primary cell-level
+    identity question.
+    """
+    current = _first_canonical_genotype(
+        row.get("comparison_current_assignment", ""),
+        row.get("current_assignment", ""),
+        row.get("refined_assignment", ""),
+        row.get("demux_original_assignment", ""))
+    proposal = _first_canonical_genotype(
+        row.get("nominated_proposal", ""),
+        row.get("proposed_assignment", ""))
+    preliminary = _first_canonical_genotype(
+        row.get("preliminary_reconciled_assignment", ""))
+    preliminary_applied = clean(
+        row.get("preliminary_action_applied", "")).lower() in {
+            "1", "true", "yes", "y"}
+    action = (
+        clean(row.get("preliminary_reconciliation_action", ""))
+        or clean(row.get("reconciliation_final_action", ""))).upper()
+    action_class = reconciliation_action_class(action)
+    disposition = clean(row.get("review_disposition", "")).upper()
+    cell_review = (
+        clean(row.get("review_record_scope", "")).upper() == "CELL"
+        and disposition in {
+            "ACCEPT_PROPOSAL", "KEEP_CURRENT", "LEAVE_UNRESOLVED",
+            "PENDING"})
+    preliminary_selected_change = bool(
+        (preliminary and preliminary != current) or preliminary_applied)
+    return bool(
+        current and proposal and proposal != current
+        and (cell_review or action_class == "CHANGE"
+             or (not action and preliminary_selected_change)))
+
+
+def _finite_float(value: object) -> float:
+    try:
+        parsed = float(clean(value))
+        return parsed if math.isfinite(parsed) else math.nan
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _reason_tokens(value: object) -> Set[str]:
+    return {
+        clean(token).upper()
+        for token in re.split(r"[,;]", clean(value))
+        if clean(token)
+    }
+
+
+def _three_state_review_reason(row: Mapping[str, object], evidence_mode: str,
+                               donor_identity_change: bool,
+                               structure_change: bool) -> Tuple[str, List[str]]:
+    """Interpret only evidence relevant to the exact current/proposed contrast."""
+    reasons: List[str] = []
+    nuclear = clean(row.get("nuclear_reconciliation_status")).upper()
+    atac = clean(row.get("atac_evidence_status")).upper()
+    mito = clean(row.get("mitochondrial_evidence_status")).upper()
+    ploidy = clean(row.get("ploidy_evidence_status")).upper()
+    occupancy = clean(row.get("occupancy_evidence_status")).upper()
+    technical = clean(row.get("technical_state")).upper()
+
+    # A one-donor/two-donor structure change may also change donor identity.
+    # Nuclear and ATAC evidence are therefore checked whenever the donor set
+    # changes; ploidy/occupancy checks below are additional, not substitutes.
+    # Pure A <-> A+A ploidy reclassification is evaluated by the structure
+    # evidence because RNA/ATAC donor evidence cannot distinguish copy count.
+    if donor_identity_change:
+        modalities_disagree = (
+            evidence_mode == "rna-atac"
+            and ((nuclear == "NUCLEAR_SUPPORTS_PROPOSAL"
+                  and atac in {"ATAC_SUPPORTS_CURRENT", "SUPPORTS_CURRENT"})
+                 or (nuclear == "NUCLEAR_SUPPORTS_CURRENT"
+                     and atac == "ATAC_SUPPORTS_ALTERNATIVE")))
+        if modalities_disagree:
+            reasons.append("RNA and ATAC disagree")
+        elif nuclear == "NUCLEAR_UNAVAILABLE":
+            reasons.append("RNA comparison not run")
+        elif nuclear != "NUCLEAR_SUPPORTS_PROPOSAL":
+            reasons.append("RNA evidence is insufficient")
+
+        if evidence_mode == "rna-atac" and not modalities_disagree:
+            if atac != "ATAC_SUPPORTS_ALTERNATIVE":
+                reasons.append("ATAC evidence is insufficient")
+
+    decision_tokens = (
+        _reason_tokens(row.get("preliminary_decision_reason_codes", ""))
+        | _reason_tokens(row.get("decision_reason_codes", "")))
+    mt_current_is_explicitly_nondecisional = (
+        "MITOCHONDRIA_SUPPORT_DISJOINT_CURRENT_LINE_COMPONENT_NONDECISIONAL"
+        in decision_tokens)
+    if (donor_identity_change and mito in {
+            "SUPPORTS_CURRENT", "CONTRADICTS", "CONTRADICTS_ALTERNATIVE",
+            "MITO_SUPPORTS_CURRENT", "MITO_CONTRADICTS"}
+            and not mt_current_is_explicitly_nondecisional):
+        reasons.append("Mitochondrial evidence conflicts")
+
+    if structure_change and ploidy != "SUPPORTS_PROPOSAL":
+        reasons.append("Ploidy or cellular state is unresolved")
+    if structure_change and ("UNRESOLVED" in occupancy or "AMBIG" in occupancy):
+        reasons.append("Ploidy or cellular state is unresolved")
+    if structure_change and (technical not in {"", "NOT_APPLICABLE", "NA"}):
+        reasons.append("Technical mixture is unresolved")
+
+    frozen = _finite_float(
+        row.get("ambient_frozen_proposal_minus_current_c"))
+    refitted = _finite_float(row.get("ambient_assignment_effect_c_minus_b"))
+    if (math.isfinite(frozen) and math.isfinite(refitted)
+            and frozen != 0 and refitted != 0
+            and (frozen < 0) != (refitted < 0)):
+        reasons.append("Ambient correction changes the result")
+
+    reasons = list(dict.fromkeys(reasons))
+    if len(reasons) > 1:
+        return "Multiple evidence sources conflict", reasons
+    if reasons:
+        return reasons[0], reasons
+    return "", []
+
+
+def derive_three_state_assignment(
+        row: Mapping[str, object], evidence_mode: str = "rna") -> Dict[str, str]:
+    """Derive the sole user-facing assignment status and safe assignment.
+
+    Optional diagnostics never create a review case until the cell action first
+    establishes a real current-versus-proposed identity question.
+    """
+    current = _first_canonical_genotype(
+        row.get("comparison_current_assignment", ""),
+        row.get("current_assignment", ""),
+        row.get("refined_assignment", ""),
+        row.get("demux_original_assignment", ""))
+    proposal = _first_canonical_genotype(
+        row.get("nominated_proposal", ""),
+        row.get("proposed_assignment", ""))
+    action = (
+        clean(row.get("preliminary_reconciliation_action", ""))
+        or clean(row.get("reconciliation_final_action", ""))).upper()
+    action_class = reconciliation_action_class(action)
+    disposition = clean(row.get("review_disposition", "")).upper()
+    cell_disposition = (
+        disposition
+        if clean(row.get("review_record_scope", "")).upper() == "CELL"
+        else "")
+
+    def result(status: str, final: str, reason: str = "NONE",
+               details: Optional[Sequence[str]] = None) -> Dict[str, str]:
+        # Context/event nominations remain available in nominated_proposal in
+        # the verbose ledger.  The compact primary proposal is populated only
+        # when there is an applied or unresolved production identity change.
+        proposed = (
+            proposal if status != ASSIGNMENT_STATUS_FINE
+            and proposal and proposal != current else "")
+        change = (
+            f"{current} -> {proposed}"
+            if status != ASSIGNMENT_STATUS_FINE and proposed else "NONE")
+        if status == ASSIGNMENT_STATUS_APPLIED:
+            summary = (
+                "Direct evidence supports the proposed assignment with no "
+                "relevant unresolved conflict.")
+        elif status == ASSIGNMENT_STATUS_REVIEW:
+            detail_text = "; ".join(details or ([reason] if reason != "NONE" else []))
+            summary = detail_text or "The proposed identity requires review."
+        else:
+            summary = "Current assignment retained; no cell-level identity change is recommended."
+        release = (
+            "HELD_FOR_REVIEW" if status == ASSIGNMENT_STATUS_REVIEW else "READY")
+        legacy_status = (
+            DOWNSTREAM_ASSIGNMENT_READY
+            if status == ASSIGNMENT_STATUS_APPLIED else
+            DOWNSTREAM_ASSIGNMENT_HELD
+            if status == ASSIGNMENT_STATUS_REVIEW else
+            DOWNSTREAM_ASSIGNMENT_NO_CHANGE)
+        source = (
+            DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_APPROVED
+            if status == ASSIGNMENT_STATUS_APPLIED else
+            DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_CURRENT)
+        return {
+            "assignment_status": status,
+            "current_assignment": current or "NA",
+            "proposed_assignment": proposed or "NA",
+            "final_assignment": final or current or "NA",
+            "assignment_change": change,
+            "review_reason": reason if status == ASSIGNMENT_STATUS_REVIEW else "NONE",
+            "evidence_summary": summary,
+            # Deprecated compatibility aliases.  production_assignment is the
+            # safe final assignment, never a held proposal.
+            "production_assignment": final or current or "NA",
+            "downstream_release_status": release,
+            "downstream_safe_assignment": final or current or "NA",
+            "downstream_safe_assignment_source": source,
+            "downstream_safe_change_applied": (
+                "TRUE" if status == ASSIGNMENT_STATUS_APPLIED else "FALSE"),
+            "downstream_assignment_status": legacy_status,
+            "review_required": (
+                "TRUE" if status == ASSIGNMENT_STATUS_REVIEW else "FALSE"),
+        }
+
+    if action_class == "UNKNOWN":
+        return result(
+            ASSIGNMENT_STATUS_REVIEW, current,
+            "Unknown reconciliation action", ["Unknown reconciliation action"])
+
+    # Establish the cell-level question before considering review records or
+    # evidence.  Event-wide review metadata cannot turn KEEP/context rows into
+    # changes, and a proposal equal to current is never a change question.
+    real_change_proposal = has_real_cell_change_proposal(row)
+    if not real_change_proposal:
+        return result(ASSIGNMENT_STATUS_FINE, current)
+
+    if cell_disposition == "KEEP_CURRENT":
+        return result(ASSIGNMENT_STATUS_FINE, current)
+    if cell_disposition == "LEAVE_UNRESOLVED":
+        return result(
+            ASSIGNMENT_STATUS_REVIEW, current,
+            "Multiple evidence sources conflict",
+            ["Explicit review left the identity unresolved"])
+    if cell_disposition == "PENDING":
+        return result(
+            ASSIGNMENT_STATUS_REVIEW, current,
+            "Multiple evidence sources conflict",
+            ["Explicit cell review remains pending"])
+    if cell_disposition == "ACCEPT_PROPOSAL":
+        return result(ASSIGNMENT_STATUS_APPLIED, proposal)
+
+    if action_class == "REVIEW":
+        preferred = {
+            "REVIEW_CELLULAR_ORIGIN": "Technical mixture is unresolved",
+            "REVIEW_HOMOTET_OCCUPANCY":
+                "Ploidy or cellular state is unresolved",
+            "REVIEW_UNEXPECTED_IDENTITY": "RNA evidence is insufficient",
+            "KEEP_CURRENT_CONFLICTED": "Multiple evidence sources conflict",
+            "UNRESOLVED_INSUFFICIENT_EVIDENCE":
+                "RNA evidence is insufficient",
+        }.get(action, "Multiple evidence sources conflict")
+        return result(ASSIGNMENT_STATUS_REVIEW, current, preferred, [preferred])
+
+    structure_change = (
+        len(donor_components(current)) != len(donor_components(proposal)))
+    donor_identity_change = (
+        set(donor_components(current)) != set(donor_components(proposal)))
+    reason, details = _three_state_review_reason(
+        row, evidence_mode, donor_identity_change, structure_change)
+    if reason:
+        return result(ASSIGNMENT_STATUS_REVIEW, current, reason, details)
+    return result(ASSIGNMENT_STATUS_APPLIED, proposal)
+
+
+def derive_downstream_safe_assignment(row: Mapping[str, object]) -> Dict[str, str]:
+    """Derive the assignment that may be consumed without review leakage.
+
+    Three-state rows use ``final_assignment`` as authoritative and expose
+    ``production_assignment`` only as a deprecated safe alias.  The older
+    production/release derivation remains below for resumable v3 checkpoints.
+    """
+    primary_status = clean(row.get("assignment_status", "")).upper()
+    if primary_status in ASSIGNMENT_STATUSES:
+        final = canonical_genotype(row.get("final_assignment", ""))
+        current = canonical_genotype(
+            row.get("current_assignment", "")
+            or row.get("comparison_current_assignment", ""))
+        if primary_status == ASSIGNMENT_STATUS_APPLIED:
+            status = DOWNSTREAM_ASSIGNMENT_READY
+            source = DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_APPROVED
+        elif primary_status == ASSIGNMENT_STATUS_REVIEW:
+            status = DOWNSTREAM_ASSIGNMENT_HELD
+            source = DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_CURRENT
+        else:
+            status = DOWNSTREAM_ASSIGNMENT_NO_CHANGE
+            source = DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_CURRENT
+        return {
+            "downstream_safe_assignment": final or current or "NA",
+            "downstream_safe_assignment_source": source,
+            "downstream_safe_change_applied": (
+                "TRUE" if primary_status == ASSIGNMENT_STATUS_APPLIED else "FALSE"),
+            "downstream_assignment_status": status,
+        }
+
+    current = canonical_genotype(row.get("comparison_current_assignment", ""))
+    production = canonical_genotype(row.get("production_assignment", ""))
+    release = clean(row.get("downstream_release_status", "")).upper()
+
+    if not current:
+        return {
+            "downstream_safe_assignment": "NA",
+            "downstream_safe_assignment_source":
+                DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_UNAVAILABLE,
+            "downstream_safe_change_applied": "FALSE",
+            "downstream_assignment_status": DOWNSTREAM_ASSIGNMENT_NO_CURRENT,
+        }
+    if not production:
+        return {
+            "downstream_safe_assignment": current,
+            "downstream_safe_assignment_source":
+                DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_CURRENT,
+            "downstream_safe_change_applied": "FALSE",
+            "downstream_assignment_status":
+                DOWNSTREAM_ASSIGNMENT_INVALID_PROPOSAL,
+        }
+    if current != production and release == "READY":
+        return {
+            "downstream_safe_assignment": production,
+            "downstream_safe_assignment_source":
+                DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_APPROVED,
+            "downstream_safe_change_applied": "TRUE",
+            "downstream_assignment_status": DOWNSTREAM_ASSIGNMENT_READY,
+        }
+    if current != production:
+        return {
+            "downstream_safe_assignment": current,
+            "downstream_safe_assignment_source":
+                DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_CURRENT,
+            "downstream_safe_change_applied": "FALSE",
+            "downstream_assignment_status": DOWNSTREAM_ASSIGNMENT_HELD,
+        }
+    return {
+        "downstream_safe_assignment": current,
+        "downstream_safe_assignment_source":
+            DOWNSTREAM_SAFE_ASSIGNMENT_SOURCE_CURRENT,
+        "downstream_safe_change_applied": "FALSE",
+        "downstream_assignment_status": DOWNSTREAM_ASSIGNMENT_NO_CHANGE,
+    }
 
 
 def expected_library_context(expected_genotypes_by_library: Mapping[str, object]):
