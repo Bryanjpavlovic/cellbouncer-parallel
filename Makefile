@@ -14,6 +14,7 @@ HTSLIB_RPATH_FLAG = -Wl,-rpath,$(HTSLIB_LIB)
 CPU_ARCH ?= znver3
 CPU_TUNE ?= znver3
 ARCHFLAGS ?= -march=$(CPU_ARCH) -mtune=$(CPU_TUNE)
+PANEL_RUNTIME_FLAGS ?= -flto=auto -fno-semantic-interposition
 
 BC_LENX2 = 32
 KX2 = 16
@@ -31,6 +32,9 @@ CXXFLAGS_TET = -std=c++11 -fPIC -D_REENTRANT -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2)
 CXXFLAGS_CACHE = -std=c++17 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
 CXXFLAGS_MT = -std=c++17 -fPIC -D_REENTRANT -DCELLBOUNCER_SOURCE_REVISION=\"$(SOURCE_REVISION)\" -O3 $(ARCHFLAGS) -Wall -Wextra -pedantic
 CXXFLAGS_SCRUB = -std=c++11 -fPIC -D_REENTRANT -O3 $(ARCHFLAGS) -Wall -Wextra
+CXXFLAGS_ARM_CNV = -std=c++17 -fPIC -D_REENTRANT \
+                   -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) \
+                   -O3 $(ARCHFLAGS) -fopenmp -Wall -Wextra -pedantic
 CFLAGS = -fPIC -DBC_LENX2=$(BC_LENX2) -DKX2=$(KX2) -O3 $(ARCHFLAGS)
 
 # Refactored sources include the unified headers directly.
@@ -67,7 +71,8 @@ OPTIMML_SOURCE_FILES = $(shell find dependencies/optimML -type f \
 # Executables installed for orchestrated production stages.
 ORCHESTRATOR_BINS = demux_parallel vcf_loader_daemon tet_ambient_profile \
                     tet_contam_estimate legacy2c_contam_estimate \
-                    tetra_score_calls tetra_refine mt_identity_score
+                    tetra_score_calls tetra_refine mt_identity_score \
+                    bam_window_coverage downsample_vcf_parallel tetra_arm_ase
 AUX_ROOT_BINS = demux_mt demux_species demux_tags doublet_dragon bulkprops \
                 bam_ram_host_daemon genotype_scrub_bam snps_per_read \
                 mt_fusion_ratio
@@ -76,7 +81,7 @@ DEPRECATED_BINS = demux_vcf quant_contam quant3_contam quant3_contam_ap \
 UTIL_BINS = utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs \
             utils/bam_cb_cache_extract utils/split_read_files \
             utils/atac_fq_preprocess utils/combine_species_counts \
-            utils/composite_bam2counts utils/downsample_vcf_parallel \
+            utils/composite_bam2counts \
             utils/nuclear_panel_distinguishability
 
 # Preserve the unrelated FASTK utility when the full upstream source subtree is
@@ -106,6 +111,7 @@ print_flags:
 	@echo "CPU_ARCH=$(CPU_ARCH)"
 	@echo "CPU_TUNE=$(CPU_TUNE)"
 	@echo "ARCHFLAGS=$(ARCHFLAGS)"
+	@echo "PANEL_RUNTIME_FLAGS=$(PANEL_RUNTIME_FLAGS)"
 	@echo "SOURCE_REVISION=$(SOURCE_REVISION)"
 	@echo "CXXFLAGS_PARALLEL=$(CXXFLAGS_PARALLEL)"
 	@echo "CXXFLAGS_TET=$(CXXFLAGS_TET)"
@@ -175,6 +181,21 @@ tetra_refine: src/tetra_refine.cpp lib/libhtswrapper.a
 tetra_score_calls: src/tetra_score_calls.cpp lib/libhtswrapper.a
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_TET) -g src/tetra_score_calls.cpp \
 	    -o $@ $(LFLAGS_TET) lib/libhtswrapper.a -lz
+
+bam_window_coverage: src/bam_window_coverage.cpp
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_MT) $(PANEL_RUNTIME_FLAGS) src/bam_window_coverage.cpp \
+	    -o $@ $(LFLAGS) $(DEPS_MT)
+
+downsample_vcf_parallel: src/downsample_vcf_parallel.cpp \
+    src/downsample_vcf_parallel.h build/common_parallel.o $(DEPS)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o \
+	    src/downsample_vcf_parallel.cpp -o $@ \
+	    $(PANEL_RUNTIME_FLAGS) $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
+
+tetra_arm_ase: src/tetra_arm_ase.cpp lib/libhtswrapper.a \
+    $(HTSWRAPPER_HEADER_STAMP)
+	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_ARM_CNV) src/tetra_arm_ase.cpp \
+	    -o $@ $(LFLAGS_TET) lib/libhtswrapper.a -lhts -lz -lpthread
 
 # -----------------------------------------------------------------------------
 # Build-target compatibility for the existing compcb shell function
@@ -258,13 +279,6 @@ utils/refine_vcf: src/refine_vcf.cpp src/refine_vcf.h src/vcf_hts.h \
 	mkdir -p utils
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o \
 	    build/vcf_hts.o src/refine_vcf.cpp -o $@ \
-	    $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
-
-utils/downsample_vcf_parallel: src/downsample_vcf_parallel.cpp \
-    src/downsample_vcf_parallel.h build/common_parallel.o $(DEPS)
-	mkdir -p utils
-	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_PARALLEL) -g build/common_parallel.o \
-	    src/downsample_vcf_parallel.cpp -o $@ \
 	    $(LFLAGS_PARALLEL) $(DEPS) $(DEPS2_PARALLEL)
 
 utils/get_unique_kmers: src/get_unique_kmers.c src/FASTK/libfastk.c \
