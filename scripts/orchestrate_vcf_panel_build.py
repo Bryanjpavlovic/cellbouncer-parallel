@@ -24,7 +24,7 @@ import sys
 from typing import Iterable, Sequence
 
 
-VERSION = "1.8.2"
+VERSION = "1.9.0-central-figures"
 
 STAGES = (
     "ALL",
@@ -41,12 +41,16 @@ MODALITIES = ("rna", "atac")
 POPULATIONS = ("cells", "all_barcoded", "noncell", "empty", "bam_all")
 BASE_MERGE_POPULATIONS = ("bam_all", "all_barcoded", "cells", "noncell")
 
-DEFAULT_RNA_ROOT = "/mnt/beegfs/tetmultiome_rna_mapped/mapping_output"
-DEFAULT_ATAC_ROOT = "/mnt/beegfs/tetmultiome_atac/mapping_output"
-DEFAULT_OUTPUT_ROOT = (
-    "/mnt/beegfs/tetmultiome_rna_mapped/mapping_output/aggregate_library_analysis/"
-    "vcf_panel_build"
+CURRENT_RNA_RUN_ROOT = (
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/3P"
 )
+CURRENT_RNA_ANALYSIS_ROOT = CURRENT_RNA_RUN_ROOT + "/analysis"
+DEFAULT_RNA_ROOT = CURRENT_RNA_RUN_ROOT + "/mapping_output"
+DEFAULT_ATAC_ROOT = "/mnt/beegfs/tetraploid_multiome_cis_trans/ATAC/mapping_output"
+DEFAULT_OUTPUT_ROOT = (
+    CURRENT_RNA_ANALYSIS_ROOT + "/aggregate_library_analysis/vcf_panel_build"
+)
+DEFAULT_FIGURE_ROOT = CURRENT_RNA_RUN_ROOT + "/figures/all40/vcf_panels"
 DEFAULT_SOURCE_BCF = "/nvme/software/shared_data/downsamples/tet.vars.all.use.bcf"
 DEFAULT_SOURCE_CSI = DEFAULT_SOURCE_BCF + ".csi"
 DEFAULT_GTF = (
@@ -58,10 +62,10 @@ DEFAULT_NUMT_BED = (
     "human_chimp_bonobo/numts.bed"
 )
 DEFAULT_PANEL_METADATA = (
-    "/mnt/beegfs/tetmultiome_rna_mapped/Misc_Metadata/panel_metadata.tsv"
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/Misc_Metadata/panel_metadata.tsv"
 )
 DEFAULT_POOL_COMBINATIONS = (
-    "/mnt/beegfs/tetmultiome_rna_mapped/Misc_Metadata/pool_combinations.tsv"
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/Misc_Metadata/pool_combinations.tsv"
 )
 DEFAULT_PRODUCTION_RNA_PANEL_ROOT = (
     "/mnt/beegfs/home/b/vcfdownsample/Downsample_ATAC_Species_poolInformer/NoMito"
@@ -2771,7 +2775,7 @@ def render_plot_script(
 ) -> tuple[Path, dict[str, Path]]:
     script = run_dir / "control" / "slurm" / "panel_qc_plots.sbatch"
     logs = run_dir / "logs"
-    plot_dir = run_dir / "plots"
+    plot_dir = Path(args.figures_root) / args.run_label
     prefix = plot_dir / "atac_vs_rna_panel_qc"
     cache = Path(str(prefix) + "_cache.npz")
     marker = plot_dir / "plots.complete.tsv"
@@ -3064,6 +3068,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage", choices=STAGES, default="ALL")
     parser.add_argument("--run-label", required=True)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--figures-root", default=DEFAULT_FIGURE_ROOT,
+        help=("Physical root for centralized VCF-panel figures; each run is "
+              "written beneath <figures-root>/<run-label>."),
+    )
     parser.add_argument(
         "--coverage-run-label",
         default=None,
@@ -3440,6 +3449,7 @@ def validate_general_args(args: argparse.Namespace, modalities: Sequence[str]) -
             "with the full source BCF"
         )
     output_root = ensure_absolute(args.output_root, "--output-root")
+    ensure_absolute(args.figures_root, "--figures-root")
     if any(character.isspace() for character in str(output_root)):
         raise PipelineError("--output-root cannot contain whitespace (SBATCH log-path constraint)")
     aggregate_overrides = (
@@ -3564,7 +3574,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_dir / "coverage" / "per_library",
             run_dir / "coverage" / "aggregate",
             run_dir / "panels",
-            run_dir / "plots",
+            Path(args.figures_root) / args.run_label,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
