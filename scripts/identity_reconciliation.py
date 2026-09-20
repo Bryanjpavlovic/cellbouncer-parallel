@@ -2,8 +2,8 @@
 """CellBouncer identity-reconciliation command line.
 
 Subcommands keep the SLURM stages independent without deploying a separate
-Python executable for every small operation. Ambient RNA is intentionally not
-an evidence channel. Decision thresholds are versioned in
+Python executable for every small operation. Ambient RNA remains a nuisance
+term rather than an identity evidence channel. Decision thresholds are versioned in
 identity_reconciliation_common.py rather than a separate YAML file.
 """
 from __future__ import annotations
@@ -16,12 +16,15 @@ import sys
 # -----------------------------------------------------------------------------
 
 import argparse
+import bisect
 import csv
 import gzip
 import json
+import math
 import os
 import re
-from collections import defaultdict
+import statistics
+from collections import Counter, defaultdict
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from itertools import chain
@@ -34,7 +37,8 @@ from identity_reconciliation_common import (
     SCHEMA_VERSION, THREE_STATE_ASSIGNMENT_FIELDS, canonical_genotype,
     canonical_uid_set, clean, derive_downstream_safe_assignment,
     derive_three_state_assignment, format_value, iter_tsv, json_dump_atomic,
-    natural_key, reconciliation_action_class, sha256_file, write_tsv,
+    natural_key, reconciliation_action_class, sha256_file,
+    write_headerless_tsv, write_tsv,
 )
 
 EXPECTED_FIELDS = [
@@ -4567,6 +4571,16 @@ FINAL_PREWRITE_MANIFEST_FIELDS = [
     "path", "size_bytes", "modification_time_utc", "sha256",
 ]
 
+# Finalization historically placed plots beside the aggregate table directory.
+# The orchestrator can now supply one physical, centralized figure directory.
+FINAL_FIGURE_ROOT_OVERRIDE = None
+
+
+def _final_figure_root(output_root):
+    if FINAL_FIGURE_ROOT_OVERRIDE is not None:
+        return Path(FINAL_FIGURE_ROOT_OVERRIDE)
+    return Path(output_root).parent / "plots"
+
 
 def finalize_parse_args():
     p = argparse.ArgumentParser(
@@ -4586,6 +4600,10 @@ def finalize_parse_args():
         "--checkpoint-only", action="store_true",
         help=("reinterpret the completed final-cell checkpoint and rewrite "
               "assignment products without rebuilding evidence joins"))
+    p.add_argument(
+        "--figure-root", default="",
+        help=("Physical directory for reconciliation figures. When omitted, "
+              "retain the historical <final-root>/plots location."))
     p.add_argument("--output-root", required=True)
     return p.parse_args()
 
@@ -5123,14 +5141,14 @@ def _final_write_three_state_products(
             "identity_reconciliation_joint_supported_held_transitions.tsv"),
         joint_legacy, FINAL_TRANSITION_FIELDS)
     _final_write_transition_plot(
-        output_root.parent / "plots" /
+        _final_figure_root(output_root) /
         "identity_reconciliation_joint_supported_held_transitions.png",
         joint_legacy, joint_total)
     _final_write_assignment_status_plot(
-        output_root.parent / "plots" / "identity_assignment_status.png",
+        _final_figure_root(output_root) / "identity_assignment_status.png",
         status_rows)
     _final_write_line_changes_plot(
-        output_root.parent / "plots" / "identity_line_changes.png",
+        _final_figure_root(output_root) / "identity_line_changes.png",
         applied_rows, review_rows)
     return {
         "n_rows": n_rows,
@@ -5172,7 +5190,7 @@ def _final_preserve_prewrite_manifest(output_root, assignments_root, libraries):
         for library in libraries
     )
     paths.extend(
-        output_root.parent / "plots" / name
+        _final_figure_root(output_root) / name
         for name in (
             "identity_reconciliation_joint_supported_held_transitions.png",
             "identity_assignment_status.png", "identity_line_changes.png")
@@ -5232,7 +5250,7 @@ def _final_resume_checkpoint_available_v3_legacy(
         return False
     ledger_mtime = ledger.stat().st_mtime
     completion_products = [
-        output_root.parent / "plots" /
+        _final_figure_root(output_root) /
         "identity_reconciliation_joint_supported_held_transitions.png",
         output_root.parent / "validation" / "validation_summary.tsv",
     ]
@@ -5397,7 +5415,7 @@ def _final_resume_from_checkpoint_v3_legacy(
         output_root /
         "identity_reconciliation_joint_supported_held_transitions.tsv"))
     _final_write_transition_plot(
-        output_root.parent / "plots" /
+        _final_figure_root(output_root) /
         "identity_reconciliation_joint_supported_held_transitions.png",
         transition_rows, all_counts["joint_supported_held_cells"])
     print(
@@ -5430,8 +5448,8 @@ def _final_resume_checkpoint_available(
         output_root / "identity_applied_changes.tsv",
         output_root / "identity_review_needed.tsv.gz",
         output_root / "identity_review_transition_summary.tsv",
-        output_root.parent / "plots" / "identity_assignment_status.png",
-        output_root.parent / "plots" / "identity_line_changes.png",
+        _final_figure_root(output_root) / "identity_assignment_status.png",
+        _final_figure_root(output_root) / "identity_line_changes.png",
     )
     if schema != FINAL_SCHEMA_VERSION or any(not path.is_file() for path in required):
         return True
@@ -6415,11 +6433,20 @@ def _final_four_arm_fields(library, barcode, event_bearing, pivot, strata,
 
 
 def finalize_main():
+    global FINAL_FIGURE_ROOT_OVERRIDE
     args = finalize_parse_args()
     library_numbers = parse_library_spec(args.libraries)
     libraries = [f"lib{number}" for number in library_numbers]
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    if args.figure_root:
+        requested_figure_root = Path(args.figure_root).expanduser()
+        if not requested_figure_root.is_absolute():
+            raise ValueError("--figure-root must be an absolute path")
+        FINAL_FIGURE_ROOT_OVERRIDE = requested_figure_root.resolve(strict=False)
+    else:
+        FINAL_FIGURE_ROOT_OVERRIDE = None
+    _final_figure_root(output_root).mkdir(parents=True, exist_ok=True)
     assignments_root = output_root.parent / "final_assignments"
     assignments_root.mkdir(parents=True, exist_ok=True)
     if args.checkpoint_only and args.review_input:
@@ -7768,6 +7795,1784 @@ def finalize_main():
     return 0
 
 
+# -----------------------------------------------------------------------------
+# joint-prepare / joint-aggregate
+# -----------------------------------------------------------------------------
+
+JOINT_LEDGER_SCHEMA = "joint_doublet_canonical_cell_ledger_v2"
+JOINT_MANIFEST_SCHEMA = "joint_doublet_candidate_manifest_v2"
+JOINT_AGGREGATE_SCHEMA = "joint_doublet_ranked_cell_ledger_v2"
+JOINT_ANALYSIS_SCHEMA = "joint_doublet_post_gather_analysis_v1"
+
+
+def _joint_open(path):
+    return gzip.open(path, "rt", encoding="utf-8", errors="replace") \
+        if str(path).endswith(".gz") else \
+        open(path, "r", encoding="utf-8", errors="replace")
+
+
+def _joint_barcode(value):
+    raw = clean(value).upper()
+    if not raw:
+        return ""
+    core = raw.split("-", 1)[0]
+    if not re.fullmatch(r"[ACGT]{16}", core):
+        return ""
+    return core
+
+
+def _joint_library(value):
+    match = re.search(r"(\d+)", clean(value))
+    if not match:
+        raise SystemExit(f"invalid library label: {value}")
+    return f"lib{int(match.group(1))}"
+
+
+def _joint_bool(value):
+    return clean(value).lower() in {"1", "true", "yes", "y"}
+
+
+def _joint_finite(value, default=math.nan):
+    try:
+        result = float(clean(value))
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _joint_read_barcodes(path):
+    result = []
+    raw_by_barcode = {}
+    with _joint_open(path) as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            raw = line.split()[0]
+            barcode = _joint_barcode(raw)
+            if not barcode:
+                raise SystemExit(
+                    f"{path}: invalid 16-bp barcode at line {line_no}: {raw}")
+            prior = raw_by_barcode.setdefault(barcode, raw)
+            if prior != raw:
+                raise SystemExit(
+                    f"{path}: canonical barcode collision: {prior} and {raw}")
+            result.append(barcode)
+    if len(set(result)) != len(result):
+        raise SystemExit(f"{path}: duplicate canonical barcodes")
+    return result
+
+
+def _joint_rows_by_barcode(path):
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return {}
+    result = {}
+    with _joint_open(path) as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            barcode = _joint_barcode(row.get("barcode", ""))
+            if barcode:
+                result[barcode] = dict(row)
+    return result
+
+
+def _joint_assignments(path):
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return {}
+    result = {}
+    with _joint_open(path) as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 2:
+                continue
+            barcode = _joint_barcode(fields[0])
+            if not barcode:
+                continue
+            result[barcode] = {
+                "assignment": canonical_genotype(fields[1]),
+                "type": clean(fields[2]) if len(fields) > 2 else "",
+                "llr": clean(fields[3]) if len(fields) > 3 else "",
+                "source_line": line_no,
+            }
+    return result
+
+
+def _joint_runnerups(path, maximum):
+    result = defaultdict(list)
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return result
+    with _joint_open(path) as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            barcode = _joint_barcode(row.get("barcode", ""))
+            try:
+                rank = int(float(clean(row.get("rank", "0"))))
+            except ValueError:
+                continue
+            identity = canonical_genotype(row.get("identity", ""))
+            if barcode and identity and 1 <= rank <= maximum:
+                result[barcode].append((rank, identity))
+    for barcode in result:
+        result[barcode].sort()
+    return result
+
+
+def _joint_expression_features(barcodes, features_path, matrix_path):
+    feature_names = []
+    feature_is_gex = []
+    with _joint_open(features_path) as handle:
+        for line in handle:
+            fields = line.rstrip("\r\n").split("\t")
+            name = clean(fields[1] if len(fields) > 1 else fields[0])
+            kind = clean(fields[2] if len(fields) > 2 else "Gene Expression")
+            feature_names.append(name)
+            feature_is_gex.append(kind in {"", "Gene Expression"})
+    totals = [0.0] * len(barcodes)
+    detected = [0] * len(barcodes)
+    mitochondrial = [0.0] * len(barcodes)
+    ribosomal = [0.0] * len(barcodes)
+    dimensions = None
+    with _joint_open(matrix_path) as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip() or line.startswith("%"):
+                continue
+            fields = line.split()
+            if dimensions is None:
+                if len(fields) != 3:
+                    raise SystemExit(
+                        f"{matrix_path}: malformed MatrixMarket dimensions")
+                dimensions = tuple(int(x) for x in fields)
+                if dimensions[0] != len(feature_names) or \
+                        dimensions[1] != len(barcodes):
+                    raise SystemExit(
+                        f"{matrix_path}: dimensions {dimensions[:2]} do not "
+                        f"match features/barcodes {(len(feature_names), len(barcodes))}")
+                continue
+            if len(fields) < 3:
+                continue
+            feature_index = int(fields[0]) - 1
+            barcode_index = int(fields[1]) - 1
+            value = float(fields[2])
+            if value <= 0 or not feature_is_gex[feature_index]:
+                continue
+            name = feature_names[feature_index].upper()
+            totals[barcode_index] += value
+            detected[barcode_index] += 1
+            if name.startswith("MT-"):
+                mitochondrial[barcode_index] += value
+            if name.startswith("RPL") or name.startswith("RPS"):
+                ribosomal[barcode_index] += value
+    if dimensions is None:
+        raise SystemExit(f"{matrix_path}: missing MatrixMarket dimensions")
+    return {
+        barcode: {
+            "rna_total_counts": totals[index],
+            "rna_detected_features": detected[index],
+            "rna_mitochondrial_counts": mitochondrial[index],
+            "rna_ribosomal_counts": ribosomal[index],
+            "rna_mitochondrial_fraction": (
+                mitochondrial[index] / totals[index]
+                if totals[index] > 0 else math.nan),
+        }
+        for index, barcode in enumerate(barcodes)
+    }
+
+
+def _joint_fragment_features(path, selected_barcodes=None):
+    selected = set(selected_barcodes) if selected_barcodes is not None else None
+    result = defaultdict(lambda: {
+        "atac_fragment_records": 0,
+        "atac_fragments": 0.0,
+        "atac_cut_sites": 0.0,
+        "atac_nucleosome_free_fragments": 0.0,
+        "atac_mononucleosome_fragments": 0.0,
+    })
+    aliases = {}
+    with _joint_open(path) as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 4:
+                continue
+            barcode = _joint_barcode(fields[3])
+            if not barcode:
+                continue
+            if selected is not None and barcode not in selected:
+                continue
+            raw = clean(fields[3])
+            prior = aliases.setdefault(barcode, raw)
+            if prior != raw:
+                raise SystemExit(
+                    f"{path}: canonical barcode collision at line {line_no}: "
+                    f"{prior} and {raw}")
+            try:
+                start, end = int(fields[1]), int(fields[2])
+                weight = float(fields[4]) if len(fields) > 4 else 1.0
+            except ValueError:
+                continue
+            if end <= start or weight <= 0 or not math.isfinite(weight):
+                continue
+            row = result[barcode]
+            row["atac_fragment_records"] += 1
+            row["atac_fragments"] += weight
+            row["atac_cut_sites"] += 2.0 * weight
+            length = end - start
+            if length < 147:
+                row["atac_nucleosome_free_fragments"] += weight
+            if 180 <= length <= 247:
+                row["atac_mononucleosome_fragments"] += weight
+    for row in result.values():
+        denominator = row["atac_mononucleosome_fragments"]
+        row["atac_nfr_to_mono_ratio"] = (
+            row["atac_nucleosome_free_fragments"] / denominator
+            if denominator > 0 else math.nan)
+    return dict(result)
+
+
+def _joint_load_rates(path):
+    result = {}
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return result
+    with _joint_open(path) as handle:
+        for line in handle:
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            barcode = _joint_barcode(fields[0])
+            rate = _joint_finite(fields[1])
+            if barcode and math.isfinite(rate) and 0 <= rate <= 1:
+                result[barcode] = min(rate, 0.99)
+    return result
+
+
+def _joint_load_profile(path):
+    profile = {}
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return profile
+    with _joint_open(path) as handle:
+        for line in handle:
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            value = _joint_finite(fields[1])
+            if math.isfinite(value) and value > 0 and clean(fields[0]) != "-1":
+                profile[clean(fields[0])] = profile.get(clean(fields[0]), 0.0) + value
+    total = sum(profile.values())
+    return {key: value / total for key, value in profile.items()} \
+        if total > 0 else {}
+
+
+def _joint_load_samples(path):
+    samples = []
+    with _joint_open(path) as handle:
+        for line in handle:
+            sample = clean(line.split()[0] if line.split() else "")
+            if sample:
+                samples.append(sample)
+    if not samples or len(samples) != len(set(samples)):
+        raise SystemExit(f"{path}: sample vector must be nonempty and unique")
+    return samples
+
+
+def _joint_copy_vector(state):
+    components = donor_components(canonical_genotype(state))
+    counts = Counter(components)
+    return ",".join(
+        f"{donor}:{counts[donor]}" for donor in sorted(counts, key=natural_key))
+
+
+def _joint_weight_vector(profile):
+    return ",".join(
+        f"{donor}:{profile[donor]:.17g}"
+        for donor in sorted(profile, key=natural_key))
+
+
+def _joint_pool_state_catalog(path, library):
+    physical_states = set()
+    component_states = set()
+    with _joint_open(path) as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        fields = reader.fieldnames or []
+        library_field = next(
+            (field for field in fields
+             if re.sub(r"[^a-z0-9]", "", field.lower())
+             in {"library", "libraryid", "lib"}), fields[0] if fields else "")
+        identity_field = next(
+            (field for field in fields
+             if re.sub(r"[^a-z0-9]", "", field.lower())
+             in {"cellidentities", "identities", "genotypes"}),
+            fields[1] if len(fields) > 1 else "")
+        for row in reader:
+            try:
+                row_library = _joint_library(row.get(library_field, ""))
+            except SystemExit:
+                continue
+            if row_library != library:
+                continue
+            for token in re.split(r"[,;]", clean(row.get(identity_field, ""))):
+                state = canonical_genotype(token)
+                if state and not state.startswith("M{"):
+                    physical_states.add(state)
+                    component_states.update(donor_components(state))
+    if not physical_states:
+        raise SystemExit(
+            f"{path}: no legal biological states resolved for {library}")
+    return {
+        "physical_states": sorted(physical_states, key=natural_key),
+        "component_states": sorted(component_states, key=natural_key),
+    }
+
+
+def _joint_pool_states(path, library):
+    """Legacy union retained for backward-compatible callers."""
+    catalog = _joint_pool_state_catalog(path, library)
+    return sorted(
+        set(catalog["physical_states"]) | set(catalog["component_states"]),
+        key=natural_key)
+
+
+def _joint_candidate_relationship(locked, candidate, physical_states):
+    locked_counts = Counter(donor_components(canonical_genotype(locked)))
+    candidate_counts = Counter(donor_components(canonical_genotype(candidate)))
+    if not candidate_counts:
+        return "UNAVAILABLE"
+    new_donors = sorted(set(candidate_counts) - set(locked_counts), key=natural_key)
+    if new_donors:
+        relationship = "CONTAINS_NEW_DONOR"
+    else:
+        locked_total = sum(locked_counts.values())
+        candidate_total = sum(candidate_counts.values())
+        same_proportions = locked_total > 0 and candidate_total > 0 and all(
+            locked_counts[donor] * candidate_total ==
+            candidate_counts[donor] * locked_total
+            for donor in set(locked_counts) | set(candidate_counts))
+        relationship = (
+            "GENETICALLY_IDENTICAL_NO_CHANGE" if same_proportions else
+            "EXISTING_COMPONENT_REWEIGHTING")
+    if candidate in physical_states:
+        return f"PHYSICAL_POOL_STATE__{relationship}"
+    return f"COMPONENT_ONLY_NONPHYSICAL__{relationship}"
+
+
+def _joint_disposition(row):
+    for field in ("assignment_status", "downstream_assignment_status"):
+        value = clean(row.get(field, "")).upper()
+        if value:
+            return value
+    if _joint_bool(row.get("reassignment_applied", "")) or \
+            _joint_bool(row.get("reconciliation_reassignment_applied", "")):
+        return "CHANGE_APPLIED"
+    action = clean(
+        row.get("final_action", "") or
+        row.get("reconciliation_final_action", "")).upper()
+    confidence = clean(
+        row.get("decision_confidence", "") or
+        row.get("reconciliation_decision_confidence", "")).upper()
+    if "REVIEW" in action or "CONFLICT" in action or \
+            confidence in {"CONFLICTED", "INSUFFICIENT"}:
+        return "REVIEW_NEEDED"
+    return "FINE_NO_CHANGE"
+
+
+def _joint_uncertain(assignment, diagnostic, observed, llr_threshold):
+    if not observed or not assignment or not assignment.get("assignment"):
+        return True
+    resolved = clean(diagnostic.get("selection_resolved", ""))
+    if resolved and resolved.lower() not in {"1", "true", "yes"}:
+        return True
+    llr = _joint_finite(
+        diagnostic.get("llr_vs_runner_up", assignment.get("llr", "")))
+    return not math.isfinite(llr) or llr < llr_threshold
+
+
+def _joint_modality_relation(rna_assignment, atac_assignment):
+    rna = canonical_genotype(rna_assignment)
+    atac = canonical_genotype(atac_assignment)
+    if not rna and not atac:
+        return "BOTH_MISSING"
+    if not rna:
+        return "RNA_MISSING"
+    if not atac:
+        return "ATAC_MISSING"
+    return "AGREE" if rna == atac else "DISAGREE"
+
+
+def joint_prepare_parse_args():
+    parser = argparse.ArgumentParser(
+        description="Build one canonical library+16bp-barcode joint-doublet ledger and candidate manifests.")
+    parser.add_argument("--library", required=True)
+    parser.add_argument("--rna-barcodes", required=True)
+    parser.add_argument("--rna-features", required=True)
+    parser.add_argument("--rna-matrix", required=True)
+    parser.add_argument("--rna-samples", required=True)
+    parser.add_argument("--rna-assignments", required=True)
+    parser.add_argument("--rna-diagnostics", required=True)
+    parser.add_argument("--rna-runner-ups", default="")
+    parser.add_argument("--atac-fragments", required=True)
+    parser.add_argument("--atac-samples", required=True)
+    parser.add_argument("--atac-assignments", required=True)
+    parser.add_argument("--atac-diagnostics", required=True)
+    parser.add_argument("--atac-runner-ups", default="")
+    parser.add_argument("--reconciled-assignments", required=True)
+    parser.add_argument("--reconciled-cells", required=True)
+    parser.add_argument("--technical-candidates", default="")
+    parser.add_argument("--ploidy-calls", default="")
+    parser.add_argument("--ambient-rates", default="")
+    parser.add_argument("--ambient-profile", default="")
+    parser.add_argument("--pool-combinations", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--max-runner-ups", type=int, default=8)
+    parser.add_argument("--uncertain-llr", type=float, default=20.0)
+    parser.add_argument(
+        "--candidate-policy", choices=["LEGACY_NOMINATED", "DERIVATIVE_COMPLETE"],
+        default="LEGACY_NOMINATED",
+        help=("Legacy data-dependent nomination or one complete, identical "
+              "RNA/ATAC menu built from legal physical pool states and their "
+              "component-only states."))
+    return parser.parse_args()
+
+
+def joint_prepare_main():
+    args = joint_prepare_parse_args()
+    library = _joint_library(args.library)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rna_barcodes = _joint_read_barcodes(args.rna_barcodes)
+    expression = _joint_expression_features(
+        rna_barcodes, args.rna_features, args.rna_matrix)
+    rna_assignments = _joint_assignments(args.rna_assignments)
+    atac_assignments = _joint_assignments(args.atac_assignments)
+    frozen_assignments = _joint_assignments(args.reconciled_assignments)
+    rna_diagnostics = _joint_rows_by_barcode(args.rna_diagnostics)
+    atac_diagnostics = _joint_rows_by_barcode(args.atac_diagnostics)
+    reconciled = _joint_rows_by_barcode(args.reconciled_cells)
+    ploidy = _joint_rows_by_barcode(args.ploidy_calls)
+    rna_runnerups = _joint_runnerups(
+        args.rna_runner_ups, args.max_runner_ups)
+    atac_runnerups = _joint_runnerups(
+        args.atac_runner_ups, args.max_runner_ups)
+    # The fragments file contains the raw barcode universe, including empty
+    # droplets and sequencing background.  A barcode becomes an ATAC-observed
+    # cell only when it occurs in the completed ATAC demux evidence.  Scan the
+    # fragments once for QC features, but retain rows only for canonical cells.
+    atac_observed = (
+        set(atac_assignments) | set(atac_diagnostics) | set(atac_runnerups))
+    canonical_barcodes = set(rna_barcodes) | atac_observed
+    fragments = _joint_fragment_features(
+        args.atac_fragments, canonical_barcodes)
+    ambient_rates = _joint_load_rates(args.ambient_rates)
+    ambient_profile = _joint_load_profile(args.ambient_profile)
+    rna_samples = set(_joint_load_samples(args.rna_samples))
+    atac_samples = set(_joint_load_samples(args.atac_samples)) \
+        if os.path.isfile(args.atac_samples) else set()
+    ambient_profile = {
+        donor: weight for donor, weight in ambient_profile.items()
+        if donor in rna_samples
+    }
+    ambient_total = sum(ambient_profile.values())
+    if ambient_total > 0:
+        ambient_profile = {
+            donor: weight / ambient_total
+            for donor, weight in ambient_profile.items()
+        }
+    ambient_vector = _joint_weight_vector(ambient_profile)
+    state_catalog = _joint_pool_state_catalog(args.pool_combinations, library)
+    physical_states = set(state_catalog["physical_states"])
+    component_states = set(state_catalog["component_states"])
+    legal_states = sorted(physical_states | component_states, key=natural_key)
+    candidate_states = sorted(
+        set(legal_states) | rna_samples | atac_samples, key=natural_key)
+    candidate_state_set = set(candidate_states)
+
+    technical = defaultdict(list)
+    if args.technical_candidates and os.path.isfile(args.technical_candidates):
+        with _joint_open(args.technical_candidates) as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            for row in reader:
+                barcode = _joint_barcode(row.get("barcode", ""))
+                if barcode:
+                    technical[barcode].append(dict(row))
+
+    barcode_universe = sorted(canonical_barcodes, key=natural_key)
+    ledger_rows = []
+    rna_called = set(rna_barcodes)
+    for barcode in barcode_universe:
+        rna_assignment = rna_assignments.get(barcode, {})
+        atac_assignment = atac_assignments.get(barcode, {})
+        frozen = frozen_assignments.get(barcode, {})
+        rec = reconciled.get(barcode, {})
+        ploidy_row = ploidy.get(barcode, {})
+        expression_row = expression.get(barcode, {})
+        fragment_row = fragments.get(barcode, {})
+        locked = canonical_genotype(
+            frozen.get("assignment", "") or
+            rec.get("reconciled_donor_genotype", ""))
+        rate = ambient_rates.get(barcode, math.nan)
+        ambient_status = (
+            "AVAILABLE" if math.isfinite(rate) and ambient_profile else
+            "RATE_AVAILABLE_PROFILE_MISSING" if math.isfinite(rate) else
+            "PROFILE_AVAILABLE_RATE_MISSING" if ambient_profile else
+            "UNAVAILABLE")
+        technical_classes = sorted({
+            clean(row.get("technical_class", ""))
+            for row in technical.get(barcode, [])
+            if clean(row.get("technical_class", ""))
+        }, key=natural_key)
+        ledger_rows.append({
+            "schema_version": JOINT_LEDGER_SCHEMA,
+            "library": library,
+            "barcode": barcode,
+            "cohort_role": (
+                "CALIBRATION_TUNING_ONLY" if library == "lib25" else
+                "HELD_OUT_FROZEN_EVALUATION"
+                if library in {"lib35", "lib38"} else
+                "HELD_OUT_PATHOLOGICAL_INTERPRET_LAST"
+                if library == "lib19" else
+                "ALL40_FEATURE_EXTRACTION_AND_FROZEN_APPLICATION"),
+            "rna_called": barcode in rna_called,
+            "atac_observed": barcode in atac_observed,
+            "rna_modality_status": (
+                "OBSERVED" if barcode in rna_called else "MISSING"),
+            "atac_modality_status": (
+                "OBSERVED" if barcode in atac_observed else
+                "FRAGMENTS_ONLY_NOT_CELL_EVIDENCE" if barcode in fragments else
+                "MISSING_NOT_SINGLET"),
+            "rna_assignment": rna_assignment.get("assignment", ""),
+            "rna_assignment_type": rna_assignment.get("type", ""),
+            "rna_assignment_llr": rna_assignment.get("llr", ""),
+            "rna_selection_resolved": rna_diagnostics.get(
+                barcode, {}).get("selection_resolved", ""),
+            "rna_runnerup_llr": rna_diagnostics.get(
+                barcode, {}).get("llr_vs_runner_up", ""),
+            "atac_assignment": atac_assignment.get("assignment", ""),
+            "atac_assignment_type": atac_assignment.get("type", ""),
+            "atac_assignment_llr": atac_assignment.get("llr", ""),
+            "atac_selection_resolved": atac_diagnostics.get(
+                barcode, {}).get("selection_resolved", ""),
+            "atac_runnerup_llr": atac_diagnostics.get(
+                barcode, {}).get("llr_vs_runner_up", ""),
+            "demux_modality_relation": _joint_modality_relation(
+                rna_assignment.get("assignment", ""),
+                atac_assignment.get("assignment", "")),
+            "reconciled_identity_locked": locked,
+            "identity_disposition": _joint_disposition(rec),
+            "identity_source": (
+                "FROZEN_RECONCILED_ASSIGNMENT" if locked else "UNAVAILABLE"),
+            "ambient_rate": rate,
+            "ambient_status": ambient_status,
+            "biological_ploidy": clean(
+                rec.get("reconciled_biological_ploidy", "")),
+            "biological_state": clean(rec.get("reconciled_state", "")),
+            "reconciled_droplet_state": clean(
+                rec.get("reconciled_droplet_state", "")),
+            "current_droplet_flag": clean(rec.get("current_droplet_flag", "")),
+            "explicit_multiplet_evidence": clean(
+                rec.get("explicit_multiplet_evidence", "")),
+            "occupancy_resolution_status": clean(
+                rec.get("occupancy_resolution_status", "")),
+            "competing_technical_state": clean(
+                rec.get("competing_technical_state", "")),
+            "biological_fusion_context": clean(
+                rec.get("mt_verification_mode", "") or
+                rec.get("species_relation", "")),
+            "reconciliation_action": clean(
+                rec.get("reconciliation_final_action", "") or
+                rec.get("final_action", "")),
+            "reconciliation_confidence": clean(
+                rec.get("reconciliation_decision_confidence", "") or
+                rec.get("decision_confidence", "")),
+            "ploidy_call": clean(
+                ploidy_row.get("ploidy_call", "") or
+                rec.get("nn_ploidy_call", "")),
+            "ploidy_probability": clean(
+                ploidy_row.get("ploidy_probability", "") or
+                rec.get("nn_prob_tetraploid", "")),
+            "ploidy_qc_pass": clean(
+                ploidy_row.get("qc_pass", "") or rec.get("nn_qc_pass", "")),
+            "technical_occupancy_candidate_count": len(technical.get(barcode, [])),
+            "technical_occupancy_candidate_classes": (
+                ",".join(technical_classes) if technical_classes else "NONE"),
+            **{
+                field: expression_row.get(
+                    field,
+                    (0 if field != "rna_mitochondrial_fraction" else math.nan)
+                    if barcode in rna_called else math.nan)
+                for field in (
+                    "rna_total_counts", "rna_detected_features",
+                    "rna_mitochondrial_counts", "rna_ribosomal_counts",
+                    "rna_mitochondrial_fraction")
+            },
+            **{
+                field: fragment_row.get(field, 0 if barcode in fragments else math.nan)
+                for field in (
+                    "atac_fragment_records", "atac_fragments", "atac_cut_sites",
+                    "atac_nucleosome_free_fragments",
+                    "atac_mononucleosome_fragments", "atac_nfr_to_mono_ratio")
+            },
+        })
+
+    ledger_fields = list(ledger_rows[0]) if ledger_rows else [
+        "schema_version", "library", "barcode"]
+    write_tsv(
+        str(output_dir / f"{library}.cell_ledger.tsv.gz"),
+        ledger_rows, ledger_fields)
+    write_headerless_tsv(
+        str(output_dir / f"{library}.atac_union_barcodes.tsv"),
+        ([barcode] for barcode in barcode_universe))
+
+    manifest_rows = []
+    exhaustive_cells = set()
+    ledger_by_barcode = {row["barcode"]: row for row in ledger_rows}
+    for barcode in barcode_universe:
+        ledger = ledger_by_barcode[barcode]
+        locked = canonical_genotype(ledger["reconciled_identity_locked"])
+        if not locked or locked.startswith("M{") or not _joint_copy_vector(locked):
+            continue
+        nominations = defaultdict(lambda: {"origins": set(), "modalities": set()})
+
+        def nominate(raw_state, origin, modality):
+            state = canonical_genotype(raw_state)
+            if not state or state.startswith("M{"):
+                return
+            candidates = []
+            if state in candidate_state_set:
+                candidates.append(state)
+            locked_components = Counter(donor_components(locked))
+            for donor in donor_components(state):
+                if donor in candidate_state_set:
+                    candidates.append(donor)
+                if locked_components[donor] > 0:
+                    locked_components[donor] -= 1
+            for candidate in candidates:
+                nominations[candidate]["origins"].add(origin)
+                nominations[candidate]["modalities"].add(modality)
+
+        if args.candidate_policy == "DERIVATIVE_COMPLETE":
+            for state in legal_states:
+                nominations[state]["origins"].add(
+                    "DERIVATIVE_COMPLETE_LEGAL_STATE_POLICY")
+                nominations[state]["modalities"].add("RNA_AND_ATAC_COMPLETE_MENU")
+
+        nominate(locked, "SAME_STATE_OCCUPANCY", "OCCUPANCY")
+        for modality, assignment, diagnostic, runnerups in (
+                ("RNA", rna_assignments.get(barcode, {}),
+                 rna_diagnostics.get(barcode, {}), rna_runnerups.get(barcode, [])),
+                ("ATAC", atac_assignments.get(barcode, {}),
+                 atac_diagnostics.get(barcode, {}), atac_runnerups.get(barcode, []))):
+            if args.candidate_policy == "LEGACY_NOMINATED":
+                nominate(assignment.get("assignment", ""),
+                         f"{modality}_WINNER", modality)
+                nominate(diagnostic.get("candidate_identity", ""),
+                         f"{modality}_DIAGNOSTIC_WINNER", modality)
+                nominate(diagnostic.get("worst_competitor", ""),
+                         f"{modality}_WORST_COMPETITOR", modality)
+                for rank, identity in runnerups:
+                    nominate(identity, f"{modality}_RUNNER_UP_{rank}", modality)
+        if args.candidate_policy == "LEGACY_NOMINATED":
+            for row in technical.get(barcode, []):
+                nominate(row.get("donor_composition", ""),
+                         "TECHNICAL_MULTIPLET_CANDIDATE", "OCCUPANCY")
+                nominate(row.get("additional_donor", ""),
+                         "TECHNICAL_ADDITIONAL_DONOR", "OCCUPANCY")
+
+        rna_uncertain = _joint_uncertain(
+            rna_assignments.get(barcode, {}), rna_diagnostics.get(barcode, {}),
+            barcode in rna_called, args.uncertain_llr)
+        atac_uncertain = _joint_uncertain(
+            atac_assignments.get(barcode, {}), atac_diagnostics.get(barcode, {}),
+            barcode in atac_observed, args.uncertain_llr)
+        exhaustive = rna_uncertain or atac_uncertain or \
+            ledger["demux_modality_relation"] == "DISAGREE"
+        if exhaustive and args.candidate_policy == "LEGACY_NOMINATED":
+            exhaustive_cells.add(barcode)
+            for state in candidate_states:
+                nominations[state]["origins"].add("UNCERTAINTY_EXHAUSTIVE_FALLBACK")
+                nominations[state]["modalities"].add("FALLBACK")
+
+        for second_state in sorted(nominations, key=natural_key):
+            info = nominations[second_state]
+            common = {
+                "schema_version": JOINT_MANIFEST_SCHEMA,
+                "library": library,
+                "barcode": barcode,
+                "candidate_id": f"{library}:{barcode}:K2:{second_state}",
+                "locked_state": locked,
+                "locked_copy_vector": _joint_copy_vector(locked),
+                "second_state": second_state,
+                "second_copy_vector": _joint_copy_vector(second_state),
+                "candidate_origin": ",".join(
+                    sorted(info["origins"], key=natural_key)),
+                "exhaustive_fallback": exhaustive,
+                "nomination_modalities": ",".join(
+                    sorted(info["modalities"], key=natural_key)),
+                "candidate_policy": args.candidate_policy,
+                "physical_pool_state": second_state in physical_states,
+                "component_only_state": (
+                    second_state in component_states and
+                    second_state not in physical_states),
+                "structural_added_state_relationship":
+                    _joint_candidate_relationship(
+                        locked, second_state, physical_states),
+            }
+            rate = ambient_rates.get(barcode, math.nan)
+            rna_row = dict(common)
+            rna_row.update({
+                "rho": rate if math.isfinite(rate) else 0.0,
+                "ambient_copy_vector": ambient_vector,
+                "ambient_status": (
+                    "AVAILABLE" if math.isfinite(rate) and ambient_vector else
+                    "UNAVAILABLE_RHO_ZERO"),
+            })
+            atac_row = dict(common)
+            atac_row.update({
+                "rho": 0.0,
+                "ambient_copy_vector": "",
+                "ambient_status": "ATAC_AMBIENT_NOT_ESTIMATED",
+            })
+            manifest_rows.append((rna_row, atac_row))
+
+    manifest_fields = [
+        "schema_version", "library", "barcode", "candidate_id",
+        "locked_state", "locked_copy_vector", "second_state",
+        "second_copy_vector", "candidate_origin", "exhaustive_fallback",
+        "nomination_modalities", "rho", "ambient_copy_vector", "ambient_status",
+        "candidate_policy", "physical_pool_state", "component_only_state",
+        "structural_added_state_relationship",
+    ]
+    write_tsv(
+        str(output_dir / f"{library}.rna_joint_manifest.tsv.gz"),
+        (rows[0] for rows in manifest_rows), manifest_fields)
+    write_tsv(
+        str(output_dir / f"{library}.atac_joint_manifest.tsv.gz"),
+        (rows[1] for rows in manifest_rows), manifest_fields)
+    summary = [{
+        "schema_version": JOINT_LEDGER_SCHEMA,
+        "library": library,
+        "canonical_cells": len(barcode_universe),
+        "rna_called_cells": len(rna_called),
+        "atac_observed_cells": len(atac_observed),
+        "rna_called_missing_atac": len(rna_called - atac_observed),
+        "atac_observed_not_rna_called": len(atac_observed - rna_called),
+        "frozen_identity_available": sum(
+            bool(row["reconciled_identity_locked"]) for row in ledger_rows),
+        "candidate_rows": len(manifest_rows),
+        "exhaustive_fallback_cells": len(exhaustive_cells),
+        "ambient_rates_available": len(ambient_rates),
+        "ambient_profile_donors": len(ambient_profile),
+        "candidate_second_states": len(candidate_states),
+        "candidate_policy": args.candidate_policy,
+        "physical_pool_states": len(physical_states),
+        "component_only_states": len(component_states - physical_states),
+        "atac_observed_basis": (
+            "ATAC_DEMUX_ASSIGNMENT_OR_DIAGNOSTIC_OR_RUNNER_UP"),
+        "canonical_cells_with_fragment_qc": len(fragments),
+    }]
+    write_tsv(
+        str(output_dir / f"{library}.prepare_summary.tsv"),
+        summary, list(summary[0]))
+    print(
+        f"Prepared {library}: {len(barcode_universe)} cells, "
+        f"{len(manifest_rows)} K2 candidates")
+    return 0
+
+
+def _joint_quantile(values, probability):
+    ordered = sorted(value for value in values if math.isfinite(value))
+    if not ordered:
+        return math.nan
+    position = probability * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def _joint_robust_parameters(values):
+    finite = sorted(value for value in values if math.isfinite(value))
+    if not finite:
+        return math.nan, math.nan
+    median = statistics.median(finite)
+    mad = statistics.median(abs(value - median) for value in finite)
+    scale = 1.4826 * mad
+    if not math.isfinite(scale) or scale <= 0:
+        scale = statistics.pstdev(finite) if len(finite) > 1 else 1.0
+    if not math.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    return median, scale
+
+
+def _joint_percentile(value, reference):
+    if not math.isfinite(value) or not reference:
+        return math.nan
+    return bisect.bisect_right(reference, value) / len(reference)
+
+
+def _joint_score_rows(path, modality):
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    rows = []
+    for row in read_tsv(str(path)):
+        base = {
+            key: row.get(key, "")
+            for key in (
+                "schema_version", "library", "barcode", "candidate_id",
+                "locked_state", "locked_copy_vector", "second_state",
+                "second_copy_vector", "candidate_origin", "exhaustive_fallback",
+                "nomination_modalities")
+        }
+        for key, value in row.items():
+            if key not in base and key not in {"library", "barcode", "candidate_id"}:
+                base[f"{modality}_{key}"] = value
+        rows.append(base)
+    return rows
+
+
+def joint_aggregate_parse_args():
+    parser = argparse.ArgumentParser(
+        description="Calibrate on Library 25 and build the frozen all-library ranked joint-doublet ledger.")
+    parser.add_argument("--input-root", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--libraries", nargs="+", required=True)
+    parser.add_argument("--calibration-library", default="25")
+    return parser.parse_args()
+
+
+def joint_aggregate_main():
+    args = joint_aggregate_parse_args()
+    input_root = Path(args.input_root)
+    output_root = Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    libraries = [_joint_library(value) for value in args.libraries]
+    calibration_library = _joint_library(args.calibration_library)
+    if calibration_library not in libraries:
+        raise SystemExit(
+            "joint-aggregate requires the selected calibration library in --libraries")
+
+    ledgers = []
+    ledger_by_key = {}
+    candidate_by_key = {}
+    for library in libraries:
+        ledger_path = input_root / library / f"{library}.cell_ledger.tsv.gz"
+        if not ledger_path.is_file():
+            raise SystemExit(f"missing canonical ledger: {ledger_path}")
+        for row in read_tsv(str(ledger_path)):
+            row = dict(row)
+            ledgers.append(row)
+            ledger_by_key[(library, row["barcode"])] = row
+        for modality in ("rna", "atac"):
+            score_path = input_root / library / f"{library}.{modality}_joint_scores.tsv.gz"
+            for row in _joint_score_rows(score_path, modality):
+                key = (library, row["barcode"], row["candidate_id"])
+                candidate_by_key.setdefault(key, {}).update(row)
+        manifest_path = input_root / library / f"{library}.rna_joint_manifest.tsv.gz"
+        if manifest_path.is_file():
+            for row in read_tsv(str(manifest_path)):
+                key = (library, row["barcode"], row["candidate_id"])
+                candidate_by_key.setdefault(key, {}).update({
+                    field: row.get(field, "") for field in (
+                        "library", "barcode", "candidate_id", "locked_state",
+                        "locked_copy_vector", "second_state", "second_copy_vector",
+                        "candidate_origin", "exhaustive_fallback",
+                        "nomination_modalities")
+                })
+
+    calibration_cells = [
+        row for row in ledgers
+        if row.get("library") == calibration_library and
+        donor_components(canonical_genotype(
+            row.get("reconciled_identity_locked", "")))]
+    if not calibration_cells:
+        raise SystemExit(
+            f"{calibration_library} has no canonical cells with a frozen identity")
+    feature_names = (
+        "rna_total_counts", "rna_detected_features",
+        "atac_fragments", "atac_fragment_records")
+    feature_values = {
+        feature: [
+            math.log1p(max(_joint_finite(row.get(feature, ""), 0.0), 0.0))
+            for row in calibration_cells
+            if math.isfinite(_joint_finite(row.get(feature, "")))
+        ]
+        for feature in feature_names
+    }
+    feature_parameters = {
+        feature: _joint_robust_parameters(feature_values[feature])
+        for feature in feature_names
+    }
+
+    occupancy_by_cell = {}
+    for row in ledgers:
+        z_values = {}
+        for feature in feature_names:
+            value = _joint_finite(row.get(feature, ""))
+            median, scale = feature_parameters[feature]
+            z_values[feature] = (
+                (math.log1p(max(value, 0.0)) - median) / scale
+                if math.isfinite(value) and math.isfinite(median) else math.nan)
+        rna_z = statistics.mean([
+            z_values[name] for name in feature_names[:2]
+            if math.isfinite(z_values[name])]) if any(
+                math.isfinite(z_values[name]) for name in feature_names[:2]) else math.nan
+        atac_z = statistics.mean([
+            z_values[name] for name in feature_names[2:]
+            if math.isfinite(z_values[name])]) if any(
+                math.isfinite(z_values[name]) for name in feature_names[2:]) else math.nan
+        available = [value for value in (rna_z, atac_z) if math.isfinite(value)]
+        combined = statistics.mean(available) if available else math.nan
+        occupancy_by_cell[(row["library"], row["barcode"])] = (
+            rna_z, atac_z, combined)
+    occupancy_reference = sorted(
+        occupancy_by_cell[(calibration_library, row["barcode"])][2]
+        for row in calibration_cells
+        if math.isfinite(occupancy_by_cell[(calibration_library, row["barcode"])][2]))
+
+    # The calibration distribution is one best nested-model improvement per
+    # Library-25 cell and assay. Candidate multiplicity therefore cannot make
+    # the reference distribution artificially more extreme.
+    best_calibration_delta = {"rna": defaultdict(lambda: -math.inf),
+                              "atac": defaultdict(lambda: -math.inf)}
+    for row in candidate_by_key.values():
+        if row.get("library") != calibration_library:
+            continue
+        for modality in ("rna", "atac"):
+            status = clean(row.get(f"{modality}_score_status", "")).upper()
+            delta = _joint_finite(row.get(
+                f"{modality}_delta_site_balanced_log_likelihood_k2_minus_k1", ""))
+            if status == "AVAILABLE" and math.isfinite(delta):
+                barcode = row["barcode"]
+                best_calibration_delta[modality][barcode] = max(
+                    best_calibration_delta[modality][barcode], delta)
+    delta_reference = {
+        modality: sorted(
+            value for value in best_calibration_delta[modality].values()
+            if math.isfinite(value))
+        for modality in ("rna", "atac")
+    }
+    if not delta_reference["rna"] and not delta_reference["atac"]:
+        raise SystemExit(
+            f"{calibration_library} has no available RNA or ATAC joint-doublet scores")
+
+    candidate_rows = []
+    candidates_by_cell = defaultdict(list)
+    for key in sorted(candidate_by_key, key=lambda item: (
+            natural_key(item[0]), natural_key(item[1]), natural_key(item[2]))):
+        row = dict(candidate_by_key[key])
+        library, barcode, _ = key
+        percentiles = {}
+        for modality in ("rna", "atac"):
+            status = clean(row.get(f"{modality}_score_status", "")).upper()
+            delta = _joint_finite(row.get(
+                f"{modality}_delta_site_balanced_log_likelihood_k2_minus_k1", ""))
+            percentiles[modality] = _joint_percentile(
+                delta, delta_reference[modality]) \
+                if status == "AVAILABLE" else math.nan
+            row[f"{modality}_library25_empirical_percentile"] = percentiles[modality]
+        available_snp = [
+            value for value in percentiles.values() if math.isfinite(value)]
+        snp_score = statistics.mean(available_snp) if available_snp else math.nan
+        rna_z, atac_z, occupancy = occupancy_by_cell.get(
+            (library, barcode), (math.nan, math.nan, math.nan))
+        occupancy_percentile = _joint_percentile(
+            occupancy, occupancy_reference)
+        genotype_equivalent_evidence = any(
+            clean(row.get(f"{modality}_score_status", "")).upper() ==
+            "GENOTYPE_EQUIVALENT" or
+            _joint_bool(row.get(f"{modality}_genotype_equivalent", ""))
+            for modality in ("rna", "atac"))
+        locked_copy_vector = clean(row.get("locked_copy_vector", ""))
+        second_copy_vector = clean(row.get("second_copy_vector", ""))
+        genotype_equivalent = (
+            bool(locked_copy_vector) and
+            locked_copy_vector == second_copy_vector or
+            (not available_snp and genotype_equivalent_evidence))
+        rank_score = occupancy_percentile if genotype_equivalent else snp_score
+        row.update({
+            "schema_version": "joint_doublet_candidate_aggregate_v1",
+            "calibration_library": calibration_library,
+            "rna_expression_occupancy_z": rna_z,
+            "atac_chromatin_occupancy_z": atac_z,
+            "technical_occupancy_combined_z": occupancy,
+            "technical_occupancy_library25_empirical_percentile": occupancy_percentile,
+            "genotype_equivalent_candidate": genotype_equivalent,
+            "combined_snp_library25_empirical_percentile": snp_score,
+            "candidate_rank_score": rank_score,
+            "ranking_evidence_basis": (
+                "OCCUPANCY_GENOTYPE_EQUIVALENT" if genotype_equivalent else
+                "RNA_ATAC_SNP_ASSAY_CALIBRATED" if len(available_snp) == 2 else
+                "RNA_SNP_ASSAY_CALIBRATED" if math.isfinite(percentiles["rna"]) else
+                "ATAC_SNP_ASSAY_CALIBRATED" if math.isfinite(percentiles["atac"]) else
+                "UNAVAILABLE"),
+            "discovery_priority_tier": (
+                "PRIORITY_P99" if math.isfinite(rank_score) and rank_score >= 0.99 else
+                "REVIEW_P95" if math.isfinite(rank_score) and rank_score >= 0.95 else
+                "BACKGROUND" if math.isfinite(rank_score) else "UNRANKED"),
+        })
+        candidate_rows.append(row)
+        candidates_by_cell[(library, barcode)].append(row)
+
+    rna_top = {}
+    atac_top = {}
+    for cell_key, rows in candidates_by_cell.items():
+        for modality, target in (("rna", rna_top), ("atac", atac_top)):
+            scored = [
+                row for row in rows
+                if math.isfinite(_joint_finite(
+                    row.get(f"{modality}_library25_empirical_percentile", "")))]
+            if scored:
+                target[cell_key] = max(
+                    scored, key=lambda row: (
+                        _joint_finite(row[f"{modality}_library25_empirical_percentile"]),
+                        natural_key(row["candidate_id"])))
+
+    cell_rows = []
+    for ledger in ledgers:
+        library, barcode = ledger["library"], ledger["barcode"]
+        rows = candidates_by_cell.get((library, barcode), [])
+        best = max(rows, key=lambda row: (
+            _joint_finite(row.get("candidate_rank_score", ""), -math.inf),
+            natural_key(row.get("candidate_id", "")))) if rows else None
+        rna_best = rna_top.get((library, barcode))
+        atac_best = atac_top.get((library, barcode))
+        if rna_best and atac_best:
+            modality_conflict = (
+                "AGREE_TOP_SECOND_CONTRIBUTOR"
+                if rna_best["second_state"] == atac_best["second_state"] else
+                "CONFLICT_TOP_SECOND_CONTRIBUTOR")
+        elif rna_best:
+            modality_conflict = "ATAC_EVIDENCE_MISSING"
+        elif atac_best:
+            modality_conflict = "RNA_EVIDENCE_MISSING"
+        else:
+            modality_conflict = "BOTH_SNP_EVIDENCE_MISSING"
+        rna_z, atac_z, occupancy = occupancy_by_cell.get(
+            (library, barcode), (math.nan, math.nan, math.nan))
+        technical_parts = [
+            clean(ledger.get(field, ""))
+            for field in (
+                "reconciled_droplet_state", "current_droplet_flag",
+                "explicit_multiplet_evidence",
+                "technical_occupancy_candidate_classes")
+            if clean(ledger.get(field, "")).lower()
+            not in {"", "na", "none", "unavailable"}
+        ]
+        row = dict(ledger)
+        row.update({
+            "schema_version": JOINT_AGGREGATE_SCHEMA,
+            "interpretation_order": (
+                1 if library == calibration_library else
+                2 if library in {"lib35", "lib38"} else
+                4 if library == "lib19" else 3),
+            "best_candidate_id": best.get("candidate_id", "") if best else "",
+            "best_second_state": best.get("second_state", "") if best else "",
+            "best_second_copy_vector": best.get("second_copy_vector", "") if best else "",
+            "best_candidate_origin": best.get("candidate_origin", "") if best else "",
+            "candidate_rank_score": best.get("candidate_rank_score", math.nan) if best else math.nan,
+            "ranking_evidence_basis": best.get("ranking_evidence_basis", "UNAVAILABLE") if best else "UNAVAILABLE",
+            "discovery_priority_tier": best.get("discovery_priority_tier", "UNRANKED") if best else "UNRANKED",
+            "rna_top_second_state": rna_best.get("second_state", "") if rna_best else "",
+            "rna_top_empirical_percentile": rna_best.get(
+                "rna_library25_empirical_percentile", math.nan) if rna_best else math.nan,
+            "atac_top_second_state": atac_best.get("second_state", "") if atac_best else "",
+            "atac_top_empirical_percentile": atac_best.get(
+                "atac_library25_empirical_percentile", math.nan) if atac_best else math.nan,
+            "modality_conflict": modality_conflict,
+            "rna_expression_occupancy_z": rna_z,
+            "atac_chromatin_occupancy_z": atac_z,
+            "technical_occupancy_combined_z": occupancy,
+            "technical_occupancy_library25_empirical_percentile":
+                _joint_percentile(occupancy, occupancy_reference),
+            "donor_composition_field": (
+                f"K1[{ledger.get('reconciled_identity_locked', '')}]"
+                + (f"|K2_SECOND[{best.get('second_state', '')}]" if best else "")),
+            "biological_tetraploidy_field": ledger.get("biological_ploidy", ""),
+            "technical_occupancy_field": (
+                "|".join(technical_parts) if technical_parts else "NONE"),
+            "ploidy_field": ledger.get("ploidy_call", ""),
+        })
+        cell_rows.append(row)
+
+    ranked = sorted(
+        [row for row in cell_rows if math.isfinite(
+            _joint_finite(row.get("candidate_rank_score", "")))],
+        key=lambda row: (-_joint_finite(row["candidate_rank_score"]),
+                         natural_key(row["library"]), natural_key(row["barcode"])))
+    global_rank = {
+        (row["library"], row["barcode"]): rank
+        for rank, row in enumerate(ranked, 1)}
+    within_library_rank = {}
+    for library in libraries:
+        subset = [row for row in ranked if row["library"] == library]
+        for rank, row in enumerate(subset, 1):
+            within_library_rank[(library, row["barcode"])] = rank
+    for row in cell_rows:
+        key = (row["library"], row["barcode"])
+        row["global_candidate_doublet_rank"] = global_rank.get(key, "")
+        row["within_library_candidate_doublet_rank"] = within_library_rank.get(key, "")
+    cell_rows.sort(key=lambda row: (
+        int(row["interpretation_order"]),
+        int(row["within_library_candidate_doublet_rank"])
+        if str(row["within_library_candidate_doublet_rank"]).isdigit()
+        else 10**12,
+        natural_key(row["library"]), natural_key(row["barcode"])))
+
+    candidate_fields = []
+    candidate_field_set = set()
+    for row in candidate_rows:
+        for field in row:
+            if field not in candidate_field_set:
+                candidate_fields.append(field)
+                candidate_field_set.add(field)
+    cell_fields = []
+    cell_field_set = set()
+    for row in cell_rows:
+        for field in row:
+            if field not in cell_field_set:
+                cell_fields.append(field)
+                cell_field_set.add(field)
+    write_tsv(
+        str(output_root / "joint_doublet_candidate_scores.tsv.gz"),
+        candidate_rows, candidate_fields)
+    write_tsv(
+        str(output_root / "joint_doublet_cell_ledger.tsv.gz"),
+        cell_rows, cell_fields)
+
+    calibration_rows = []
+    for feature, (median, scale) in feature_parameters.items():
+        calibration_rows.append({
+            "schema_version": "joint_doublet_calibration_v2",
+            "calibration_library": calibration_library,
+            "channel": feature,
+            "reference_count": len(feature_values[feature]),
+            "median": median,
+            "robust_scale": scale,
+            "p95": "",
+            "p99": "",
+            "calibration_interpretation":
+                "LIB25_FROZEN_ROBUST_NORMALIZATION;EMPIRICAL_DISCOVERY_REFERENCE_NOT_TRUTH_LABELS_OR_FDR",
+        })
+    for modality in ("rna", "atac"):
+        reference = delta_reference[modality]
+        calibration_rows.append({
+            "schema_version": "joint_doublet_calibration_v2",
+            "calibration_library": calibration_library,
+            "channel": f"{modality}_best_cell_site_balanced_delta",
+            "reference_count": len(reference),
+            "median": _joint_quantile(reference, 0.5),
+            "robust_scale": "",
+            "p95": _joint_quantile(reference, 0.95),
+            "p99": _joint_quantile(reference, 0.99),
+            "calibration_interpretation":
+                "EMPIRICAL_DISCOVERY_REFERENCE_NOT_TRUTH_LABELS_OR_FDR",
+        })
+    calibration_rows.append({
+        "schema_version": "joint_doublet_calibration_v2",
+        "calibration_library": calibration_library,
+        "channel": "technical_occupancy_combined_z",
+        "reference_count": len(occupancy_reference),
+        "median": _joint_quantile(occupancy_reference, 0.5),
+        "robust_scale": "",
+        "p95": _joint_quantile(occupancy_reference, 0.95),
+        "p99": _joint_quantile(occupancy_reference, 0.99),
+        "calibration_interpretation":
+            "EMPIRICAL_DISCOVERY_REFERENCE_NOT_TRUTH_LABELS_OR_FDR",
+    })
+    calibration_library_number = calibration_library.removeprefix("lib")
+    write_tsv(
+        str(output_root / f"library{calibration_library_number}_calibration.tsv"),
+        calibration_rows, list(calibration_rows[0]))
+
+    summary_rows = []
+    for library in libraries:
+        rows = [row for row in cell_rows if row["library"] == library]
+        tiers = Counter(row["discovery_priority_tier"] for row in rows)
+        conflicts = Counter(row["modality_conflict"] for row in rows)
+        summary_rows.append({
+            "schema_version": JOINT_AGGREGATE_SCHEMA,
+            "library": library,
+            "cohort_role": rows[0].get("cohort_role", "") if rows else "",
+            "interpretation_order": rows[0].get("interpretation_order", "") if rows else "",
+            "canonical_cells": len(rows),
+            "ranked_cells": sum(
+                row["discovery_priority_tier"] != "UNRANKED" for row in rows),
+            "priority_p99": tiers["PRIORITY_P99"],
+            "review_p95": tiers["REVIEW_P95"],
+            "background": tiers["BACKGROUND"],
+            "unranked": tiers["UNRANKED"],
+            "rna_atac_top_conflicts": conflicts["CONFLICT_TOP_SECOND_CONTRIBUTOR"],
+            "atac_evidence_missing": conflicts["ATAC_EVIDENCE_MISSING"],
+            "rna_evidence_missing": conflicts["RNA_EVIDENCE_MISSING"],
+        })
+    write_tsv(
+        str(output_root / "joint_doublet_library_summary.tsv"),
+        summary_rows, list(summary_rows[0]))
+    print(
+        f"Aggregated {len(cell_rows)} cells and {len(candidate_rows)} candidates; "
+        f"{calibration_library} alone supplied calibration references")
+    return 0
+
+
+# -----------------------------------------------------------------------------
+# joint-analyze
+# -----------------------------------------------------------------------------
+
+def joint_analyze_parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Analyze an existing joint-doublet gather without rerunning "
+            "preparation, BAM/fragment counting, or RNA/ATAC scoring."))
+    parser.add_argument("--input-root", required=True)
+    parser.add_argument("--output-root", required=True)
+    return parser.parse_args()
+
+
+def _joint_analysis_candidate_value(row, modality, suffix, default=math.nan):
+    return _joint_finite(row.get(f"{modality}_{suffix}", ""), default)
+
+
+def _joint_analysis_candidate_record(row, modality):
+    percentile = _joint_finite(
+        row.get(f"{modality}_library25_empirical_percentile", ""))
+    status = clean(row.get(f"{modality}_score_status", "")).upper()
+    if status != "AVAILABLE" or not math.isfinite(percentile):
+        return None
+    return {
+        "candidate_id": clean(row.get("candidate_id", "")),
+        "second_state": clean(row.get("second_state", "")),
+        "percentile": percentile,
+        "delta": _joint_analysis_candidate_value(
+            row, modality,
+            "delta_site_balanced_log_likelihood_k2_minus_k1"),
+        "fitted_second_fraction": _joint_analysis_candidate_value(
+            row, modality, "fitted_second_fraction"),
+        "fitted_second_fraction_profile_low": _joint_analysis_candidate_value(
+            row, modality, "fitted_second_fraction_profile_low"),
+        "fitted_second_fraction_profile_high": _joint_analysis_candidate_value(
+            row, modality, "fitted_second_fraction_profile_high"),
+        "n_discriminating_sites": _joint_analysis_candidate_value(
+            row, modality, "n_discriminating_sites"),
+        "discriminating_depth": _joint_analysis_candidate_value(
+            row, modality, "discriminating_depth"),
+        "fold_support_fraction": _joint_analysis_candidate_value(
+            row, modality, "leave_one_fold_out_support_fraction"),
+        "minimum_fold_delta": _joint_analysis_candidate_value(
+            row, modality, "minimum_leave_one_fold_out_balanced_delta"),
+        "top_site_fraction": _joint_analysis_candidate_value(
+            row, modality,
+            "maximum_single_site_absolute_balanced_delta_fraction"),
+        "warnings": clean(row.get(f"{modality}_warnings", "")),
+        "candidate_origin": clean(row.get("candidate_origin", "")),
+        "exhaustive_fallback": clean(row.get("exhaustive_fallback", "")),
+    }
+
+
+def _joint_analysis_push_top(top_records, record):
+    if record is None:
+        return
+    top_records.append(record)
+    top_records.sort(
+        key=lambda item: (
+            item["percentile"], natural_key(item["candidate_id"])),
+        reverse=True)
+    del top_records[2:]
+
+
+def _joint_analysis_strength(rna_percentile, atac_percentile):
+    rna = rna_percentile if math.isfinite(rna_percentile) else None
+    atac = atac_percentile if math.isfinite(atac_percentile) else None
+    if rna is None and atac is None:
+        return "BOTH_MISSING"
+    if rna is None:
+        return "ATAC_P99_ONLY" if atac >= 0.99 else \
+            "ATAC_P95_ONLY" if atac >= 0.95 else "ATAC_BELOW_P95_ONLY"
+    if atac is None:
+        return "RNA_P99_ONLY" if rna >= 0.99 else \
+            "RNA_P95_ONLY" if rna >= 0.95 else "RNA_BELOW_P95_ONLY"
+    if rna >= 0.99 and atac >= 0.99:
+        return "BOTH_P99"
+    if rna >= 0.95 and atac >= 0.95:
+        return "BOTH_P95"
+    if rna >= 0.99 or atac >= 0.99:
+        return "ONE_P99"
+    if rna >= 0.95 or atac >= 0.95:
+        return "ONE_P95"
+    return "BOTH_BELOW_P95"
+
+
+def _joint_analysis_quantile(values, probability):
+    return _joint_quantile(
+        [value for value in values if math.isfinite(value)], probability)
+
+
+def joint_analyze_main():
+    args = joint_analyze_parse_args()
+    input_root = Path(args.input_root).resolve()
+    output_root = Path(args.output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    ledger_path = input_root / "joint_doublet_cell_ledger.tsv.gz"
+    candidates_path = input_root / "joint_doublet_candidate_scores.tsv.gz"
+    calibration_path = input_root / "library25_calibration.tsv"
+    library_summary_path = input_root / "joint_doublet_library_summary.tsv"
+    for path in (
+            ledger_path, candidates_path, calibration_path,
+            library_summary_path):
+        if not path.is_file() or path.stat().st_size == 0:
+            raise SystemExit(f"missing or empty gathered input: {path}")
+
+    ledger_by_key = {}
+    library_metadata = {}
+    library_counts = defaultdict(Counter)
+    library_rank_scores = defaultdict(list)
+    strata = Counter()
+    compact_ranked_rows = []
+    ledger_fields_needed = (
+        "library", "barcode", "reconciled_identity_locked",
+        "cohort_role", "interpretation_order", "discovery_priority_tier",
+        "candidate_rank_score", "ranking_evidence_basis",
+        "best_candidate_id", "best_second_state",
+        "rna_top_second_state", "rna_top_empirical_percentile",
+        "atac_top_second_state", "atac_top_empirical_percentile",
+        "modality_conflict", "technical_occupancy_combined_z",
+        "technical_occupancy_library25_empirical_percentile",
+        "technical_occupancy_field", "biological_tetraploidy_field",
+        "ploidy_field", "demux_modality_relation", "ambient_status",
+        "global_candidate_doublet_rank",
+        "within_library_candidate_doublet_rank")
+    with _joint_open(ledger_path) as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        missing = [field for field in ("library", "barcode")
+                   if field not in (reader.fieldnames or [])]
+        if missing:
+            raise SystemExit(
+                f"{ledger_path}: missing fields: {', '.join(missing)}")
+        for row in reader:
+            library = clean(row.get("library", ""))
+            barcode = clean(row.get("barcode", ""))
+            key = (library, barcode)
+            if key in ledger_by_key:
+                raise SystemExit(
+                    f"{ledger_path}: duplicate cell {library}:{barcode}")
+            compact = {field: clean(row.get(field, ""))
+                       for field in ledger_fields_needed}
+            ledger_by_key[key] = compact
+            library_metadata.setdefault(library, {
+                "cohort_role": compact.get("cohort_role", ""),
+                "interpretation_order": compact.get(
+                    "interpretation_order", ""),
+            })
+            counts = library_counts[library]
+            counts["ledger_cells"] += 1
+            tier = compact["discovery_priority_tier"] or "UNAVAILABLE"
+            basis = compact["ranking_evidence_basis"] or "UNAVAILABLE"
+            conflict = compact["modality_conflict"] or "UNAVAILABLE"
+            counts[f"tier::{tier}"] += 1
+            counts[f"basis::{basis}"] += 1
+            counts[f"ledger_conflict::{conflict}"] += 1
+            score = _joint_finite(compact["candidate_rank_score"])
+            if math.isfinite(score):
+                library_rank_scores[library].append(score)
+            for dimension in (
+                    "ranking_evidence_basis", "modality_conflict",
+                    "technical_occupancy_field",
+                    "biological_tetraploidy_field", "ploidy_field",
+                    "demux_modality_relation", "ambient_status"):
+                value = compact.get(dimension, "") or "MISSING"
+                strata[(library, dimension, value, tier)] += 1
+            if tier in {"PRIORITY_P99", "REVIEW_P95"}:
+                compact_ranked_rows.append(compact)
+
+    candidate_status = Counter()
+    cell_diagnostic_fields = [
+        "schema_version", "library", "barcode", "cohort_role",
+        "interpretation_order", "discovery_priority_tier",
+        "candidate_rank_score", "ranking_evidence_basis",
+        "ledger_modality_conflict", "recomputed_modality_relation",
+        "cross_modality_strength", "conflict_strength_class",
+        "rna_top_candidate_id", "rna_top_second_state",
+        "rna_top_percentile", "rna_runner_up_percentile",
+        "rna_top_minus_runner_up_percentile", "rna_top_delta",
+        "rna_top_fitted_second_fraction", "rna_top_profile_low",
+        "rna_top_profile_high", "rna_top_discriminating_sites",
+        "rna_top_discriminating_depth", "rna_top_fold_support_fraction",
+        "rna_top_minimum_fold_delta", "rna_top_site_fraction",
+        "rna_top_warnings", "atac_top_candidate_id",
+        "atac_top_second_state", "atac_top_percentile",
+        "atac_runner_up_percentile",
+        "atac_top_minus_runner_up_percentile", "atac_top_delta",
+        "atac_top_fitted_second_fraction", "atac_top_profile_low",
+        "atac_top_profile_high", "atac_top_discriminating_sites",
+        "atac_top_discriminating_depth", "atac_top_fold_support_fraction",
+        "atac_top_minimum_fold_delta", "atac_top_site_fraction",
+        "atac_top_warnings", "technical_occupancy_combined_z",
+        "technical_occupancy_library25_empirical_percentile",
+        "technical_occupancy_field", "biological_tetraploidy_field",
+        "ploidy_field", "reconciled_identity_locked"]
+    cell_diagnostics_path = (
+        output_root / "joint_doublet_cell_diagnostics.tsv.gz")
+    library_gaps = defaultdict(lambda: defaultdict(list))
+    candidate_cell_keys = set()
+
+    def empty_top_state():
+        return {"rna": [], "atac": []}
+
+    def emit_cell(handle, key, top):
+        if key is None:
+            return
+        library, barcode = key
+        ledger = ledger_by_key.get(key)
+        if ledger is None:
+            raise SystemExit(
+                f"{candidates_path}: candidate cell absent from ledger: "
+                f"{library}:{barcode}")
+        candidate_cell_keys.add(key)
+        rna = top["rna"][0] if top["rna"] else None
+        atac = top["atac"][0] if top["atac"] else None
+        rna_second = top["rna"][1] if len(top["rna"]) > 1 else None
+        atac_second = top["atac"][1] if len(top["atac"]) > 1 else None
+        rna_pct = rna["percentile"] if rna else math.nan
+        atac_pct = atac["percentile"] if atac else math.nan
+        rna_gap = (rna_pct - rna_second["percentile"]
+                   if rna and rna_second else math.nan)
+        atac_gap = (atac_pct - atac_second["percentile"]
+                    if atac and atac_second else math.nan)
+        if math.isfinite(rna_gap):
+            library_gaps[library]["rna"].append(rna_gap)
+        if math.isfinite(atac_gap):
+            library_gaps[library]["atac"].append(atac_gap)
+        if rna and atac:
+            relation = ("AGREE_TOP_SECOND_CONTRIBUTOR"
+                        if rna["second_state"] == atac["second_state"] else
+                        "CONFLICT_TOP_SECOND_CONTRIBUTOR")
+        elif rna:
+            relation = "ATAC_EVIDENCE_MISSING"
+        elif atac:
+            relation = "RNA_EVIDENCE_MISSING"
+        else:
+            relation = "BOTH_SNP_EVIDENCE_MISSING"
+        strength = _joint_analysis_strength(rna_pct, atac_pct)
+        if relation == "CONFLICT_TOP_SECOND_CONTRIBUTOR":
+            conflict_class = (
+                "CONFLICT_BOTH_P95" if
+                math.isfinite(rna_pct) and rna_pct >= 0.95 and
+                math.isfinite(atac_pct) and atac_pct >= 0.95 else
+                "CONFLICT_BELOW_OR_ASYMMETRIC_P95")
+        elif relation == "AGREE_TOP_SECOND_CONTRIBUTOR":
+            conflict_class = (
+                "AGREE_BOTH_P95" if
+                math.isfinite(rna_pct) and rna_pct >= 0.95 and
+                math.isfinite(atac_pct) and atac_pct >= 0.95 else
+                "AGREE_BELOW_OR_ASYMMETRIC_P95")
+        else:
+            conflict_class = relation
+        counts = library_counts[library]
+        counts["candidate_cells"] += 1
+        counts[f"recomputed::{relation}"] += 1
+        counts[f"strength::{strength}"] += 1
+        counts[f"conflict_class::{conflict_class}"] += 1
+        if math.isfinite(rna_gap) and rna_gap <= 0.01:
+            counts["rna_top_gap_le_0.01"] += 1
+        if math.isfinite(atac_gap) and atac_gap <= 0.01:
+            counts["atac_top_gap_le_0.01"] += 1
+        if ledger.get("modality_conflict", "") != relation:
+            counts["ledger_relation_mismatches"] += 1
+
+        result = {
+            "schema_version": JOINT_ANALYSIS_SCHEMA,
+            "library": library,
+            "barcode": barcode,
+            "cohort_role": ledger.get("cohort_role", ""),
+            "interpretation_order": ledger.get("interpretation_order", ""),
+            "discovery_priority_tier": ledger.get(
+                "discovery_priority_tier", ""),
+            "candidate_rank_score": ledger.get("candidate_rank_score", ""),
+            "ranking_evidence_basis": ledger.get(
+                "ranking_evidence_basis", ""),
+            "ledger_modality_conflict": ledger.get("modality_conflict", ""),
+            "recomputed_modality_relation": relation,
+            "cross_modality_strength": strength,
+            "conflict_strength_class": conflict_class,
+            "technical_occupancy_combined_z": ledger.get(
+                "technical_occupancy_combined_z", ""),
+            "technical_occupancy_library25_empirical_percentile": ledger.get(
+                "technical_occupancy_library25_empirical_percentile", ""),
+            "technical_occupancy_field": ledger.get(
+                "technical_occupancy_field", ""),
+            "biological_tetraploidy_field": ledger.get(
+                "biological_tetraploidy_field", ""),
+            "ploidy_field": ledger.get("ploidy_field", ""),
+            "reconciled_identity_locked": ledger.get(
+                "reconciled_identity_locked", ""),
+        }
+        for modality, first, second in (
+                ("rna", rna, rna_second), ("atac", atac, atac_second)):
+            result.update({
+                f"{modality}_top_candidate_id": (
+                    first["candidate_id"] if first else ""),
+                f"{modality}_top_second_state": (
+                    first["second_state"] if first else ""),
+                f"{modality}_top_percentile": (
+                    first["percentile"] if first else math.nan),
+                f"{modality}_runner_up_percentile": (
+                    second["percentile"] if second else math.nan),
+                f"{modality}_top_minus_runner_up_percentile": (
+                    (first["percentile"] - second["percentile"])
+                    if first and second else math.nan),
+                f"{modality}_top_delta": (
+                    first["delta"] if first else math.nan),
+                f"{modality}_top_fitted_second_fraction": (
+                    first["fitted_second_fraction"] if first else math.nan),
+                f"{modality}_top_profile_low": (
+                    first["fitted_second_fraction_profile_low"]
+                    if first else math.nan),
+                f"{modality}_top_profile_high": (
+                    first["fitted_second_fraction_profile_high"]
+                    if first else math.nan),
+                f"{modality}_top_discriminating_sites": (
+                    first["n_discriminating_sites"] if first else math.nan),
+                f"{modality}_top_discriminating_depth": (
+                    first["discriminating_depth"] if first else math.nan),
+                f"{modality}_top_fold_support_fraction": (
+                    first["fold_support_fraction"] if first else math.nan),
+                f"{modality}_top_minimum_fold_delta": (
+                    first["minimum_fold_delta"] if first else math.nan),
+                f"{modality}_top_site_fraction": (
+                    first["top_site_fraction"] if first else math.nan),
+                f"{modality}_top_warnings": (
+                    first["warnings"] if first else ""),
+            })
+        handle.write("\t".join(format_value(result.get(field, ""))
+                               for field in cell_diagnostic_fields) + "\n")
+
+    with gzip.open(cell_diagnostics_path, "wt", encoding="utf-8", newline="") as output:
+        output.write("\t".join(cell_diagnostic_fields) + "\n")
+        with _joint_open(candidates_path) as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            required = {"library", "barcode", "candidate_id"}
+            missing = sorted(required - set(reader.fieldnames or []))
+            if missing:
+                raise SystemExit(
+                    f"{candidates_path}: missing fields: {', '.join(missing)}")
+            current_key = None
+            top = empty_top_state()
+            for row in reader:
+                key = (clean(row.get("library", "")),
+                       clean(row.get("barcode", "")))
+                if current_key is not None and key != current_key:
+                    emit_cell(output, current_key, top)
+                    top = empty_top_state()
+                current_key = key
+                for modality in ("rna", "atac"):
+                    status = clean(
+                        row.get(f"{modality}_score_status", "")).upper()
+                    candidate_status[(key[0], modality,
+                                      status or "MISSING")] += 1
+                    _joint_analysis_push_top(
+                        top[modality],
+                        _joint_analysis_candidate_record(row, modality))
+            emit_cell(output, current_key, top)
+
+    def library_analysis_key(library):
+        raw_order = clean(
+            library_metadata.get(library, {}).get(
+                "interpretation_order", ""))
+        try:
+            order = int(float(raw_order))
+        except ValueError:
+            order = 10**6
+        return order, natural_key(library)
+
+    libraries = sorted(library_counts, key=library_analysis_key)
+    library_position = {
+        library: position for position, library in enumerate(libraries)}
+    summary_rows = []
+    for library in libraries:
+        counts = library_counts[library]
+        cells = counts["ledger_cells"]
+        conflict = counts["recomputed::CONFLICT_TOP_SECOND_CONTRIBUTOR"]
+        both_p95_conflict = counts[
+            "conflict_class::CONFLICT_BOTH_P95"]
+        p99 = counts["tier::PRIORITY_P99"]
+        p95 = counts["tier::REVIEW_P95"]
+        summary_rows.append({
+            "schema_version": JOINT_ANALYSIS_SCHEMA,
+            "library": library,
+            "cohort_role": library_metadata.get(
+                library, {}).get("cohort_role", ""),
+            "ledger_cells": cells,
+            "candidate_cells": counts["candidate_cells"],
+            "priority_p99": p99,
+            "priority_p99_fraction": p99 / cells if cells else math.nan,
+            "review_p95": p95,
+            "review_p95_fraction": p95 / cells if cells else math.nan,
+            "raw_top_contributor_conflicts": conflict,
+            "raw_top_contributor_conflict_fraction": (
+                conflict / cells if cells else math.nan),
+            "both_p95_top_contributor_conflicts": both_p95_conflict,
+            "both_p95_top_contributor_conflict_fraction": (
+                both_p95_conflict / cells if cells else math.nan),
+            "weak_or_asymmetric_p95_conflicts": counts[
+                "conflict_class::CONFLICT_BELOW_OR_ASYMMETRIC_P95"],
+            "both_p95_top_contributor_agreements": counts[
+                "conflict_class::AGREE_BOTH_P95"],
+            "rna_top_gap_le_0.01": counts["rna_top_gap_le_0.01"],
+            "rna_top_gap_median": _joint_analysis_quantile(
+                library_gaps[library]["rna"], 0.5),
+            "atac_top_gap_le_0.01": counts["atac_top_gap_le_0.01"],
+            "atac_top_gap_median": _joint_analysis_quantile(
+                library_gaps[library]["atac"], 0.5),
+            "atac_evidence_missing": counts[
+                "recomputed::ATAC_EVIDENCE_MISSING"],
+            "rna_evidence_missing": counts[
+                "recomputed::RNA_EVIDENCE_MISSING"],
+            "both_snp_evidence_missing": counts[
+                "recomputed::BOTH_SNP_EVIDENCE_MISSING"],
+            "ledger_relation_mismatches": counts[
+                "ledger_relation_mismatches"],
+        })
+    write_tsv(
+        str(output_root / "joint_doublet_library_diagnostics.tsv"),
+        summary_rows, list(summary_rows[0]) if summary_rows else [])
+
+    status_rows = [{
+        "schema_version": JOINT_ANALYSIS_SCHEMA,
+        "library": library,
+        "modality": modality.upper(),
+        "score_status": status,
+        "candidate_rows": count,
+    } for (library, modality, status), count in sorted(
+        candidate_status.items(), key=lambda item: (
+            library_position.get(item[0][0], 10**6),
+            item[0][1], item[0][2]))]
+    write_tsv(
+        str(output_root / "joint_doublet_candidate_status_summary.tsv"),
+        status_rows, list(status_rows[0]) if status_rows else [])
+
+    strata_rows = [{
+        "schema_version": JOINT_ANALYSIS_SCHEMA,
+        "library": library,
+        "dimension": dimension,
+        "value": value,
+        "discovery_priority_tier": tier,
+        "cells": count,
+    } for (library, dimension, value, tier), count in sorted(
+        strata.items(), key=lambda item: (
+            library_position.get(item[0][0], 10**6), item[0][1],
+            natural_key(item[0][2]), item[0][3]))]
+    write_tsv(
+        str(output_root / "joint_doublet_stratified_summary.tsv"),
+        strata_rows, list(strata_rows[0]) if strata_rows else [])
+
+    compact_ranked_rows.sort(key=lambda row: (
+        int(row.get("global_candidate_doublet_rank", "") or 10**12),
+        natural_key(row.get("library", "")),
+        natural_key(row.get("barcode", ""))))
+    compact_fields = list(ledger_fields_needed)
+    write_tsv(
+        str(output_root / "joint_doublet_ranked_review_cells.tsv.gz"),
+        compact_ranked_rows, compact_fields)
+
+    total_cells = sum(row["ledger_cells"] for row in summary_rows)
+    total_candidates = sum(candidate_status.values()) // 2
+    selected_libraries = ", ".join(libraries)
+    heldout_present = [library for library in ("lib35", "lib38")
+                       if library in library_counts]
+    report_lines = [
+        "# Joint RNA/ATAC doublet post-gather diagnostics",
+        "",
+        f"Schema: `{JOINT_ANALYSIS_SCHEMA}`",
+        "",
+        "## Scope and interpretation",
+        "",
+        f"- Gathered libraries: {selected_libraries}",
+        f"- Cells in ranked ledger: {total_cells:,}",
+        f"- Candidate hypotheses represented: {total_candidates:,}",
+        "- Library 25 is the only empirical calibration reference.",
+        "- P95/P99 are discovery percentiles, not truth labels, posterior "
+        "probabilities, FDR estimates, or final singlet/doublet calls.",
+        "- Raw RNA/ATAC top-contributor conflict includes weak and nearly "
+        "tied hypotheses; use the both-P95 and top-gap diagnostics below "
+        "before interpreting conflict biologically.",
+        "- Library 19 remains the pathological holdout and must be "
+        "interpreted after the ordinary libraries.",
+        ("- Frozen held-out Libraries 35 and 38 are present."
+         if len(heldout_present) == 2 else
+         "- Frozen held-out Libraries 35 and 38 are not both present, so "
+         "the planned held-out evaluation is not yet possible."),
+        "",
+        "## Library diagnostics",
+        "",
+        "| Library | Cells | P99 | P95 review | Raw conflict | Both-P95 conflict | RNA median top gap | ATAC median top gap |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in summary_rows:
+        report_lines.append(
+            f"| {row['library']} | {row['ledger_cells']:,} | "
+            f"{100 * row['priority_p99_fraction']:.2f}% | "
+            f"{100 * row['review_p95_fraction']:.2f}% | "
+            f"{100 * row['raw_top_contributor_conflict_fraction']:.2f}% | "
+            f"{100 * row['both_p95_top_contributor_conflict_fraction']:.2f}% | "
+            f"{format_value(row['rna_top_gap_median'])} | "
+            f"{format_value(row['atac_top_gap_median'])} |")
+    report_lines += [
+        "",
+        "## Output guide",
+        "",
+        "- `joint_doublet_library_diagnostics.tsv`: library-level ranking, "
+        "conflict-strength, missing-evidence, and ambiguity summary.",
+        "- `joint_doublet_cell_diagnostics.tsv.gz`: one row per scored cell "
+        "with the best and runner-up hypothesis in each modality.",
+        "- `joint_doublet_candidate_status_summary.tsv`: candidate score "
+        "availability and failure/status counts by assay and library.",
+        "- `joint_doublet_stratified_summary.tsv`: tier counts kept separate "
+        "by occupancy, ploidy, biological tetraploidy, modality relation, "
+        "and evidence basis.",
+        "- `joint_doublet_ranked_review_cells.tsv.gz`: compact P95/P99 review "
+        "roster; it is not a final doublet callset.",
+        "",
+    ]
+    (output_root / "joint_doublet_post_gather_report.md").write_text(
+        "\n".join(report_lines), encoding="utf-8")
+
+    manifest = {
+        "schema_version": JOINT_ANALYSIS_SCHEMA,
+        "created_utc": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "input_root": str(input_root),
+        "output_root": str(output_root),
+        "libraries": libraries,
+        "ledger_cells": total_cells,
+        "candidate_hypotheses": total_candidates,
+        "candidate_cells": len(candidate_cell_keys),
+        "library25_calibration_only": True,
+        "heldout_35_38_complete": len(heldout_present) == 2,
+        "pathological_library19_interpret_last": "lib19" in library_counts,
+        "source_files": {
+            path.name: path.stat().st_size for path in (
+                ledger_path, candidates_path, calibration_path,
+                library_summary_path)},
+        "outputs": [
+            "joint_doublet_post_gather_report.md",
+            "joint_doublet_library_diagnostics.tsv",
+            "joint_doublet_cell_diagnostics.tsv.gz",
+            "joint_doublet_candidate_status_summary.tsv",
+            "joint_doublet_stratified_summary.tsv",
+            "joint_doublet_ranked_review_cells.tsv.gz",
+        ],
+    }
+    (output_root / "joint_doublet_analysis_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8")
+    (output_root / "JOINT_DOUBLET_ANALYSIS_COMPLETE").write_text(
+        "complete\n", encoding="utf-8")
+    print(
+        f"Analyzed {total_cells} cells and {total_candidates} candidate "
+        f"hypotheses across {len(libraries)} libraries")
+    return 0
+
+
 _COMMANDS = {
     "metadata": metadata_main,
     "candidates": candidates_main,
@@ -7779,6 +9584,9 @@ _COMMANDS = {
     "finalize": finalize_main,
     "atac-barcode-map": atac_barcode_map_main,
     "atac-finalize": atac_finalize_main,
+    "joint-prepare": joint_prepare_main,
+    "joint-aggregate": joint_aggregate_main,
+    "joint-analyze": joint_analyze_main,
 }
 
 def main():

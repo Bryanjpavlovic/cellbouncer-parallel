@@ -3,10 +3,10 @@
 
 The working scientific execution graph is retained for demultiplexing,
 contamination estimation, ploidy/refinement, post-hoc audit,
-identity reconciliation, and mitochondrial analysis.  Outputs now live with
-their source libraries under ``mapping_output/Tet_2025_Multiome-RNA_N``;
-cross-library products live under ``mapping_output/aggregate_library_analysis``.
-An alternate mapped-library tree can be selected with
+identity reconciliation, and mitochondrial analysis.  The production mapping
+and analysis namespaces are separate: mapped libraries live below
+``rna3/mapping_output`` and analysis products live below the canonical all-40
+RNA analysis root.  An alternate mapped-library tree can be selected with
 ``--mapping-input-root``.  Pair it with ``--analysis-output-root`` to place the
 complete generated analysis namespace outside both the selected mapping tree
 and the production mapping tree.
@@ -47,6 +47,21 @@ MEX containing only cells with expression, clusters, and valid contamination
 rates.  Versioned gene-distribution summaries test whether ambient RNA is
 concentrated in a few genes or broadly distributed.
 
+``JOINT_DOUBLET`` resumes after ATAC demultiplexing.  It fans out all selected
+libraries to build a canonical 16-bp-barcode ledger, independently score the
+same K=1/K=2 hypotheses from RNA and ATAC SNP observations, add expression and
+chromatin occupancy evidence for genotype-equivalent doublets, calibrate only
+on Library 25, and gather one ranked ledger.  Reconciled identity remains
+frozen and missing ATAC evidence remains missing rather than becoming a
+singlet call.  The same stage is also the sole management entrypoint for an
+existing run: STATUS audits per-library score completion, TRIM cancels only
+explicitly selected short or pending array tasks, and PARTIAL_GATHER submits a
+paired-library aggregate that waits for Library 25 and never reads an active
+score file.  ANALYZE performs one streaming pass over an existing completed
+gather and writes post-gather ambiguity, modality-conflict, evidence-status,
+ploidy/occupancy-stratified, and compact review outputs.  It does not reread a
+BAM or fragment file and does not convert discovery percentiles into calls.
+
 ``CLEANUP_RESULTS`` is a standalone maintenance stage for the entire pipeline.
 It keeps the newest completed result for each versioned aggregate workflow,
 keeps the newest valid per-library generated profile/result generation, removes
@@ -84,15 +99,22 @@ import shlex
 import stat
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 # AMBIENT_PLOTS uses only standard-library imports during orchestration.  The
 # numerical plotting stack is loaded inside its compute-node worker.
 AMBIENT_PLOT_DEFAULT_CONDITION = "IND_CK_RF_SX0_GATED_RFREE_PFIT"
-ORCHESTRATOR_RELEASE = "2026-09-14-three-state-production-evidence-repair-v1"
+ORCHESTRATOR_RELEASE = "2026-09-18-joint-doublet-derivative-validation-v1"
 CANDIDATE_AXIS_STAGE = "IDENTITY_CANDIDATE_AXIS"
+JOINT_DOUBLET_STAGE = "JOINT_DOUBLET"
+JOINT_DOUBLET_ACTIONS = (
+    "FULL", "STATUS", "TRIM", "PARTIAL_GATHER",
+    "PARTIAL_GATHER_WORKER", "ANALYZE", "ANALYZE_WORKER",
+    "VALIDATION_PREFLIGHT", "VALIDATE_EXISTING", "DERIVATIVE_RESCORE",
+    "REPAIR_MOLECULE_SIDECARS", "DERIVATIVE_STATUS", "DERIVATIVE_RESUME",
+    "VALIDATION_FINALIZE")
 IDENTITY_READINESS_STAGE = "IDENTITY_RECONCILIATION_READINESS"
 IDENTITY_FILL_MISSING_STAGE = "IDENTITY_RECONCILIATION_FILL_MISSING"
 CANDIDATE_AXIS_MIN_EVIDENCE = 10
@@ -103,7 +125,7 @@ AMBIENT_PROFILE_REQUIRED_VERSION = "2.6-adaptive-simplex"
 AMBIENT_CONDITION_SHORT_NAMES = {
     "IND_CK_RF_SX0_GATED_RFREE_PFIT": "CK_SX0_GATED",
 }
-AMBIENT_PLOT_DIRNAME = "ambient_rna"
+AMBIENT_PLOT_DIRNAME = "ambient_RNA"
 AMBIENT_CONTAMINATION_SUBDIR = "contamination"
 AMBIENT_R_MODULE = "R/4.5.1"
 AMBIENT_PYTHON_MODULES = ("miniforge/3", "genomics-base/latest")
@@ -204,10 +226,13 @@ AMBIENT_SWAP_TEST_ARMS = {
 # Paths (all absolute, hardcoded)
 # =============================================================================
 
-PROJECT_ROOT = "/mnt/beegfs/tetmultiome_rna_mapped"
-PRODUCTION_MAPPING_ROOT = os.path.join(PROJECT_ROOT, "mapping_output")
+PROJECT_ROOT = "/mnt/beegfs/tetraploid_multiome_cis_trans"
+CURRENT_RNA_RUN_ROOT = os.path.join(PROJECT_ROOT, "3P")
+PRODUCTION_MAPPING_ROOT = os.path.join(CURRENT_RNA_RUN_ROOT, "mapping_output")
+PRODUCTION_ANALYSIS_ROOT = os.path.join(CURRENT_RNA_RUN_ROOT, "analysis")
 BEEGFS_ROOT = PRODUCTION_MAPPING_ROOT
-AGGREGATE_ROOT = os.path.join(BEEGFS_ROOT, "aggregate_library_analysis")
+AGGREGATE_ROOT = os.path.join(
+    PRODUCTION_ANALYSIS_ROOT, "aggregate_library_analysis")
 CONDITION_INDEX_ROOT = os.path.join(AGGREGATE_ROOT, "condition_index")
 CONDF_DIR = os.path.join(AGGREGATE_ROOT, "condf")
 SOFTWARE_BIN = "/nvme/software/packages/cellbouncer/dev/bin"
@@ -215,12 +240,12 @@ SOFTWARE_PLOT = "/nvme/software/packages/cellbouncer/dev/plot"
 IDENTITY_RECONCILIATION_FIGURES = os.path.join(
     SOFTWARE_PLOT, "identity_reconciliation_figures.py")
 CONTAM_R = os.path.join(SOFTWARE_PLOT, "contam.R")
-PANEL_METADATA = "/mnt/beegfs/tetmultiome_rna_mapped/Misc_Metadata/panel_metadata.tsv"
-EXPECTED_LINES_DIR = "/mnt/beegfs/tetmultiome_rna_mapped/Misc_Metadata"
+PANEL_METADATA = os.path.join(PROJECT_ROOT, "Misc_Metadata", "panel_metadata.tsv")
+EXPECTED_LINES_DIR = os.path.join(PROJECT_ROOT, "Misc_Metadata")
 LIBRARY_CONVERSIONS_XLSX = os.path.join(EXPECTED_LINES_DIR, "Library_conversions.xlsx")
-# Identity reconciliation uses the authoritative project-wide workbook colocated
-# with the mapping outputs; 2025_LineMeta defines the global biological universe.
-IDENTITY_LIBRARY_CONVERSIONS_XLSX = os.path.join(BEEGFS_ROOT, "Library_conversions.xlsx")
+# The consolidated metadata copy is byte-identical to the authoritative
+# project-wide identity workbook and is the canonical downstream location.
+IDENTITY_LIBRARY_CONVERSIONS_XLSX = LIBRARY_CONVERSIONS_XLSX
 
 # Cross-library roots.  Per-library writers use libN directory symlinks from
 # these roots into each library's demux_nomito analysis folders; aggregate
@@ -229,9 +254,13 @@ EXPECTED_POOL_METADATA = os.path.join(EXPECTED_LINES_DIR, "pool_combinations.tsv
 AUDIT_ROOT = os.path.join(AGGREGATE_ROOT, "posthoc")
 HYBRID_ROOT = os.path.join(AGGREGATE_ROOT, "hybrid")
 MT_FUSION_ROOT = os.path.join(AGGREGATE_ROOT, "mitochondrial")
-AMBIENT_PLOT_ROOT = os.path.join(AGGREGATE_ROOT, "ambient_rna")
 GEX_AMBIENT_ROOT = os.path.join(AGGREGATE_ROOT, "gex_ambient")
-FIGURE_ROOT = os.path.join(AGGREGATE_ROOT, "figures")
+# Figure products are physical directories in the modality tree.  The all-40
+# dataset has its own namespace so it cannot collide with Day95 or later runs.
+FIGURE_ROOT = os.path.join(CURRENT_RNA_RUN_ROOT, "figures", "all40")
+AMBIENT_PLOT_ROOT = os.path.join(FIGURE_ROOT, "ambient_RNA")
+RECONCILIATION_FIGURE_ROOT = os.path.join(
+    FIGURE_ROOT, "reconciliation", "final_assignment")
 DEFAULT_AGGREGATE_ROOT = AGGREGATE_ROOT
 DEFAULT_CONDITION_INDEX_ROOT = CONDITION_INDEX_ROOT
 DEFAULT_CONDF_DIR = CONDF_DIR
@@ -241,6 +270,7 @@ DEFAULT_MT_FUSION_ROOT = MT_FUSION_ROOT
 DEFAULT_AMBIENT_PLOT_ROOT = AMBIENT_PLOT_ROOT
 DEFAULT_GEX_AMBIENT_ROOT = GEX_AMBIENT_ROOT
 DEFAULT_FIGURE_ROOT = FIGURE_ROOT
+DEFAULT_RECONCILIATION_FIGURE_ROOT = RECONCILIATION_FIGURE_ROOT
 
 # Production NoMito panel family. CONDF/DEMUX consume the nuclear panels through
 # vcf_loader_daemon shared-memory segments, while MT_FUSION reads its compact
@@ -266,8 +296,7 @@ MT_PANEL_FILES = {
 
 # The trained model remains at its versioned source location.  New inference,
 # refinement, reconciliation, and audit outputs no longer write there.
-PLOIDY_MODEL_ROOT = os.path.join(
-    PROJECT_ROOT, "ploidy_classifier", "retrain_nomito_20260814")
+PLOIDY_MODEL_ROOT = "/mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier"
 IDENTITY_RECONCILIATION_ROOT = os.path.join(
     AGGREGATE_ROOT, "identity_reconciliation")
 TETRA_REFINE_ROOT = os.path.join(AGGREGATE_ROOT, "tetra_refine")
@@ -275,13 +304,19 @@ PLOIDY_CALLS_ROOT = os.path.join(AGGREGATE_ROOT, "ploidy")
 DEFAULT_IDENTITY_RECONCILIATION_ROOT = IDENTITY_RECONCILIATION_ROOT
 DEFAULT_TETRA_REFINE_ROOT = TETRA_REFINE_ROOT
 DEFAULT_PLOIDY_CALLS_ROOT = PLOIDY_CALLS_ROOT
-PLOIDY_NN_H5AD = os.path.join(BEEGFS_ROOT, "h5a5_outs", "unfiltered_normed_tetmultiome_rna.h5ad")
-PLOIDY_NN_WEIGHTS = os.path.join(PLOIDY_MODEL_ROOT, "model", "ploidy_nn_weights.pt")
+PLOIDY_NN_H5AD = os.path.join(
+    CURRENT_RNA_RUN_ROOT, "archive", "tetraploid_reanalysis_20260904_v1",
+    "ploidy_input", "all40.filtered_normed.h5ad")
+PLOIDY_NN_WEIGHTS = os.path.join(PLOIDY_MODEL_ROOT, "ploidy_nn_weights.pt")
 PLOIDY_NN_MODULE = "ploidy-inference/latest"
 IDENTITY_AUDIT_ROOT = AUDIT_ROOT
-ATAC_MAPPING_ROOT = "/mnt/beegfs/tetmultiome_atac/mapping_output"
-DEFAULT_ATAC_DEMUX_OUTPUT_ROOT = os.path.join(
-    AGGREGATE_ROOT, "atac_demux")
+ATAC_MAPPING_ROOT = os.path.join(PROJECT_ROOT, "ATAC", "mapping_output")
+DEFAULT_ATAC_DEMUX_OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "ATAC", "analysis")
+DEFAULT_JOINT_DOUBLET_ATAC_VCF = os.path.join(
+    PROJECT_ROOT, "3P", "archive", "legacy_partial_rna_pre_full_saturation",
+    "mapping_output", "aggregate_library_analysis", "vcf_panel_build",
+    "atac_full_bam_cells_noncell_all40_20260901_v8_incremental_corrected",
+    "panels", "tet.vars.atac_cells.demux_20M.bcf")
 ATAC_DEMUX_REQUIRED_SUFFIXES = (
     ".counts", ".samples", ".assignments", ".summary",
     ".diagnostics.gz", ".runner_ups.gz",
@@ -760,7 +795,8 @@ def configure_runtime_roots(args):
     """
     global BEEGFS_ROOT, AGGREGATE_ROOT, CONDITION_INDEX_ROOT, CONDF_DIR
     global AUDIT_ROOT, HYBRID_ROOT, MT_FUSION_ROOT, AMBIENT_PLOT_ROOT
-    global GEX_AMBIENT_ROOT, FIGURE_ROOT, IDENTITY_RECONCILIATION_ROOT
+    global GEX_AMBIENT_ROOT, FIGURE_ROOT, RECONCILIATION_FIGURE_ROOT
+    global IDENTITY_RECONCILIATION_ROOT
     global IDENTITY_AUDIT_ROOT, TETRA_REFINE_ROOT, PLOIDY_CALLS_ROOT
     global VCF_DAEMON_STATE_ROOT, DEMUX_OUTPUT_ROOT, CONDF_PATHS
 
@@ -785,6 +821,12 @@ def configure_runtime_roots(args):
             "production analysis tree")
     if analysis_root_value and not os.path.isabs(analysis_root_value):
         raise ValueError("--analysis-output-root must be an absolute path")
+    for option, value in (
+            ("--figure-root", args.figure_root),
+            ("--reconciliation-figure-root",
+             args.reconciliation_figure_root)):
+        if not os.path.isabs(value):
+            raise ValueError(f"{option} must be an absolute path")
     if analysis_root:
         if (_path_contains(mapping_root, analysis_root) or
                 _path_contains(analysis_root, mapping_root)):
@@ -799,6 +841,15 @@ def configure_runtime_roots(args):
 
         aggregate_root = os.path.join(
             analysis_root, "aggregate_library_analysis")
+        if args.figure_root == DEFAULT_FIGURE_ROOT:
+            selected_figure_root = (
+                DEFAULT_FIGURE_ROOT
+                if analysis_root == os.path.abspath(PRODUCTION_ANALYSIS_ROOT)
+                else os.path.join(analysis_root, "figures")
+            )
+            args.figure_root = selected_figure_root
+        else:
+            selected_figure_root = os.path.abspath(args.figure_root)
         derived = {
             "condf_dir": os.path.join(aggregate_root, "condf"),
             "audit_root": os.path.join(aggregate_root, "posthoc"),
@@ -806,7 +857,9 @@ def configure_runtime_roots(args):
             "mt_output_root": os.path.join(
                 aggregate_root, "mitochondrial"),
             "ambient_plot_root": os.path.join(
-                aggregate_root, "ambient_rna"),
+                selected_figure_root, "ambient_RNA"),
+            "reconciliation_figure_root": os.path.join(
+                selected_figure_root, "reconciliation", "final_assignment"),
             "gex_ambient_root": os.path.join(
                 aggregate_root, "gex_ambient"),
             "identity_reconciliation_root": os.path.join(
@@ -820,6 +873,8 @@ def configure_runtime_roots(args):
             "hybrid_root": DEFAULT_HYBRID_ROOT,
             "mt_output_root": DEFAULT_MT_FUSION_ROOT,
             "ambient_plot_root": DEFAULT_AMBIENT_PLOT_ROOT,
+            "reconciliation_figure_root":
+                DEFAULT_RECONCILIATION_FIGURE_ROOT,
             "gex_ambient_root": DEFAULT_GEX_AMBIENT_ROOT,
             "identity_reconciliation_root":
                 DEFAULT_IDENTITY_RECONCILIATION_ROOT,
@@ -865,6 +920,8 @@ def configure_runtime_roots(args):
         "--hybrid-root": args.hybrid_root,
         "--mt-output-root": args.mt_output_root,
         "--ambient-plot-root": args.ambient_plot_root,
+        "--figure-root": args.figure_root,
+        "--reconciliation-figure-root": args.reconciliation_figure_root,
         "--gex-ambient-root": args.gex_ambient_root,
         "--identity-reconciliation-root":
             args.identity_reconciliation_root,
@@ -891,7 +948,9 @@ def configure_runtime_roots(args):
     BEEGFS_ROOT = mapping_root
     AGGREGATE_ROOT = aggregate_root
     CONDITION_INDEX_ROOT = os.path.join(AGGREGATE_ROOT, "condition_index")
-    FIGURE_ROOT = os.path.join(AGGREGATE_ROOT, "figures")
+    FIGURE_ROOT = os.path.abspath(args.figure_root)
+    RECONCILIATION_FIGURE_ROOT = os.path.abspath(
+        args.reconciliation_figure_root)
     VCF_DAEMON_STATE_ROOT = os.path.join(
         AGGREGATE_ROOT, "vcf_daemon_state")
 
@@ -2876,12 +2935,13 @@ def get_script_dir():
 
 
 def publish_figure_shortcut(analysis, target, active_aggregate_root=None):
-    """Atomically publish one stable aggregate figure-directory shortcut."""
-    names = {
-        "ambient_plots": "ambient_plots",
-        "ambient_validation": "ambient_validation",
-        "ambient_swap_test": "ambient_swap_test",
-    }
+    """Validate a physically published figure directory.
+
+    The historical implementation created aggregate-directory symlinks.  New
+    jobs already write into the centralized figure tree, so publication is a
+    validation step and never creates an alias.
+    """
+    names = {"ambient_plots", "ambient_validation", "ambient_swap_test"}
     analysis = str(analysis).strip().lower()
     if analysis not in names:
         raise ValueError(f"unknown figure analysis: {analysis}")
@@ -2889,50 +2949,9 @@ def publish_figure_shortcut(analysis, target, active_aggregate_root=None):
     if not target.is_dir() or target.is_symlink():
         raise RuntimeError(f"figure target is not a real directory: {target}")
     target = target.resolve()
-    if active_aggregate_root is None:
-        candidates = [
-            candidate for candidate in (target, *target.parents)
-            if candidate.name == "aggregate_library_analysis"
-        ]
-        if len(candidates) != 1:
-            raise RuntimeError(
-                "could not uniquely infer aggregate_library_analysis "
-                f"from figure target: {target}")
-        aggregate_root = candidates[0]
-    else:
-        requested_root = Path(active_aggregate_root)
-        if not requested_root.is_absolute():
-            raise RuntimeError(
-                f"active aggregate root is not absolute: {requested_root}")
-        if requested_root.is_symlink() or not requested_root.is_dir():
-            raise RuntimeError(
-                f"active aggregate root is not a real directory: {requested_root}")
-        aggregate_root = requested_root.resolve()
-    if aggregate_root.name != "aggregate_library_analysis":
-        raise RuntimeError(
-            "active aggregate root must resolve to a directory named "
-            f"aggregate_library_analysis: {aggregate_root}")
-    try:
-        target.relative_to(aggregate_root)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"figure target escaped aggregate_library_analysis: {target}") from exc
-    figure_root = aggregate_root / "figures"
-    figure_root.mkdir(parents=True, exist_ok=True)
-    if figure_root.is_symlink() or not figure_root.is_dir():
-        raise RuntimeError(f"unsafe central figure root: {figure_root}")
-    link = figure_root / names[analysis]
-    if link.exists() and not link.is_symlink():
-        raise RuntimeError(
-            f"refusing to replace non-symlink figure index entry: {link}")
-    temporary = figure_root / (
-        f".{link.name}.tmp.{os.environ.get('SLURM_JOB_ID', os.getpid())}")
-    if temporary.exists() or temporary.is_symlink():
-        temporary.unlink()
-    relative_target = os.path.relpath(target, figure_root.resolve())
-    temporary.symlink_to(relative_target, target_is_directory=True)
-    os.replace(temporary, link)
-    print(f"Published figure index: {link} -> {relative_target}")
+    if target.is_symlink():
+        raise RuntimeError(f"figure target may not be a symlink: {target}")
+    print(f"Figure directory is physically published: {analysis}: {target}")
 
 
 def get_ambient_plot_run_dir(args, cond_list):
@@ -4507,6 +4526,8 @@ echo "Finished: $(date)"
 def run_atac_demux(args, lib_nums):
     """Render and optionally submit one independent worker per selected library."""
     if (getattr(args, "analysis_output_root", None)
+            and os.path.abspath(args.analysis_output_root) !=
+            os.path.abspath(PRODUCTION_ANALYSIS_ROOT)
             and args.atac_demux_output_root == DEFAULT_ATAC_DEMUX_OUTPUT_ROOT):
         args.atac_demux_output_root = os.path.join(
             AGGREGATE_ROOT, "atac_demux")
@@ -4573,6 +4594,1269 @@ def run_atac_demux(args, lib_nums):
         f"ATAC_DEMUX summary: {len(generated)} worker(s) rendered, "
         f"{len(failed_libraries)} library failure(s)")
     return 1 if failed_libraries else 0
+
+
+# =============================================================================
+# JOINT_DOUBLET: all-library candidate discovery and frozen scoring
+# =============================================================================
+
+JOINT_DOUBLET_TASK_FIELDS = (
+    "library", "output_dir", "rna_barcodes", "rna_features", "rna_matrix",
+    "rna_samples", "rna_assignments", "rna_diagnostics", "rna_runner_ups",
+    "rna_pileup_sites", "rna_pileup_observations", "atac_fragments",
+    "atac_bam", "atac_samples", "atac_assignments", "atac_diagnostics",
+    "atac_runner_ups", "reconciled_assignments", "reconciled_cells",
+    "technical_candidates", "ploidy_calls", "ambient_rates",
+    "ambient_profile", "pool_combinations", "atac_pileup_prefix",
+    "rna_manifest", "atac_manifest", "rna_scores", "atac_scores",
+)
+
+
+def _joint_doublet_runtime_block(modules, commands, python_imports=""):
+    """Return the exact module and executable audit required by cluster policy."""
+    lines = ["module purge"]
+    lines.extend(f"module load {module}" for module in modules)
+    lines.append("module list 2>&1")
+    lines.extend(f"command -v {command}" for command in commands)
+    if python_imports:
+        lines.append(
+            "python3 -c " + shlex.quote(f"import {python_imports}"))
+    return "\n".join(lines)
+
+
+def _joint_doublet_task_records(args, lib_nums, output_root):
+    records = []
+    for lib_num in lib_nums:
+        library = f"lib{lib_num}"
+        output_dir = os.path.join(output_root, library)
+        rna_prefix = get_demux_prefix(lib_num)
+        atac_prefix = get_atac_demux_prefix(lib_num, args)
+        ambient_prefix = get_contam_prefix(
+            lib_num, args.joint_doublet_ambient_condition,
+            args.joint_doublet_ambient_assignment_source)
+        atac_pileup_prefix = os.path.join(
+            output_dir, f"{library}.atac_joint_pileup_v2")
+        records.append({
+            "library": library,
+            "output_dir": output_dir,
+            "rna_barcodes": get_filtered_barcodes(lib_num),
+            "rna_features": get_filtered_features(lib_num),
+            "rna_matrix": get_filtered_matrix(lib_num),
+            "rna_samples": rna_prefix + ".samples",
+            "rna_assignments": rna_prefix + ".assignments",
+            "rna_diagnostics": rna_prefix + ".diagnostics.gz",
+            "rna_runner_ups": rna_prefix + ".runner_ups.gz",
+            "rna_pileup_sites": rna_prefix + ".pileup_sites.tsv.gz",
+            "rna_pileup_observations": rna_prefix + ".pileup_obs.tsv.gz",
+            "atac_fragments": os.path.join(
+                os.path.abspath(args.atac_demux_atac_root),
+                f"Tet_2025_Multiome-ATAC_{lib_num}",
+                "atac_fragments.tsv.gz"),
+            "atac_bam": get_atac_demux_bam(lib_num, args),
+            "atac_samples": atac_prefix + ".samples",
+            "atac_assignments": atac_prefix + ".assignments",
+            "atac_diagnostics": atac_prefix + ".diagnostics.gz",
+            "atac_runner_ups": atac_prefix + ".runner_ups.gz",
+            "reconciled_assignments": os.path.join(
+                os.path.abspath(args.identity_reconciliation_root),
+                "final_assignments", f"{library}.reconciled.assignments"),
+            "reconciled_cells": os.path.join(
+                os.path.abspath(args.identity_reconciliation_root),
+                "decisions", f"{library}.reconciled_cells.tsv.gz"),
+            "technical_candidates": os.path.join(
+                os.path.abspath(args.identity_reconciliation_root),
+                "candidates", f"{library}.technical_multiplet_candidates.tsv.gz"),
+            "ploidy_calls": get_ploidy_calls_path(lib_num),
+            "ambient_rates": ambient_prefix + ".contam_rate",
+            "ambient_profile": ambient_prefix + ".contam_prof",
+            "pool_combinations": os.path.abspath(EXPECTED_POOL_METADATA),
+            "atac_pileup_prefix": atac_pileup_prefix,
+            "rna_manifest": os.path.join(
+                output_dir, f"{library}.rna_joint_manifest.tsv.gz"),
+            "atac_manifest": os.path.join(
+                output_dir, f"{library}.atac_joint_manifest.tsv.gz"),
+            "rna_scores": os.path.join(
+                output_dir, f"{library}.rna_joint_scores.tsv.gz"),
+            "atac_scores": os.path.join(
+                output_dir, f"{library}.atac_joint_scores.tsv.gz"),
+        })
+    return records
+
+
+def _joint_doublet_write_task_manifest(path, records):
+    lines = ["\t".join(JOINT_DOUBLET_TASK_FIELDS)]
+    for record in records:
+        values = [str(record[field]) for field in JOINT_DOUBLET_TASK_FIELDS]
+        if any("\t" in value or "\n" in value for value in values):
+            raise ValueError("joint-doublet task paths cannot contain tabs/newlines")
+        lines.append("\t".join(values))
+    return _write_if_changed(path, "\n".join(lines) + "\n")
+
+
+def _joint_doublet_task_loader(task_manifest):
+    variables = " ".join(JOINT_DOUBLET_TASK_FIELDS)
+    return f'''TASK_MANIFEST={shlex.quote(task_manifest)}
+TASK_LINE="$(awk -v task="$SLURM_ARRAY_TASK_ID" 'NR == task + 2 {{print; exit}}' "$TASK_MANIFEST")"
+if [[ -z "$TASK_LINE" ]]; then
+    echo "ERROR: no task row for SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID" >&2
+    exit 1
+fi
+IFS=$'\\t' read -r {variables} <<< "$TASK_LINE"
+'''
+
+
+def _joint_doublet_array_header(
+        name, log_dir, task_count, cpus, memory, duration, partition):
+    return f'''#!/bin/bash
+#SBATCH --job-name={name}
+#SBATCH --output={log_dir}/{name}_%A_%a.out
+#SBATCH --error={log_dir}/{name}_%A_%a.err
+#SBATCH --array=0-{task_count - 1}
+#SBATCH --time={duration}
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --mem={memory}
+#SBATCH --partition={partition}
+#SBATCH --nodes=1
+
+set -euo pipefail
+'''
+
+
+def _joint_doublet_write_script(path, content):
+    _write_if_changed(path, content)
+    os.chmod(path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP |
+             stat.S_IROTH | stat.S_IXOTH)
+    return path
+
+
+def _joint_doublet_render_scripts(args, records, output_root, task_manifest):
+    script_dir = os.path.join(output_root, "slurm_scripts")
+    log_dir = os.path.join(output_root, "logs")
+    os.makedirs(script_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    helper = os.path.join(SOFTWARE_BIN, "identity_reconciliation.py")
+    scorer = os.path.join(SOFTWARE_BIN, "tetra_score_calls")
+    demux = os.path.join(SOFTWARE_BIN, "demux_parallel")
+    task_count = len(records)
+    loader = _joint_doublet_task_loader(task_manifest)
+
+    prepare_name = "joint_doublet_prepare"
+    prepare = _joint_doublet_array_header(
+        prepare_name, log_dir, task_count, args.joint_doublet_prepare_cpus,
+        args.joint_doublet_prepare_memory, args.joint_doublet_time,
+        args.joint_doublet_partition)
+    prepare += _joint_doublet_runtime_block(
+        ("miniforge/3", "genomics-base/latest"),
+        ("python3", "awk", "mkdir"),
+        "argparse,bisect,csv,gzip,math,statistics") + "\n"
+    prepare += loader
+    prepare += f'''
+for required in "$rna_barcodes" "$rna_features" "$rna_matrix" \\
+    "$rna_samples" "$rna_assignments" "$rna_diagnostics" \\
+    "$rna_pileup_sites" "$rna_pileup_observations" "$atac_fragments" \\
+    "$reconciled_assignments" "$reconciled_cells" "$pool_combinations" \\
+    {shlex.quote(helper)}; do
+    if [[ ! -s "$required" ]]; then
+        echo "ERROR: required JOINT_DOUBLET input missing or empty: $required" >&2
+        exit 1
+    fi
+done
+mkdir -p "$output_dir"
+python3 {shlex.quote(helper)} joint-prepare \\
+    --library "$library" \\
+    --rna-barcodes "$rna_barcodes" \\
+    --rna-features "$rna_features" \\
+    --rna-matrix "$rna_matrix" \\
+    --rna-samples "$rna_samples" \\
+    --rna-assignments "$rna_assignments" \\
+    --rna-diagnostics "$rna_diagnostics" \\
+    --rna-runner-ups "$rna_runner_ups" \\
+    --atac-fragments "$atac_fragments" \\
+    --atac-samples "$atac_samples" \\
+    --atac-assignments "$atac_assignments" \\
+    --atac-diagnostics "$atac_diagnostics" \\
+    --atac-runner-ups "$atac_runner_ups" \\
+    --reconciled-assignments "$reconciled_assignments" \\
+    --reconciled-cells "$reconciled_cells" \\
+    --technical-candidates "$technical_candidates" \\
+    --ploidy-calls "$ploidy_calls" \\
+    --ambient-rates "$ambient_rates" \\
+    --ambient-profile "$ambient_profile" \\
+    --pool-combinations "$pool_combinations" \\
+    --max-runner-ups {args.joint_doublet_max_runner_ups} \\
+    --uncertain-llr {args.joint_doublet_uncertain_llr:.17g} \\
+    --output-dir "$output_dir"
+test -s "$output_dir/${{library}}.cell_ledger.tsv.gz"
+test -s "$rna_manifest"
+test -s "$atac_manifest"
+test -s "$output_dir/${{library}}.atac_union_barcodes.tsv"
+'''
+
+    pileup_name = "joint_doublet_atac_pileup"
+    pileup = _joint_doublet_array_header(
+        pileup_name, log_dir, task_count, args.joint_doublet_atac_cpus,
+        args.joint_doublet_atac_memory, args.joint_doublet_time,
+        args.joint_doublet_partition)
+    pileup += _joint_doublet_runtime_block(
+        ("htslib/1.20", "cellbouncer/dev"),
+        ("demux_parallel", "awk")) + "\n"
+    pileup += loader
+    pileup += f'''
+ATAC_PANEL={shlex.quote(os.path.abspath(args.joint_doublet_atac_vcf))}
+ATAC_WHITELIST="$output_dir/${{library}}.atac_union_barcodes.tsv"
+if [[ ! -s "$atac_bam" || ! -s "${{atac_bam}}.bai" || \\
+      ! -s "$ATAC_PANEL" || ! -s "${{ATAC_PANEL}}.csi" ]]; then
+    echo "ATAC pileup inputs unavailable for $library; preserving ATAC as missing evidence"
+    exit 0
+fi
+test -s "$ATAC_WHITELIST"
+'''
+    if not args.force:
+        pileup += '''if [[ -s "${atac_pileup_prefix}.pileup_sites.tsv.gz" &&
+      -s "${atac_pileup_prefix}.pileup_obs.tsv.gz" &&
+      -s "${atac_pileup_prefix}.samples" ]]; then
+    echo "ATAC joint pileup already complete for $library"
+    exit 0
+fi
+'''
+    pileup += f'''{shlex.quote(demux)} \\
+    -b "$atac_bam" \\
+    -o "$atac_pileup_prefix" \\
+    -v "$ATAC_PANEL" \\
+    --barcodes "$ATAC_WHITELIST" \\
+    --qual {args.atac_demux_variant_qual} \\
+    --error_ref {args.atac_demux_error_ref:.17g} \\
+    --error_alt {args.atac_demux_error_alt:.17g} \\
+    --error_sigma {args.atac_demux_error_sigma:.17g} \\
+    --min-mapq {args.atac_demux_min_mapq} \\
+    --exclude-flags 0x{args.atac_demux_exclude_flags:X} \\
+    --disable_conditional \\
+    --skip_assignment \\
+    --force_recount \\
+    --threads {args.joint_doublet_atac_threads} \\
+    --dump_pileup "$atac_pileup_prefix"
+test -s "${{atac_pileup_prefix}}.samples"
+test -s "${{atac_pileup_prefix}}.pileup_sites.tsv.gz"
+test -s "${{atac_pileup_prefix}}.pileup_obs.tsv.gz"
+'''
+
+    rna_name = "joint_doublet_rna_score"
+    rna = _joint_doublet_array_header(
+        rna_name, log_dir, task_count, args.joint_doublet_score_cpus,
+        args.joint_doublet_score_memory, args.joint_doublet_time,
+        args.joint_doublet_partition)
+    rna += _joint_doublet_runtime_block(
+        ("htslib/1.20", "cellbouncer/dev"),
+        ("tetra_score_calls", "awk")) + "\n"
+    rna += loader
+    if not args.force:
+        rna += '''if [[ -s "$rna_scores" ]]; then
+    echo "RNA joint scores already complete for $library"
+    exit 0
+fi
+'''
+    rna += f'''
+for required in "$rna_samples" "$rna_manifest" "$rna_pileup_sites" \\
+    "$rna_pileup_observations" {shlex.quote(scorer)}; do
+    test -s "$required"
+done
+TEMP_ROOT="${{SLURM_TMPDIR:-/tmp}}"
+{shlex.quote(scorer)} \\
+    --joint-doublet-output "$rna_scores" \\
+    --joint-doublet-manifest "$rna_manifest" \\
+    --joint-doublet-temp-dir "$TEMP_ROOT" \\
+    --samples "$rna_samples" \\
+    --pileup-sites "$rna_pileup_sites" \\
+    --pileup-observations "$rna_pileup_observations" \\
+    --libname "$library" \\
+    --modality RNA \\
+    --error_ref {args.joint_doublet_rna_error_ref:.17g} \\
+    --error_alt {args.joint_doublet_rna_error_alt:.17g} \\
+    --min_evidence {args.joint_doublet_min_evidence} \\
+    --max-second-fraction {args.joint_doublet_max_second_fraction:.17g} \\
+    --joint-folds {args.joint_doublet_folds} \\
+    --threads {args.joint_doublet_score_cpus}
+test -s "$rna_scores"
+'''
+
+    atac_name = "joint_doublet_atac_score"
+    atac = _joint_doublet_array_header(
+        atac_name, log_dir, task_count, args.joint_doublet_score_cpus,
+        args.joint_doublet_score_memory, args.joint_doublet_time,
+        args.joint_doublet_partition)
+    atac += _joint_doublet_runtime_block(
+        ("htslib/1.20", "cellbouncer/dev"),
+        ("tetra_score_calls", "awk")) + "\n"
+    atac += loader
+    atac += f'''
+if [[ ! -s "${{atac_pileup_prefix}}.samples" || \\
+      ! -s "${{atac_pileup_prefix}}.pileup_sites.tsv.gz" || \\
+      ! -s "${{atac_pileup_prefix}}.pileup_obs.tsv.gz" ]]; then
+    echo "ATAC joint evidence unavailable for $library; aggregate will retain missing modality"
+    exit 0
+fi
+test -s "$atac_manifest"
+TEMP_ROOT="${{SLURM_TMPDIR:-/tmp}}"
+{shlex.quote(scorer)} \\
+    --joint-doublet-output "$atac_scores" \\
+    --joint-doublet-manifest "$atac_manifest" \\
+    --joint-doublet-temp-dir "$TEMP_ROOT" \\
+    --samples "${{atac_pileup_prefix}}.samples" \\
+    --pileup-sites "${{atac_pileup_prefix}}.pileup_sites.tsv.gz" \\
+    --pileup-observations "${{atac_pileup_prefix}}.pileup_obs.tsv.gz" \\
+    --libname "$library" \\
+    --modality ATAC \\
+    --error_ref {args.joint_doublet_atac_error_ref:.17g} \\
+    --error_alt {args.joint_doublet_atac_error_alt:.17g} \\
+    --min_evidence {args.joint_doublet_min_evidence} \\
+    --max-second-fraction {args.joint_doublet_max_second_fraction:.17g} \\
+    --joint-folds {args.joint_doublet_folds} \\
+    --threads {args.joint_doublet_score_cpus}
+test -s "$atac_scores"
+'''
+
+    gather_name = "joint_doublet_gather"
+    aggregate_root = os.path.join(output_root, "aggregate")
+    library_args = " ".join(shlex.quote(record["library"]) for record in records)
+    gather = f'''#!/bin/bash
+#SBATCH --job-name={gather_name}
+#SBATCH --output={log_dir}/{gather_name}_%j.out
+#SBATCH --error={log_dir}/{gather_name}_%j.err
+#SBATCH --time={args.joint_doublet_time}
+#SBATCH --cpus-per-task={args.joint_doublet_gather_cpus}
+#SBATCH --mem={args.joint_doublet_gather_memory}
+#SBATCH --partition={args.joint_doublet_partition}
+#SBATCH --nodes=1
+
+set -euo pipefail
+{_joint_doublet_runtime_block(
+    ("miniforge/3", "genomics-base/latest"), ("python3", "mkdir"),
+    "argparse,bisect,csv,gzip,math,statistics")}
+test -s {shlex.quote(helper)}
+mkdir -p {shlex.quote(aggregate_root)}
+python3 {shlex.quote(helper)} joint-aggregate \\
+    --input-root {shlex.quote(output_root)} \\
+    --output-root {shlex.quote(aggregate_root)} \\
+    --libraries {library_args}
+test -s {shlex.quote(os.path.join(aggregate_root, 'joint_doublet_cell_ledger.tsv.gz'))}
+test -s {shlex.quote(os.path.join(aggregate_root, 'joint_doublet_candidate_scores.tsv.gz'))}
+test -s {shlex.quote(os.path.join(aggregate_root, 'joint_doublet_library_summary.tsv'))}
+test -s {shlex.quote(os.path.join(aggregate_root, 'library25_calibration.tsv'))}
+'''
+
+    paths = {
+        "prepare": os.path.join(script_dir, prepare_name + ".sbatch"),
+        "atac_pileup": os.path.join(script_dir, pileup_name + ".sbatch"),
+        "rna_score": os.path.join(script_dir, rna_name + ".sbatch"),
+        "atac_score": os.path.join(script_dir, atac_name + ".sbatch"),
+        "gather": os.path.join(script_dir, gather_name + ".sbatch"),
+    }
+    _joint_doublet_write_script(paths["prepare"], prepare)
+    _joint_doublet_write_script(paths["atac_pileup"], pileup)
+    _joint_doublet_write_script(paths["rna_score"], rna)
+    _joint_doublet_write_script(paths["atac_score"], atac)
+    _joint_doublet_write_script(paths["gather"], gather)
+    return paths
+
+
+def _joint_doublet_submit(script_path, output_root, dependency=""):
+    command = ["sbatch", "--parsable", f"--chdir={output_root}"]
+    if dependency:
+        command.append(f"--dependency={dependency}")
+    command.append(script_path)
+    last_detail = ""
+    for attempt in (1, 2):
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False)
+        except OSError as exc:
+            result = None
+            last_detail = str(exc)
+        if result is not None and result.returncode == 0:
+            job_id = result.stdout.strip().split(";", 1)[0]
+            if job_id.isdigit():
+                return job_id
+            last_detail = f"unexpected sbatch response: {result.stdout.strip()!r}"
+        elif result is not None:
+            last_detail = result.stderr.strip() or result.stdout.strip()
+        if attempt == 1:
+            print(f"  WARNING: sbatch attempt 1 failed: {last_detail}; retrying")
+    raise RuntimeError(f"sbatch did not submit {script_path}: {last_detail}")
+
+
+def _joint_doublet_read_task_manifest(path):
+    """Load the deployed task manifest; its row order owns array indexing."""
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise ValueError(f"missing JOINT_DOUBLET task manifest: {path}")
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        missing = [field for field in JOINT_DOUBLET_TASK_FIELDS
+                   if field not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(
+                "JOINT_DOUBLET task manifest lacks fields: "
+                + ", ".join(missing))
+        rows = []
+        for task_index, row in enumerate(reader):
+            record = dict(row)
+            record["_task_index"] = task_index
+            rows.append(record)
+        return rows
+
+
+def _joint_doublet_job_record_path(output_root):
+    return os.path.join(output_root, "joint_doublet_active_jobs.json")
+
+
+def _joint_doublet_valid_job_id(value, label):
+    if value in (None, ""):
+        return None
+    value = str(value).strip()
+    if not value.isdigit():
+        raise ValueError(f"{label} must be a numeric SLURM array/job id")
+    return value
+
+
+def _joint_doublet_resolve_job_ids(args, output_root):
+    """Resolve explicit current-run ids first, then the saved run record."""
+    explicit = {
+        "rna_score": args.joint_doublet_rna_score_job_id,
+        "atac_score": args.joint_doublet_atac_score_job_id,
+        "gather": args.joint_doublet_gather_job_id,
+    }
+    saved = {}
+    record_path = _joint_doublet_job_record_path(output_root)
+    if os.path.isfile(record_path):
+        try:
+            with open(record_path) as handle:
+                payload = json.load(handle)
+            saved = payload.get("jobs", {})
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"  WARNING: could not read {record_path}: {exc}")
+    resolved = {}
+    for key, label in (
+            ("rna_score", "--joint-doublet-rna-score-job-id"),
+            ("atac_score", "--joint-doublet-atac-score-job-id"),
+            ("gather", "--joint-doublet-gather-job-id")):
+        resolved[key] = _joint_doublet_valid_job_id(
+            explicit.get(key) or saved.get(key), label)
+    return resolved
+
+
+def _joint_doublet_write_job_record(output_root, jobs, action):
+    retained = {
+        key: str(value) for key, value in jobs.items()
+        if value not in (None, "")
+    }
+    payload = {
+        "schema_version": "joint_doublet_active_jobs_v1",
+        "orchestrator_release": ORCHESTRATOR_RELEASE,
+        "updated_utc": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "last_action": action,
+        "jobs": retained,
+    }
+    _write_if_changed(
+        _joint_doublet_job_record_path(output_root),
+        json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _joint_doublet_elapsed_seconds(value):
+    """Parse SLURM elapsed values MM:SS, HH:MM:SS, or D-HH:MM:SS."""
+    value = str(value).strip()
+    days = 0
+    if "-" in value:
+        day_text, value = value.split("-", 1)
+        days = int(day_text)
+    parts = [int(part) for part in value.split(":")]
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours = 0
+        minutes, seconds = parts
+    else:
+        raise ValueError(f"unrecognized SLURM elapsed value: {value!r}")
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _joint_doublet_sacct_states(job_ids):
+    """Return {(base_job_id, array_index): (state, elapsed)}."""
+    requested = sorted({str(value) for value in job_ids if value})
+    if not requested:
+        return {}
+    command = [
+        "sacct", "-n", "-P", "-j", ",".join(requested),
+        "-o", "JobID,State,Elapsed"]
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "sacct failed: " + (result.stderr.strip() or result.stdout.strip()))
+    states = {}
+    requested_set = set(requested)
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) < 3:
+            continue
+        match = re.fullmatch(r"([0-9]+)_([0-9]+)", fields[0].strip())
+        if not match or match.group(1) not in requested_set:
+            continue
+        state = fields[1].strip().split()[0].rstrip("+")
+        states[(match.group(1), int(match.group(2)))] = (
+            state, fields[2].strip())
+    return states
+
+
+def _joint_doublet_squeue_tasks(job_id):
+    """Return active array elements as (job_id, index, state, elapsed)."""
+    result = subprocess.run(
+        ["squeue", "-h", "-r", "-j", str(job_id),
+         "-o", "%i|%T|%M"],
+        capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "squeue failed: " + (result.stderr.strip() or result.stdout.strip()))
+    rows = []
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) != 3:
+            continue
+        task_id = fields[0].strip()
+        match = re.fullmatch(re.escape(str(job_id)) + r"_([0-9]+)", task_id)
+        if match:
+            rows.append((task_id, int(match.group(1)),
+                         fields[1].strip(), fields[2].strip()))
+    return rows
+
+
+def _joint_doublet_job_active(job_id):
+    if not job_id:
+        return False
+    result = subprocess.run(
+        ["squeue", "-h", "-j", str(job_id), "-o", "%i"],
+        capture_output=True, text=True, check=False)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _joint_doublet_existing_records(output_root, lib_nums):
+    manifest = os.path.join(output_root, "joint_doublet_tasks.tsv")
+    records = _joint_doublet_read_task_manifest(manifest)
+    selected = {f"lib{value}" for value in lib_nums}
+    return [record for record in records if record["library"] in selected]
+
+
+def _joint_doublet_status(args, records, output_root, jobs):
+    score_jobs = [jobs.get("rna_score"), jobs.get("atac_score")]
+    states = _joint_doublet_sacct_states(score_jobs)
+    rna_complete = []
+    atac_complete = []
+    paired_complete = []
+    print("library\tRNA_job\tRNA_file\tATAC_job\tATAC_file\tpaired_complete")
+    for record in records:
+        task_index = record["_task_index"]
+        rna_state = states.get(
+            (jobs.get("rna_score"), task_index), ("UNKNOWN", ""))[0]
+        atac_state = states.get(
+            (jobs.get("atac_score"), task_index), ("UNKNOWN", ""))[0]
+        rna_file = os.path.isfile(record["rna_scores"]) and os.path.getsize(
+            record["rna_scores"]) > 0
+        atac_file = os.path.isfile(record["atac_scores"]) and os.path.getsize(
+            record["atac_scores"]) > 0
+        rna_ready = rna_state == "COMPLETED" and rna_file
+        atac_ready = atac_state == "COMPLETED" and atac_file
+        paired = rna_ready and atac_ready
+        library = record["library"]
+        if rna_ready:
+            rna_complete.append(library)
+        if atac_ready:
+            atac_complete.append(library)
+        if paired:
+            paired_complete.append(library)
+        print(
+            f"{library}\t{rna_state}\t{int(rna_file)}\t"
+            f"{atac_state}\t{int(atac_file)}\t{int(paired)}")
+    print()
+    print("RNA_COMPLETE=" + ",".join(rna_complete))
+    print("ATAC_COMPLETE=" + ",".join(atac_complete))
+    print("PAIRED_COMPLETE=" + ",".join(paired_complete))
+    print("LIB25_RNA_READY=" + str("lib25" in rna_complete))
+    print("LIB25_ATAC_READY=" + str("lib25" in atac_complete))
+    _joint_doublet_write_job_record(output_root, jobs, "STATUS")
+    return 0
+
+
+def _joint_doublet_trim(args, records, output_root, jobs):
+    if args.joint_doublet_min_running_hours < 0:
+        raise ValueError("--joint-doublet-min-running-hours must be nonnegative")
+    protected = set(args.joint_doublet_protected_libraries or []) | {25}
+    threshold = args.joint_doublet_min_running_hours * 3600.0
+    task_to_library = {
+        record["_task_index"]: int(record["library"][3:])
+        for record in records}
+    modalities = (
+        ("RNA", jobs.get("rna_score")),
+        ("ATAC", jobs.get("atac_score")))
+    if args.joint_doublet_trim_modality != "BOTH":
+        modalities = tuple(
+            item for item in modalities
+            if item[0] == args.joint_doublet_trim_modality)
+    to_cancel = []
+    print("decision\tmodality\tlibrary\tjob_task\tstate\telapsed\treason")
+    for modality, job_id in modalities:
+        if not job_id:
+            raise ValueError(
+                f"{modality} trim requires its JOINT_DOUBLET score job id")
+        for task_id, task_index, state, elapsed in _joint_doublet_squeue_tasks(job_id):
+            library = task_to_library.get(task_index)
+            if library is None:
+                print(
+                    f"KEEP\t{modality}\tUNKNOWN\t{task_id}\t{state}\t"
+                    f"{elapsed}\tTASK_NOT_IN_MANIFEST")
+                continue
+            if library in protected:
+                decision, reason = "KEEP", "PROTECTED_LIBRARY"
+            elif state == "COMPLETING":
+                decision, reason = "KEEP", "COMPLETING"
+            elif state == "RUNNING":
+                try:
+                    old_enough = _joint_doublet_elapsed_seconds(elapsed) >= threshold
+                except ValueError:
+                    decision, reason = (
+                        "KEEP", "UNPARSEABLE_ELAPSED_LEFT_ALONE")
+                else:
+                    if old_enough:
+                        decision, reason = "KEEP", "AT_OR_ABOVE_THRESHOLD"
+                    else:
+                        decision, reason = "CANCEL", "BELOW_THRESHOLD"
+            elif state in {"PENDING", "CONFIGURING"}:
+                decision, reason = "CANCEL", "NOT_STARTED"
+            else:
+                decision, reason = "KEEP", "STATE_LEFT_ALONE"
+            print(
+                f"{decision}\t{modality}\tlib{library}\t{task_id}\t"
+                f"{state}\t{elapsed}\t{reason}")
+            if decision == "CANCEL":
+                to_cancel.append(task_id)
+    if not args.submit:
+        print(f"Dry run: {len(to_cancel)} task(s) would be cancelled")
+        return 0
+    if to_cancel:
+        result = subprocess.run(
+            ["scancel"] + to_cancel,
+            capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "scancel failed: "
+                + (result.stderr.strip() or result.stdout.strip()))
+        print(f"Cancelled {len(to_cancel)} JOINT_DOUBLET task(s)")
+        gather_id = jobs.get("gather")
+        if gather_id and _joint_doublet_job_active(gather_id):
+            result = subprocess.run(
+                ["scancel", gather_id],
+                capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                print(f"Cancelled obsolete full gather {gather_id}")
+            else:
+                print(
+                    f"  WARNING: could not cancel gather {gather_id}: "
+                    + (result.stderr.strip() or result.stdout.strip()))
+    _joint_doublet_write_job_record(output_root, jobs, "TRIM")
+    return 0
+
+
+def _joint_doublet_partial_worker(args, records, output_root, jobs):
+    if not jobs.get("rna_score") or not jobs.get("atac_score"):
+        raise ValueError(
+            "PARTIAL_GATHER_WORKER requires RNA and ATAC score job ids")
+    partial_root = os.path.abspath(args.joint_doublet_partial_output_root)
+    os.makedirs(partial_root, exist_ok=True)
+    states = _joint_doublet_sacct_states(
+        [jobs["rna_score"], jobs["atac_score"]])
+    selected = []
+    status_lines = [
+        "library\trna_state\trna_file\tatac_state\tatac_file\tselected"]
+    for record in records:
+        task_index = record["_task_index"]
+        rna_state = states.get(
+            (jobs["rna_score"], task_index), ("UNKNOWN", ""))[0]
+        atac_state = states.get(
+            (jobs["atac_score"], task_index), ("UNKNOWN", ""))[0]
+        rna_file = os.path.isfile(record["rna_scores"]) and os.path.getsize(
+            record["rna_scores"]) > 0
+        atac_file = os.path.isfile(record["atac_scores"]) and os.path.getsize(
+            record["atac_scores"]) > 0
+        paired = (
+            rna_state == "COMPLETED" and rna_file and
+            atac_state == "COMPLETED" and atac_file)
+        if paired:
+            selected.append(record["library"])
+        status_lines.append(
+            f"{record['library']}\t{rna_state}\t{int(rna_file)}\t"
+            f"{atac_state}\t{int(atac_file)}\t{int(paired)}")
+    _write_if_changed(
+        os.path.join(partial_root, "partial_gather_selection.tsv"),
+        "\n".join(status_lines) + "\n")
+    if "lib25" not in selected:
+        raise ValueError(
+            "Library 25 lacks completed RNA+ATAC scores; paired calibrated "
+            "partial gather cannot run")
+    if not selected:
+        raise ValueError("no paired-complete JOINT_DOUBLET libraries found")
+    helper = os.path.join(SOFTWARE_BIN, "identity_reconciliation.py")
+    command = [
+        sys.executable, helper, "joint-aggregate",
+        "--input-root", output_root,
+        "--output-root", partial_root,
+        "--libraries"] + selected
+    print("PARTIAL_GATHER_LIBRARIES=" + ",".join(selected))
+    print("PARTIAL_GATHER_OUTPUT_ROOT=" + partial_root)
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"joint-aggregate exited with status {result.returncode}")
+    required = (
+        "joint_doublet_cell_ledger.tsv.gz",
+        "joint_doublet_candidate_scores.tsv.gz",
+        "joint_doublet_library_summary.tsv",
+        "library25_calibration.tsv")
+    missing = [name for name in required
+               if not os.path.isfile(os.path.join(partial_root, name)) or
+               os.path.getsize(os.path.join(partial_root, name)) == 0]
+    if missing:
+        raise RuntimeError(
+            "partial gather did not create: " + ", ".join(missing))
+    print("PARTIAL_GATHER_COMPLETE")
+    return 0
+
+
+def _joint_doublet_partial_submit(args, records, output_root, jobs, lib_nums):
+    if not jobs.get("rna_score") or not jobs.get("atac_score"):
+        raise ValueError(
+            "PARTIAL_GATHER requires --joint-doublet-rna-score-job-id and "
+            "--joint-doublet-atac-score-job-id, or a saved active-job record")
+    calibration_record = next(
+        (record for record in records if record["library"] == "lib25"), None)
+    if calibration_record is None:
+        raise ValueError("PARTIAL_GATHER requires Library 25 in --libraries")
+    calibration_index = calibration_record["_task_index"]
+    calibration_states = _joint_doublet_sacct_states([jobs["atac_score"]])
+    calibration_state = calibration_states.get(
+        (jobs["atac_score"], calibration_index), ("UNKNOWN", ""))[0]
+    calibration_file = calibration_record["atac_scores"]
+    calibration_file_ready = (
+        os.path.isfile(calibration_file) and os.path.getsize(calibration_file) > 0)
+    calibration_task = f"{jobs['atac_score']}_{calibration_index}"
+    active_states = {"PENDING", "CONFIGURING", "RUNNING", "COMPLETING"}
+    if calibration_state == "COMPLETED":
+        if not calibration_file_ready:
+            raise ValueError(
+                f"Library 25 ATAC task {calibration_task} completed but its "
+                f"score file is missing or empty: {calibration_file}")
+        dependency = ""
+        calibration_note = (
+            f"already complete ({calibration_task}); submitting immediately")
+    elif calibration_state in active_states:
+        dependency = f"afterok:{calibration_task}"
+        calibration_note = (
+            f"active ({calibration_task}, {calibration_state}); waiting with "
+            f"{dependency}")
+    elif calibration_state == "UNKNOWN" and calibration_file_ready:
+        dependency = ""
+        calibration_note = (
+            f"output already present; SLURM history unavailable for "
+            f"{calibration_task}; submitting immediately")
+    else:
+        raise ValueError(
+            f"Library 25 ATAC calibration is not usable: task "
+            f"{calibration_task} state={calibration_state}, "
+            f"score_file_ready={int(calibration_file_ready)}, "
+            f"score_file={calibration_file}")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    partial_root = os.path.abspath(
+        args.joint_doublet_partial_output_root or os.path.join(
+            output_root, "partial_gathers", f"paired_{timestamp}"))
+    script_dir = os.path.join(output_root, "slurm_scripts")
+    log_dir = os.path.join(output_root, "logs")
+    os.makedirs(script_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    script_path = os.path.join(
+        script_dir, f"joint_doublet_partial_gather_{timestamp}.sbatch")
+    orchestrator = os.path.abspath(__file__)
+    worker_command = [
+        "python3", orchestrator,
+        "--stage", JOINT_DOUBLET_STAGE,
+        "--libraries"] + [str(value) for value in lib_nums] + [
+        "--joint-doublet-action", "PARTIAL_GATHER_WORKER",
+        "--joint-doublet-output-root", output_root,
+        "--joint-doublet-partial-output-root", partial_root,
+        "--joint-doublet-rna-score-job-id", jobs["rna_score"],
+        "--joint-doublet-atac-score-job-id", jobs["atac_score"],
+        "--analysis-output-root", os.path.abspath(args.analysis_output_root)]
+    script = f'''#!/bin/bash
+#SBATCH --job-name=joint_doublet_partial
+#SBATCH --output={log_dir}/joint_doublet_partial_%j.out
+#SBATCH --error={log_dir}/joint_doublet_partial_%j.err
+#SBATCH --time={args.joint_doublet_time}
+#SBATCH --cpus-per-task={args.joint_doublet_gather_cpus}
+#SBATCH --mem={args.joint_doublet_gather_memory}
+#SBATCH --partition={args.joint_doublet_partition}
+#SBATCH --nodes=1
+
+set -euo pipefail
+{_joint_doublet_runtime_block(
+    ("miniforge/3", "genomics-base/latest"), ("python3",),
+    "argparse,bisect,csv,gzip,math,statistics")}
+{" ".join(shlex.quote(value) for value in worker_command)}
+'''
+    _joint_doublet_write_script(script_path, script)
+    print("JOINT_DOUBLET PARTIAL_GATHER")
+    print("  Selection: paired-complete libraries at worker start")
+    print(f"  Calibration status: {calibration_note}")
+    print(f"  Calibration dependency: {dependency or 'none'}")
+    print(f"  Partial output root: {partial_root}")
+    print(f"  Script: {script_path}")
+    if not args.submit:
+        print("  Dry run: script rendered; no job submitted")
+        return 0
+    partial_job = _joint_doublet_submit(
+        script_path, output_root, dependency)
+    jobs = dict(jobs)
+    jobs["partial_gather"] = partial_job
+    _joint_doublet_write_job_record(output_root, jobs, "PARTIAL_GATHER")
+    print(f"  Submitted partial_gather={partial_job}")
+    return 0
+
+
+def _joint_doublet_analysis_paths(args):
+    gather_root = os.path.abspath(
+        args.joint_doublet_partial_output_root or "")
+    if not args.joint_doublet_partial_output_root:
+        raise ValueError(
+            "ANALYZE requires --joint-doublet-partial-output-root pointing "
+            "to one completed gather")
+    analysis_root = os.path.abspath(
+        args.joint_doublet_analysis_output_root or os.path.join(
+            gather_root, "post_gather_analysis"))
+    return gather_root, analysis_root
+
+
+def _joint_doublet_analysis_validate_inputs(gather_root):
+    required = (
+        "joint_doublet_cell_ledger.tsv.gz",
+        "joint_doublet_candidate_scores.tsv.gz",
+        "joint_doublet_library_summary.tsv",
+        "library25_calibration.tsv")
+    missing = [
+        os.path.join(gather_root, name) for name in required
+        if not os.path.isfile(os.path.join(gather_root, name)) or
+        os.path.getsize(os.path.join(gather_root, name)) == 0]
+    if missing:
+        raise ValueError(
+            "ANALYZE gather is incomplete; missing or empty: "
+            + ", ".join(missing))
+
+
+def _joint_doublet_analysis_worker(args):
+    gather_root, analysis_root = _joint_doublet_analysis_paths(args)
+    _joint_doublet_analysis_validate_inputs(gather_root)
+    os.makedirs(analysis_root, exist_ok=True)
+    helper = os.path.join(SOFTWARE_BIN, "identity_reconciliation.py")
+    command = [
+        sys.executable, helper, "joint-analyze",
+        "--input-root", gather_root,
+        "--output-root", analysis_root]
+    print("JOINT_DOUBLET_ANALYSIS_INPUT_ROOT=" + gather_root)
+    print("JOINT_DOUBLET_ANALYSIS_OUTPUT_ROOT=" + analysis_root)
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"joint-analyze exited with status {result.returncode}")
+    required = (
+        "JOINT_DOUBLET_ANALYSIS_COMPLETE",
+        "joint_doublet_post_gather_report.md",
+        "joint_doublet_library_diagnostics.tsv",
+        "joint_doublet_cell_diagnostics.tsv.gz",
+        "joint_doublet_candidate_status_summary.tsv",
+        "joint_doublet_stratified_summary.tsv",
+        "joint_doublet_ranked_review_cells.tsv.gz",
+        "joint_doublet_analysis_manifest.json")
+    missing = [name for name in required
+               if not os.path.isfile(os.path.join(analysis_root, name)) or
+               os.path.getsize(os.path.join(analysis_root, name)) == 0]
+    if missing:
+        raise RuntimeError(
+            "post-gather analysis did not create: " + ", ".join(missing))
+    print("JOINT_DOUBLET_ANALYSIS_COMPLETE")
+    return 0
+
+
+def _joint_doublet_analysis_submit(args, output_root, lib_nums):
+    gather_root, analysis_root = _joint_doublet_analysis_paths(args)
+    _joint_doublet_analysis_validate_inputs(gather_root)
+    script_dir = os.path.join(output_root, "slurm_scripts")
+    log_dir = os.path.join(output_root, "logs")
+    os.makedirs(script_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    script_path = os.path.join(
+        script_dir, f"joint_doublet_analysis_{timestamp}.sbatch")
+    orchestrator = os.path.abspath(__file__)
+    worker_command = [
+        "python3", orchestrator,
+        "--stage", JOINT_DOUBLET_STAGE,
+        "--libraries"] + [str(value) for value in lib_nums] + [
+        "--joint-doublet-action", "ANALYZE_WORKER",
+        "--joint-doublet-output-root", output_root,
+        "--joint-doublet-partial-output-root", gather_root,
+        "--joint-doublet-analysis-output-root", analysis_root,
+        "--analysis-output-root", os.path.abspath(args.analysis_output_root)]
+    script = f'''#!/bin/bash
+#SBATCH --job-name=joint_doublet_analysis
+#SBATCH --output={log_dir}/joint_doublet_analysis_%j.out
+#SBATCH --error={log_dir}/joint_doublet_analysis_%j.err
+#SBATCH --time={args.joint_doublet_time}
+#SBATCH --cpus-per-task={args.joint_doublet_analysis_cpus}
+#SBATCH --mem={args.joint_doublet_analysis_memory}
+#SBATCH --partition={args.joint_doublet_partition}
+#SBATCH --nodes=1
+
+set -euo pipefail
+{_joint_doublet_runtime_block(
+    ("miniforge/3", "genomics-base/latest"), ("python3",),
+    "argparse,bisect,csv,gzip,json,math,statistics")}
+{" ".join(shlex.quote(value) for value in worker_command)}
+'''
+    _joint_doublet_write_script(script_path, script)
+    print("JOINT_DOUBLET ANALYZE")
+    print("  Mode: one-pass post-gather diagnostics; no BAM/fragment rescoring")
+    print(f"  Gather input root: {gather_root}")
+    print(f"  Analysis output root: {analysis_root}")
+    print(f"  Script: {script_path}")
+    if not args.submit:
+        print("  Dry run: script rendered; no job submitted")
+        return 0
+    analysis_job = _joint_doublet_submit(script_path, output_root)
+    print(f"  Submitted analysis={analysis_job}")
+    return 0
+
+
+def _joint_doublet_option_errors(args):
+    errors = []
+    for option, value in (
+            ("--joint-doublet-output-root", args.joint_doublet_output_root),
+            ("--joint-doublet-atac-vcf", args.joint_doublet_atac_vcf)):
+        if not value or not os.path.isabs(value):
+            errors.append(f"{option} must be an absolute path")
+    if args.joint_doublet_atac_threads < 2:
+        errors.append("--joint-doublet-atac-threads must be at least 2")
+    if args.joint_doublet_atac_cpus < args.joint_doublet_atac_threads:
+        errors.append(
+            "--joint-doublet-atac-cpus must be at least --joint-doublet-atac-threads")
+    for option in (
+            "joint_doublet_prepare_cpus", "joint_doublet_score_cpus",
+            "joint_doublet_gather_cpus", "joint_doublet_analysis_cpus"):
+        if getattr(args, option) < 1:
+            errors.append("--" + option.replace("_", "-") + " must be positive")
+    for option in (
+            "joint_doublet_prepare_memory", "joint_doublet_atac_memory",
+            "joint_doublet_score_memory", "joint_doublet_gather_memory",
+            "joint_doublet_analysis_memory"):
+        if not re.fullmatch(r"[0-9]+[KMGTP]", getattr(args, option)):
+            errors.append("--" + option.replace("_", "-") +
+                          " must be a SLURM memory token such as 128G")
+    if not 0 < args.joint_doublet_max_second_fraction <= 1:
+        errors.append("--joint-doublet-max-second-fraction must be in (0,1]")
+    if args.joint_doublet_folds < 2:
+        errors.append("--joint-doublet-folds must be at least 2")
+    if args.joint_doublet_min_evidence < 0:
+        errors.append("--joint-doublet-min-evidence must be nonnegative")
+    if args.joint_doublet_max_runner_ups < 1:
+        errors.append("--joint-doublet-max-runner-ups must be positive")
+    if not re.fullmatch(
+            r"(?:[0-9]+-[0-9]{2}:[0-9]{2}:[0-9]{2}|"
+            r"[0-9]+:[0-9]{2}:[0-9]{2})",
+            args.joint_doublet_time):
+        errors.append(
+            "--joint-doublet-time must be a SLURM duration such as 7-00:00:00")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.joint_doublet_partition):
+        errors.append("--joint-doublet-partition contains unsafe characters")
+    for label, ref_error, alt_error in (
+            ("RNA", args.joint_doublet_rna_error_ref,
+             args.joint_doublet_rna_error_alt),
+            ("ATAC", args.joint_doublet_atac_error_ref,
+             args.joint_doublet_atac_error_alt)):
+        if (not 0 <= ref_error <= 1 or not 0 <= alt_error <= 1 or
+                ref_error + alt_error >= 1):
+            errors.append(
+                f"JOINT_DOUBLET {label} errors must be in [0,1] and sum below 1")
+    return errors
+
+
+def _joint_doublet_validation_action(args, lib_nums):
+    """Invoke the validation control plane from one explicit tool root."""
+    helper_root = os.path.abspath(
+        args.joint_doublet_tool_bin_root or os.path.dirname(__file__))
+    helper = os.path.join(helper_root, "joint_doublet_validation.py")
+    if not os.path.isfile(helper):
+        raise ValueError(
+            "validation helper is absent from --joint-doublet-tool-bin-root: " + helper)
+    action = args.joint_doublet_action
+    mapped = {
+        "VALIDATION_PREFLIGHT": "preflight",
+        "VALIDATE_EXISTING": "run-stage",
+        "DERIVATIVE_RESCORE": "run-stage",
+        "REPAIR_MOLECULE_SIDECARS": "run-repair",
+        "DERIVATIVE_STATUS": "status",
+        "DERIVATIVE_RESUME": "resume",
+        "VALIDATION_FINALIZE": "finalize-checkpoint",
+    }[action]
+    command = [sys.executable, helper, mapped,
+               "--validation-root", os.path.abspath(
+                   args.joint_doublet_validation_root or "")]
+    if mapped == "preflight":
+        required = {
+            "--joint-doublet-source-output-root":
+                args.joint_doublet_source_output_root,
+            "--joint-doublet-partial-output-root":
+                args.joint_doublet_partial_output_root,
+            "--joint-doublet-validation-root":
+                args.joint_doublet_validation_root,
+        }
+        missing = [name for name, value in required.items()
+                   if not value or not os.path.isabs(value)]
+        if missing:
+            raise ValueError("absolute paths required: " + ", ".join(missing))
+        command.extend([
+            "--libraries", *[str(value) for value in lib_nums],
+            "--source-output-root", args.joint_doublet_source_output_root,
+            "--partial-output-root", args.joint_doublet_partial_output_root,
+            "--calibration-library", str(args.joint_doublet_calibration_library),
+            "--evidence-mode", args.joint_doublet_evidence_mode,
+        ])
+        if args.joint_doublet_heldout_libraries:
+            command.extend(["--heldout-libraries", *[
+                str(value) for value in args.joint_doublet_heldout_libraries]])
+        if args.joint_doublet_regression_libraries:
+            command.extend(["--regression-libraries", *[
+                str(value) for value in args.joint_doublet_regression_libraries]])
+    elif mapped == "run-stage":
+        required = {
+            "--joint-doublet-source-output-root":
+                args.joint_doublet_source_output_root,
+            "--joint-doublet-output-root": args.joint_doublet_output_root,
+            "--joint-doublet-validation-root":
+                args.joint_doublet_validation_root,
+            "--joint-doublet-tool-bin-root": args.joint_doublet_tool_bin_root,
+        }
+        if action == "VALIDATE_EXISTING":
+            required["--joint-doublet-partial-output-root"] = \
+                args.joint_doublet_partial_output_root
+        missing = [name for name, value in required.items()
+                   if not value or not os.path.isabs(value)]
+        if missing:
+            raise ValueError("absolute paths required: " + ", ".join(missing))
+        command.extend([
+            "--workflow-action", action,
+            "--libraries", *[str(value) for value in lib_nums],
+            "--source-output-root", args.joint_doublet_source_output_root,
+            "--stage-root", args.joint_doublet_output_root,
+            "--tool-bin-root", args.joint_doublet_tool_bin_root,
+            "--calibration-library", str(args.joint_doublet_calibration_library),
+            "--evidence-mode", args.joint_doublet_evidence_mode,
+            "--score-cpus", str(args.joint_doublet_score_cpus),
+            "--score-memory", args.joint_doublet_score_memory,
+            "--score-max-concurrent", str(args.joint_doublet_score_max_concurrent),
+            "--worker-cpus", str(args.joint_doublet_validation_worker_cpus),
+            "--worker-memory", args.joint_doublet_validation_worker_memory,
+            "--worker-max-concurrent",
+                str(args.joint_doublet_validation_max_concurrent),
+            "--gather-cpus", str(args.joint_doublet_gather_cpus),
+            "--gather-memory", args.joint_doublet_gather_memory,
+            "--analysis-cpus", str(args.joint_doublet_analysis_cpus),
+            "--analysis-memory", args.joint_doublet_analysis_memory,
+            "--time", args.joint_doublet_time,
+            "--partition", args.joint_doublet_partition,
+        ])
+        if args.joint_doublet_partial_output_root:
+            command.extend(["--partial-output-root",
+                            args.joint_doublet_partial_output_root])
+        if args.joint_doublet_heldout_libraries:
+            command.extend(["--heldout-libraries", *map(
+                str, args.joint_doublet_heldout_libraries)])
+        if args.joint_doublet_regression_libraries:
+            command.extend(["--regression-libraries", *map(
+                str, args.joint_doublet_regression_libraries)])
+        if args.joint_doublet_frozen_spec:
+            command.extend(["--frozen-spec", args.joint_doublet_frozen_spec])
+        if args.joint_doublet_temp_root:
+            command.extend(["--temp-root", args.joint_doublet_temp_root])
+        if args.submit:
+            command.append("--submit")
+    elif mapped == "run-repair":
+        required = {
+            "--joint-doublet-output-root": args.joint_doublet_output_root,
+            "--joint-doublet-validation-root": args.joint_doublet_validation_root,
+            "--joint-doublet-repair-plan": args.joint_doublet_repair_plan,
+            "--joint-doublet-tool-bin-root": args.joint_doublet_tool_bin_root,
+        }
+        missing = [name for name, value in required.items()
+                   if not value or not os.path.isabs(value)]
+        if missing:
+            raise ValueError("absolute paths required: " + ", ".join(missing))
+        command.extend([
+            "--libraries", *[str(value) for value in lib_nums],
+            "--stage-root", args.joint_doublet_output_root,
+            "--repair-plan", args.joint_doublet_repair_plan,
+            "--tool-bin-root", args.joint_doublet_tool_bin_root,
+            "--repair-cpus", str(args.joint_doublet_repair_cpus),
+            "--repair-threads", str(args.joint_doublet_repair_threads),
+            "--repair-memory", args.joint_doublet_repair_memory,
+            "--repair-max-concurrent", str(args.joint_doublet_repair_max_concurrent),
+            "--time", args.joint_doublet_time,
+            "--partition", args.joint_doublet_partition,
+        ])
+        if args.joint_doublet_temp_root:
+            command.extend(["--temp-root", args.joint_doublet_temp_root])
+        if args.submit:
+            command.append("--submit")
+    elif mapped in {"status", "resume"}:
+        if not args.joint_doublet_validation_root or not os.path.isabs(
+                args.joint_doublet_validation_root):
+            raise ValueError("--joint-doublet-validation-root must be absolute")
+        if args.joint_doublet_output_root:
+            if not os.path.isabs(args.joint_doublet_output_root):
+                raise ValueError("--joint-doublet-output-root must be absolute")
+            command.extend(["--stage-root", args.joint_doublet_output_root])
+        if mapped == "resume":
+            if not args.joint_doublet_output_root:
+                raise ValueError("DERIVATIVE_RESUME requires --joint-doublet-output-root")
+            if args.submit:
+                command.append("--submit")
+    elif mapped == "finalize-checkpoint":
+        if args.joint_doublet_frozen_spec:
+            command.extend(["--frozen-spec", args.joint_doublet_frozen_spec])
+    print("JOINT_DOUBLET " + action)
+    print("  Validation helper: " + helper)
+    print("  Command: " + " ".join(shlex.quote(value) for value in command))
+    result = subprocess.run(command, check=False)
+    return result.returncode
+
+
+def run_joint_doublet(args, lib_nums):
+    """Run or manage the all-library joint-doublet workflow."""
+    action = args.joint_doublet_action
+    validation_actions = {
+        "VALIDATION_PREFLIGHT", "VALIDATE_EXISTING", "DERIVATIVE_RESCORE",
+        "REPAIR_MOLECULE_SIDECARS", "DERIVATIVE_STATUS", "DERIVATIVE_RESUME",
+        "VALIDATION_FINALIZE",
+    }
+    if action in validation_actions:
+        try:
+            return _joint_doublet_validation_action(args, lib_nums)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"  ERROR: JOINT_DOUBLET {action} failed: {exc}")
+            return 1
+    output_root = os.path.abspath(
+        args.joint_doublet_output_root or
+        os.path.join(AGGREGATE_ROOT, "joint_doublet"))
+    args.joint_doublet_output_root = output_root
+    if action != "FULL":
+        try:
+            if action == "ANALYZE":
+                return _joint_doublet_analysis_submit(
+                    args, output_root, lib_nums)
+            if action == "ANALYZE_WORKER":
+                return _joint_doublet_analysis_worker(args)
+            records = _joint_doublet_existing_records(
+                output_root, lib_nums)
+            if not records:
+                raise ValueError(
+                    "no selected libraries occur in the existing "
+                    "JOINT_DOUBLET task manifest")
+            jobs = _joint_doublet_resolve_job_ids(args, output_root)
+            if action == "STATUS":
+                return _joint_doublet_status(
+                    args, records, output_root, jobs)
+            if action == "TRIM":
+                return _joint_doublet_trim(
+                    args, records, output_root, jobs)
+            if action == "PARTIAL_GATHER":
+                if 25 not in lib_nums:
+                    raise ValueError(
+                        "PARTIAL_GATHER requires Library 25 in --libraries")
+                return _joint_doublet_partial_submit(
+                    args, records, output_root, jobs, lib_nums)
+            if action == "PARTIAL_GATHER_WORKER":
+                if not args.joint_doublet_partial_output_root:
+                    raise ValueError(
+                        "PARTIAL_GATHER_WORKER requires its managed output root")
+                return _joint_doublet_partial_worker(
+                    args, records, output_root, jobs)
+            raise ValueError(f"unsupported JOINT_DOUBLET action: {action}")
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"  ERROR: JOINT_DOUBLET {action} failed: {exc}")
+            return 1
+
+    if 25 not in lib_nums:
+        print("ERROR: JOINT_DOUBLET requires Library 25 for calibration")
+        return 1
+    errors = _joint_doublet_option_errors(args)
+    if errors:
+        for error in errors:
+            print(f"  ERROR: {error}")
+        return 1
+    os.makedirs(output_root, exist_ok=True)
+    records = _joint_doublet_task_records(args, lib_nums, output_root)
+    for record in records:
+        os.makedirs(record["output_dir"], exist_ok=True)
+    task_manifest = _joint_doublet_write_task_manifest(
+        os.path.join(output_root, "joint_doublet_tasks.tsv"), records)
+    scripts = _joint_doublet_render_scripts(
+        args, records, output_root, task_manifest)
+
+    print("=" * 72)
+    print("JOINT_DOUBLET")
+    print(f"  Libraries: {' '.join(record['library'] for record in records)}")
+    print("  Calibration: lib25 only")
+    print("  Frozen evaluation: lib35 lib38")
+    print("  Pathological holdout interpreted last: lib19")
+    print(f"  Output root: {output_root}")
+    print(f"  Task manifest: {task_manifest}")
+    for name, path in scripts.items():
+        print(f"  {name}: {path}")
+    if not args.submit:
+        print("  Dry run: scripts rendered; no jobs submitted")
+        return 0
+    try:
+        prepare_id = _joint_doublet_submit(
+            scripts["prepare"], output_root)
+        pileup_id = _joint_doublet_submit(
+            scripts["atac_pileup"], output_root,
+            f"aftercorr:{prepare_id}")
+        rna_id = _joint_doublet_submit(
+            scripts["rna_score"], output_root,
+            f"aftercorr:{prepare_id}")
+        atac_id = _joint_doublet_submit(
+            scripts["atac_score"], output_root,
+            f"aftercorr:{pileup_id}")
+        gather_id = _joint_doublet_submit(
+            scripts["gather"], output_root,
+            f"afterok:{rna_id}:{atac_id}")
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"  ERROR: JOINT_DOUBLET submission failed: {exc}")
+        return 1
+    print(
+        "  Submitted: "
+        f"prepare={prepare_id}, atac_pileup={pileup_id}, "
+        f"rna_score={rna_id}, atac_score={atac_id}, gather={gather_id}")
+    _joint_doublet_write_job_record(output_root, {
+        "prepare": prepare_id,
+        "atac_pileup": pileup_id,
+        "rna_score": rna_id,
+        "atac_score": atac_id,
+        "gather": gather_id,
+    }, "FULL")
+    return 0
 
 
 # =============================================================================
@@ -7477,7 +8761,7 @@ def _identity_readiness_paths(lib_num, args):
             final_root, "aggregate",
             "identity_reconciliation_joint_supported_held_transitions.tsv"),
         "joint-supported held transition plot": os.path.join(
-            final_root, "plots",
+            os.path.abspath(args.reconciliation_figure_root),
             "identity_reconciliation_joint_supported_held_transitions.png"),
     }
 
@@ -8399,7 +9683,8 @@ python3 -B {shlex.quote(helper)} finalize \\
   --decisions-root {shlex.quote(get_identity_subdir(args, "decisions"))} \\
   --evidence-mode {shlex.quote(args.identity_evidence_mode)} \\
   --run-id {shlex.quote(ORCHESTRATOR_RELEASE)} \\
-  --output-root {shlex.quote(aggregate)}{optional}
+  --output-root {shlex.quote(aggregate)} \\
+  --figure-root {shlex.quote(os.path.abspath(args.reconciliation_figure_root))}{optional}
 for output in \\
   identity_reconciliation_final_cells.tsv.gz \\
   identity_assignments.tsv.gz \\
@@ -8418,9 +9703,9 @@ for output in \\
   test -s {shlex.quote(aggregate)}/"$output"
 done
 {assignment_tests}
-test -s {shlex.quote(os.path.join(final_root, "plots", "identity_reconciliation_joint_supported_held_transitions.png"))}
-test -s {shlex.quote(os.path.join(final_root, "plots", "identity_assignment_status.png"))}
-test -s {shlex.quote(os.path.join(final_root, "plots", "identity_line_changes.png"))}
+test -s {shlex.quote(os.path.join(os.path.abspath(args.reconciliation_figure_root), "identity_reconciliation_joint_supported_held_transitions.png"))}
+test -s {shlex.quote(os.path.join(os.path.abspath(args.reconciliation_figure_root), "identity_assignment_status.png"))}
+test -s {shlex.quote(os.path.join(os.path.abspath(args.reconciliation_figure_root), "identity_line_changes.png"))}
 echo "IDENTITY_FINALIZE_VALIDATE: verify three-state derivation and canonical exports"
 python3 -B {shlex.quote(validator)} \\
   --libraries {libraries} \\
@@ -8435,6 +9720,7 @@ python3 -B {shlex.quote(validator)} \\
   --reports-root {shlex.quote(get_identity_subdir(args, "reports"))} \\
   --evidence-mode {shlex.quote(args.identity_evidence_mode)} \\
   --final-root {shlex.quote(final_root)} \\
+  --figure-root {shlex.quote(os.path.abspath(args.reconciliation_figure_root))} \\
   --output-root {shlex.quote(validation)}
 '''
     return _write_identity_sbatch(
@@ -11110,7 +12396,9 @@ def cleanup_results_worker(spec_path):
     records = []
     kept = []
 
-    if aggregate_root == mapping_root or aggregate_root.parent != mapping_root:
+    if (aggregate_root == mapping_root or
+            mapping_root in aggregate_root.parents or
+            aggregate_root in mapping_root.parents):
         raise RuntimeError(
             f"unsafe aggregate cleanup root: {aggregate_root}")
     expected_names = {
@@ -11288,6 +12576,27 @@ def cleanup_results_worker(spec_path):
     if latest_plot and latest_plot[1].is_dir():
         current_plot = latest_plot[1]
         allowed_figures = set()
+
+        def current_plot_path(value):
+            """Resolve current or frozen pre-migration plot-manifest paths."""
+            raw = Path(str(value).strip())
+            candidates = [raw if raw.is_absolute() else current_plot / raw]
+            if raw.is_absolute() and not is_within(raw, current_plot):
+                # Completed manifests retain their original absolute prefix.
+                # Anchor the unchanged suffix on this physical plot-generation
+                # directory without rewriting historical evidence files.
+                matching = [
+                    index for index, part in enumerate(raw.parts)
+                    if part == current_plot.name
+                ]
+                for index in reversed(matching):
+                    candidates.append(
+                        current_plot.joinpath(*raw.parts[index + 1:]))
+            for candidate in candidates:
+                if is_within(candidate, current_plot):
+                    return candidate.resolve()
+            return None
+
         manifest = current_plot / "data" / "plot_manifest.tsv"
         try:
             with manifest.open("r", encoding="utf-8", newline="") as handle:
@@ -11295,11 +12604,9 @@ def cleanup_results_worker(spec_path):
                     value = str(row.get("path", "")).strip()
                     if not value:
                         continue
-                    path = Path(value)
-                    if not path.is_absolute():
-                        path = current_plot / path
-                    if is_within(path, current_plot):
-                        allowed_figures.add(path.resolve())
+                    path = current_plot_path(value)
+                    if path is not None:
+                        allowed_figures.add(path)
         except OSError:
             pass
         task_manifest = current_plot / "data" / "contam_r_tasks.tsv"
@@ -11311,9 +12618,9 @@ def cleanup_results_worker(spec_path):
                     if not prefix:
                         continue
                     for suffix in (".contam.pdf", ".contam.png"):
-                        path = Path(prefix + suffix)
-                        if is_within(path, current_plot):
-                            allowed_figures.add(path.resolve())
+                        path = current_plot_path(prefix + suffix)
+                        if path is not None:
+                            allowed_figures.add(path)
         for root_text, dirnames, filenames in os.walk(current_plot):
             dirnames[:] = [
                 name for name in dirnames
@@ -11344,10 +12651,8 @@ def cleanup_results_worker(spec_path):
                     path, ambient_root, "aggregate_staging",
                     "abandoned staging or backup directory")
 
-    # Refresh the short, stable central figure index after obsolete aggregate
-    # generations have been removed.  These are relative symlinks, not copies.
-    if figure_root.parent.resolve() != aggregate_root:
-        raise RuntimeError(f"unsafe central figure root: {figure_root}")
+    # Figure jobs now write physically beneath the centralized figure root.
+    # Validate those locations without creating compatibility symlinks.
     figure_root.mkdir(parents=True, exist_ok=True)
     if figure_root.is_symlink() or not figure_root.is_dir():
         raise RuntimeError(f"unsafe central figure root: {figure_root}")
@@ -11361,28 +12666,13 @@ def cleanup_results_worker(spec_path):
             if latest_swap else None),
     }
     for name, target in figure_targets.items():
-        link = figure_root / name
         if target is None or not target.is_dir():
-            if link.is_symlink():
-                link.unlink()
-                records.append((
-                    "figure_index", "removed_link", str(link),
-                    "no completed current figure target"))
             continue
         target = target.resolve()
-        if not is_within(target, aggregate_root):
-            raise RuntimeError(f"figure target escaped aggregate root: {target}")
-        if link.exists() and not link.is_symlink():
+        if not is_within(target, figure_root.resolve()):
             raise RuntimeError(
-                f"refusing to replace non-symlink figure index entry: {link}")
-        temporary = figure_root / f".{name}.tmp.{job_id}"
-        if temporary.exists() or temporary.is_symlink():
-            temporary.unlink()
-        temporary.symlink_to(
-            os.path.relpath(target, figure_root.resolve()),
-            target_is_directory=True)
-        os.replace(temporary, link)
-        kept.append((f"FIGURE_INDEX:{name}", str(target)))
+                f"physical figure target escaped central figure root: {target}")
+        kept.append((f"FIGURE_DIRECTORY:{name}", str(target)))
 
     # ---- Per-library generated profiles and versioned swap results ----
     for lib_num in libraries:
@@ -13106,7 +14396,7 @@ def ambient_generate_plot_job_bundle(
     script_dir = os.path.abspath(script_dir)
     log_dir = os.path.abspath(log_dir)
     plot_root = os.path.abspath(
-        plot_root or os.path.join(aggregate_root, "ambient_rna"))
+        plot_root or os.path.join(FIGURE_ROOT, "ambient_RNA"))
     data_dir = os.path.join(plot_root, "data")
     status_dir = os.path.join(plot_root, "contam_r", "status")
     os.makedirs(script_dir, exist_ok=True)
@@ -18008,7 +19298,7 @@ def run(args):
     # Resolve stages
     if args.stage:
         stages = {stage.strip() for stage in args.stage.upper().split(",") if stage.strip()}
-        valid_stages = {"CLEANUP_RESULTS", "CONDF", "DEMUX", "ATAC_DEMUX", "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, IDENTITY_READINESS_STAGE, IDENTITY_FILL_MISSING_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"}
+        valid_stages = {"CLEANUP_RESULTS", "CONDF", "DEMUX", "ATAC_DEMUX", JOINT_DOUBLET_STAGE, "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, IDENTITY_READINESS_STAGE, IDENTITY_FILL_MISSING_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"}
         bad_stages = stages - valid_stages
         if bad_stages:
             print(f"❌ Unknown stages: {bad_stages}. Valid: {', '.join(sorted(valid_stages))}")
@@ -18023,6 +19313,12 @@ def run(args):
             print("❌ ATAC_DEMUX is an isolated standalone stage.")
             sys.exit(1)
         return run_atac_demux(args, lib_nums)
+
+    if JOINT_DOUBLET_STAGE in stages:
+        if stages != {JOINT_DOUBLET_STAGE}:
+            print("❌ JOINT_DOUBLET is an isolated standalone stage.")
+            sys.exit(1)
+        return run_joint_doublet(args, lib_nums)
 
     if args.skip_demux:
         stages.discard("DEMUX")
@@ -18363,7 +19659,7 @@ def run(args):
             "H proposed/fixed-profile, J original/joint-profile, "
             "K proposed/joint-profile")
         print(f"  Candidate discovery: {get_identity_event_path(args)}")
-    stage_order = ["CONDF", "DEMUX", "ATAC_DEMUX", "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, IDENTITY_READINESS_STAGE, IDENTITY_FILL_MISSING_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"]
+    stage_order = ["CONDF", "DEMUX", "ATAC_DEMUX", JOINT_DOUBLET_STAGE, "EMPTY_DROPS", "CONTAM", "GEX_AMBIENT", "AMBIENT_PLOTS", "AMBIENT_VALIDATE", "AMBIENT_SWAP_TEST", "PLOIDY_NN", "TETRA_REFINE", "POSTHOC", "POSTHOC_SUMMARY", "UNEXPECTED_COMPONENT_NN", "HYBRID", "IDENTITY_SCORE", "IDENTITY_SCORE_AGGREGATE_ONLY", CANDIDATE_AXIS_STAGE, IDENTITY_READINESS_STAGE, IDENTITY_FILL_MISSING_STAGE, "IDENTITY_RECONCILIATION", "IDENTITY_FINAL_EVIDENCE", "IDENTITY_FINAL_EVIDENCE_ONLY", "IDENTITY_FINALIZE_ONLY", "IDENTITY_RECONCILE_ONLY", "MT_FUSION", "MT_POPULATION"]
     stages_display = [s for s in stage_order if s in stages]
     print(f"  Stages: {', '.join(stages_display)}")
     if IDENTITY_READINESS_STAGE in stages:
@@ -20103,6 +21399,10 @@ Examples:
   orchestrate_tetraploid.py --condition-set all --stage CONTAM --submit
   orchestrate_tetraploid.py --stage DEMUX --libraries 1 2 --submit
   orchestrate_tetraploid.py --stage ATAC_DEMUX --libraries 7 19 --atac-demux-main-vcf /absolute/panel.bcf --submit
+  orchestrate_tetraploid.py --stage JOINT_DOUBLET --libraries 1-40 --submit
+  orchestrate_tetraploid.py --stage JOINT_DOUBLET --libraries 1-40 --joint-doublet-action STATUS --joint-doublet-rna-score-job-id 95999 --joint-doublet-atac-score-job-id 96000
+  orchestrate_tetraploid.py --stage JOINT_DOUBLET --libraries 1-40 --joint-doublet-action PARTIAL_GATHER --joint-doublet-rna-score-job-id 95999 --joint-doublet-atac-score-job-id 96000 --submit
+  orchestrate_tetraploid.py --stage JOINT_DOUBLET --libraries 1-40 --joint-doublet-action ANALYZE --joint-doublet-partial-output-root /absolute/completed_gather --submit
   orchestrate_tetraploid.py --libraries 1-40 --mapping-input-root /absolute/new/mapping_output --analysis-output-root /absolute/new/analysis --stage CONDF,DEMUX,EMPTY_DROPS,CONTAM,TETRA_REFINE,POSTHOC,IDENTITY_RECONCILIATION --submit
   orchestrate_tetraploid.py --stage MT_FUSION --libraries 19 --submit
   orchestrate_tetraploid.py --stage IDENTITY_SCORE --libraries 1-40 --submit
@@ -20121,6 +21421,7 @@ Stages (run in order):
   CONDF       = .condf generation (3 jobs total, library-independent)
   DEMUX       = demux (1 job per library; managed VCF holders coexist by reservation)
   ATAC_DEMUX  = selected-library ATAC-primary workers using a configured BCF directly
+  JOINT_DOUBLET = full joint scoring plus orchestrator-managed STATUS, TRIM, paired PARTIAL_GATHER, and post-gather ANALYZE actions
   EMPTY_DROPS = empty drops ambient profile (1 job per library)
   CONTAM      = contamination estimation (1 job per condition x library)
   GEX_AMBIENT = infer ambient gene profiles with RNA-Leiden, H5AD-column, or manual clusters
@@ -20308,6 +21609,134 @@ Named condition sets:
         "--atac-demux-time", default="7-00:00:00")
     atac_group.add_argument(
         "--atac-demux-partition", default=SLURM_PARTITION)
+    joint_group = parser.add_argument_group("all-library JOINT_DOUBLET")
+    joint_group.add_argument(
+        "--joint-doublet-output-root", default=None,
+        help=("Absolute output root for per-library ledgers, RNA/ATAC scores, "
+              "Library-25 calibration, and the ranked aggregate ledger. "
+              "Default: <aggregate_library_analysis>/joint_doublet."))
+    joint_group.add_argument("--joint-doublet-source-output-root", default=None)
+    joint_group.add_argument("--joint-doublet-validation-root", default=None)
+    joint_group.add_argument(
+        "--joint-doublet-tool-bin-root", default=SOFTWARE_BIN,
+        help="One directory containing the matched orchestrator, helper, and scorer")
+    joint_group.add_argument("--joint-doublet-calibration-library", type=int, default=25)
+    joint_group.add_argument("--joint-doublet-heldout-libraries", nargs="+", type=int, default=[])
+    joint_group.add_argument("--joint-doublet-regression-libraries", nargs="+", type=int, default=[])
+    joint_group.add_argument(
+        "--joint-doublet-evidence-mode", choices=["SITE_AND_MOLECULE"],
+        default="SITE_AND_MOLECULE")
+    joint_group.add_argument("--joint-doublet-frozen-spec", default=None)
+    joint_group.add_argument("--joint-doublet-repair-plan", default=None)
+    joint_group.add_argument("--joint-doublet-repair-cpus", type=int, default=40)
+    joint_group.add_argument("--joint-doublet-repair-threads", type=int, default=32)
+    joint_group.add_argument("--joint-doublet-repair-memory", default="256G")
+    joint_group.add_argument("--joint-doublet-repair-max-concurrent", type=int, default=2)
+    joint_group.add_argument("--joint-doublet-score-max-concurrent", type=int, default=4)
+    joint_group.add_argument("--joint-doublet-validation-worker-cpus", type=int, default=8)
+    joint_group.add_argument("--joint-doublet-validation-worker-memory", default="32G")
+    joint_group.add_argument("--joint-doublet-validation-max-concurrent", type=int, default=12)
+    joint_group.add_argument("--joint-doublet-temp-root", default=None)
+    joint_group.add_argument(
+        "--joint-doublet-action", type=str.upper,
+        choices=JOINT_DOUBLET_ACTIONS, default="FULL",
+        help=("FULL preserves the production fan-out. STATUS audits an "
+              "existing run. TRIM dry-runs or submits a live elapsed-time "
+              "cancellation policy. PARTIAL_GATHER submits one paired-only "
+              "aggregate that waits for Library 25. ANALYZE performs "
+              "streaming diagnostics on one completed gather without "
+              "rescoring. WORKER actions are orchestrator-managed and not "
+              "normally invoked directly."))
+    joint_group.add_argument(
+        "--joint-doublet-rna-score-job-id", default=None,
+        help=("Existing RNA score array id for STATUS, TRIM, or "
+              "PARTIAL_GATHER. Saved automatically for newly submitted runs."))
+    joint_group.add_argument(
+        "--joint-doublet-atac-score-job-id", default=None,
+        help=("Existing ATAC score array id for STATUS, TRIM, or "
+              "PARTIAL_GATHER. Saved automatically for newly submitted runs."))
+    joint_group.add_argument(
+        "--joint-doublet-gather-job-id", default=None,
+        help=("Existing full-gather id. TRIM cancels it after cancelling any "
+              "array element because its afterok dependency is then obsolete."))
+    joint_group.add_argument(
+        "--joint-doublet-partial-output-root", default=None,
+        help=("Optional absolute output root for a managed paired partial "
+              "gather. Default for PARTIAL_GATHER: "
+              "<joint-root>/partial_gathers/paired_<UTC>. Required as the "
+              "completed gather input for ANALYZE."))
+    joint_group.add_argument(
+        "--joint-doublet-analysis-output-root", default=None,
+        help=("Optional output root for ANALYZE. Default: "
+              "<joint-doublet-partial-output-root>/post_gather_analysis."))
+    joint_group.add_argument(
+        "--joint-doublet-trim-modality", type=str.upper,
+        choices=["RNA", "ATAC", "BOTH"], default="ATAC",
+        help="Score array(s) managed by JOINT_DOUBLET --action TRIM")
+    joint_group.add_argument(
+        "--joint-doublet-min-running-hours", type=float, default=4.0,
+        help=("TRIM retains running tasks at or above this elapsed time and "
+              "cancels shorter running and pending tasks. Default: 4."))
+    joint_group.add_argument(
+        "--joint-doublet-protected-libraries", nargs="+", type=int,
+        default=[25],
+        help=("Libraries TRIM must retain regardless of elapsed time. "
+              "Library 25 is always protected."))
+    joint_group.add_argument(
+        "--joint-doublet-atac-vcf", default=DEFAULT_JOINT_DOUBLET_ATAC_VCF,
+        help="Direct ATAC BCF used only for the independent joint pileup pass")
+    joint_group.add_argument(
+        "--joint-doublet-ambient-condition", default=REFINE_CONTAM_CONDITION,
+        help="RNA contamination condition supplying optional rate/profile inputs")
+    joint_group.add_argument(
+        "--joint-doublet-ambient-assignment-source",
+        choices=["demux", "reconciled"], default="demux")
+    joint_group.add_argument(
+        "--joint-doublet-max-runner-ups", type=int, default=8)
+    joint_group.add_argument(
+        "--joint-doublet-uncertain-llr", type=float, default=20.0)
+    joint_group.add_argument(
+        "--joint-doublet-min-evidence", type=int, default=10)
+    joint_group.add_argument(
+        "--joint-doublet-max-second-fraction", type=float, default=0.95)
+    joint_group.add_argument(
+        "--joint-doublet-folds", type=int, default=5)
+    joint_group.add_argument(
+        "--joint-doublet-rna-error-ref", type=float, default=0.001)
+    joint_group.add_argument(
+        "--joint-doublet-rna-error-alt", type=float, default=0.001)
+    joint_group.add_argument(
+        "--joint-doublet-atac-error-ref", type=float, default=0.005)
+    joint_group.add_argument(
+        "--joint-doublet-atac-error-alt", type=float, default=0.005)
+    joint_group.add_argument(
+        "--joint-doublet-atac-threads", type=int, default=32)
+    joint_group.add_argument(
+        "--joint-doublet-prepare-cpus", type=int, default=1)
+    joint_group.add_argument(
+        "--joint-doublet-atac-cpus", type=int, default=40)
+    joint_group.add_argument(
+        "--joint-doublet-score-cpus", type=int, default=8)
+    joint_group.add_argument(
+        "--joint-doublet-gather-cpus", type=int, default=1)
+    joint_group.add_argument(
+        "--joint-doublet-analysis-cpus", type=int, default=1,
+        help=("CPUs for the single-pass gzip/TSV post-gather analysis. "
+              "The parser is intentionally one-pass and one-core."))
+    joint_group.add_argument(
+        "--joint-doublet-prepare-memory", default="8G")
+    joint_group.add_argument(
+        "--joint-doublet-atac-memory", default="256G")
+    joint_group.add_argument(
+        "--joint-doublet-score-memory", default="32G")
+    joint_group.add_argument(
+        "--joint-doublet-gather-memory", default="256G")
+    joint_group.add_argument(
+        "--joint-doublet-analysis-memory", default="64G")
+    joint_group.add_argument(
+        "--joint-doublet-time", default="7-00:00:00")
+    joint_group.add_argument(
+        "--joint-doublet-partition", default=SLURM_PARTITION)
     parser.add_argument(
         "--mapping-input-root", default=PRODUCTION_MAPPING_ROOT,
         help=("Absolute mapping-output root containing "
@@ -20315,14 +21744,19 @@ Named condition sets:
               "directories. A non-production value requires "
               "--analysis-output-root."))
     parser.add_argument(
-        "--analysis-output-root", default=None,
+        "--analysis-output-root", default=PRODUCTION_ANALYSIS_ROOT,
         help=("Absolute isolated root for the complete generated analysis "
               "namespace. Per-library DEMUX products are written under "
               "<root>/Tet_2025_Multiome-RNA_<N>/demux_nomito and all shared "
               "CONDF, logs, scripts, audits, refinement, reconciliation, "
-              "figures, and daemon state under "
+              "and daemon state under "
               "<root>/aggregate_library_analysis. Existing panel, metadata, "
               "model, and non-produced ploidy-call inputs remain read-only."))
+    parser.add_argument(
+        "--figure-root", default=FIGURE_ROOT,
+        help=("Physical root for this dataset's centralized figures. The "
+              "production default is 3P/figures/all40; isolated analysis "
+              "roots derive their own figures directory unless overridden."))
     parser.add_argument(
         "--demux-output-root",
         dest="demux_output_root", default=None,
@@ -20468,6 +21902,11 @@ Named condition sets:
         "--identity-reconciliation-root", default=IDENTITY_RECONCILIATION_ROOT,
         help=("Root for identity metadata, candidates, evidence, decisions, reports, "
               "and validation. MT_FUSION/MT_POPULATION consume the decisions here."))
+    parser.add_argument(
+        "--reconciliation-figure-root",
+        default=RECONCILIATION_FIGURE_ROOT,
+        help=("Physical directory for final reconciliation figures; kept "
+              "separate from reconciliation tables and assignments."))
     parser.add_argument("--mt-library-id-template", default="lib{lib}",
                         help="Manifest library_id template; supports {lib}, {lib_num}, and {library}")
     parser.add_argument("--mt-bam-template", default=None,

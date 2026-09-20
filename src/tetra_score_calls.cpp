@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <clocale>
 #include <cmath>
@@ -2199,6 +2200,19 @@ struct AxisObservationRecord {
     double alt = 0.0;
 };
 
+// Fixed-width on-disk record used only in the bounded joint-doublet molecule
+// spool.  Strings are represented by a validated basis code so no pointers are
+// ever serialized.
+struct JointMoleculeRecord {
+    unsigned long barcode = 0;
+    uint64_t molecule = 0;
+    uint8_t basis = 0;
+    int32_t tid = -1;
+    int32_t pos = -1;
+    double ref = 0.0;
+    double alt = 0.0;
+};
+
 static bool axis_observation_less(
         const AxisObservationRecord& left,
         const AxisObservationRecord& right){
@@ -3136,6 +3150,24 @@ static bool axis_read_binary_record(
     return true;
 }
 
+static void axis_write_binary_record(
+        ofstream& out, const JointMoleculeRecord& record,
+        const string& path){
+    out.write(reinterpret_cast<const char*>(&record),sizeof(record));
+    if (!out)
+        throw runtime_error("failed writing joint molecule temporary record: "+path);
+}
+
+static bool axis_read_binary_record(
+        ifstream& in, JointMoleculeRecord& record,
+        const string& path){
+    in.read(reinterpret_cast<char*>(&record),sizeof(record));
+    if (in.gcount()==0 && in.eof()) return false;
+    if (in.gcount()!=(streamsize)sizeof(record))
+        throw runtime_error("truncated joint molecule temporary record: "+path);
+    return true;
+}
+
 static string axis_spill_run(
         vector<AxisObservationRecord>& records,
         const string& temp_path,
@@ -3535,7 +3567,8 @@ static vector<unsigned long long> axis_assign_buckets(
         const unordered_map<unsigned long,unsigned long long>& rows_by_barcode,
         unsigned long long bucket_target_bytes,
         unordered_map<unsigned long,size_t>& assignment,
-        AxisResourceAudit& audit){
+        AxisResourceAudit& audit,
+        size_t minimum_bucket_count = 1){
     vector<pair<unsigned long,unsigned long long>> ordered(rows_by_barcode.begin(),
         rows_by_barcode.end());
     sort(ordered.begin(), ordered.end(), [](const pair<unsigned long,unsigned long long>& a,
@@ -3552,6 +3585,7 @@ static vector<unsigned long long> axis_assign_buckets(
     for (const auto& item : ordered) total_rows += item.second;
     size_t bucket_count = max<unsigned long long>(1,
         (total_rows * row_bytes + bucket_target_bytes - 1) / bucket_target_bytes);
+    bucket_count = max(bucket_count, minimum_bucket_count);
     bucket_count = min(bucket_count, ordered.size());
     vector<unsigned long long> loads;
     while (true){
@@ -3617,6 +3651,320 @@ static vector<string> axis_second_observation_pass(
         outputs[i].close();
         if (!outputs[i]) throw runtime_error("failed closing candidate-axis bucket: " + paths[i]);
     }
+    return paths;
+}
+
+static string joint_stage_observations_one_pass(
+        const string& path,
+        const unordered_map<unsigned long,CandidateAxisPair>& targets,
+        const string& temp_path,
+        AxisResourceAudit& audit,
+        unordered_map<unsigned long,unsigned long long>& rows_by_barcode,
+        vector<uint64_t>& selected_site_keys){
+    const string spool_path = temp_path + "/joint_selected_observations.bin";
+    ofstream spool(spool_path.c_str(), ios::binary);
+    if (!spool)
+        throw runtime_error("could not create joint-doublet observation spool: " +
+            spool_path);
+    gzFile input = gzopen(path.c_str(), "rb");
+    if (!input)
+        throw runtime_error("could not open joint-doublet observations: " + path);
+
+    const size_t key_capacity = (128ULL * 1024ULL * 1024ULL) /
+        sizeof(uint64_t);
+    vector<uint64_t> key_chunk;
+    key_chunk.reserve(min<size_t>(key_capacity, 1000000));
+    vector<string> key_runs;
+    char buffer[1<<20];
+    unsigned long long line_no = 0;
+    try {
+        while (gzgets(input, buffer, sizeof(buffer))){
+            ++line_no;
+            string line(buffer);
+            line.erase(remove(line.begin(), line.end(), '\n'), line.end());
+            line.erase(remove(line.begin(), line.end(), '\r'), line.end());
+            if (line.empty()) continue;
+            vector<string> fields = split_tsv_strict(line);
+            if (fields.empty()) continue;
+            unsigned long barcode = 0;
+            try {
+                barcode = strict_barcode_number(
+                    fields[0], path + ": line " + to_string(line_no));
+            } catch (const exception&) {
+                continue;
+            }
+            if (targets.find(barcode) == targets.end()) continue;
+            const AxisObservationRecord record = axis_parse_observation(
+                fields, path, line_no);
+            axis_write_binary_record(spool, record, spool_path);
+            ++audit.target_rows;
+            ++rows_by_barcode[barcode];
+            key_chunk.push_back(site_key(record.tid, record.pos));
+            if (key_chunk.size() >= key_capacity){
+                key_runs.push_back(axis_spill_key_run(
+                    key_chunk, temp_path, key_runs.size()));
+                key_chunk.reserve(min<size_t>(key_capacity, 1000000));
+            }
+        }
+        if (gzclose(input) != Z_OK)
+            throw runtime_error(
+                "failed closing joint-doublet observations: " + path);
+        input = NULL;
+        spool.close();
+        if (!spool)
+            throw runtime_error(
+                "failed closing joint-doublet observation spool: " +
+                spool_path);
+    } catch (...) {
+        if (input) gzclose(input);
+        spool.close();
+        throw;
+    }
+
+    audit.target_barcodes = rows_by_barcode.size();
+    for (const auto& item : rows_by_barcode)
+        audit.largest_barcode_rows = max(
+            audit.largest_barcode_rows, item.second);
+
+    if (key_runs.empty()){
+        sort(key_chunk.begin(), key_chunk.end());
+        key_chunk.erase(unique(key_chunk.begin(), key_chunk.end()),
+            key_chunk.end());
+        selected_site_keys.swap(key_chunk);
+    } else {
+        if (!key_chunk.empty())
+            key_runs.push_back(axis_spill_key_run(
+                key_chunk, temp_path, key_runs.size()));
+        vector<ifstream> inputs(key_runs.size());
+        priority_queue<AxisKeyCursor,vector<AxisKeyCursor>,AxisKeyCursorGreater>
+            heap;
+        for (size_t i = 0; i < key_runs.size(); ++i){
+            inputs[i].open(key_runs[i].c_str(), ios::binary);
+            if (!inputs[i])
+                throw runtime_error(
+                    "could not open joint-doublet selected-site run: " +
+                    key_runs[i]);
+            uint64_t key = 0;
+            if (axis_read_key(inputs[i], key, key_runs[i])){
+                AxisKeyCursor cursor;
+                cursor.key = key;
+                cursor.run = i;
+                heap.push(cursor);
+            }
+        }
+        bool have_prior = false;
+        uint64_t prior = 0;
+        while (!heap.empty()){
+            const AxisKeyCursor cursor = heap.top();
+            heap.pop();
+            if (!have_prior || cursor.key != prior){
+                selected_site_keys.push_back(cursor.key);
+                prior = cursor.key;
+                have_prior = true;
+            }
+            uint64_t next = 0;
+            if (axis_read_key(
+                    inputs[cursor.run], next, key_runs[cursor.run])){
+                AxisKeyCursor following;
+                following.key = next;
+                following.run = cursor.run;
+                heap.push(following);
+            }
+        }
+        for (size_t i = 0; i < inputs.size(); ++i){
+            inputs[i].close();
+            unlink(key_runs[i].c_str());
+        }
+    }
+    audit.spill_runs = key_runs.size();
+    audit.unique_site_keys = selected_site_keys.size();
+    audit.selected_key_bytes =
+        selected_site_keys.capacity() * sizeof(uint64_t);
+    return spool_path;
+}
+
+static vector<string> joint_partition_staged_observations(
+        const string& spool_path,
+        const unordered_map<unsigned long,size_t>& assignment,
+        size_t bucket_count,
+        const string& temp_path){
+    vector<string> paths(bucket_count);
+    vector<ofstream> outputs(bucket_count);
+    for (size_t i = 0; i < bucket_count; ++i){
+        paths[i] = temp_path + "/joint_bucket_" + to_string(i) + ".bin";
+        outputs[i].open(paths[i].c_str(), ios::binary);
+        if (!outputs[i])
+            throw runtime_error(
+                "could not create joint-doublet bucket: " + paths[i]);
+    }
+    ifstream input(spool_path.c_str(), ios::binary);
+    if (!input)
+        throw runtime_error(
+            "could not reopen joint-doublet observation spool: " +
+            spool_path);
+    AxisObservationRecord record;
+    while (axis_read_binary_record(input, record, spool_path)){
+        const auto found = assignment.find(record.barcode);
+        if (found == assignment.end())
+            throw runtime_error(
+                "joint-doublet observation spool contains nontarget barcode");
+        axis_write_binary_record(outputs[found->second], record,
+            paths[found->second]);
+    }
+    input.close();
+    for (size_t i = 0; i < outputs.size(); ++i){
+        outputs[i].close();
+        if (!outputs[i])
+            throw runtime_error(
+                "failed closing joint-doublet bucket: " + paths[i]);
+    }
+    unlink(spool_path.c_str());
+    return paths;
+}
+
+static uint8_t joint_molecule_basis_code(const string& raw){
+    const string basis=trim(raw);
+    if (basis=="UB_GX") return 1;
+    if (basis=="UB_GN") return 2;
+    if (basis=="QNAME_FALLBACK") return 3;
+    throw runtime_error("unsupported pileup molecule basis: " + basis);
+}
+
+static string joint_molecule_basis_name(uint8_t basis){
+    if (basis==1) return "UB_GX";
+    if (basis==2) return "UB_GN";
+    if (basis==3) return "QNAME_FALLBACK";
+    return "UNKNOWN";
+}
+
+static bool joint_molecule_less(
+        const JointMoleculeRecord& left, const JointMoleculeRecord& right){
+    if (left.barcode!=right.barcode) return left.barcode<right.barcode;
+    if (left.basis!=right.basis) return left.basis<right.basis;
+    if (left.molecule!=right.molecule) return left.molecule<right.molecule;
+    if (left.tid!=right.tid) return left.tid<right.tid;
+    return left.pos<right.pos;
+}
+
+static string joint_stage_molecules_one_pass(
+        const string& path,
+        const unordered_map<unsigned long,CandidateAxisPair>& targets,
+        const vector<uint64_t>& selected_site_keys,
+        const string& temp_path,
+        unordered_map<unsigned long,unsigned long long>& rows_by_barcode,
+        unordered_map<unsigned long,long>& malformed_by_barcode){
+    if (path.empty() || !file_exists(path)) return "";
+    const string spool_path=temp_path+"/joint_selected_molecules.bin";
+    ofstream spool(spool_path.c_str(),ios::binary);
+    if (!spool)
+        throw runtime_error("could not create joint-doublet molecule spool: "+spool_path);
+    gzFile input=gzopen(path.c_str(),"rb");
+    if (!input)
+        throw runtime_error("could not open joint-doublet molecule sidecar: "+path);
+    char buffer[1<<20];
+    unsigned long long line_no=0, parsed_rows=0, malformed_rows=0;
+    try {
+        while (gzgets(input,buffer,sizeof(buffer))){
+            ++line_no;
+            string line(buffer);
+            line.erase(remove(line.begin(),line.end(),'\n'),line.end());
+            line.erase(remove(line.begin(),line.end(),'\r'),line.end());
+            if (line.empty()) continue;
+            const vector<string> fields=split_tsv_strict(line);
+            unsigned long barcode=0;
+            try {
+                if (fields.empty()) throw runtime_error("missing barcode");
+                barcode=strict_barcode_number(fields[0],path+": line "+to_string(line_no));
+            } catch (const exception&){
+                ++malformed_rows;
+                continue;
+            }
+            if (targets.find(barcode)==targets.end()) continue;
+            try {
+                if (fields.size()!=7)
+                    throw runtime_error("expected exactly seven columns");
+                char* molecule_end=NULL;
+                errno=0;
+                const uint64_t molecule=strtoull(fields[1].c_str(),&molecule_end,10);
+                if (errno!=0 || molecule_end==fields[1].c_str() ||
+                        *molecule_end!='\0')
+                    throw runtime_error("invalid molecule hash");
+                char* tid_end=NULL; char* pos_end=NULL;
+                errno=0;
+                const long tid=strtol(fields[3].c_str(),&tid_end,10);
+                const long pos=strtol(fields[4].c_str(),&pos_end,10);
+                if (errno!=0 || tid_end==fields[3].c_str() || *tid_end!='\0' ||
+                        pos_end==fields[4].c_str() || *pos_end!='\0' ||
+                        tid<INT32_MIN || tid>INT32_MAX ||
+                        pos<INT32_MIN || pos>INT32_MAX)
+                    throw runtime_error("invalid molecule site coordinate");
+                const long double ref=strict_ld(fields[5],path+": molecule ref");
+                const long double alt=strict_ld(fields[6],path+": molecule alt");
+                if (ref<0.0L || alt<0.0L || ref+alt<=0.0L)
+                    throw runtime_error("nonpositive molecule allele depth");
+                const uint64_t key=site_key((int32_t)tid,(int32_t)pos);
+                if (!binary_search(selected_site_keys.begin(),selected_site_keys.end(),key))
+                    continue;
+                JointMoleculeRecord record;
+                record.barcode=barcode;
+                record.molecule=molecule;
+                record.basis=joint_molecule_basis_code(fields[2]);
+                record.tid=(int32_t)tid; record.pos=(int32_t)pos;
+                record.ref=(double)ref; record.alt=(double)alt;
+                axis_write_binary_record(spool,record,spool_path);
+                ++rows_by_barcode[barcode];
+                ++parsed_rows;
+            } catch (const exception&){
+                ++malformed_rows;
+                ++malformed_by_barcode[barcode];
+            }
+        }
+        if (gzclose(input)!=Z_OK)
+            throw runtime_error("failed closing joint-doublet molecule sidecar: "+path);
+        input=NULL;
+        spool.close();
+        if (!spool)
+            throw runtime_error("failed closing joint-doublet molecule spool: "+spool_path);
+    } catch (...){
+        if (input) gzclose(input);
+        spool.close();
+        throw;
+    }
+    if (parsed_rows==0 && malformed_rows>0)
+        throw runtime_error(path+": molecule sidecar has no valid seven-column target records");
+    return spool_path;
+}
+
+static vector<string> joint_partition_staged_molecules(
+        const string& spool_path,
+        const unordered_map<unsigned long,size_t>& assignment,
+        size_t bucket_count, const string& temp_path){
+    if (spool_path.empty()) return vector<string>();
+    vector<string> paths(bucket_count);
+    vector<ofstream> outputs(bucket_count);
+    for (size_t i=0;i<bucket_count;++i){
+        paths[i]=temp_path+"/joint_molecule_bucket_"+to_string(i)+".bin";
+        outputs[i].open(paths[i].c_str(),ios::binary);
+        if (!outputs[i])
+            throw runtime_error("could not create joint molecule bucket: "+paths[i]);
+    }
+    ifstream input(spool_path.c_str(),ios::binary);
+    if (!input)
+        throw runtime_error("could not reopen joint molecule spool: "+spool_path);
+    JointMoleculeRecord record;
+    while (axis_read_binary_record(input,record,spool_path)){
+        const auto found=assignment.find(record.barcode);
+        if (found==assignment.end())
+            throw runtime_error("joint molecule spool contains nontarget barcode");
+        axis_write_binary_record(outputs[found->second],record,paths[found->second]);
+    }
+    input.close();
+    for (size_t i=0;i<outputs.size();++i){
+        outputs[i].close();
+        if (!outputs[i])
+            throw runtime_error("failed closing joint molecule bucket: "+paths[i]);
+    }
+    unlink(spool_path.c_str());
     return paths;
 }
 
@@ -4485,6 +4833,1438 @@ static int candidate_axis_self_test(){
     return 0;
 }
 
+// -------------------------------------------------------------------------
+// Generalized K=1 versus K=2 + ambient scorer (standalone bounded mode)
+// -------------------------------------------------------------------------
+
+static const char* JOINT_DOUBLET_SCHEMA =
+    "joint_doublet_site_and_molecule_candidate_score_v2";
+static const char* JOINT_DOUBLET_MANIFEST_SCHEMA =
+    "joint_doublet_candidate_manifest_v2";
+static const char* JOINT_DOUBLET_FORMULA =
+    "K1_LOCKED_STATE_VS_K2_ADDED_STATE_PLUS_FIXED_AMBIENT_V1";
+static const char* JOINT_DOUBLET_FOLD_VERSION =
+    "JOINT_DOUBLET_GENOMIC_SITE_FNV1A64_V1";
+static const char* JOINT_DOUBLET_MOLECULE_FORMULA =
+    "LINKED_UNIT_EQUAL_WEIGHT_NORMALIZED_SITE_LL_V1";
+static const char* JOINT_DOUBLET_MOLECULE_FOLD_VERSION =
+    "JOINT_DOUBLET_LINKED_UNIT_SORTED_ROUND_ROBIN_FNV1A64_V1";
+static const char* JOINT_DOUBLET_MOLECULE_SIDECAR_SCHEMA =
+    "pileup_molecules_headerless_7col_v1";
+
+struct JointComposition {
+    vector<pair<int,long double>> members;
+    string text;
+    string missing_donors = "NONE";
+    bool valid = false;
+};
+
+struct JointHypothesis {
+    string library;
+    string barcode;
+    unsigned long encoded_barcode = 0;
+    string candidate_id;
+    string locked_state;
+    JointComposition locked;
+    string second_state;
+    JointComposition second;
+    JointComposition ambient;
+    string candidate_origin = "UNSPECIFIED";
+    string exhaustive_fallback = "FALSE";
+    string nomination_modalities = "NONE";
+    string ambient_status = "UNAVAILABLE";
+    long double rho_requested = 0.0L;
+    long double rho_effective = 0.0L;
+};
+
+struct JointSiteUnit {
+    int32_t tid = -1;
+    int32_t pos = -1;
+    long double ref = 0.0L;
+    long double alt = 0.0L;
+    long double q_locked = 0.0L;
+    long double q_second = 0.0L;
+    long double q_ambient = 0.0L;
+};
+
+struct JointLinkedUnit {
+    uint64_t molecule = 0;
+    uint8_t basis = 0;
+    vector<JointSiteUnit> sites;
+    int fold = -1;
+};
+
+struct JointFit {
+    long double alpha = NAN;
+    long double balanced = NAN;
+    long double raw = NAN;
+};
+
+struct JointResult {
+    string status = "NO_OBSERVATIONS";
+    string genotype_visibility = "UNAVAILABLE";
+    string warnings = "NONE";
+    long double k1_balanced = NAN;
+    long double k2_balanced = NAN;
+    long double delta_balanced = NAN;
+    long double k1_raw = NAN;
+    long double k2_raw = NAN;
+    long double delta_raw = NAN;
+    long double alpha = NAN;
+    long double alpha_low = NAN;
+    long double alpha_high = NAN;
+    long double discriminating_depth = 0.0L;
+    long double top_site_fraction = NAN;
+    long double fold_support_fraction = NAN;
+    long double fold_min_delta = NAN;
+    long double fold_median_delta = NAN;
+    int common_sites = 0;
+    int discriminating_sites = 0;
+    int folds_evaluable = 0;
+    long excluded_missing_definition = 0;
+    long excluded_mitochondrial = 0;
+    long excluded_nonpositive = 0;
+    long excluded_missing_genotype = 0;
+    bool genotype_equivalent = false;
+    bool replacement_like = false;
+    string molecule_status = "MOLECULE_SIDECAR_UNAVAILABLE";
+    string molecule_unusable_reason = "PILEUP_MOLECULES_NOT_PROVIDED";
+    string molecule_warnings = "NONE";
+    long double molecule_k1 = NAN;
+    long double molecule_k2 = NAN;
+    long double molecule_delta = NAN;
+    long double molecule_alpha = NAN;
+    long double molecule_alpha_low = NAN;
+    long double molecule_alpha_high = NAN;
+    long double molecule_effective_units = NAN;
+    long double molecule_maximum_influence_fraction = NAN;
+    long double molecule_heldout_delta = NAN;
+    long double molecule_heldout_support_fraction = NAN;
+    long double molecule_fold_min_delta = NAN;
+    long double molecule_fold_median_delta = NAN;
+    long double molecule_without_top_delta = NAN;
+    long double molecule_without_top_alpha = NAN;
+    long double molecule_umi_gene_fraction = NAN;
+    long double molecule_query_name_fraction = NAN;
+    int molecule_units = 0;
+    int molecule_discriminating_units = 0;
+    int molecule_multi_snp_units = 0;
+    int molecule_total_snps = 0;
+    int molecule_fold_count = 0;
+    int molecule_folds_evaluable = 0;
+    string molecule_snps_per_unit = "NA";
+    string molecule_fold_units = "NA";
+    string molecule_fold_fitted_fractions = "NA";
+    long molecule_malformed_rows = 0;
+};
+
+static map<string,int> joint_header_index(
+        const vector<string>& header, const string& path){
+    map<string,int> result;
+    for (size_t i = 0; i < header.size(); ++i){
+        const string key = lowercase(trim(header[i]));
+        if (key.empty())
+            throw runtime_error(path + ": blank manifest header field");
+        if (result.count(key))
+            throw runtime_error(path + ": duplicate manifest header field: " + key);
+        result[key] = (int)i;
+    }
+    return result;
+}
+
+static string joint_field(
+        const vector<string>& fields, const map<string,int>& index,
+        const string& name, const string& path, long long line_no,
+        bool required = true){
+    auto found = index.find(lowercase(name));
+    if (found == index.end()){
+        if (!required) return "";
+        throw runtime_error(path + ": missing required manifest column: " + name);
+    }
+    if (found->second < 0 || found->second >= (int)fields.size()){
+        if (!required) return "";
+        throw runtime_error(path + ": short manifest row at line " +
+            to_string(line_no) + " for column " + name);
+    }
+    const string value = trim(fields[found->second]);
+    if (required && (value.empty() || lowercase(value) == "na"))
+        throw runtime_error(path + ": blank required value at line " +
+            to_string(line_no) + " column " + name);
+    return value;
+}
+
+static JointComposition joint_parse_composition(
+        const string& raw, const unordered_map<string,int>& sample2idx,
+        const string& context, bool required){
+    JointComposition result;
+    result.text = trim(raw);
+    const string lower = lowercase(result.text);
+    if (result.text.empty() || lower == "na" || lower == "none" ||
+            result.text == "."){
+        if (required) result.missing_donors = "MISSING_COMPOSITION";
+        return result;
+    }
+    map<int,long double> aggregated;
+    vector<string> missing;
+    for (const string& raw_token : split(result.text, ',')){
+        const string token = trim(raw_token);
+        const size_t colon = token.find_last_of(':');
+        if (colon == string::npos)
+            throw runtime_error(context + ": composition token must be donor:copies: " + token);
+        const string donor = trim(token.substr(0, colon));
+        const long double copies = strict_ld(
+            token.substr(colon + 1), context + " donor=" + donor);
+        if (donor.empty() || copies <= 0.0L)
+            throw runtime_error(context + ": donor names and copies must be positive");
+        auto found = sample2idx.find(donor);
+        if (found == sample2idx.end()) missing.push_back(donor);
+        else aggregated[found->second] += copies;
+    }
+    if (!missing.empty()){
+        sort(missing.begin(), missing.end());
+        missing.erase(unique(missing.begin(), missing.end()), missing.end());
+        result.missing_donors.clear();
+        for (size_t i = 0; i < missing.size(); ++i){
+            if (i) result.missing_donors += ",";
+            result.missing_donors += missing[i];
+        }
+        return result;
+    }
+    for (const auto& item : aggregated)
+        result.members.push_back(item);
+    result.valid = !result.members.empty();
+    return result;
+}
+
+static vector<JointHypothesis> joint_load_manifest(
+        const string& path, const unordered_map<string,int>& sample2idx,
+        const string& library,
+        unordered_map<unsigned long,vector<size_t>>& by_cell){
+    gzFile input = gzopen(path.c_str(), "rb");
+    if (!input) throw runtime_error("could not open joint-doublet manifest: " + path);
+    char buffer[1<<20];
+    if (!gzgets(input, buffer, sizeof(buffer))){
+        gzclose(input);
+        throw runtime_error("empty joint-doublet manifest: " + path);
+    }
+    string header_line(buffer);
+    header_line.erase(remove(header_line.begin(), header_line.end(), '\n'), header_line.end());
+    header_line.erase(remove(header_line.begin(), header_line.end(), '\r'), header_line.end());
+    const map<string,int> index = joint_header_index(
+        split_tsv_strict(header_line), path);
+    vector<JointHypothesis> hypotheses;
+    unordered_set<string> candidate_ids;
+    long long line_no = 1;
+    try {
+        while (gzgets(input, buffer, sizeof(buffer))){
+            ++line_no;
+            string line(buffer);
+            line.erase(remove(line.begin(), line.end(), '\n'), line.end());
+            line.erase(remove(line.begin(), line.end(), '\r'), line.end());
+            if (line.empty()) continue;
+            const vector<string> fields = split_tsv_strict(line);
+            const string schema = joint_field(
+                fields,index,"schema_version",path,line_no);
+            if (schema != JOINT_DOUBLET_MANIFEST_SCHEMA)
+                throw runtime_error(path + ": unsupported schema at line " +
+                    to_string(line_no) + ": " + schema);
+            JointHypothesis hypothesis;
+            hypothesis.library = joint_field(
+                fields,index,"library",path,line_no);
+            if (hypothesis.library != library)
+                throw runtime_error(path + ": manifest library does not match --libname at line " +
+                    to_string(line_no));
+            hypothesis.barcode = joint_field(
+                fields,index,"barcode",path,line_no);
+            if (hypothesis.barcode.size() != 16 ||
+                    any_of(hypothesis.barcode.begin(),hypothesis.barcode.end(),
+                        [](char base){
+                            return base!='A' && base!='C' &&
+                                   base!='G' && base!='T';
+                        }))
+                throw runtime_error(path +
+                    ": joint-doublet barcodes must be canonical 16-bp A/C/G/T strings at line " +
+                    to_string(line_no));
+            hypothesis.encoded_barcode = bc_ul(hypothesis.barcode);
+            hypothesis.candidate_id = joint_field(
+                fields,index,"candidate_id",path,line_no);
+            const string unique_id = hypothesis.barcode + "\t" + hypothesis.candidate_id;
+            if (!candidate_ids.insert(unique_id).second)
+                throw runtime_error(path + ": duplicate barcode/candidate_id at line " +
+                    to_string(line_no));
+            hypothesis.locked_state = joint_field(
+                fields,index,"locked_state",path,line_no);
+            const string locked_text = joint_field(
+                fields,index,"locked_copy_vector",path,line_no);
+            hypothesis.locked = joint_parse_composition(
+                locked_text,sample2idx,path + ": line " + to_string(line_no) +
+                " locked_copy_vector",true);
+            hypothesis.second_state = joint_field(
+                fields,index,"second_state",path,line_no);
+            const string second_text = joint_field(
+                fields,index,"second_copy_vector",path,line_no);
+            hypothesis.second = joint_parse_composition(
+                second_text,sample2idx,path + ": line " + to_string(line_no) +
+                " second_copy_vector",true);
+            const string ambient_text = joint_field(
+                fields,index,"ambient_copy_vector",path,line_no,false);
+            hypothesis.ambient = joint_parse_composition(
+                ambient_text,sample2idx,path + ": line " + to_string(line_no) +
+                " ambient_copy_vector",false);
+            hypothesis.candidate_origin = joint_field(
+                fields,index,"candidate_origin",path,line_no,false);
+            if (hypothesis.candidate_origin.empty())
+                hypothesis.candidate_origin = "UNSPECIFIED";
+            hypothesis.exhaustive_fallback = joint_field(
+                fields,index,"exhaustive_fallback",path,line_no,false);
+            if (hypothesis.exhaustive_fallback.empty())
+                hypothesis.exhaustive_fallback = "FALSE";
+            hypothesis.nomination_modalities = joint_field(
+                fields,index,"nomination_modalities",path,line_no,false);
+            if (hypothesis.nomination_modalities.empty())
+                hypothesis.nomination_modalities = "NONE";
+            hypothesis.ambient_status = joint_field(
+                fields,index,"ambient_status",path,line_no,false);
+            if (hypothesis.ambient_status.empty())
+                hypothesis.ambient_status = "UNAVAILABLE";
+            const string rho_text = joint_field(
+                fields,index,"rho",path,line_no,false);
+            hypothesis.rho_requested = rho_text.empty() || lowercase(rho_text) == "na" ?
+                0.0L : strict_ld(rho_text,path + ": line " + to_string(line_no) + " rho");
+            if (hypothesis.rho_requested < 0.0L ||
+                    hypothesis.rho_requested > 0.99L)
+                throw runtime_error(path + ": rho must be in [0,0.99] at line " +
+                    to_string(line_no));
+            hypothesis.rho_effective = hypothesis.ambient.valid ?
+                hypothesis.rho_requested : 0.0L;
+            by_cell[hypothesis.encoded_barcode].push_back(hypotheses.size());
+            hypotheses.push_back(hypothesis);
+        }
+        if (gzclose(input) != Z_OK)
+            throw runtime_error("failed closing joint-doublet manifest: " + path);
+        input = NULL;
+    } catch (...) {
+        if (input) gzclose(input);
+        throw;
+    }
+    return hypotheses;
+}
+
+static bool joint_expected(
+        const JointComposition& composition,
+        const AxisSiteDefinition& site,
+        const unordered_map<int,size_t>& donor_slot,
+        long double& expected, bool allow_missing_members = false){
+    if (!composition.valid) return false;
+    AxisKahan numerator, denominator;
+    for (const auto& member : composition.members){
+        auto slot = donor_slot.find(member.first);
+        if (slot == donor_slot.end() || slot->second >= site.genotype.size()){
+            if (allow_missing_members) continue;
+            return false;
+        }
+        const int8_t gt = site.genotype[slot->second];
+        if (gt < 0){
+            if (allow_missing_members) continue;
+            return false;
+        }
+        numerator.add(member.second * ((long double)gt / 2.0L));
+        denominator.add(member.second);
+    }
+    if (denominator.value <= 0.0L) return false;
+    expected = numerator.value / denominator.value;
+    return true;
+}
+
+static long double joint_adjust_probability(
+        long double probability, long double e_ref, long double e_alt){
+    const long double adjusted = probability * (1.0L - e_alt) +
+        (1.0L - probability) * e_ref;
+    return min(max(adjusted, 1e-15L), 1.0L - 1e-15L);
+}
+
+static long double joint_site_log_likelihood(
+        const JointSiteUnit& unit, long double alpha, long double rho,
+        long double e_ref, long double e_alt, bool balanced){
+    const long double biological =
+        (1.0L-alpha)*unit.q_locked + alpha*unit.q_second;
+    const long double mixture = (1.0L-rho)*biological +
+        rho*unit.q_ambient;
+    const long double probability = joint_adjust_probability(
+        mixture,e_ref,e_alt);
+    const long double raw = unit.alt*logl(probability) +
+        unit.ref*logl(1.0L-probability);
+    const long double depth = unit.ref + unit.alt;
+    return balanced && depth > 0.0L ? raw/depth : raw;
+}
+
+static pair<long double,long double> joint_site_log_likelihood_derivatives(
+        const JointSiteUnit& unit, long double alpha, long double rho,
+        long double e_ref, long double e_alt, bool balanced){
+    const long double error_scale=1.0L-e_ref-e_alt;
+    const long double biological=
+        (1.0L-alpha)*unit.q_locked+alpha*unit.q_second;
+    const long double mixture=(1.0L-rho)*biological+rho*unit.q_ambient;
+    const long double unclamped=e_ref+error_scale*mixture;
+    const long double epsilon=1e-15L;
+    const long double probability=min(max(unclamped,epsilon),1.0L-epsilon);
+    long double slope=error_scale*(1.0L-rho)*
+        (unit.q_second-unit.q_locked);
+    if (unclamped<=epsilon || unclamped>=1.0L-epsilon) slope=0.0L;
+    const long double depth=unit.ref+unit.alt;
+    const long double weight=balanced && depth>0.0L ? 1.0L/depth : 1.0L;
+    const long double first=weight*slope*
+        (unit.alt/probability-unit.ref/(1.0L-probability));
+    const long double second=-weight*slope*slope*
+        (unit.alt/(probability*probability)+
+         unit.ref/((1.0L-probability)*(1.0L-probability)));
+    return make_pair(first,second);
+}
+
+template <typename DerivativeFunction,typename ScoreFunction>
+static pair<long double,long double> joint_concave_maximum(
+        long double max_alpha, const DerivativeFunction& derivatives,
+        const ScoreFunction& score){
+    const pair<long double,long double> at_zero=derivatives(0.0L);
+    const pair<long double,long double> at_max=derivatives(max_alpha);
+    long double alpha=0.0L;
+    if (at_zero.first<=0.0L){
+        alpha=0.0L;
+    } else if (at_max.first>=0.0L){
+        alpha=max_alpha;
+    } else {
+        long double left=0.0L,right=max_alpha;
+        long double current=(left+right)/2.0L;
+        for (int iteration=0;iteration<32;++iteration){
+            const pair<long double,long double> value=derivatives(current);
+            if (value.first>0.0L) left=current;
+            else right=current;
+            if (right-left<=1e-10L*max(1.0L,max_alpha)) break;
+            long double proposed=NAN;
+            if (isfinite(value.second) && value.second<0.0L)
+                proposed=current-value.first/value.second;
+            if (!isfinite(proposed) || proposed<=left || proposed>=right)
+                proposed=(left+right)/2.0L;
+            if (proposed==current){ left=current; right=current; break; }
+            current=proposed;
+        }
+        alpha=(left+right)/2.0L;
+    }
+    long double best=score(alpha);
+    const long double zero_score=score(0.0L);
+    if (zero_score>best){ alpha=0.0L; best=zero_score; }
+    const long double max_score=score(max_alpha);
+    if (max_score>best){ alpha=max_alpha; best=max_score; }
+    return make_pair(alpha,best);
+}
+
+template <typename ScoreFunction>
+static pair<long double,long double> joint_profile_interval(
+        long double max_alpha, long double maximum_alpha,
+        long double cutoff, const ScoreFunction& score){
+    // Preserve the established 201-point profile reporting grid, but exploit
+    // concavity to locate its passing interval by binary search instead of
+    // rescoring all 201 points for every candidate.
+    const int steps=200;
+    const auto grid_alpha=[&](int index){
+        return max_alpha*(long double)index/(long double)steps;
+    };
+    const long double scaled=maximum_alpha/max_alpha*(long double)steps;
+    const int floor_index=max(0,min(steps,(int)floorl(scaled)));
+    const int ceil_index=max(0,min(steps,(int)ceill(scaled)));
+    int peak_index=floor_index;
+    long double peak_score=score(grid_alpha(peak_index));
+    if (ceil_index!=floor_index){
+        const long double candidate=score(grid_alpha(ceil_index));
+        if (candidate>peak_score){
+            peak_index=ceil_index; peak_score=candidate;
+        }
+    }
+    if (peak_score<cutoff) return make_pair(NAN,NAN);
+
+    int low=0;
+    if (score(grid_alpha(low))<cutoff){
+        int left=low,right=peak_index;
+        while (left+1<right){
+            const int midpoint=left+(right-left)/2;
+            if (score(grid_alpha(midpoint))>=cutoff) right=midpoint;
+            else left=midpoint;
+        }
+        low=right;
+    }
+    int high=steps;
+    if (score(grid_alpha(high))<cutoff){
+        int left=peak_index,right=high;
+        while (left+1<right){
+            const int midpoint=left+(right-left)/2;
+            if (score(grid_alpha(midpoint))>=cutoff) left=midpoint;
+            else right=midpoint;
+        }
+        high=left;
+    }
+    return make_pair(grid_alpha(low),grid_alpha(high));
+}
+
+static JointFit joint_fit(
+        const vector<JointSiteUnit>& units, const vector<size_t>& indices,
+        long double rho, long double e_ref, long double e_alt,
+        long double max_alpha){
+    JointFit result;
+    if (indices.empty()) return result;
+    auto score = [&](long double alpha, bool balanced){
+        AxisKahan sum;
+        for (size_t index : indices)
+            sum.add(joint_site_log_likelihood(
+                units[index],alpha,rho,e_ref,e_alt,balanced));
+        return sum.value;
+    };
+    const auto derivatives=[&](long double alpha){
+        AxisKahan first,second;
+        for (size_t index : indices){
+            const pair<long double,long double> value=
+                joint_site_log_likelihood_derivatives(
+                    units[index],alpha,rho,e_ref,e_alt,true);
+            first.add(value.first); second.add(value.second);
+        }
+        return make_pair(first.value,second.value);
+    };
+    const auto balanced_score=[&](long double alpha){
+        return score(alpha,true);
+    };
+    const pair<long double,long double> maximum=joint_concave_maximum(
+        max_alpha,derivatives,balanced_score);
+    result.alpha=maximum.first;
+    result.balanced=maximum.second;
+    result.balanced /= (long double)indices.size();
+    result.raw = score(result.alpha,false);
+    return result;
+}
+
+static long double joint_linked_unit_log_likelihood(
+        const JointLinkedUnit& unit, long double alpha, long double rho,
+        long double e_ref, long double e_alt){
+    if (unit.sites.empty()) return NAN;
+    AxisKahan total;
+    for (const JointSiteUnit& site : unit.sites)
+        total.add(joint_site_log_likelihood(
+            site,alpha,rho,e_ref,e_alt,true));
+    return total.value/(long double)unit.sites.size();
+}
+
+static JointFit joint_fit_linked_units(
+        const vector<JointLinkedUnit>& units, const vector<size_t>& indices,
+        long double rho, long double e_ref, long double e_alt,
+        long double max_alpha){
+    JointFit result;
+    if (indices.empty()) return result;
+    const auto score=[&](long double alpha){
+        AxisKahan total;
+        for (size_t index : indices)
+            total.add(joint_linked_unit_log_likelihood(
+                units[index],alpha,rho,e_ref,e_alt));
+        return total.value/(long double)indices.size();
+    };
+    const auto derivatives=[&](long double alpha){
+        AxisKahan first,second;
+        for (size_t index : indices){
+            AxisKahan unit_first,unit_second;
+            for (const JointSiteUnit& site : units[index].sites){
+                const pair<long double,long double> value=
+                    joint_site_log_likelihood_derivatives(
+                        site,alpha,rho,e_ref,e_alt,true);
+                unit_first.add(value.first); unit_second.add(value.second);
+            }
+            const long double count=(long double)units[index].sites.size();
+            first.add(unit_first.value/count);
+            second.add(unit_second.value/count);
+        }
+        const long double count=(long double)indices.size();
+        return make_pair(first.value/count,second.value/count);
+    };
+    const pair<long double,long double> maximum=joint_concave_maximum(
+        max_alpha,derivatives,score);
+    result.alpha=maximum.first;
+    result.balanced=maximum.second;
+    result.raw=result.balanced*(long double)indices.size();
+    return result;
+}
+
+static uint64_t joint_linked_fold_hash(
+        const JointHypothesis& hypothesis, const JointLinkedUnit& unit){
+    return stable_text_hash(
+        hypothesis.library+"|"+hypothesis.barcode+"|"+
+        joint_molecule_basis_name(unit.basis)+"|"+
+        to_string(unit.molecule)+"|"+JOINT_DOUBLET_MOLECULE_FOLD_VERSION);
+}
+
+static string joint_summary_integers(vector<int> values){
+    if (values.empty()) return "NA";
+    sort(values.begin(),values.end());
+    const auto quantile=[&](long double p){
+        const size_t index=(size_t)floorl(
+            p*(long double)(values.size()-1));
+        return values[index];
+    };
+    return string("min=")+to_string(values.front())+
+        ";q1="+to_string(quantile(0.25L))+
+        ";median="+to_string(quantile(0.5L))+
+        ";q3="+to_string(quantile(0.75L))+
+        ";max="+to_string(values.back());
+}
+
+static void joint_evaluate_molecules(
+        const JointHypothesis& hypothesis,
+        const vector<JointMoleculeRecord>& records,
+        const vector<AxisSiteDefinition>& sites,
+        const unordered_map<int,size_t>& donor_slot,
+        long double e_ref, long double e_alt, long double max_alpha,
+        long malformed_rows, JointResult& result){
+    result.molecule_malformed_rows=malformed_rows;
+    if (!hypothesis.locked.valid || !hypothesis.second.valid){
+        result.molecule_status="UNAVAILABLE";
+        result.molecule_unusable_reason="DONOR_NOT_IN_MODALITY_PANEL";
+        return;
+    }
+    vector<JointLinkedUnit> units;
+    size_t cursor=0;
+    while (cursor<records.size()){
+        const uint64_t molecule=records[cursor].molecule;
+        const uint8_t basis=records[cursor].basis;
+        JointLinkedUnit linked;
+        linked.molecule=molecule; linked.basis=basis;
+        while (cursor<records.size() && records[cursor].molecule==molecule &&
+                records[cursor].basis==basis){
+            const JointMoleculeRecord& record=records[cursor++];
+            const uint64_t key=site_key(record.tid,record.pos);
+            auto found=lower_bound(sites.begin(),sites.end(),key,
+                [](const AxisSiteDefinition& site,uint64_t value){
+                    return site.key<value;
+                });
+            if (found==sites.end() || found->key!=key || !found->found ||
+                    found->mitochondrial) continue;
+            const long double depth=record.ref+record.alt;
+            if (depth<=0.0L) continue;
+            JointSiteUnit site;
+            site.tid=record.tid; site.pos=record.pos;
+            // Normalize within linked-unit/site so duplicated reads do not
+            // increase weight.
+            site.ref=record.ref/depth; site.alt=record.alt/depth;
+            if (!joint_expected(hypothesis.locked,*found,donor_slot,site.q_locked) ||
+                    !joint_expected(hypothesis.second,*found,donor_slot,site.q_second) ||
+                    (hypothesis.rho_effective>0.0L &&
+                     !joint_expected(hypothesis.ambient,*found,donor_slot,
+                                     site.q_ambient,true))) continue;
+            if (hypothesis.rho_effective==0.0L) site.q_ambient=site.q_locked;
+            linked.sites.push_back(site);
+        }
+        if (!linked.sites.empty()) units.push_back(linked);
+    }
+    result.molecule_units=(int)units.size();
+    if (units.empty()){
+        result.molecule_status="UNAVAILABLE";
+        result.molecule_unusable_reason=malformed_rows>0 ?
+            "NO_USABLE_LINKED_UNITS_AFTER_MALFORMED_ROWS" :
+            "NO_USABLE_LINKED_UNITS";
+        return;
+    }
+    vector<int> snps_per_unit;
+    int umi_gene=0,qname=0;
+    vector<size_t> informative;
+    for (size_t index=0;index<units.size();++index){
+        JointLinkedUnit& unit=units[index];
+        snps_per_unit.push_back((int)unit.sites.size());
+        result.molecule_total_snps+=(int)unit.sites.size();
+        if (unit.sites.size()>1) ++result.molecule_multi_snp_units;
+        if (unit.basis==1 || unit.basis==2) ++umi_gene;
+        if (unit.basis==3) ++qname;
+        bool distinguishes=false;
+        for (const JointSiteUnit& site : unit.sites)
+            if (fabsl(site.q_locked-site.q_second)>1e-18L){
+                distinguishes=true; break;
+            }
+        if (distinguishes) informative.push_back(index);
+    }
+    result.molecule_discriminating_units=(int)informative.size();
+    result.molecule_snps_per_unit=joint_summary_integers(snps_per_unit);
+    result.molecule_umi_gene_fraction=(long double)umi_gene/(long double)units.size();
+    result.molecule_query_name_fraction=(long double)qname/(long double)units.size();
+    if (informative.empty()){
+        result.molecule_status="GENOTYPE_EQUIVALENT";
+        result.molecule_unusable_reason="NO_GENOTYPE_DISTINGUISHABLE_LINKED_UNITS";
+        result.molecule_alpha=0.0L;
+        return;
+    }
+    const JointFit fit=joint_fit_linked_units(
+        units,informative,hypothesis.rho_effective,e_ref,e_alt,max_alpha);
+    result.molecule_alpha=fit.alpha;
+    result.molecule_k2=fit.balanced;
+    AxisKahan frozen;
+    for (size_t index : informative)
+        frozen.add(joint_linked_unit_log_likelihood(
+            units[index],0.0L,hypothesis.rho_effective,e_ref,e_alt));
+    result.molecule_k1=frozen.value/(long double)informative.size();
+    result.molecule_delta=result.molecule_k2-result.molecule_k1;
+
+    const long double cutoff=result.molecule_k2-
+        1.920729410347062L/(long double)informative.size();
+    const auto profile_score=[&](long double alpha){
+        AxisKahan score;
+        for (size_t index : informative)
+            score.add(joint_linked_unit_log_likelihood(
+                units[index],alpha,hypothesis.rho_effective,e_ref,e_alt));
+        return score.value/(long double)informative.size();
+    };
+    const pair<long double,long double> profile=joint_profile_interval(
+        max_alpha,result.molecule_alpha,cutoff,profile_score);
+    result.molecule_alpha_low=profile.first;
+    result.molecule_alpha_high=profile.second;
+
+    vector<long double> influences(informative.size());
+    AxisKahan absolute_sum,squared_sum;
+    size_t top_position=0;
+    for (size_t i=0;i<informative.size();++i){
+        const JointLinkedUnit& unit=units[informative[i]];
+        const long double signed_delta=joint_linked_unit_log_likelihood(
+            unit,result.molecule_alpha,hypothesis.rho_effective,e_ref,e_alt)-
+            joint_linked_unit_log_likelihood(
+                unit,0.0L,hypothesis.rho_effective,e_ref,e_alt);
+        influences[i]=fabsl(signed_delta);
+        absolute_sum.add(influences[i]);
+        squared_sum.add(influences[i]*influences[i]);
+        if (influences[i]>influences[top_position]) top_position=i;
+    }
+    if (squared_sum.value>0.0L)
+        result.molecule_effective_units=
+            absolute_sum.value*absolute_sum.value/squared_sum.value;
+    if (absolute_sum.value>0.0L)
+        result.molecule_maximum_influence_fraction=
+            influences[top_position]/absolute_sum.value;
+    if (informative.size()>1){
+        vector<size_t> without_top;
+        for (size_t i=0;i<informative.size();++i)
+            if (i!=top_position) without_top.push_back(informative[i]);
+        const JointFit reduced=joint_fit_linked_units(
+            units,without_top,hypothesis.rho_effective,e_ref,e_alt,max_alpha);
+        AxisKahan reduced_frozen;
+        for (size_t index : without_top)
+            reduced_frozen.add(joint_linked_unit_log_likelihood(
+                units[index],0.0L,hypothesis.rho_effective,e_ref,e_alt));
+        result.molecule_without_top_alpha=reduced.alpha;
+        result.molecule_without_top_delta=reduced.balanced-
+            reduced_frozen.value/(long double)without_top.size();
+    }
+
+    const int fold_count=min<int>(5,(int)units.size());
+    result.molecule_fold_count=fold_count;
+    vector<size_t> fold_order(units.size());
+    iota(fold_order.begin(),fold_order.end(),0);
+    sort(fold_order.begin(),fold_order.end(),[&](size_t left,size_t right){
+        const uint64_t a=joint_linked_fold_hash(hypothesis,units[left]);
+        const uint64_t b=joint_linked_fold_hash(hypothesis,units[right]);
+        if (a!=b) return a<b;
+        if (units[left].basis!=units[right].basis)
+            return units[left].basis<units[right].basis;
+        return units[left].molecule<units[right].molecule;
+    });
+    vector<int> fold_sizes(fold_count,0);
+    for (size_t rank=0;rank<fold_order.size();++rank){
+        const int fold=(int)(rank%(size_t)fold_count);
+        units[fold_order[rank]].fold=fold;
+        ++fold_sizes[fold];
+    }
+    result.molecule_fold_units=joint_summary_integers(fold_sizes);
+    vector<long double> heldout_unit_deltas,fold_means,fold_alphas;
+    int positive_folds=0;
+    if (informative.size()>=2 && fold_count>=2){
+        for (int fold=0;fold<fold_count;++fold){
+            vector<size_t> training,heldout;
+            for (size_t index : informative){
+                if (units[index].fold==fold) heldout.push_back(index);
+                else training.push_back(index);
+            }
+            if (training.empty() || heldout.empty()) continue;
+            const JointFit fold_fit=joint_fit_linked_units(
+                units,training,hypothesis.rho_effective,e_ref,e_alt,max_alpha);
+            AxisKahan fold_total;
+            for (size_t index : heldout){
+                const long double delta=joint_linked_unit_log_likelihood(
+                    units[index],fold_fit.alpha,hypothesis.rho_effective,
+                    e_ref,e_alt)-joint_linked_unit_log_likelihood(
+                    units[index],0.0L,hypothesis.rho_effective,e_ref,e_alt);
+                heldout_unit_deltas.push_back(delta);
+                fold_total.add(delta);
+            }
+            const long double fold_mean=fold_total.value/(long double)heldout.size();
+            fold_means.push_back(fold_mean);
+            fold_alphas.push_back(fold_fit.alpha);
+            if (fold_mean>0.0L) ++positive_folds;
+        }
+    }
+    result.molecule_folds_evaluable=(int)fold_means.size();
+    if (heldout_unit_deltas.size()>=2 && fold_means.size()>=2){
+        AxisKahan heldout_total;
+        for (long double value : heldout_unit_deltas) heldout_total.add(value);
+        result.molecule_heldout_delta=heldout_total.value/
+            (long double)heldout_unit_deltas.size();
+        result.molecule_heldout_support_fraction=(long double)positive_folds/
+            (long double)fold_means.size();
+        sort(fold_means.begin(),fold_means.end());
+        result.molecule_fold_min_delta=fold_means.front();
+        result.molecule_fold_median_delta=fold_means[fold_means.size()/2];
+        string alpha_text;
+        for (size_t i=0;i<fold_alphas.size();++i){
+            if (i) alpha_text+=",";
+            alpha_text+=axis_fmt(fold_alphas[i]);
+        }
+        result.molecule_fold_fitted_fractions=alpha_text;
+    }
+    result.molecule_status=informative.size()<2 ? "LIMITED_EVIDENCE" : "AVAILABLE";
+    result.molecule_unusable_reason=informative.size()<2 ?
+        "FEWER_THAN_TWO_DISCRIMINATING_LINKED_UNITS" : "NONE";
+    vector<string> warnings;
+    if (malformed_rows>0)
+        warnings.push_back("MALFORMED_CELL_MOLECULE_ROWS_SKIPPED:"+
+            to_string(malformed_rows));
+    if (isfinite(result.molecule_maximum_influence_fraction) &&
+            result.molecule_maximum_influence_fraction>0.5L)
+        warnings.push_back("TOP_LINKED_UNIT_DOMINATES_ABSOLUTE_INFLUENCE");
+    if (result.molecule_folds_evaluable<2)
+        warnings.push_back("HELD_OUT_LINKED_UNIT_SCORE_UNAVAILABLE");
+    result.molecule_warnings=warnings.empty() ? "NONE" : join_flags(warnings);
+}
+
+static uint64_t joint_fold_hash(const JointSiteUnit& unit){
+    return stable_text_hash(to_string(unit.tid) + "|" +
+        to_string(unit.pos) + "|" + JOINT_DOUBLET_FOLD_VERSION);
+}
+
+static JointResult joint_evaluate(
+        const JointHypothesis& hypothesis,
+        const vector<AxisObservationRecord>& observations,
+        const vector<AxisSiteDefinition>& sites,
+        const unordered_map<int,size_t>& donor_slot,
+        long double e_ref, long double e_alt, long min_evidence,
+        long double max_alpha, int requested_folds){
+    JointResult result;
+    vector<string> warnings;
+    if (!hypothesis.locked.valid || !hypothesis.second.valid){
+        result.status = "DONOR_NOT_IN_MODALITY_PANEL";
+        result.genotype_visibility = "UNAVAILABLE_DONOR";
+        if (!hypothesis.locked.valid)
+            warnings.push_back("LOCKED_DONOR_MISSING:" + hypothesis.locked.missing_donors);
+        if (!hypothesis.second.valid)
+            warnings.push_back("SECOND_DONOR_MISSING:" + hypothesis.second.missing_donors);
+        result.warnings = join_flags(warnings);
+        return result;
+    }
+    if (hypothesis.rho_requested > 0.0L && !hypothesis.ambient.valid)
+        warnings.push_back("AMBIENT_PROFILE_UNAVAILABLE_RHO_ZEROED");
+    vector<JointSiteUnit> units;
+    units.reserve(observations.size());
+    for (const AxisObservationRecord& observation : observations){
+        const uint64_t key = site_key(observation.tid,observation.pos);
+        auto found = lower_bound(sites.begin(),sites.end(),key,
+            [](const AxisSiteDefinition& site, uint64_t value){
+                return site.key < value;
+            });
+        if (found == sites.end() || found->key != key || !found->found){
+            ++result.excluded_missing_definition; continue;
+        }
+        if (found->mitochondrial){
+            ++result.excluded_mitochondrial; continue;
+        }
+        const long double depth = observation.ref + observation.alt;
+        if (depth <= 0.0L){
+            ++result.excluded_nonpositive; continue;
+        }
+        JointSiteUnit unit;
+        unit.tid=observation.tid; unit.pos=observation.pos;
+        unit.ref=observation.ref; unit.alt=observation.alt;
+        if (!joint_expected(hypothesis.locked,*found,donor_slot,unit.q_locked) ||
+                !joint_expected(hypothesis.second,*found,donor_slot,unit.q_second) ||
+                (hypothesis.rho_effective > 0.0L &&
+                 !joint_expected(hypothesis.ambient,*found,donor_slot,
+                                 unit.q_ambient,true))){
+            ++result.excluded_missing_genotype; continue;
+        }
+        if (hypothesis.rho_effective == 0.0L)
+            unit.q_ambient = unit.q_locked;
+        units.push_back(unit);
+    }
+    result.common_sites = (int)units.size();
+    if (units.empty()){
+        result.status = observations.empty() ? "NO_OBSERVATIONS" :
+            "NO_COMMON_NUCLEAR_GENOTYPES";
+        result.genotype_visibility = "UNAVAILABLE";
+        result.warnings = warnings.empty() ? "NONE" : join_flags(warnings);
+        return result;
+    }
+    vector<size_t> discriminating;
+    discriminating.reserve(units.size());
+    for (size_t i = 0; i < units.size(); ++i){
+        if (fabsl(units[i].q_locked-units[i].q_second) > 1e-18L){
+            discriminating.push_back(i);
+            ++result.discriminating_sites;
+            result.discriminating_depth += units[i].ref+units[i].alt;
+        }
+    }
+    result.genotype_equivalent = result.discriminating_sites == 0;
+    result.genotype_visibility = result.genotype_equivalent ?
+        "GENOTYPE_EQUIVALENT_REQUIRES_OCCUPANCY" : "GENOTYPE_VISIBLE";
+    if (result.genotype_equivalent){
+        AxisKahan baseline_balanced, baseline_raw;
+        for (const JointSiteUnit& unit : units){
+            baseline_balanced.add(joint_site_log_likelihood(
+                unit,0.0L,hypothesis.rho_effective,e_ref,e_alt,true));
+            baseline_raw.add(joint_site_log_likelihood(
+                unit,0.0L,hypothesis.rho_effective,e_ref,e_alt,false));
+        }
+        result.alpha=0.0L;
+        result.k1_balanced=baseline_balanced.value/(long double)units.size();
+        result.k2_balanced=result.k1_balanced;
+        result.delta_balanced=0.0L;
+        result.k1_raw=baseline_raw.value;
+        result.k2_raw=result.k1_raw;
+        result.delta_raw=0.0L;
+        result.status="GENOTYPE_EQUIVALENT";
+        result.warnings=warnings.empty() ? "NONE" : join_flags(warnings);
+        return result;
+    }
+    const JointFit fitted = joint_fit(units,discriminating,hypothesis.rho_effective,
+        e_ref,e_alt,max_alpha);
+    result.alpha=fitted.alpha;
+    result.k2_balanced=fitted.balanced;
+    result.k2_raw=fitted.raw;
+    AxisKahan k1_balanced_sum, k1_raw_sum;
+    for (size_t index : discriminating){
+        const JointSiteUnit& unit=units[index];
+        k1_balanced_sum.add(joint_site_log_likelihood(
+            unit,0.0L,hypothesis.rho_effective,e_ref,e_alt,true));
+        k1_raw_sum.add(joint_site_log_likelihood(
+            unit,0.0L,hypothesis.rho_effective,e_ref,e_alt,false));
+    }
+    result.k1_balanced=k1_balanced_sum.value/(long double)discriminating.size();
+    result.k1_raw=k1_raw_sum.value;
+    result.delta_balanced=result.k2_balanced-result.k1_balanced;
+    result.delta_raw=result.k2_raw-result.k1_raw;
+    result.replacement_like=result.alpha > 0.5L;
+
+    // A likelihood-profile interval on the site-balanced likelihood scale.
+    const long double cutoff = result.k2_balanced-
+        1.920729410347062L/(long double)discriminating.size();
+    const auto profile_score=[&](long double alpha){
+        AxisKahan value;
+        for (size_t index : discriminating)
+            value.add(joint_site_log_likelihood(
+                units[index],alpha,hypothesis.rho_effective,e_ref,e_alt,true));
+        return value.value/(long double)discriminating.size();
+    };
+    const pair<long double,long double> profile=joint_profile_interval(
+        max_alpha,result.alpha,cutoff,profile_score);
+    result.alpha_low=profile.first;
+    result.alpha_high=profile.second;
+
+    vector<long double> absolute_site_delta;
+    AxisKahan absolute_total;
+    for (const JointSiteUnit& unit : units){
+        const long double delta = joint_site_log_likelihood(
+            unit,result.alpha,hypothesis.rho_effective,e_ref,e_alt,true) -
+            joint_site_log_likelihood(
+                unit,0.0L,hypothesis.rho_effective,e_ref,e_alt,true);
+        absolute_site_delta.push_back(fabsl(delta));
+        absolute_total.add(fabsl(delta));
+    }
+    if (absolute_total.value > 0.0L)
+        result.top_site_fraction=*max_element(
+            absolute_site_delta.begin(),absolute_site_delta.end())/
+            absolute_total.value;
+
+    const int folds=min<int>(max<int>(requested_folds,2),discriminating.size());
+    vector<long double> fold_deltas;
+    int supporting=0;
+    if (discriminating.size() >= 2){
+        for (int fold = 0; fold < folds; ++fold){
+            vector<size_t> training;
+            for (size_t index : discriminating)
+                if ((int)(joint_fold_hash(units[index])%(uint64_t)folds) != fold)
+                    training.push_back(index);
+            if (training.empty() || training.size() == discriminating.size()) continue;
+            JointFit fold_fit=joint_fit(units,training,hypothesis.rho_effective,
+                e_ref,e_alt,max_alpha);
+            AxisKahan fold_k1;
+            for (size_t index : training)
+                fold_k1.add(joint_site_log_likelihood(
+                    units[index],0.0L,hypothesis.rho_effective,e_ref,e_alt,true));
+            const long double delta=fold_fit.balanced-
+                fold_k1.value/(long double)training.size();
+            fold_deltas.push_back(delta);
+            if (fold_fit.alpha > 0.01L && delta > 0.0L) ++supporting;
+        }
+    }
+    result.folds_evaluable=(int)fold_deltas.size();
+    if (!fold_deltas.empty()){
+        sort(fold_deltas.begin(),fold_deltas.end());
+        result.fold_min_delta=fold_deltas.front();
+        result.fold_median_delta=fold_deltas[fold_deltas.size()/2];
+        result.fold_support_fraction=(long double)supporting/
+            (long double)fold_deltas.size();
+    }
+
+    if (result.discriminating_sites < 2 ||
+            result.discriminating_depth < min_evidence)
+        result.status="LOW_EVIDENCE";
+    else result.status="AVAILABLE";
+    if (result.replacement_like)
+        warnings.push_back("FITTED_SECOND_FRACTION_ABOVE_ONE_HALF");
+    if (isfinite(result.top_site_fraction) && result.top_site_fraction > 0.5L)
+        warnings.push_back("TOP_SITE_DOMINATES_BALANCED_DELTA");
+    if (result.folds_evaluable > 0 && result.fold_support_fraction < 0.8L)
+        warnings.push_back("LEAVE_ONE_FOLD_OUT_SUPPORT_UNSTABLE");
+    result.warnings=warnings.empty() ? "NONE" : join_flags(warnings);
+    return result;
+}
+
+static vector<string> joint_output_header(){
+    return {
+        "schema_version","library","barcode","modality","candidate_id",
+        "locked_state","locked_copy_vector","second_state",
+        "second_copy_vector","candidate_origin","exhaustive_fallback",
+        "nomination_modalities","rho_requested","rho_effective",
+        "ambient_copy_vector","ambient_status","score_status",
+        "genotype_visibility","genotype_equivalent","replacement_like",
+        "fitted_second_fraction","fitted_second_fraction_profile_low",
+        "fitted_second_fraction_profile_high",
+        "k1_site_balanced_log_likelihood",
+        "k2_site_balanced_log_likelihood",
+        "delta_site_balanced_log_likelihood_k2_minus_k1",
+        "k1_raw_log_likelihood","k2_raw_log_likelihood",
+        "delta_raw_log_likelihood_k2_minus_k1",
+        "n_common_nuclear_sites","n_discriminating_sites",
+        "discriminating_depth","n_leave_one_fold_out_evaluable",
+        "leave_one_fold_out_support_fraction",
+        "minimum_leave_one_fold_out_balanced_delta",
+        "median_leave_one_fold_out_balanced_delta",
+        "maximum_single_site_absolute_balanced_delta_fraction",
+        "n_excluded_missing_site_definition","n_excluded_mitochondrial",
+        "n_excluded_nonpositive","n_excluded_missing_genotype",
+        "error_ref","error_alt","min_evidence","max_second_fraction",
+        "site_fold_count_requested","formula_version","fold_version",
+        "observation_bucket_count","target_observation_rows",
+        "unique_selected_site_keys","peak_bucket_rows","warnings"
+        ,"molecule_score_status","molecule_unusable_reason",
+        "primary_evidence_basis","n_independent_linked_units",
+        "n_discriminating_linked_units","effective_linked_unit_count",
+        "n_multi_snp_linked_units","multi_snp_linked_unit_fraction",
+        "total_snps_in_linked_units","snps_per_linked_unit_summary",
+        "maximum_single_linked_unit_absolute_contribution_fraction",
+        "molecule_balanced_k1_log_likelihood",
+        "molecule_balanced_k2_log_likelihood",
+        "molecule_balanced_delta_log_likelihood_k2_minus_k1",
+        "molecule_balanced_fitted_second_fraction",
+        "molecule_balanced_fitted_second_fraction_profile_low",
+        "molecule_balanced_fitted_second_fraction_profile_high",
+        "molecule_fold_count","molecule_folds_evaluable",
+        "molecule_heldout_equal_unit_mean_delta",
+        "molecule_heldout_fold_support_fraction",
+        "molecule_heldout_minimum_fold_mean_delta",
+        "molecule_heldout_median_fold_mean_delta",
+        "molecule_fold_unit_count_summary",
+        "molecule_fold_fitted_second_fractions",
+        "molecule_without_top_unit_delta",
+        "molecule_without_top_unit_fitted_second_fraction",
+        "rna_umi_gene_basis_fraction","query_name_fallback_basis_fraction",
+        "molecule_malformed_rows","molecule_formula_version",
+        "molecule_sidecar_schema_version","molecule_fold_version",
+        "molecule_warnings"
+    };
+}
+
+static vector<string> joint_output_row(
+        const JointHypothesis& hypothesis, const JointResult& result,
+        const string& modality, const AxisResourceAudit& audit,
+        long double e_ref, long double e_alt, long min_evidence,
+        long double max_alpha, int folds){
+    return {
+        JOINT_DOUBLET_SCHEMA,hypothesis.library,hypothesis.barcode,modality,
+        hypothesis.candidate_id,hypothesis.locked_state,hypothesis.locked.text,
+        hypothesis.second_state,hypothesis.second.text,
+        hypothesis.candidate_origin,hypothesis.exhaustive_fallback,
+        hypothesis.nomination_modalities,axis_fmt(hypothesis.rho_requested),
+        axis_fmt(hypothesis.rho_effective),
+        hypothesis.ambient.text.empty() ? "NA" : hypothesis.ambient.text,
+        hypothesis.ambient_status,result.status,result.genotype_visibility,
+        bool_text(result.genotype_equivalent),bool_text(result.replacement_like),
+        axis_fmt(result.alpha),axis_fmt(result.alpha_low),axis_fmt(result.alpha_high),
+        axis_fmt(result.k1_balanced),axis_fmt(result.k2_balanced),
+        axis_fmt(result.delta_balanced),axis_fmt(result.k1_raw),
+        axis_fmt(result.k2_raw),axis_fmt(result.delta_raw),
+        to_string(result.common_sites),to_string(result.discriminating_sites),
+        axis_fmt(result.discriminating_depth),to_string(result.folds_evaluable),
+        axis_fmt(result.fold_support_fraction),axis_fmt(result.fold_min_delta),
+        axis_fmt(result.fold_median_delta),axis_fmt(result.top_site_fraction),
+        to_string(result.excluded_missing_definition),
+        to_string(result.excluded_mitochondrial),
+        to_string(result.excluded_nonpositive),
+        to_string(result.excluded_missing_genotype),axis_fmt(e_ref),
+        axis_fmt(e_alt),to_string(min_evidence),axis_fmt(max_alpha),
+        to_string(folds),JOINT_DOUBLET_FORMULA,JOINT_DOUBLET_FOLD_VERSION,
+        to_string(audit.bucket_count),to_string(audit.target_rows),
+        to_string(audit.unique_site_keys),
+        to_string(audit.observed_peak_bucket_rows),result.warnings,
+        result.molecule_status,result.molecule_unusable_reason,
+        "SITE_AND_MOLECULE_SEPARATE_SENSITIVITIES",
+        to_string(result.molecule_units),
+        to_string(result.molecule_discriminating_units),
+        axis_fmt(result.molecule_effective_units),
+        to_string(result.molecule_multi_snp_units),
+        result.molecule_units>0 ? axis_fmt(
+            (long double)result.molecule_multi_snp_units/
+            (long double)result.molecule_units) : "NA",
+        to_string(result.molecule_total_snps),result.molecule_snps_per_unit,
+        axis_fmt(result.molecule_maximum_influence_fraction),
+        axis_fmt(result.molecule_k1),axis_fmt(result.molecule_k2),
+        axis_fmt(result.molecule_delta),axis_fmt(result.molecule_alpha),
+        axis_fmt(result.molecule_alpha_low),axis_fmt(result.molecule_alpha_high),
+        to_string(result.molecule_fold_count),
+        to_string(result.molecule_folds_evaluable),
+        axis_fmt(result.molecule_heldout_delta),
+        axis_fmt(result.molecule_heldout_support_fraction),
+        axis_fmt(result.molecule_fold_min_delta),
+        axis_fmt(result.molecule_fold_median_delta),
+        result.molecule_fold_units,result.molecule_fold_fitted_fractions,
+        axis_fmt(result.molecule_without_top_delta),
+        axis_fmt(result.molecule_without_top_alpha),
+        axis_fmt(result.molecule_umi_gene_fraction),
+        axis_fmt(result.molecule_query_name_fraction),
+        to_string(result.molecule_malformed_rows),
+        JOINT_DOUBLET_MOLECULE_FORMULA,
+        JOINT_DOUBLET_MOLECULE_SIDECAR_SCHEMA,
+        JOINT_DOUBLET_MOLECULE_FOLD_VERSION,result.molecule_warnings
+    };
+}
+
+static void run_joint_doublet(
+        const string& samples_path, const string& manifest_path,
+        const string& sites_path, const string& observations_path,
+        const string& molecules_path,
+        const string& output_path, const string& temp_root,
+        const string& library, const string& modality,
+        long double e_ref, long double e_alt, long min_evidence,
+        long double max_alpha, int folds, int worker_threads){
+    if (e_ref < 0.0L || e_ref > 1.0L || e_alt < 0.0L || e_alt > 1.0L ||
+            e_ref+e_alt >= 1.0L)
+        throw runtime_error("joint-doublet errors must be in [0,1] and sum to less than one");
+    if (min_evidence < 0)
+        throw runtime_error("--min_evidence must be nonnegative in joint-doublet mode");
+    if (max_alpha <= 0.0L || max_alpha > 1.0L)
+        throw runtime_error("--max-second-fraction must be in (0,1]");
+    if (folds < 2)
+        throw runtime_error("--joint-folds must be at least 2");
+    if (worker_threads < 1)
+        throw runtime_error("--threads must be positive in joint-doublet mode");
+    if (modality != "RNA" && modality != "ATAC")
+        throw runtime_error("--modality must be RNA or ATAC");
+
+    const vector<string> samples=load_samples(samples_path);
+    unordered_map<string,int> sample2idx;
+    for (int i=0; i<(int)samples.size(); ++i){
+        if (trim(samples[i]).empty() || sample2idx.count(samples[i]))
+            throw runtime_error("joint-doublet samples must be nonblank and unique");
+        sample2idx[samples[i]]=i;
+    }
+    unordered_map<unsigned long,vector<size_t>> by_cell;
+    vector<JointHypothesis> hypotheses=joint_load_manifest(
+        manifest_path,sample2idx,library,by_cell);
+
+    unordered_map<unsigned long,CandidateAxisPair> targets;
+    for (const auto& item : by_cell) targets[item.first]=CandidateAxisPair();
+    vector<int> donors;
+    for (const JointHypothesis& hypothesis : hypotheses){
+        const JointComposition* compositions[] = {
+            &hypothesis.locked,&hypothesis.second,&hypothesis.ambient};
+        for (const JointComposition* composition : compositions)
+            for (const auto& member : composition->members)
+                donors.push_back(member.first);
+    }
+    sort(donors.begin(),donors.end());
+    donors.erase(unique(donors.begin(),donors.end()),donors.end());
+    unordered_map<int,size_t> donor_slot;
+    for (size_t i=0; i<donors.size(); ++i) donor_slot[donors[i]]=i;
+
+    AxisResourceAudit audit;
+    vector<JointResult> results(hypotheses.size());
+    if (!hypotheses.empty()){
+        AxisTempGuard temporary(temp_root);
+        const unsigned long long bucket_bytes=256ULL*1024ULL*1024ULL;
+        typedef chrono::steady_clock JointClock;
+        JointClock::time_point phase_start=JointClock::now();
+        const auto report_phase = [&](const string& phase){
+            const JointClock::time_point now=JointClock::now();
+            cerr << "JOINT_DOUBLET_PHASE\t" << phase << "\tseconds="
+                 << chrono::duration<double>(now-phase_start).count() << "\n";
+            phase_start=now;
+        };
+        unordered_map<unsigned long,unsigned long long> rows_by_barcode;
+        vector<uint64_t> selected_keys;
+        const string spool_path=joint_stage_observations_one_pass(
+            observations_path,targets,temporary.path(),audit,
+            rows_by_barcode,selected_keys);
+        report_phase("read_and_stage_observations");
+        vector<AxisSiteDefinition> sites=axis_load_site_definitions(
+            sites_path,selected_keys,(int)samples.size(),donors,audit);
+        report_phase("load_selected_site_definitions");
+        unordered_map<unsigned long,size_t> bucket_assignment;
+        const vector<unsigned long long> bucket_loads=axis_assign_buckets(
+            rows_by_barcode,bucket_bytes,bucket_assignment,audit,
+            max<size_t>(1,static_cast<size_t>(worker_threads)*4));
+        vector<string> bucket_paths=joint_partition_staged_observations(
+            spool_path,bucket_assignment,bucket_loads.size(),temporary.path());
+        unordered_map<unsigned long,unsigned long long> molecule_rows_by_barcode;
+        unordered_map<unsigned long,long> malformed_molecule_rows;
+        const string molecule_spool=joint_stage_molecules_one_pass(
+            molecules_path,targets,selected_keys,temporary.path(),
+            molecule_rows_by_barcode,malformed_molecule_rows);
+        vector<string> molecule_bucket_paths=joint_partition_staged_molecules(
+            molecule_spool,bucket_assignment,bucket_loads.size(),temporary.path());
+        vector<size_t> bucket_rows(bucket_paths.size(),0);
+        for (size_t bucket_index=0; bucket_index<bucket_paths.size();
+                ++bucket_index){
+            const string& path=bucket_paths[bucket_index];
+            struct stat info;
+            if (stat(path.c_str(),&info) != 0)
+                throw runtime_error("could not stat joint-doublet bucket: " + path);
+            if (info.st_size < 0 ||
+                    static_cast<unsigned long long>(info.st_size) %
+                        sizeof(AxisObservationRecord) != 0)
+                throw runtime_error(
+                    "joint-doublet bucket has a truncated binary record: " + path);
+            const size_t n=static_cast<size_t>(info.st_size) /
+                sizeof(AxisObservationRecord);
+            bucket_rows[bucket_index]=n;
+            audit.observed_peak_bucket_rows=max<unsigned long long>(
+                audit.observed_peak_bucket_rows,n);
+        }
+        report_phase("partition_binary_buckets");
+
+        vector<string> bucket_errors(bucket_paths.size());
+#pragma omp parallel for schedule(dynamic,1) num_threads(worker_threads)
+        for (long long raw_bucket_index=0;
+                raw_bucket_index<static_cast<long long>(bucket_paths.size());
+                ++raw_bucket_index){
+            const size_t bucket_index=static_cast<size_t>(raw_bucket_index);
+            const string& path=bucket_paths[bucket_index];
+            try {
+                const size_t n=bucket_rows[bucket_index];
+                vector<AxisObservationRecord> records(n);
+                ifstream input(path.c_str(),ios::binary);
+                if (!input)
+                    throw runtime_error(
+                        "could not open joint-doublet bucket: " + path);
+                if (n){
+                    input.read(reinterpret_cast<char*>(records.data()),
+                        n*sizeof(AxisObservationRecord));
+                    if (!input)
+                        throw runtime_error(
+                            "failed reading joint-doublet bucket: " + path);
+                }
+                sort(records.begin(),records.end(),axis_observation_less);
+                size_t begin=0;
+                while (begin<records.size()){
+                    const unsigned long barcode=records[begin].barcode;
+                    size_t end=begin;
+                    while (end<records.size() &&
+                            records[end].barcode==barcode) ++end;
+                    vector<AxisObservationRecord> merged;
+                    size_t cursor=begin;
+                    while (cursor<end){
+                        AxisObservationRecord aggregate=records[cursor];
+                        AxisKahan ref,alt;
+                        while (cursor<end &&
+                                records[cursor].tid==aggregate.tid &&
+                                records[cursor].pos==aggregate.pos){
+                            ref.add(records[cursor].ref);
+                            alt.add(records[cursor].alt);
+                            ++cursor;
+                        }
+                        aggregate.ref=(double)ref.value;
+                        aggregate.alt=(double)alt.value;
+                        merged.push_back(aggregate);
+                    }
+                    auto found=by_cell.find(barcode);
+                    if (found==by_cell.end())
+                        throw runtime_error(
+                            "joint-doublet bucket contains nontarget barcode");
+                    for (size_t index : found->second)
+                        results[index]=joint_evaluate(
+                            hypotheses[index],merged,sites,donor_slot,e_ref,
+                            e_alt,min_evidence,max_alpha,folds);
+                    begin=end;
+                }
+                unlink(path.c_str());
+            } catch (const exception& error){
+                bucket_errors[bucket_index]=error.what();
+            }
+        }
+        for (size_t i=0; i<bucket_errors.size(); ++i)
+            if (!bucket_errors[i].empty())
+                throw runtime_error(
+                    "joint-doublet bucket worker " + to_string(i) +
+                    " failed: " + bucket_errors[i]);
+        report_phase("parallel_bucket_scoring");
+
+        const vector<AxisObservationRecord> empty;
+        vector<size_t> empty_indexes;
+        for (const auto& item : by_cell)
+            if (rows_by_barcode.count(item.first)==0)
+                for (size_t index : item.second)
+                    empty_indexes.push_back(index);
+        vector<string> empty_errors(empty_indexes.size());
+#pragma omp parallel for schedule(dynamic,16) num_threads(worker_threads)
+        for (long long raw_empty_index=0;
+                raw_empty_index<static_cast<long long>(empty_indexes.size());
+                ++raw_empty_index){
+            const size_t work_index=static_cast<size_t>(raw_empty_index);
+            const size_t result_index=empty_indexes[work_index];
+            try {
+                results[result_index]=joint_evaluate(
+                    hypotheses[result_index],empty,sites,donor_slot,e_ref,e_alt,
+                    min_evidence,max_alpha,folds);
+            } catch (const exception& error){
+                empty_errors[work_index]=error.what();
+            }
+        }
+        for (size_t i=0; i<empty_errors.size(); ++i)
+            if (!empty_errors[i].empty())
+                throw runtime_error(
+                    "joint-doublet empty-observation worker failed for result " +
+                    to_string(empty_indexes[i]) + ": " + empty_errors[i]);
+        report_phase("empty_observation_scoring");
+
+        if (!molecule_bucket_paths.empty()){
+            vector<string> molecule_bucket_errors(molecule_bucket_paths.size());
+#pragma omp parallel for schedule(dynamic,1) num_threads(worker_threads)
+            for (long long raw_bucket_index=0;
+                    raw_bucket_index<static_cast<long long>(molecule_bucket_paths.size());
+                    ++raw_bucket_index){
+                const size_t bucket_index=static_cast<size_t>(raw_bucket_index);
+                const string& path=molecule_bucket_paths[bucket_index];
+                try {
+                    struct stat info;
+                    if (stat(path.c_str(),&info)!=0 || info.st_size<0 ||
+                            static_cast<unsigned long long>(info.st_size)%
+                                sizeof(JointMoleculeRecord)!=0)
+                        throw runtime_error(
+                            "joint molecule bucket is missing or truncated: "+path);
+                    const size_t n=(size_t)info.st_size/
+                        sizeof(JointMoleculeRecord);
+                    vector<JointMoleculeRecord> records(n);
+                    ifstream input(path.c_str(),ios::binary);
+                    if (!input)
+                        throw runtime_error("could not open joint molecule bucket: "+path);
+                    if (n){
+                        input.read(reinterpret_cast<char*>(records.data()),
+                            n*sizeof(JointMoleculeRecord));
+                        if (!input)
+                            throw runtime_error("failed reading joint molecule bucket: "+path);
+                    }
+                    sort(records.begin(),records.end(),joint_molecule_less);
+                    vector<JointMoleculeRecord> merged;
+                    size_t cursor=0;
+                    while (cursor<records.size()){
+                        JointMoleculeRecord aggregate=records[cursor];
+                        AxisKahan ref,alt;
+                        while (cursor<records.size() &&
+                                records[cursor].barcode==aggregate.barcode &&
+                                records[cursor].basis==aggregate.basis &&
+                                records[cursor].molecule==aggregate.molecule &&
+                                records[cursor].tid==aggregate.tid &&
+                                records[cursor].pos==aggregate.pos){
+                            ref.add(records[cursor].ref);
+                            alt.add(records[cursor].alt);
+                            ++cursor;
+                        }
+                        aggregate.ref=(double)ref.value;
+                        aggregate.alt=(double)alt.value;
+                        merged.push_back(aggregate);
+                    }
+                    size_t begin=0;
+                    while (begin<merged.size()){
+                        const unsigned long barcode=merged[begin].barcode;
+                        size_t end=begin+1;
+                        while (end<merged.size() && merged[end].barcode==barcode) ++end;
+                        auto found=by_cell.find(barcode);
+                        if (found==by_cell.end())
+                            throw runtime_error(
+                                "joint molecule bucket contains nontarget barcode");
+                        const vector<JointMoleculeRecord> cell_records(
+                            merged.begin()+begin,merged.begin()+end);
+                        const long malformed=malformed_molecule_rows.count(barcode) ?
+                            malformed_molecule_rows.at(barcode) : 0;
+                        for (size_t index : found->second)
+                            joint_evaluate_molecules(
+                                hypotheses[index],cell_records,sites,donor_slot,
+                                e_ref,e_alt,max_alpha,malformed,results[index]);
+                        begin=end;
+                    }
+                    unlink(path.c_str());
+                } catch (const exception& error){
+                    molecule_bucket_errors[bucket_index]=error.what();
+                }
+            }
+            for (size_t i=0;i<molecule_bucket_errors.size();++i)
+                if (!molecule_bucket_errors[i].empty())
+                    throw runtime_error(
+                        "joint molecule bucket worker "+to_string(i)+
+                        " failed: "+molecule_bucket_errors[i]);
+            for (const auto& item : by_cell){
+                if (molecule_rows_by_barcode.count(item.first)>0) continue;
+                const long malformed=malformed_molecule_rows.count(item.first) ?
+                    malformed_molecule_rows.at(item.first) : 0;
+                const vector<JointMoleculeRecord> empty_molecules;
+                for (size_t index : item.second)
+                    joint_evaluate_molecules(
+                        hypotheses[index],empty_molecules,sites,donor_slot,
+                        e_ref,e_alt,max_alpha,malformed,results[index]);
+            }
+            report_phase("parallel_molecule_bucket_scoring");
+        }
+    }
+
+    const string temporary_output=output_path+".tmp."+
+        to_string((long long)getpid());
+    gzFile output=gzopen(temporary_output.c_str(),"wb");
+    if (!output) throw runtime_error("could not create joint-doublet output: " + temporary_output);
+    try {
+        const vector<string> header=joint_output_header();
+        axis_gzwrite(output,header);
+        vector<size_t> order(hypotheses.size());
+        iota(order.begin(),order.end(),0);
+        sort(order.begin(),order.end(),[&](size_t left,size_t right){
+            return make_pair(hypotheses[left].barcode,hypotheses[left].candidate_id) <
+                make_pair(hypotheses[right].barcode,hypotheses[right].candidate_id);
+        });
+        for (size_t index : order){
+            const vector<string> row=joint_output_row(
+                hypotheses[index],results[index],modality,audit,e_ref,e_alt,
+                min_evidence,max_alpha,folds);
+            if (row.size()!=header.size())
+                throw runtime_error("joint-doublet internal output schema/value count mismatch");
+            axis_gzwrite(output,row);
+        }
+        if (gzclose(output)!=Z_OK)
+            throw runtime_error("failed closing joint-doublet output: " + temporary_output);
+        output=NULL;
+    } catch (...) {
+        if (output) gzclose(output);
+        unlink(temporary_output.c_str());
+        throw;
+    }
+    if (rename(temporary_output.c_str(),output_path.c_str())!=0){
+        unlink(temporary_output.c_str());
+        throw runtime_error("failed publishing joint-doublet output: " + output_path);
+    }
+}
+
 static void usage(){
     fprintf(stderr,
         "tetra_score_calls --counts FILE --samples FILE --assignments FILE --diagnostics FILE --output FILE [options]\n"
@@ -4497,7 +6277,7 @@ static void usage(){
         "  --species_support_threshold X  default 0.70; used for species support QC\n"
         "  --condf FILE                   accepted for manifest compatibility\n"
         "  --libname STR                  output library label\n"
-        "  --threads N                    accepted; current streaming scorer is deterministic single-writer\n"
+        "  --threads N                    joint-doublet barcode-bucket workers (default 1)\n"
         "  --min_evidence INT             default 10\n"
         "  --error_ref FLOAT              default 0.001\n"
         "  --error_alt FLOAT              default 0.001\n"
@@ -4522,7 +6302,17 @@ static void usage(){
         "  --error_alt, --min_evidence, and --poor-fit-residual. It is standalone:\n"
         "  counts, assignments, molecule evidence, resamples, and legacy outputs are rejected.\n"
         "  candidate_axis_position_raw is uncalibrated and must never be called confidence,\n"
-        "  certainty, accuracy, FDR, posterior probability, or correctness probability.\n");
+        "  certainty, accuracy, FDR, posterior probability, or correctness probability.\n"
+        "\nStandalone generalized joint-doublet scoring:\n"
+        "  --joint-doublet-output FILE    K=1 versus K=2 + ambient candidate rows\n"
+        "  --joint-doublet-manifest FILE  joint_doublet_candidate_manifest_v2 TSV[.gz]\n"
+        "  --joint-doublet-temp-dir DIR   existing absolute job-local temp root\n"
+        "  --modality RNA|ATAC            preserve assay-specific evidence\n"
+        "  --pileup-molecules FILE         optional seven-column linked-unit sidecar\n"
+        "  --max-second-fraction FLOAT    fitted range upper bound (default 0.95)\n"
+        "  --joint-folds N                genomic leave-one-fold-out groups (default 5)\n"
+        "  Joint-doublet mode also requires --samples, --pileup-sites,\n"
+        "  --pileup-observations, and --libname. It never changes identity assignments.\n");
 }
 
 int main(int argc, char** argv){
@@ -4531,6 +6321,8 @@ int main(int argc, char** argv){
     string candidate_manifest, pileup_sites, pileup_observations;
     string pileup_molecules, site_fold_output, probability_output, score_prefix;
     string candidate_axis_output, candidate_axis_temp_dir;
+    string joint_doublet_output, joint_doublet_manifest;
+    string joint_doublet_temp_dir, modality;
     int site_folds = 5;
     int probability_resamples = 100;
     uint64_t probability_seed = 1729;
@@ -4538,6 +6330,9 @@ int main(int argc, char** argv){
     double e_ref = 0.001, e_alt = 0.001;
     double poor_fit_residual = 0.30;
     double species_support_threshold = 0.70;
+    double max_second_fraction = 0.95;
+    int joint_folds = 5;
+    int threads = 1;
     bool strict = false;
     bool candidate_axis_self_test_requested = false;
     bool explicit_error_ref = false, explicit_error_alt = false;
@@ -4559,7 +6354,7 @@ int main(int argc, char** argv){
         else if (a == "--species_samples") need(species_samples_path);
         else if (a == "--condf") need(condf);
         else if (a == "--libname") need(libname);
-        else if (a == "--threads") { string tmp; need(tmp); explicit_threads = true; }
+        else if (a == "--threads") { string tmp; need(tmp); threads = atoi(tmp.c_str()); explicit_threads = true; }
         else if (a == "--min_evidence") { string tmp; need(tmp); min_evidence = atol(tmp.c_str()); explicit_min_evidence = true; }
         else if (a == "--error_ref") { string tmp; need(tmp); e_ref = atof(tmp.c_str()); explicit_error_ref = true; }
         else if (a == "--error_alt") { string tmp; need(tmp); e_alt = atof(tmp.c_str()); explicit_error_alt = true; }
@@ -4573,6 +6368,12 @@ int main(int argc, char** argv){
         else if (a == "--candidate-axis-output") need(candidate_axis_output);
         else if (a == "--candidate-axis-temp-dir") need(candidate_axis_temp_dir);
         else if (a == "--candidate-axis-self-test") candidate_axis_self_test_requested = true;
+        else if (a == "--joint-doublet-output") need(joint_doublet_output);
+        else if (a == "--joint-doublet-manifest") need(joint_doublet_manifest);
+        else if (a == "--joint-doublet-temp-dir") need(joint_doublet_temp_dir);
+        else if (a == "--modality") need(modality);
+        else if (a == "--max-second-fraction") { string tmp; need(tmp); max_second_fraction = atof(tmp.c_str()); }
+        else if (a == "--joint-folds") { string tmp; need(tmp); joint_folds = atoi(tmp.c_str()); }
         else if (a == "--score-prefix") need(score_prefix);
         else if (a == "--site-folds") { string tmp; need(tmp); site_folds = atoi(tmp.c_str()); explicit_site_folds = true; }
         else if (a == "--probability-resamples") { string tmp; need(tmp); probability_resamples = atoi(tmp.c_str()); explicit_probability_resamples = true; }
@@ -4587,6 +6388,44 @@ int main(int argc, char** argv){
         try { return candidate_axis_self_test(); }
         catch (const exception& error){
             fprintf(stderr, "ERROR: %s\n", error.what());
+            return 1;
+        }
+    }
+    if (!joint_doublet_output.empty()){
+        const bool incompatible = !counts.empty() || !assignments.empty() ||
+            !diagnostics.empty() || !output.empty() || !runnerups.empty() ||
+            !panel_path.empty() || !species_counts.empty() ||
+            !species_condf.empty() || !species_samples_path.empty() ||
+            !condf.empty() || !candidate_manifest.empty() ||
+            !site_fold_output.empty() ||
+            !probability_output.empty() || !score_prefix.empty() ||
+            !candidate_axis_output.empty() || !candidate_axis_temp_dir.empty() ||
+            explicit_probability_resamples || explicit_probability_seed ||
+            explicit_site_folds || explicit_poor_fit;
+        if (incompatible)
+            die("--joint-doublet-output is standalone and rejects legacy/candidate-axis options");
+        if (samples_path.empty() || joint_doublet_manifest.empty() ||
+                pileup_sites.empty() || pileup_observations.empty() ||
+                joint_doublet_temp_dir.empty() || libname.empty() ||
+                libname == "NA" || modality.empty()){
+            usage();
+            return 1;
+        }
+        try {
+            if (setlocale(LC_NUMERIC,"C") == NULL)
+                throw runtime_error(
+                    "joint-doublet mode could not establish the C numeric locale");
+            run_joint_doublet(samples_path,joint_doublet_manifest,pileup_sites,
+                pileup_observations,pileup_molecules,joint_doublet_output,
+                joint_doublet_temp_dir,
+                libname,modality,
+                strict_ld(axis_fmt(e_ref),"--error_ref"),
+                strict_ld(axis_fmt(e_alt),"--error_alt"),min_evidence,
+                strict_ld(axis_fmt(max_second_fraction),"--max-second-fraction"),
+                joint_folds,threads);
+            return 0;
+        } catch (const exception& error){
+            fprintf(stderr,"ERROR: %s\n",error.what());
             return 1;
         }
     }

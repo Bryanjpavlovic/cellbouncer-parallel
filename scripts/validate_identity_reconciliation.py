@@ -271,12 +271,16 @@ def parse_args():
         help=("Optional canonical identity-reconciliation root. When supplied, "
               "validate the finalized aggregate and downstream assignment "
               "exports in addition to upstream scientific invariants."))
+    p.add_argument(
+        "--figure-root", default="",
+        help=("Optional physical reconciliation-figure directory. When "
+              "omitted, use the historical <final-root>/plots directory."))
     p.add_argument("--output-root", required=True)
     return p.parse_args()
 
 
 def _validate_downstream_safe_exports_v3_legacy(
-        final_root, libs, expected_keys=None):
+        final_root, libs, expected_keys=None, figure_root=""):
     failures = []
     summaries = []
 
@@ -568,7 +572,7 @@ def _validate_downstream_safe_exports_v3_legacy(
         finish(check, before, f"subset_cells={len(keys)}")
 
     before = len(failures)
-    plot = root / "plots" / (
+    plot = (Path(figure_root) if figure_root else root / "plots") / (
         "identity_reconciliation_joint_supported_held_transitions.png")
     if not plot.is_file() or plot.stat().st_size == 0:
         fail("joint_supported_held_transition_plot_present", detail=str(plot))
@@ -577,12 +581,14 @@ def _validate_downstream_safe_exports_v3_legacy(
 
 
 def validate_downstream_safe_exports(
-        final_root, libs, expected_keys=None, evidence_mode="rna"):
+        final_root, libs, expected_keys=None, evidence_mode="rna",
+        figure_root=""):
     """Report the three-state contract without adding a new release gate."""
     summaries = []
     warnings = []
     root = Path(final_root)
     aggregate = root / "aggregate"
+    figures = Path(figure_root) if figure_root else root / "plots"
     selected = {f"lib{number}" for number in libs}
     ledger_path = aggregate / "identity_reconciliation_final_cells.tsv.gz"
     required_fields = {
@@ -947,6 +953,17 @@ def validate_downstream_safe_exports(
     except Exception as exc:
         warn("review_file_readable", detail=str(exc))
     summarize("review_file_exact", before)
+
+    before = len(warnings)
+    for name in (
+            "identity_reconciliation_joint_supported_held_transitions.png",
+            "identity_assignment_status.png",
+            "identity_line_changes.png"):
+        path = figures / name
+        if not path.is_file() or path.stat().st_size == 0:
+            warn("reconciliation_figure_present", detail=str(path))
+    summarize("reconciliation_figures_present", before,
+              f"figure_root={figures}")
 
     if warnings:
         print(
@@ -1715,7 +1732,7 @@ def main():
         downstream_failures, downstream_summaries = (
             validate_downstream_safe_exports(
                 args.final_root, libs, expected_final_keys,
-                args.evidence_mode))
+                args.evidence_mode, args.figure_root))
         failures.extend(downstream_failures)
         summaries.extend(downstream_summaries)
 
