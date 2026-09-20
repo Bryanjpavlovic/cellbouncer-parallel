@@ -25,14 +25,14 @@ import tempfile
 from typing import Sequence
 
 
-RELEASE = "2.4.0"
+RELEASE = "2.5.0"
 LIBRARY_PREFIX = "Tet_2025_Multiome-RNA_"
 DEFAULT_MAPPING_ROOT = (
-    "/mnt/beegfs/tet2025_mapping_staging/"
-    "rna3_all40_full_saturation_20260830_v2/rna3/mapping_output")
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/3P/mapping_output")
 DEFAULT_REFERENCE_H5AD = (
-    "/mnt/beegfs/tetmultiome_rna_mapped/mapping_output/h5a5_outs/"
-    "unfiltered_normed_tetmultiome_rna.h5ad")
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/3P/archive/"
+    "tetraploid_reanalysis_20260904_v1/ploidy_input/"
+    "all40.filtered_normed.h5ad")
 
 
 def parse_libraries(values: Sequence[str]) -> list[int]:

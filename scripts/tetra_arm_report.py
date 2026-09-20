@@ -14,7 +14,6 @@ from collections import Counter
 from pathlib import Path
 
 from tetra_arm_common import (
-    RELEASE,
     atomic_text,
     clean,
     file_record,
@@ -28,11 +27,12 @@ from tetra_arm_common import (
 )
 
 
-REPORT_SCHEMA = "tetra_arm_cnv_report_v2"
+PROGRAM_VERSION = "2.6.0"
+REPORT_SCHEMA = "tetra_arm_cnv_report_v3"
 CALL_SCHEMA = "tetra_arm_cnv_calls_v2"
 CALIBRATION_SCHEMA = "tetra_arm_calibration_v2"
-UID_SCHEMA = "tetra_arm_uid_chromosome_flags_v2"
-PAIR_SCHEMA = "tetra_arm_donor_pair_arm_summary_v2"
+UID_SCHEMA = "tetra_arm_uid_chromosome_flags_v3"
+PAIR_SCHEMA = "tetra_arm_donor_pair_arm_summary_v3"
 CALL_QC_SCHEMA = "tetra_arm_call_qc_v2"
 CALL_CONTRACT_SCHEMA = "tetra_arm_call_contract_v2"
 EVENT_STATES = (
@@ -291,7 +291,7 @@ def load_call_contract(path: str) -> dict:
     if not isinstance(output_schemas, dict) or any(
             clean(output_schemas.get(key)) != value
             for key, value in expected_outputs.items()):
-        raise ValueError("caller contract output_schemas do not match report v2")
+        raise ValueError("caller contract output_schemas do not match report v3")
     return payload
 
 
@@ -323,13 +323,16 @@ def main_impl(args) -> int:
         require_table_columns(
             uid_header,
             {"uid", "donor_pair", "chromosome", "p_state", "q_state",
+             "directional_support_basis", "min_directional_log_bf",
              "whole_chromosome_flag", "summary_status", "schema_version"},
             "UID table")
     if pair_path:
         require_table_columns(
             pair_header,
             {"library", "calibration_group", "donor_pair", "arm",
-             "tested_cells", "tested_uid_blocks", "partial_conjunction_method",
+             "tested_cells", "tested_uid_blocks", "supporting_fraction",
+             "directional_support_basis", "min_directional_log_bf",
+             "partial_conjunction_method",
              "dependence_assumption", "fdr_interpretation",
              "partial_conjunction_q_value",
              "partial_conjunction_q_resolution_floor", "recurrence_flag",
@@ -432,7 +435,7 @@ def main_impl(args) -> int:
 
     payload = {
         "schema_version": REPORT_SCHEMA,
-        "release": RELEASE,
+        "release": PROGRAM_VERSION,
         "status": overall,
         "caller_terminal_state": terminal_state,
         "inputs": {
@@ -497,6 +500,7 @@ def main_impl(args) -> int:
             "p_empirical_q_resolution_floor", "q_arm", "q_evaluable_cells",
             "q_concordant_cells", "q_state", "q_best_state_posterior",
             "q_empirical_q_value", "q_empirical_q_resolution_floor",
+            "directional_support_basis", "min_directional_log_bf",
             "paired_pq_concordant_cells",
             "whole_chromosome_flag", "whole_chromosome_state", "summary_status")
             if field in uid_rows[0]]
@@ -508,10 +512,12 @@ def main_impl(args) -> int:
             "library", "calibration_group", "donor_pair", "arm", "libraries",
             "total_cells", "eligible_uid_blocks", "tested_cells",
             "tested_uid_blocks", "qc_blocked_cells", "supporting_cells",
-            "concordant_cells", "concordance", "best_state",
+            "supporting_fraction", "concordant_cells", "concordance",
+            "best_state",
             "best_state_posterior", "pooled_effective_units",
             "partial_conjunction_r", "partial_conjunction_method",
             "fisher_terms", "fisher_df", "dependence_assumption",
+            "directional_support_basis", "min_directional_log_bf",
             "partial_conjunction_p_value", "partial_conjunction_q_value",
             "partial_conjunction_q_resolution_floor", "fdr_interpretation",
             "recurrence_flag", "summary_status") if field in pair_rows[0]]
@@ -561,7 +567,7 @@ def main_impl(args) -> int:
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
         f"<title>{html.escape(args.title)}</title><style>{css}</style></head><body>",
         f"<h1>{html.escape(args.title)}</h1>",
-        f'<p class="subtle">Schema <code>{REPORT_SCHEMA}</code>. State weights are working pseudo-posteriors; production events require selected-state held-out empirical q support. Downstream identity and modality fields are QC context, not duplicated likelihood evidence.</p>',
+        f'<p class="subtle">Schema <code>{REPORT_SCHEMA}</code>. State weights are working pseudo-posteriors; production events require selected-state held-out empirical q support. Aggregate donor-direction concordance uses prior-independent ASE event-vs-balanced evidence, while individual-cell calls retain the conservative event prior. Downstream identity and modality fields are QC context, not duplicated likelihood evidence.</p>',
         f'<div class="cards">{card_html}</div>',
         "<h2>Caller outcome</h2>",
         f"<p><code>{html.escape(terminal_state)}</code>: "
@@ -588,7 +594,7 @@ def main_impl(args) -> int:
         sections.extend(["<h2>Worker QC</h2>", small_table(qc_fields, qc_table)])
     sections.extend([
         "<h2>Interpretation</h2>",
-        "<p>A gain or loss is reportable only when donor-directed ASE has usable interindividual sites and the selected state passes its held-out empirical q and resolution thresholds. Expression supports total-copy direction when present. A nonbalanced maximum working pseudo-posterior without matching state-specific empirical support remains a candidate. Sex-chromosome rows are exploratory only.</p>",
+        "<p>A gain or loss is reportable only when donor-directed ASE has usable interindividual sites and the selected aggregate state passes its held-out empirical q, resolution, recurrence, and donor-direction concordance thresholds. Expression supports total-copy direction when present. Individual-cell event calls remain prior-regularized and are not prerequisites for aggregate support. A nonbalanced maximum working pseudo-posterior without matching state-specific empirical support remains a candidate. Sex-chromosome rows are exploratory only.</p>",
         "</body></html>",
     ])
     with atomic_text(str(html_path), gzip_output=False) as handle:
@@ -600,7 +606,8 @@ def main_impl(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build a self-contained audit report for calibrated chromosome-arm calls.")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {RELEASE}")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {PROGRAM_VERSION}")
     parser.add_argument("--calls", required=True)
     parser.add_argument("--calibration", default="")
     parser.add_argument("--uid-summary", default="")

@@ -37,7 +37,6 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequ
 from tetra_arm_common import (
     CELL_MANIFEST_SCHEMA,
     EXPRESSION_SCHEMA,
-    RELEASE,
     canonical_barcode,
     clean,
     finite_float,
@@ -51,12 +50,12 @@ from tetra_arm_common import (
 )
 
 
-PROGRAM_VERSION = RELEASE
+PROGRAM_VERSION = "2.6.0"
 ASE_INPUT_SCHEMA = "tetra_arm_ase_evidence_v2"
 CALL_OUTPUT_SCHEMA = "tetra_arm_cnv_calls_v2"
 CALIBRATION_OUTPUT_SCHEMA = "tetra_arm_calibration_v2"
-UID_OUTPUT_SCHEMA = "tetra_arm_uid_chromosome_flags_v2"
-PAIR_OUTPUT_SCHEMA = "tetra_arm_donor_pair_arm_summary_v2"
+UID_OUTPUT_SCHEMA = "tetra_arm_uid_chromosome_flags_v3"
+PAIR_OUTPUT_SCHEMA = "tetra_arm_donor_pair_arm_summary_v3"
 QC_OUTPUT_SCHEMA = "tetra_arm_call_qc_v2"
 CONTRACT_OUTPUT_SCHEMA = "tetra_arm_call_contract_v2"
 
@@ -66,6 +65,20 @@ STATES: Tuple[str, ...] = (
     "DONOR_B_LOSS",
     "DONOR_A_GAIN",
     "DONOR_B_GAIN",
+)
+
+EVENT_STATES: Tuple[str, ...] = STATES[1:]
+EVENT_DIRECTIONS: Mapping[str, Tuple[str, ...]] = {
+    "DONOR_A_DEPLETED": ("DONOR_A_LOSS", "DONOR_B_GAIN"),
+    "DONOR_A_ENRICHED": ("DONOR_B_LOSS", "DONOR_A_GAIN"),
+}
+STATE_DIRECTION = {
+    state: direction
+    for direction, states in EVENT_DIRECTIONS.items()
+    for state in states
+}
+AGGREGATE_DIRECTIONAL_SUPPORT_BASIS = (
+    "PRIOR_INDEPENDENT_ASE_EVENT_VS_BALANCED_LOG_BF_DONOR_DIRECTION"
 )
 
 # Copy-number states act as odds multipliers relative to the cross-fitted
@@ -233,6 +246,7 @@ UID_FIELDS: Tuple[str, ...] = (
     "q_state_p_DONOR_B_LOSS", "q_state_q_DONOR_B_LOSS",
     "q_state_p_DONOR_A_GAIN", "q_state_q_DONOR_A_GAIN",
     "q_state_p_DONOR_B_GAIN", "q_state_q_DONOR_B_GAIN",
+    "directional_support_basis", "min_directional_log_bf",
     "paired_pq_concordant_cells",
     "whole_chromosome_flag", "whole_chromosome_state", "summary_status",
     "schema_version",
@@ -243,7 +257,7 @@ PAIR_SUMMARY_FIELDS: Tuple[str, ...] = (
     "libraries",
     "total_cells", "individual_evaluable_cells", "aggregate_eligible_cells",
     "eligible_uid_blocks", "tested_cells", "tested_uid_blocks",
-    "qc_blocked_cells", "supporting_cells",
+    "qc_blocked_cells", "supporting_cells", "supporting_fraction",
     "concordant_cells", "concordance", "best_state", "best_state_posterior",
     "event_posterior", "aggregate_log_bf_best_vs_balanced",
     "pooled_sites", "pooled_soft_molecule_units", "pooled_effective_units",
@@ -251,6 +265,7 @@ PAIR_SUMMARY_FIELDS: Tuple[str, ...] = (
     "partial_conjunction_r", "partial_conjunction_method", "fisher_terms",
     "fisher_df", "dependence_assumption", "fdr_interpretation",
     "partial_conjunction_p_value",
+    "directional_support_basis", "min_directional_log_bf",
     "partial_conjunction_q_value", "partial_conjunction_p_floor",
     "partial_conjunction_q_resolution_floor",
     "state_p_DONOR_A_LOSS", "state_q_DONOR_A_LOSS",
@@ -318,7 +333,7 @@ class ExpressionStore:
             library, barcode, arm, chromosome,
             *(str(row.get(name, "")) for name in EXPRESSION_VALUE_FIELDS),
             clean(manifest.get("calibration_group")) or f"lib{library}",
-            pair_from_row(manifest), clean(manifest.get("uid")), str(fold),
+            pair_from_row(manifest), uid_block(manifest), str(fold),
             str(int(truthy(manifest.get("calibration_eligible")) and
                     context_eligible)),
             str(int(truthy(manifest.get("model_eligible")) and
@@ -560,10 +575,21 @@ def is_autosomal(value: object) -> bool:
     return text.isdigit() and 1 <= int(text) <= 22
 
 
+def uid_block(row: Mapping[str, str]) -> str:
+    """Return the internal replicate block without asserting a usable UID.
+
+    A finalized reconciliation table can retain a stale physical UID after the
+    production donor pair changes.  ``load_manifests`` suppresses that UID from
+    user-facing UID aggregation but retains a donor-pair-scoped internal block
+    so cells from the same putative replicate are not treated as independent.
+    """
+    return clean(row.get("_uid_block")) or clean(row.get("uid"))
+
+
 def calibration_entity(row: Mapping[str, str]) -> str:
-    uid = clean(row.get("uid"))
-    if uid:
-        return "UID:" + uid
+    block = uid_block(row)
+    if block:
+        return "UID:" + block
     return "CELL:" + canonical_library(row.get("library")) + ":" + canonical_barcode(
         row.get("barcode", ""))
 
@@ -635,6 +661,10 @@ class CallRecord:
     @property
     def uid(self) -> str:
         return clean(self.manifest.get("uid"))
+
+    @property
+    def uid_block(self) -> str:
+        return uid_block(self.manifest)
 
     @property
     def calibration_eligible(self) -> bool:
@@ -1757,7 +1787,7 @@ def pair_test_records(
     """Apply deterministic score-blind per-UID and total pair-test caps."""
     blocks: MutableMapping[str, List[CallRecord]] = defaultdict(list)
     for record in records:
-        block = record.uid or f"CELL:{record.library}:{record.barcode}"
+        block = record.uid_block or f"CELL:{record.library}:{record.barcode}"
         blocks[block].append(record)
 
     def digest(text: str) -> bytes:
@@ -1785,7 +1815,7 @@ def pair_test_records(
             break
         depth += 1
     tested_blocks = len({
-        record.uid or f"CELL:{record.library}:{record.barcode}"
+        record.uid_block or f"CELL:{record.library}:{record.barcode}"
         for record in selected
     })
     return selected, tested_blocks
@@ -1901,8 +1931,8 @@ def assign_empirical_values(records: Sequence[CallRecord], args) -> None:
             external = [
                 candidate for candidate in pools.get((level, key), [])
                 if candidate.donor_pair != record.donor_pair and
-                not (record.uid and candidate.uid and
-                     candidate.uid == record.uid) and
+                not (record.uid_block and candidate.uid_block and
+                     candidate.uid_block == record.uid_block) and
                 crossfit_fold(candidate.manifest,
                               args.calibration_crossfit_folds) == query_fold and
                 abs(finite_float(candidate.ase.get("ambient_c"), 0.0) -
@@ -2018,9 +2048,24 @@ def assign_empirical_values(records: Sequence[CallRecord], args) -> None:
             record.call_status = "EMPIRICAL_Q_NOT_SIGNIFICANT"
 
 
-def load_manifests(paths: Sequence[str]) -> Tuple[Dict[Tuple[str, str], Dict[str, str]], List[str]]:
+def load_manifests(
+        paths: Sequence[str]
+        ) -> Tuple[
+            Dict[Tuple[str, str], Dict[str, str]], List[str], Dict[str, object]
+        ]:
+    """Load manifests and quarantine donor-pair-inconsistent UID labels.
+
+    UID is an optional physical-replicate label, not a prerequisite for a
+    cell-level or donor-pair arm call.  A stale UID can survive an upstream
+    final-assignment change.  When one textual UID is attached to multiple
+    donor pairs, suppress it from user-facing UID aggregation for every
+    affected cell.  Retain a donor-pair-scoped private block for cross-fitting,
+    empirical-null exclusion, and score-blind pair-test caps so correlated
+    cells are still not treated as independent.
+    """
     manifests: Dict[Tuple[str, str], Dict[str, str]] = {}
-    uid_pairs: Dict[str, str] = {}
+    uid_pairs: MutableMapping[str, set[str]] = defaultdict(set)
+    uid_cells: MutableMapping[str, List[Tuple[str, str]]] = defaultdict(list)
     used_paths = []
     required = {
         "library", "barcode", "donor_a", "donor_b", "donor_pair",
@@ -2045,17 +2090,43 @@ def load_manifests(paths: Sequence[str]) -> Tuple[Dict[Tuple[str, str], Dict[str
             uid = clean(row.get("uid"))
             donor_pair = pair_from_row(row)
             if uid:
-                previous_pair = uid_pairs.get(uid)
-                if previous_pair is not None and previous_pair != donor_pair:
-                    raise ValueError(
-                        f"UID {uid!r} maps to multiple donor pairs: "
-                        f"{previous_pair!r} and {donor_pair!r}")
-                uid_pairs[uid] = donor_pair
+                uid_pairs[uid].add(donor_pair)
+                uid_cells[uid].append(key)
             manifests[key] = row
         used_paths.append(path)
     if not manifests:
         raise ValueError("cell manifests contain no rows")
-    return manifests, used_paths
+
+    conflicts = {
+        uid: pairs for uid, pairs in uid_pairs.items() if len(pairs) > 1
+    }
+    suppressed_cells = 0
+    for uid, pairs in conflicts.items():
+        for key in uid_cells[uid]:
+            row = manifests[key]
+            donor_pair = pair_from_row(row)
+            # Private only: never emitted as a biological UID.
+            row["_uid_block"] = f"{uid}|PAIR:{donor_pair}"
+            row["uid"] = ""
+            reasons = {
+                clean(value)
+                for value in str(row.get("eligibility_reasons", "")).split(";")
+                if clean(value) and clean(value).upper() != "PASS"
+            }
+            reasons.add("UID_DONOR_PAIR_CONFLICT_SUPPRESSED")
+            row["eligibility_reasons"] = ";".join(
+                sorted(reasons, key=natural_key))
+            suppressed_cells += 1
+
+    diagnostics: Dict[str, object] = {
+        "conflicting_uid_labels": len(conflicts),
+        "suppressed_uid_cells": suppressed_cells,
+        "conflicting_uid_pair_sets": ";".join(
+            f"{uid}={'|'.join(sorted(pairs, key=natural_key))}"
+            for uid, pairs in sorted(
+                conflicts.items(), key=lambda item: natural_key(item[0]))) or "NONE",
+    }
+    return manifests, used_paths, diagnostics
 
 
 def load_expression(
@@ -2554,6 +2625,41 @@ def aggregate_state_posterior(
             log_bayes_factors[state])
 
 
+def aggregate_directional_support(
+        record: CallRecord, args) -> Tuple[str, float]:
+    """Return prior-independent donor-direction support for aggregation.
+
+    Single-cell production calls deliberately retain the conservative event
+    prior.  Requiring such a call before a cell can support a pooled event,
+    however, defeats the purpose of pooling sparse single-cell ASE.  Aggregate
+    concordance therefore uses ASE event-vs-balanced log Bayes factors before
+    applying the single-cell prior.  Reciprocal copy states with the same
+    donor-A direction are combined because arm-total expression, rather than
+    ASE, distinguishes loss from the reciprocal gain.
+    """
+    scores = {
+        direction: max(
+            finite_float(record.ase_relative.get(state), -math.inf)
+            for state in states)
+        for direction, states in EVENT_DIRECTIONS.items()
+    }
+    direction = max(scores, key=scores.get)
+    score = scores[direction]
+    if (not math.isfinite(score) or
+            score <= args.min_aggregate_directional_log_bf):
+        return "NO_DIRECTIONAL_SUPPORT", score
+    return direction, score
+
+
+def supports_aggregate_state(
+        record: CallRecord, state: str, args) -> bool:
+    expected_direction = STATE_DIRECTION.get(state)
+    if expected_direction is None:
+        return False
+    observed_direction, _score = aggregate_directional_support(record, args)
+    return observed_direction == expected_direction
+
+
 def build_uid_rows(records: Sequence[CallRecord], args) -> List[Dict[str, object]]:
     grouped: MutableMapping[
         Tuple[str, str, str, str], List[CallRecord]
@@ -2578,10 +2684,15 @@ def build_uid_rows(records: Sequence[CallRecord], args) -> List[Dict[str, object
         total_cells = len({(record.library, record.barcode) for record in values})
         evaluable_cells = len({(record.library, record.barcode)
                                for record in evaluable})
-        supporting = [record for record in evaluable
-                      if record.call_status == "PASS_EVENT"]
-        concordant = [record for record in supporting
-                      if record.call_state == state]
+        supporting = [
+            record for record in evaluable
+            if aggregate_directional_support(record, args)[0]
+            != "NO_DIRECTIONAL_SUPPORT"
+        ]
+        concordant = [
+            record for record in evaluable
+            if supports_aggregate_state(record, state, args)
+        ]
         supporting_cells = len({(record.library, record.barcode)
                                 for record in supporting})
         concordant_cells = len({(record.library, record.barcode)
@@ -2653,13 +2764,13 @@ def build_uid_rows(records: Sequence[CallRecord], args) -> List[Dict[str, object
             same_event = p_arm.state == q_arm.state and p_arm.state != "BALANCED"
             p_concordant = {
                 (record.library, record.barcode) for record in p_arm.records
-                if record.call_status == "PASS_EVENT" and
-                record.call_state == p_arm.state
+                if aggregate_qc_eligible(record, args) and
+                supports_aggregate_state(record, p_arm.state, args)
             }
             q_concordant = {
                 (record.library, record.barcode) for record in q_arm.records
-                if record.call_status == "PASS_EVENT" and
-                record.call_state == q_arm.state
+                if aggregate_qc_eligible(record, args) and
+                supports_aggregate_state(record, q_arm.state, args)
             }
             paired_concordant = len(p_concordant & q_concordant)
             significant = (
@@ -2740,6 +2851,9 @@ def build_uid_rows(records: Sequence[CallRecord], args) -> List[Dict[str, object
             "uid": uid, "donor_pair": donor_pair, "chromosome": chromosome,
             "libraries": ";".join(libraries),
             "calibration_groups": ";".join(groups), "n_cells": len(cells),
+            "directional_support_basis": AGGREGATE_DIRECTIONAL_SUPPORT_BASIS,
+            "min_directional_log_bf": format_number(
+                args.min_aggregate_directional_log_bf),
             "whole_chromosome_flag": flag, "whole_chromosome_state": state,
             "paired_pq_concordant_cells": paired_concordant,
             "summary_status": status,
@@ -2794,16 +2908,19 @@ def build_pair_summary_rows(
                 "NO_CALL", math.nan, math.nan, math.nan)
         candidates = [
             record for record in evaluable
-            if record.best_state != "BALANCED" and
-            record.best_posterior >= args.min_pair_cell_posterior
+            if aggregate_directional_support(record, args)[0]
+            != "NO_DIRECTIONAL_SUPPORT"
         ]
-        concordant = [record for record in candidates if record.best_state == state]
+        concordant = [
+            record for record in evaluable
+            if supports_aggregate_state(record, state, args)
+        ]
         total_cells = len({(record.library, record.barcode) for record in values})
         aggregate_eligible_cells = len({
             (record.library, record.barcode) for record in aggregate_eligible
         })
         eligible_uid_blocks = len({
-            record.uid or f"CELL:{record.library}:{record.barcode}"
+            record.uid_block or f"CELL:{record.library}:{record.barcode}"
             for record in aggregate_eligible
         })
         tested_cells = len({(record.library, record.barcode)
@@ -2816,6 +2933,8 @@ def build_pair_summary_rows(
                                 for record in candidates})
         concordant_cells = len({(record.library, record.barcode)
                                 for record in concordant})
+        supporting_fraction = (
+            supporting_cells / tested_cells if tested_cells else 0.0)
         concordance = concordant_cells / tested_cells if tested_cells else 0.0
         qc_blocked = total_cells - len({
             (record.library, record.barcode) for record in aggregate_eligible
@@ -2850,6 +2969,7 @@ def build_pair_summary_rows(
             "tested_uid_blocks": tested_uid_blocks,
             "qc_blocked_cells": qc_blocked,
             "supporting_cells": supporting_cells,
+            "supporting_fraction": format_number(supporting_fraction),
             "concordant_cells": concordant_cells,
             "concordance": format_number(concordance),
             "best_state": state,
@@ -2871,6 +2991,10 @@ def build_pair_summary_rows(
             "dependence_assumption": (
                 "APPROXIMATE_CONDITIONAL_INDEPENDENCE_AFTER_SCORE_BLIND_UID_CAP"),
             "fdr_interpretation": "WORKING_FDR_APPROXIMATE",
+            "directional_support_basis": (
+                AGGREGATE_DIRECTIONAL_SUPPORT_BASIS),
+            "min_directional_log_bf": format_number(
+                args.min_aggregate_directional_log_bf),
             "_state_p_values": state_p_values,
             "_state_p_floors": state_p_floors,
             "_best_posterior": best_posterior,
@@ -2945,8 +3069,7 @@ def validate_args(args) -> None:
         "event_prior", "max_event_q", "max_whole_chromosome_q",
         "min_event_posterior", "min_balanced_posterior",
         "min_uid_arm_posterior", "min_uid_state_concordance",
-        "min_pair_state_concordance", "min_pair_cell_posterior",
-        "min_pair_arm_posterior",
+        "min_pair_state_concordance", "min_pair_arm_posterior",
         "max_pair_arm_q", "empirical_ambient_window",
         "max_qname_fallback_fraction",
         "min_ambient_genotyped_mass", "min_rho", "max_rho", "default_rho",
@@ -2977,6 +3100,13 @@ def validate_args(args) -> None:
     if args.min_pair_recurrence_cells > args.max_pair_test_cells:
         raise ValueError(
             "--min-pair-recurrence-cells cannot exceed --max-pair-test-cells")
+    if (not math.isfinite(args.min_aggregate_directional_log_bf) or
+            args.min_aggregate_directional_log_bf < 0.0 or
+            args.min_aggregate_directional_log_bf >
+            args.max_aggregate_cell_log_bf):
+        raise ValueError(
+            "--min-aggregate-directional-log-bf must be nonnegative and no "
+            "greater than --max-aggregate-cell-log-bf")
     if args.expression_weight < 0.0 or args.max_expression_log_bf < 0.0:
         raise ValueError("expression weights must be nonnegative")
     if args.empirical_depth_fold <= 1.0:
@@ -2994,6 +3124,7 @@ def validate_args(args) -> None:
             args.calibration_huber_z <= 0.0 or
             args.calibration_expression_mad_cutoff <= 0.0 or
             args.cell_baseline_shrinkage_arms <= 0.0 or
+            not math.isfinite(args.max_aggregate_cell_log_bf) or
             args.max_aggregate_cell_log_bf <= 0.0):
         raise ValueError("calibration tuning values must be positive")
 
@@ -3018,7 +3149,8 @@ def main_impl(args) -> int:
 
 
 def run_call(args, output_prefix: str, expression_store: ExpressionStore) -> int:
-    manifests, _manifest_paths = load_manifests(args.cell_manifest)
+    manifests, _manifest_paths, manifest_diagnostics = load_manifests(
+        args.cell_manifest)
     target_manifests = {
         key: row for key, row in manifests.items()
         if clean(row.get("donor_a")) and clean(row.get("donor_b")) and
@@ -3115,11 +3247,21 @@ def run_call(args, output_prefix: str, expression_store: ExpressionStore) -> int
         {"metric": "target_heterotypic_cells", "value": len(target_manifests)},
         {"metric": "excluded_nonheterotypic_manifest_cells",
          "value": excluded_nonheterotypic_cells},
+        {"metric": "conflicting_uid_labels_suppressed",
+         "value": manifest_diagnostics["conflicting_uid_labels"]},
+        {"metric": "conflicting_uid_cells_suppressed",
+         "value": manifest_diagnostics["suppressed_uid_cells"]},
+        {"metric": "conflicting_uid_pair_sets",
+         "value": manifest_diagnostics["conflicting_uid_pair_sets"]},
         {"metric": "ase_observed_rows", "value": len(records)},
         {"metric": "ase_total_effective_weight", "value": format_number(
             sum(record.n_effective_units for record in records))},
         {"metric": "aggregate_eligible_rows", "value": sum(
             aggregate_qc_eligible(record, args) for record in records)},
+        {"metric": "aggregate_directionally_supporting_rows", "value": sum(
+            aggregate_qc_eligible(record, args) and
+            aggregate_directional_support(record, args)[0]
+            != "NO_DIRECTIONAL_SUPPORT" for record in records)},
         {"metric": "expression_rows", "value": expression_store.count},
         {"metric": "skipped_nonheterotypic_ase_rows",
          "value": skipped_nonheterotypic_ase},
@@ -3173,6 +3315,19 @@ def run_call(args, output_prefix: str, expression_store: ExpressionStore) -> int
             "contract": ".contract.json",
         },
         "states": list(STATES),
+        "uid_handling": {
+            "conflicting_uid_labels_suppressed": (
+                manifest_diagnostics["conflicting_uid_labels"]),
+            "conflicting_uid_cells_suppressed": (
+                manifest_diagnostics["suppressed_uid_cells"]),
+            "conflicting_uid_pair_sets": (
+                manifest_diagnostics["conflicting_uid_pair_sets"]),
+            "policy": (
+                "A textual UID attached to multiple donor pairs is omitted "
+                "from user-facing UID aggregation. Cell-level and donor-pair "
+                "inference remain eligible; a donor-pair-scoped private block "
+                "is retained for cross-fitting and dependence control."),
+        },
         "model": {
             "effective_evidence": (
                 "For each molecule-arm unit with normalized donor-A support p, "
@@ -3233,6 +3388,15 @@ def run_call(args, output_prefix: str, expression_store: ExpressionStore) -> int
                 "cluster labels are not comparable across libraries. This is "
                 "an approximate working FDR under conditional independence, "
                 "not an exact/conservative dependence-robust guarantee"),
+            "aggregate_directional_support": (
+                "UID and donor-pair recurrence concordance uses the strongest "
+                "ASE event-vs-balanced log Bayes factor before application of "
+                "the single-cell event prior. Reciprocal loss/gain states are "
+                "collapsed to donor-A depleted versus donor-A enriched for "
+                "this concordance calculation because expression supplies "
+                "total-copy direction. Individual-cell call states retain the "
+                "conservative event prior and are not prerequisites for pooled "
+                "event support"),
             "sex_chromosomes": (
                 "Non-autosomal rows are exploratory only and cannot PASS or enter "
                 "UID/donor-pair recurrence inference"),
@@ -3264,6 +3428,8 @@ def run_call(args, output_prefix: str, expression_store: ExpressionStore) -> int
             "min_pair_recurrence_cells": args.min_pair_recurrence_cells,
             "max_pair_test_cells": args.max_pair_test_cells,
             "max_pair_cells_per_uid": args.max_pair_cells_per_uid,
+            "min_aggregate_directional_log_bf": (
+                args.min_aggregate_directional_log_bf),
             "min_pair_arm_posterior": args.min_pair_arm_posterior,
             "min_pair_state_concordance": args.min_pair_state_concordance,
             "max_pair_arm_q": args.max_pair_arm_q,
@@ -3278,6 +3444,7 @@ def run_call(args, output_prefix: str, expression_store: ExpressionStore) -> int
             "A multi-library invocation is preferred for study-wide BH control and cross-library UID aggregation.",
             "ASE records are held in memory once; optional expression rows are disk-backed in a temporary SQLite index.",
             "The approximate Fisher/BH pair result requires leave-one-donor-pair and UID-block negative-control QQ/type-I validation before its q-value is interpreted as calibrated FDR; the caller does not impute evidence when external p-values are scarce.",
+            "A UID that conflicts across donor pairs is suppressed from UID-level output rather than guessed; affected cells remain available to cell-level and donor-pair inference with donor-pair-scoped internal dependence blocks.",
         ],
         "terminal_state": terminal_state,
         "status": terminal_state if terminal_state != "NONE" else "PASS",
@@ -3361,7 +3528,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-pair-cells-per-uid", type=int, default=100,
         help="Score-blind within-UID cap for one Fisher pair-arm test")
     parser.add_argument("--min-pair-state-concordance", type=float, default=0.60)
-    parser.add_argument("--min-pair-cell-posterior", type=float, default=0.50)
+    parser.add_argument(
+        "--min-aggregate-directional-log-bf", type=float, default=0.0,
+        help=("Minimum prior-independent ASE event-vs-balanced log Bayes "
+              "factor for a cell to contribute donor-direction support to "
+              "UID and donor-pair aggregate concordance"))
     parser.add_argument("--min-pair-arm-posterior", type=float, default=0.90)
     parser.add_argument("--max-pair-arm-q", type=float, default=0.05)
     return parser

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 
-RELEASE = "2.4.0"
+RELEASE = "2.5.0"
 CELL_MANIFEST_SCHEMA = "tetra_arm_cell_manifest_v1"
 AMBIENT_SCHEMA = "tetra_arm_ambient_sources_v1"
 ASE_SCHEMA = "tetra_arm_ase_evidence_v2"

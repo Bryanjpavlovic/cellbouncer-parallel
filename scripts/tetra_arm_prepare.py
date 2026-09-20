@@ -63,9 +63,13 @@ AMBIENT_FIELDS = [
     "profile_origin", "ambient_arm", "schema_version",
 ]
 
-FINAL_IDENTITY_SCHEMA = "identity_reconciliation_final_v2_phase3_dispositions"
+FINAL_IDENTITY_SCHEMA = "identity_reconciliation_final_v8_production_evidence_split"
+FINAL_ASSIGNMENT_STATUSES = {
+    "FINE_NO_CHANGE", "CHANGE_APPLIED", "REVIEW_NEEDED",
+}
 FINAL_IDENTITY_REQUIRED_FIELDS = {
-    "library", "barcode", "production_assignment",
+    "library", "barcode", "assignment_status", "current_assignment",
+    "proposed_assignment", "final_assignment", "production_assignment",
     "production_assignment_source", "review_required",
     "downstream_release_status", "ambient_production_arm",
     "ambient_production_c", "ambient_evaluation_status", "event_id",
@@ -447,11 +451,23 @@ def prepare_library(args) -> int:
     for barcode in sorted(assignments, key=natural_key):
         row = ledger_by_barcode[barcode]
         assignment, _assignment_type, score = assignments[barcode]
-        ledger_assignment = clean(row.get("production_assignment"))
+        assignment_status = clean(row.get("assignment_status")).upper()
+        if assignment_status not in FINAL_ASSIGNMENT_STATUSES:
+            raise ValueError(
+                f"lib{library}/{barcode} has invalid assignment status "
+                f"{assignment_status!r}")
+        ledger_assignment = clean(row.get("final_assignment"))
         if canonical_identity(assignment) != canonical_identity(ledger_assignment):
             raise ValueError(
                 f"lib{library}/{barcode} final assignment mismatch: "
                 f"{assignment!r} != {ledger_assignment!r}")
+        compatibility_assignment = clean(row.get("production_assignment"))
+        if (compatibility_assignment and
+                canonical_identity(compatibility_assignment) !=
+                canonical_identity(ledger_assignment)):
+            raise ValueError(
+                f"lib{library}/{barcode} deprecated production assignment "
+                "does not match the canonical final assignment")
         donor_a, donor_b = canonical_pair(assignment)
         arm = clean(row.get("ambient_production_arm")).upper()
         if arm != expected_production_arm:
@@ -498,7 +514,7 @@ def prepare_library(args) -> int:
         model_reasons = []
         if not donor_a or not donor_b:
             model_reasons.append("NOT_HETEROTYPIC_TWO_DONOR")
-        if truthy(row.get("review_required")):
+        if assignment_status == "REVIEW_NEEDED":
             model_reasons.append("IDENTITY_REVIEW_REQUIRED")
         if row_bad_status(row.get("technical_state")):
             model_reasons.append("TECHNICAL_STATE")
@@ -564,7 +580,8 @@ def prepare_library(args) -> int:
             "species_b": species.get(donor_b, "NA") if donor_b else "NA",
             "demux_score": "NA" if not math.isfinite(score) else f"{score:.17g}",
             "production_assignment_source": clean(
-                row.get("production_assignment_source")) or "NA",
+                row.get("production_assignment_source")) or
+                "THREE_STATE_FINAL_ASSIGNMENT",
             "application_state": clean(row.get("application_state")) or "NA",
             "application_reason": clean(row.get("application_reason")) or "NA",
             "calibration_group": group,
@@ -587,12 +604,14 @@ def prepare_library(args) -> int:
             "uid_resolution_status": clean(row.get("uid_resolution_status")) or "NA",
             "metadata_event_status": clean(row.get("metadata_event_status")) or "NA",
             "library_exchange_status": clean(row.get("library_exchange_status")) or "NA",
-            "review_required": clean(row.get("review_required")) or "FALSE",
-            "review_reasons": clean(row.get("review_reasons")) or "NONE",
+            "review_required": (
+                "TRUE" if assignment_status == "REVIEW_NEEDED" else "FALSE"),
+            "review_reasons": clean(
+                row.get("review_reason") or row.get("review_reasons")) or "NONE",
             "downstream_release_status": clean(row.get("downstream_release_status")) or "NA",
             "downstream_exclusion_reason": clean(row.get("downstream_exclusion_reason")) or "NONE",
-            "identity_changed": "TRUE" if canonical_identity(
-                row.get("demux_original_assignment", "")) != canonical_identity(assignment) else "FALSE",
+            "identity_changed": (
+                "TRUE" if assignment_status == "CHANGE_APPLIED" else "FALSE"),
             "event_id": clean(row.get("event_id")) or "NA",
             "event_identity_evidence_disposition": clean(
                 row.get("event_identity_evidence_disposition")) or "NA",

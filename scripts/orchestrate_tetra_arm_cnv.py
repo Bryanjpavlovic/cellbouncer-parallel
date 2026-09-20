@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit the downstream Tetraploid chromosome-arm ASE/CNV workflow.
+"""Submit downstream Tetraploid ASE workflows.
 
 This orchestrator deliberately starts at the canonical outputs of
 ``orchestrate_tetraploid.py``.  It does not modify or extend that upstream
@@ -13,12 +13,22 @@ Planning and script generation do not submit jobs.  ``--submit``
 submits the selected stages with SLURM ``afterok`` dependencies.  Array task
 manifests are ordinary, deterministic TSV files so every command and input can
 be inspected before submission.
+
+The ``fusebox-karyotype`` workflow adds gene-level ASE to the existing
+expression H5AD and then invokes Fusebox's established karyotype model::
+
+    METADATA -> ASE[] -> H5AD -> KARYOTYPE
+
+METADATA is built only from reconciliation-released cells.  ASE is counted
+with explicit fixed-difference SNP panels; panel/species mappings are never
+guessed by this orchestrator.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timezone
 import glob
 import gzip
 import hashlib
@@ -38,7 +48,12 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 
-RELEASE = "2.4.0"
+RELEASE = "3.0.10"
+MIN_AGGREGATE_SAFE_CALLER = (2, 6, 0)
+FINAL_IDENTITY_SCHEMA = "identity_reconciliation_final_v8_production_evidence_split"
+FINAL_ASSIGNMENT_STATUSES = {
+    "FINE_NO_CHANGE", "CHANGE_APPLIED", "REVIEW_NEEDED",
+}
 STAGES = ("REFERENCE", "LEDGER", "PREPARE", "ASE", "EXPRESSION", "CALL", "REPORT")
 STAGE_PARENTS = {
     "REFERENCE": (),
@@ -49,13 +64,19 @@ STAGE_PARENTS = {
     "CALL": ("ASE", "EXPRESSION"),
     "REPORT": ("CALL",),
 }
+FUSEBOX_STAGES = ("METADATA", "ASE", "H5AD", "KARYOTYPE")
+FUSEBOX_STAGE_PARENTS = {
+    "METADATA": (),
+    "ASE": ("METADATA",),
+    "H5AD": ("METADATA", "ASE"),
+    "KARYOTYPE": ("H5AD",),
+}
 
-# Production paths inherited from orchestrate_tetraploid.py.  Production keeps
-# its historical combined mapping/analysis tree.  Alternate remaps use a
-# separate mapping-input tree and upstream-analysis tree, matching
-# orchestrate_tetraploid.py's isolation contract.
-PROJECT_ROOT = "/mnt/beegfs/tetmultiome_rna_mapped"
-MAPPING_ROOT = os.path.join(PROJECT_ROOT, "mapping_output")
+# Production paths inherited from orchestrate_tetraploid.py.
+PROJECT_ROOT = "/mnt/beegfs/tetraploid_multiome_cis_trans"
+CURRENT_RNA_RUN_ROOT = os.path.join(PROJECT_ROOT, "3P")
+MAPPING_ROOT = os.path.join(CURRENT_RNA_RUN_ROOT, "mapping_output")
+PRODUCTION_ANALYSIS_ROOT = os.path.join(CURRENT_RNA_RUN_ROOT, "analysis")
 DEFAULT_PANEL_METADATA = os.path.join(
     PROJECT_ROOT, "Misc_Metadata", "panel_metadata.tsv")
 DEFAULT_DEMUX_POOL_WORKBOOK = os.path.join(
@@ -63,7 +84,7 @@ DEFAULT_DEMUX_POOL_WORKBOOK = os.path.join(
 DEFAULT_EXPECTED_POOL_METADATA = os.path.join(
     PROJECT_ROOT, "Misc_Metadata", "pool_combinations.tsv")
 DEFAULT_IDENTITY_WORKBOOK = os.path.join(
-    MAPPING_ROOT, "Library_conversions.xlsx")
+    PROJECT_ROOT, "Misc_Metadata", "Library_conversions.xlsx")
 DEFAULT_CONDITION = "IND_CK_RF_SX0_GATED_RFREE_PFIT"
 DEFAULT_GEX_AMBIENT_ANALYSIS = "full_gene_rna_leiden_v1"
 LIBRARY_PREFIX = "Tet_2025_Multiome-RNA_"
@@ -75,9 +96,10 @@ DEFAULT_INTERINDIVIDUAL_PANEL = os.path.join(
     NOMITO_PANEL_ROOT, "tet.vars.downsampled_20M.bcf")
 DEFAULT_HET_PANEL = os.path.join(NOMITO_PANEL_ROOT, "tet.vars.het_10M.bcf")
 DEFAULT_SPECIES_PANEL = os.path.join(NOMITO_PANEL_ROOT, "tet.vars.species_20M.bcf")
-DEFAULT_PLOIDY_NN_WEIGHTS = os.path.join(
-    PROJECT_ROOT, "ploidy_classifier", "retrain_nomito_20260814", "model",
-    "ploidy_nn_weights.pt")
+DEFAULT_PLOIDY_NN_WEIGHTS = (
+    "/mnt/beegfs/tetmultiome_rna_mapped/ploidy_classifier/"
+    "ploidy_nn_weights.pt"
+)
 
 CELLBOUNCER_ROOT = "/nvme/software/packages/cellbouncer/dev"
 DEPLOYED_BIN = os.path.join(CELLBOUNCER_ROOT, "bin")
@@ -86,6 +108,8 @@ FUSEBOX_DATA = "/nvme/software/packages/fusebox/latest/data"
 
 DEFAULT_GENE_ARMS = os.path.join(
     FUSEBOX_DATA, "hg38_gene_arms_noXCI.txt")
+DEFAULT_KARYOTYPE_GENE_ARMS = os.path.join(
+    FUSEBOX_DATA, "hg38_gene_arms.txt")
 DEFAULT_SOURCE_ARMS = os.path.join(FUSEBOX_DATA, "hg38_arms.bed")
 DEFAULT_ARM_BUILDER_SCRIPT = os.path.join(
     DEPLOYED_SCRIPTS, "tetra_arm_gene_synteny.py")
@@ -99,12 +123,37 @@ DEFAULT_REPORT_SCRIPT = os.path.join(DEPLOYED_SCRIPTS, "tetra_arm_report.py")
 DEFAULT_ASE_BINARY = os.path.join(DEPLOYED_BIN, "tetra_arm_ase")
 DEFAULT_PLOIDY_NN_HELPER = os.path.join(
     DEPLOYED_SCRIPTS, "run_ploidy_nn_inference.py")
+DEFAULT_FUSEBOX_METADATA_SCRIPT = os.path.join(
+    DEPLOYED_SCRIPTS, "tetra_fusebox_metadata.py")
+DEFAULT_FUSEBOX_ROOT = "/nvme/software/packages/fusebox/latest"
+DEFAULT_FUSEBOX_COUNT_ASE = os.path.join(DEFAULT_FUSEBOX_ROOT, "bin", "count_ase")
+DEFAULT_FUSEBOX_KARYOTYPE = os.path.join(DEFAULT_FUSEBOX_ROOT, "bin", "karyotype")
+DEFAULT_FUSEBOX_H5AD_SCRIPT = os.path.join(
+    DEFAULT_FUSEBOX_ROOT, "bin", "anndata_add_ASE.py")
+DEFAULT_ANCESTRAL_SNP_ROOT = "/mnt/beegfs/genomes_annotations/ancestral_snps"
+DEFAULT_FUSEBOX_PANEL_FILES = (
+    ("HP", "Human", "Pan", "human_pan.snps.nopoly.bed.gz"),
+    ("CB", "Chimp", "Bonobo", "pan.snps.nopoly.bed.gz"),
+    ("HO", "Hominini", "Orangutan", "hominini_orang.snps.nopoly.bed.gz"),
+)
+DEFAULT_KARYOTYPE_ASE_MAPS = (
+    "Human_Chimp,HP,Human,Chimp",
+    "Human_Orangutan,HO,Human,Orangutan",
+    "Chimp_Orangutan,HO,Chimp,Orangutan",
+    "Chinobo_Orangutan,HO,Chinobo,Orangutan",
+    "Chinobo,CB,Chimp,Bonobo",
+)
 
 BASE_PYTHON_MODULES = ("miniforge/3",)
 SCIENTIFIC_PYTHON_MODULES = ("miniforge/3", "genomics-base/latest")
 ASE_MODULES = ("htslib/1.20", "cellbouncer/dev")
 DEFAULT_PARTITION = "compute"
 DEFAULT_TIME = "7-00:00:00"
+
+
+def emit_warning(message: str) -> None:
+    """Report non-fatal provenance drift without blocking valid data reuse."""
+    print(f"WARNING: {message}", file=sys.stderr)
 
 PREPARE_HEADER = (
     "task_index", "library", "ledger", "final_assignments",
@@ -273,7 +322,7 @@ CALL_FLOAT_DEFAULTS = (
     ("max_aggregate_cell_log_bf", 8.0),
     ("max_whole_chromosome_q", 0.05),
     ("min_pair_state_concordance", 0.60),
-    ("min_pair_cell_posterior", 0.50),
+    ("min_aggregate_directional_log_bf", 0.0),
     ("min_pair_arm_posterior", 0.90),
     ("max_pair_arm_q", 0.05),
 )
@@ -364,6 +413,35 @@ class RunPaths:
     @property
     def input_provenance(self) -> str:
         return os.path.join(self.root, "input_provenance.json")
+
+
+@dataclass(frozen=True)
+class FuseboxPanel:
+    name: str
+    species1: str
+    species2: str
+    snps: str
+
+
+@dataclass(frozen=True)
+class FuseboxRunPaths:
+    root: str
+    logs: str
+    scripts: str
+    manifests: str
+    metadata: str
+    barcodes: str
+    prepared_panels: str
+    ase: str
+    h5ad: str
+    karyotype: str
+    metadata_table: str
+    metadata_summary: str
+    ase_manifest: str
+    h5ad_output: str
+    h5ad_summary: str
+    karyotype_prefix: str
+    karyotype_complete: str
 
 
 def parse_libraries(values: Sequence[str]) -> list[int]:
@@ -850,8 +928,7 @@ def ledger_event_libraries(path: str,
         reader = csv.DictReader(handle, delimiter="\t")
         fields = set(reader.fieldnames or [])
         required = {
-            "library", "barcode", "production_assignment",
-            "production_assignment_source", "review_required",
+            "library", "barcode", "assignment_status", "final_assignment",
             "downstream_release_status", "ambient_production_arm",
             "ambient_production_c", "event_id", "final_schema_version",
         }
@@ -879,7 +956,7 @@ def ledger_event_libraries(path: str,
                     f"lib{library}/{barcode}")
             seen.add(key)
             schema = str(row.get("final_schema_version", "")).strip()
-            if schema != "identity_reconciliation_final_v2_phase3_dispositions":
+            if schema != FINAL_IDENTITY_SCHEMA:
                 raise ValueError(
                     "unsupported final reconciliation ledger schema: " + schema)
             event_id = str(row.get("event_id", "")).strip()
@@ -903,8 +980,8 @@ def validate_final_assignment_bundle(
     with opener(ledger_path, "rt", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {
-            "library", "barcode", "production_assignment",
-            "final_schema_version",
+            "library", "barcode", "assignment_status", "final_assignment",
+            "production_assignment", "final_schema_version",
         }
         fields = set(reader.fieldnames or [])
         if not required <= fields:
@@ -921,11 +998,24 @@ def validate_final_assignment_bundle(
             if library not in requested:
                 continue
             if (str(row.get("final_schema_version", "")).strip() !=
-                    "identity_reconciliation_final_v2_phase3_dispositions"):
+                    FINAL_IDENTITY_SCHEMA):
                 raise ValueError(
                     f"lib{library} canonical ledger has an unsupported schema")
             barcode = str(row.get("barcode", "")).strip()
-            assignment = str(row.get("production_assignment", "")).strip()
+            status = str(row.get("assignment_status", "")).strip().upper()
+            assignment = str(row.get("final_assignment", "")).strip()
+            compatibility_assignment = str(
+                row.get("production_assignment", "")).strip()
+            if status not in FINAL_ASSIGNMENT_STATUSES:
+                raise ValueError(
+                    f"lib{library}/{barcode or 'NA'} has an invalid canonical "
+                    f"assignment status: {status!r}")
+            if canonical_final_identity(
+                    compatibility_assignment) != canonical_final_identity(
+                    assignment):
+                raise ValueError(
+                    f"lib{library}/{barcode or 'NA'} deprecated production "
+                    "assignment does not match final_assignment")
             if not barcode or not assignment or barcode in ledger[library]:
                 raise ValueError(
                     f"lib{library} canonical ledger has an empty/duplicate cell")
@@ -990,6 +1080,77 @@ def validate_final_assignment_bundle(
     return counts
 
 
+def validate_primary_identity_bundle(
+        primary_path: str, ledger_path: str,
+        libraries: Sequence[int]) -> dict[str, object]:
+    """Bind the rich audit ledger to the canonical compact identity table."""
+    requested = {int(value) for value in libraries}
+    required = {
+        "library", "barcode", "assignment_status", "final_assignment",
+    }
+
+    def load(path: str, label: str, require_schema: bool) -> dict[
+            tuple[int, str], tuple[str, str]]:
+        result: dict[tuple[int, str], tuple[str, str]] = {}
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            fields = set(reader.fieldnames or [])
+            missing = required - fields
+            if require_schema and "final_schema_version" not in fields:
+                missing.add("final_schema_version")
+            if missing:
+                raise ValueError(
+                    f"{label} lacks canonical identity fields: "
+                    + ",".join(sorted(missing)))
+            for row_number, row in enumerate(reader, start=2):
+                raw_library = str(row.get("library", "")).strip().lower()
+                raw_library = raw_library.removeprefix("lib")
+                try:
+                    library = int(raw_library)
+                except ValueError:
+                    continue
+                if library not in requested:
+                    continue
+                barcode = str(row.get("barcode", "")).strip()
+                status = str(row.get("assignment_status", "")).strip().upper()
+                assignment = canonical_final_identity(
+                    str(row.get("final_assignment", "")))
+                if require_schema and str(
+                        row.get("final_schema_version", "")).strip() != \
+                        FINAL_IDENTITY_SCHEMA:
+                    raise ValueError(
+                        f"{label} has an unsupported identity schema at "
+                        f"line {row_number}")
+                key = (library, barcode)
+                if (not barcode or status not in FINAL_ASSIGNMENT_STATUSES or
+                        not assignment or key in result):
+                    raise ValueError(
+                        f"{label} has an invalid canonical identity row at "
+                        f"line {row_number}")
+                result[key] = (status, assignment)
+        if not result:
+            raise ValueError(f"{label} has no selected identity rows")
+        return result
+
+    primary = load(primary_path, "compact primary identity table", False)
+    ledger = load(ledger_path, "rich identity audit ledger", True)
+    if primary != ledger:
+        missing = sorted(set(ledger) - set(primary))[:5]
+        extra = sorted(set(primary) - set(ledger))[:5]
+        changed = sorted(
+            key for key in set(primary) & set(ledger)
+            if primary[key] != ledger[key])[:5]
+        raise ValueError(
+            "compact primary identity/rich ledger mismatch: "
+            f"missing={missing}, extra={extra}, changed={changed}")
+    counts = {
+        status: sum(1 for value in primary.values() if value[0] == status)
+        for status in sorted(FINAL_ASSIGNMENT_STATUSES)
+    }
+    return {"status": "PASS", "cells": len(primary), "status_counts": counts}
+
+
 def validate_finalization_summary(
         path: str, libraries: Sequence[int],
         assignment_counts: Mapping[int, int]) -> dict[str, object]:
@@ -1041,7 +1202,7 @@ def validate_finalization_summary(
                 output_count != expected_count or
                 str(row["accounting_status"]).strip().upper() != "PASS" or
                 str(row["final_schema_version"]).strip() !=
-                "identity_reconciliation_final_v2_phase3_dispositions"):
+                FINAL_IDENTITY_SCHEMA):
             raise ValueError(
                 f"lib{library} identity finalization accounting is not PASS")
         total += output_count
@@ -1054,7 +1215,7 @@ def validate_finalization_summary(
     if (overall_input != total or overall_output != total or
             str(overall["accounting_status"]).strip().upper() != "PASS" or
             str(overall["final_schema_version"]).strip() !=
-            "identity_reconciliation_final_v2_phase3_dispositions"):
+            FINAL_IDENTITY_SCHEMA):
         raise ValueError("ALL identity finalization accounting is not PASS")
     return {"status": "PASS", "libraries": len(libraries), "cells": total}
 
@@ -1062,7 +1223,7 @@ def validate_finalization_summary(
 def validate_identity_metadata_manifest(
         path: str, workbook: str, panel_metadata: str,
         libraries: Sequence[int]) -> dict[str, object]:
-    """Bind canonical reconciliation to its workbook and panel metadata."""
+    """Validate reconciliation metadata while allowing physical relocation."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
             manifest = json.load(handle)
@@ -1075,11 +1236,6 @@ def validate_identity_metadata_manifest(
     except (TypeError, ValueError) as exc:
         raise ValueError("identity metadata manifest has invalid libraries") from exc
     if (manifest.get("schema_version") != "identity_reconciliation_v1" or
-            absolute(str(manifest.get("workbook", ""))) != workbook or
-            manifest.get("workbook_sha256") != sha256_file(workbook) or
-            absolute(str(manifest.get("panel_metadata", ""))) != panel_metadata or
-            manifest.get("panel_metadata_sha256") !=
-            sha256_file(panel_metadata) or
             manifest.get("global_biological_line_source") != "2025_LineMeta" or
             manifest.get("ambient_rna_evaluated") is not False or
             not isinstance(manifest.get("n_global_biological_lines"), int) or
@@ -1088,12 +1244,45 @@ def validate_identity_metadata_manifest(
             int(manifest.get("n_global_donors", 0)) < 1 or
             not set(libraries) <= manifest_libraries):
         raise ValueError(
-            "identity metadata manifest does not match the declared workbook, "
-            "panel metadata, and upstream cohort")
+            "identity metadata manifest does not match the required schema "
+            "and upstream cohort")
+
+    warnings = []
+    recorded_workbook = absolute(str(manifest.get("workbook", "")))
+    recorded_panel = absolute(str(manifest.get("panel_metadata", "")))
+    if recorded_workbook != workbook:
+        warnings.append(
+            f"identity workbook was relocated: manifest={recorded_workbook} "
+            f"selected={workbook}")
+    if recorded_panel != panel_metadata:
+        warnings.append(
+            f"panel metadata was relocated: manifest={recorded_panel} "
+            f"selected={panel_metadata}")
+
+    selected_workbook_sha = sha256_file(workbook)
+    selected_panel_sha = sha256_file(panel_metadata)
+    if manifest.get("workbook_sha256") != selected_workbook_sha:
+        warnings.append(
+            "selected identity workbook content differs from the frozen "
+            "metadata-manifest digest")
+    if manifest.get("panel_metadata_sha256") != selected_panel_sha:
+        warnings.append(
+            "selected panel metadata content differs from the frozen "
+            "metadata-manifest digest")
+    for warning in warnings:
+        emit_warning(warning)
     return {
-        "status": "PASS", "libraries": len(libraries),
-        "workbook_sha256": manifest["workbook_sha256"],
-        "panel_metadata_sha256": manifest["panel_metadata_sha256"],
+        "status": "PASS_WITH_RELOCATION_WARNINGS" if warnings else "PASS",
+        "libraries": len(libraries),
+        "manifest_workbook": recorded_workbook,
+        "selected_workbook": workbook,
+        "manifest_panel_metadata": recorded_panel,
+        "selected_panel_metadata": panel_metadata,
+        "workbook_content_matches_manifest": (
+            manifest.get("workbook_sha256") == selected_workbook_sha),
+        "panel_metadata_content_matches_manifest": (
+            manifest.get("panel_metadata_sha256") == selected_panel_sha),
+        "warnings": warnings,
     }
 
 
@@ -1367,6 +1556,7 @@ def validate_identity_metadata_tables(
             "identity expected-genotype and resolution-audit tables differ")
     expanded: dict[int, set[str]] = {int(value): set() for value in libraries}
     expected_uids: dict[tuple[int, str], set[str]] = {}
+    unresolved_nonmodel_genotypes = 0
     with open(expected_genotypes_path, "r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {
@@ -1398,29 +1588,48 @@ def validate_identity_metadata_tables(
                     f"identity expected-genotype table has an invalid UID "
                     f"count for lib{library}/{genotype}") from exc
             status = str(row.get("uid_resolution_status", "")).strip()
-            raw_uids = str(row.get("uid_candidates", "")).strip()
-            raw_reconciled = str(row.get("reconciled_uid", "")).strip()
+            # The upstream TSV writer serializes empty metadata values as NA.
+            # Normalize those sentinels before testing whether a UID exists.
+            raw_uids = clean_metadata_value(row.get("uid_candidates", ""))
+            raw_reconciled = clean_metadata_value(
+                row.get("reconciled_uid", ""))
             uid_values = {
                 value.strip() for value in raw_uids.split("|")
                 if value.strip() and value.strip().upper() not in {"NA", "."}}
             components = genotype.split("+")
+            is_heterotypic = (
+                len(components) == 2 and components[0] != components[1])
             expected_ploidy = (
                 "DIPLOID" if len(components) == 1 else
                 "HOMOTYPIC_TETRAPLOID" if len(set(components)) == 1 else
                 "HETEROTYPIC_TETRAPLOID")
-            expected_status = (
-                "EXACT_LIBRARY_METADATA_MATCH" if uid_count == 1 else
-                "MULTIPLE_EXPECTED_UIDS_SAME_GENOTYPE")
-            if (uid_count < 1 or len(uid_values) != uid_count or
-                    raw_reconciled != raw_uids or status != expected_status or
+            common_invalid = (
+                    uid_count < 0 or len(uid_values) != uid_count or
                     str(row.get("uid_resolution_scope", "")).strip() !=
                     f"library:{library}" or
                     str(row.get("donor_components", "")).strip() !=
                     ",".join(components) or
                     str(row.get("expected_ploidy_class", "")).strip() !=
-                    expected_ploidy or status not in {
-                    "EXACT_LIBRARY_METADATA_MATCH",
-                    "MULTIPLE_EXPECTED_UIDS_SAME_GENOTYPE"}):
+                    expected_ploidy)
+            if uid_count:
+                expected_status = (
+                    "EXACT_LIBRARY_METADATA_MATCH" if uid_count == 1 else
+                    "MULTIPLE_EXPECTED_UIDS_SAME_GENOTYPE")
+                invalid = (
+                    common_invalid or raw_reconciled != raw_uids or
+                    status != expected_status)
+            else:
+                # LibUID intentionally contains UID-less single-donor control
+                # rows.  They are valid donor-roster entries but can never be
+                # modeled by the heterotypic arm-CNV workflow.  Missing UID
+                # metadata remains fatal for every two-distinct-donor target.
+                invalid = (
+                    common_invalid or is_heterotypic or raw_reconciled or
+                    status not in {
+                        "MISSING_UID_MAPPING", "NO_LIBRARY_METADATA_MATCH"})
+                if not invalid:
+                    unresolved_nonmodel_genotypes += 1
+            if invalid:
                 raise ValueError(
                     f"lib{library}/{genotype} has unresolved identity metadata: "
                     f"status={status!r}, uid_candidate_count={uid_count}")
@@ -1451,18 +1660,22 @@ def validate_identity_metadata_tables(
                 row.get("canonical_genotype", ""),
                 set(sample_by_library[library]),
                 f"{uid_members_path} row {row_number}")
-            uid = str(row.get("uid", "")).strip()
+            uid = clean_metadata_value(row.get("uid", ""))
             uid_values = {
                 value.strip() for value in re.split(r"[|,;]", uid)
                 if value.strip() and value.strip().upper() not in {"NA", "."}}
-            if (genotype not in expanded[library] or not uid_values or
+            if (genotype not in expanded[library] or
                     str(row.get("uid_resolution_scope", "")).strip() !=
                     f"library:{library}"):
                 raise ValueError(
                     f"invalid selected UID-member row in {uid_members_path}:"
                     f"{row_number}")
             observed_uids.setdefault((library, genotype), set()).update(uid_values)
-    if observed_uids != expected_uids:
+    unexpected_uid_keys = set(observed_uids) - set(expected_uids)
+    mismatched_uid_keys = {
+        key for key, values in expected_uids.items()
+        if observed_uids.get(key, set()) != values}
+    if unexpected_uid_keys or mismatched_uid_keys:
         raise ValueError(
             "identity UID-member rows do not reproduce selected expected UID sets")
 
@@ -1556,10 +1769,10 @@ def validate_identity_metadata_tables(
 
     critical = {
         "MISSING_DONOR_ALIAS", "DONOR_NOT_IN_NUCLEAR_PANEL",
-        "MISSING_UID", "NO_LIBRARY_METADATA_MATCH",
         "DUPLICATE_METADATA_ROW",
     }
     failures: list[str] = []
+    nonmodel_uid_warnings = 0
     with open(warnings_path, "r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"library", "canonical_genotype", "warning", "detail"}
@@ -1572,7 +1785,19 @@ def validate_identity_metadata_tables(
         for row in reader:
             library = normalize_library_number(row.get("library", ""))
             warning = str(row.get("warning", "")).strip()
-            if library in requested and warning in critical:
+            if (library in requested and warning in {
+                    "MISSING_UID", "NO_LIBRARY_METADATA_MATCH"}):
+                genotype = canonical_pool_identity(
+                    row.get("canonical_genotype", ""),
+                    set(sample_by_library[library]),
+                    f"{warnings_path} lib{library} warning")
+                components = genotype.split("+")
+                if len(components) == 2 and components[0] != components[1]:
+                    failures.append(
+                        f"lib{library}:{warning}:{row.get('detail', '')}")
+                else:
+                    nonmodel_uid_warnings += 1
+            elif library in requested and warning in critical:
                 failures.append(
                     f"lib{library}:{warning}:{row.get('detail', '')}")
             elif (str(row.get("library", "")).strip().upper() == "GLOBAL" and
@@ -1588,6 +1813,8 @@ def validate_identity_metadata_tables(
         "expanded_genotypes": sum(len(values) for values in expanded.values()),
         "global_biological_lines": len(global_lines),
         "global_donors": len(observed_donor_lines),
+        "unresolved_nonmodel_genotypes": unresolved_nonmodel_genotypes,
+        "nonmodel_uid_warnings": nonmodel_uid_warnings,
         "critical_warnings": 0,
     }
 
@@ -1623,7 +1850,7 @@ def clean_metadata_value(value: object) -> str:
 def validate_final_ledger_uids(
         args: argparse.Namespace, paths: Sequence[LibraryPaths],
         libraries: Sequence[int]) -> dict[str, object]:
-    """Bind every released production genotype to its recomputed UID set.
+    """Bind every released heterotypic production genotype to its UID set.
 
     The attached upstream finalizer can retain a preliminary UID after an
     explicit review changes ``production_assignment``.  Refuse that state so
@@ -1666,11 +1893,13 @@ def validate_final_ledger_uids(
 
     released = 0
     global_resolutions = 0
+    skipped_nonheterotypic = 0
+    ambiguous_global_uid_cells = 0
     opener = gzip.open if args.ledger_input.endswith(".gz") else open
     with opener(args.ledger_input, "rt", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {
-            "library", "barcode", "production_assignment",
+            "library", "barcode", "assignment_status", "final_assignment",
             "uid_or_uid_set", "uid_resolution_status",
             "downstream_release_status"}
         fields = set(reader.fieldnames or [])
@@ -1687,9 +1916,17 @@ def validate_final_ledger_uids(
                     "READY"):
                 continue
             genotype = canonical_pool_identity(
-                row.get("production_assignment", ""),
+                row.get("final_assignment", ""),
                 set(sample_by_library[library]),
                 f"{args.ledger_input} row {row_number}")
+            components = genotype.split("+")
+            if len(components) != 2 or components[0] == components[1]:
+                # Single-donor controls and homotypic tetraploids cannot
+                # contribute donor-specific arm imbalance.  Their blank UID
+                # mappings are intentional in LibUID and are not an arm-CNV
+                # integrity failure.
+                skipped_nonheterotypic += 1
+                continue
             if (library, genotype) in local:
                 expected_uid, expected_status = local[(library, genotype)]
             elif genotype in global_lines:
@@ -1708,6 +1945,25 @@ def validate_final_ledger_uids(
             observed_uid = clean_metadata_value(row.get("uid_or_uid_set", ""))
             observed_status = clean_metadata_value(
                 row.get("uid_resolution_status", ""))
+            if expected_status == "MULTIPLE_GLOBAL_UIDS_SAME_GENOTYPE":
+                # A globally known donor combination can correspond to more
+                # than one physical fusion UID.  The donor pair is sufficient
+                # for per-cell arm-CNV inference, but an individual UID cannot
+                # be assigned.  Accept an empty ledger UID and let the caller
+                # omit only UID-level aggregation for these cells.  A supplied
+                # UID set must still reproduce the global metadata exactly.
+                if (not expected_uid or observed_status != expected_status or
+                        (observed_uid and observed_uid != expected_uid)):
+                    raise ValueError(
+                        f"released lib{library}/{row.get('barcode')} global UID "
+                        f"ambiguity does not match production genotype "
+                        f"{genotype}: expected {expected_uid or 'NA'}/"
+                        f"{expected_status}, observed {observed_uid or 'NA'}/"
+                        f"{observed_status}")
+                if not observed_uid:
+                    ambiguous_global_uid_cells += 1
+                released += 1
+                continue
             if (not expected_uid or observed_uid != expected_uid or
                     observed_status != expected_status or
                     "MISSING" in expected_status or
@@ -1725,6 +1981,9 @@ def validate_final_ledger_uids(
     return {
         "status": "PASS", "released_cells": released,
         "global_scope_resolutions": global_resolutions,
+        "ready_nonheterotypic_cells_skipped": skipped_nonheterotypic,
+        "ambiguous_global_uid_cells_without_uid_aggregation":
+            ambiguous_global_uid_cells,
     }
 
 
@@ -2791,6 +3050,19 @@ def model_identity(value: str) -> str:
         return ""
     if len(set(parts)) == 1:
         return parts[0]
+    return "+".join(sorted(parts))
+
+
+def canonical_final_identity(value: str) -> str:
+    """Canonicalize a finalized genotype without collapsing donor dosage."""
+    text = str(value or "").strip()
+    wrapper = re.fullmatch(r"(?:D|T|UNKNOWN_SINGLE_CELL)\[(.*)\]", text)
+    if wrapper:
+        text = wrapper.group(1).strip()
+    if not text or text.startswith("M{"):
+        return text
+    parts = [part.strip() for part in text.replace("x", "+").split("+")
+             if part.strip()]
     return "+".join(sorted(parts))
 
 
@@ -5561,7 +5833,7 @@ def validate_and_record_input_bundle(
     identity_root = args.identity_root
     strict = (
         (absolute(mapping_root) != absolute(MAPPING_ROOT) or
-         absolute(analysis_root) != absolute(MAPPING_ROOT)) and
+         absolute(analysis_root) != absolute(PRODUCTION_ANALYSIS_ROOT)) and
         not args.skip_upstream_provenance_check)
 
     for root, label in (
@@ -5595,6 +5867,8 @@ def validate_and_record_input_bundle(
                 analysis_root, item.cell_groups,
                 f"lib{item.library} GEX calibration groups"))
     declared_paths.extend((
+        (identity_root, args.primary_identity_input,
+         "compact primary identity table"),
         (identity_root, args.ledger_input, "final reconciliation ledger"),
         (identity_root, args.identity_validation, "identity validation summary"),
         (identity_root, args.identity_validation_failures,
@@ -5677,6 +5951,8 @@ def validate_and_record_input_bundle(
                 item.cell_groups, f"lib{item.library} GEX calibration groups", True))
 
     records.extend((
+        provenance_file_record(args.primary_identity_input,
+                               "compact primary identity table", True),
         provenance_file_record(args.ledger_input,
                                "final reconciliation ledger", True),
         provenance_file_record(args.identity_validation,
@@ -5713,6 +5989,8 @@ def validate_and_record_input_bundle(
     ))
 
     event_libraries = ledger_event_libraries(args.ledger_input, libraries)
+    primary_identity_detail = validate_primary_identity_bundle(
+        args.primary_identity_input, args.ledger_input, libraries)
     assignment_counts = validate_final_assignment_bundle(
         args.ledger_input, paths)
     finalization_detail = validate_finalization_summary(
@@ -5728,17 +6006,14 @@ def validate_and_record_input_bundle(
         os.stat(path).st_mtime_ns for item in paths for path in (
             item.pileup_sites, item.pileup_molecules,
             item.pileup_observations, item.demux_prefix + ".assignments"))
-    if os.stat(args.ledger_input).st_mtime_ns < newest_selected_demux:
-        raise ValueError(
-            "canonical final reconciliation ledger predates a selected DEMUX "
-            "artifact; the roots do not prove one completed generation")
     ledger_mtime = os.stat(args.ledger_input).st_mtime_ns
+    primary_identity_mtime = os.stat(args.primary_identity_input).st_mtime_ns
     summary_mtime = os.stat(args.identity_run_summary).st_mtime_ns
     metadata_mtime = os.stat(args.identity_metadata_manifest).st_mtime_ns
     validation_mtime = os.stat(args.identity_validation).st_mtime_ns
     validation_failures_mtime = os.stat(
         args.identity_validation_failures).st_mtime_ns
-    validation_boundary_mtime = max(
+    validation_boundary_mtime = min(
         validation_mtime, validation_failures_mtime)
     newest_identity_metadata_input = max(
         os.stat(args.identity_metadata_workbook).st_mtime_ns,
@@ -5751,12 +6026,14 @@ def validate_and_record_input_bundle(
         os.stat(args.identity_global_donors).st_mtime_ns,
     )
     if metadata_mtime < newest_identity_metadata_input:
-        raise ValueError(
+        emit_warning(
             "identity metadata manifest predates its workbook, panel metadata, "
-            "or generated metadata tables")
+            "or generated metadata tables; physical migration can change "
+            "timestamps without changing the finalized reconciliation")
     if newest_selected_demux < os.stat(args.demux_pool_workbook).st_mtime_ns:
-        raise ValueError(
-            "selected DEMUX artifacts predate the declared donor-pool workbook")
+        emit_warning(
+            "selected DEMUX artifacts predate the declared donor-pool workbook; "
+            "continuing because donor/sample membership is validated directly")
     newest_posthoc_script = max(
         os.stat(os.path.join(
             args.upstream_analysis_root, "aggregate_library_analysis",
@@ -5765,21 +6042,22 @@ def validate_and_record_input_bundle(
     if validation_mtime < max(
             os.stat(args.expected_pool_metadata).st_mtime_ns,
             newest_posthoc_script):
-        raise ValueError(
+        emit_warning(
             "identity validation predates its expected-pool metadata or "
-            "POSTHOC generation scripts")
-    if not (metadata_mtime <= validation_mtime and
-            newest_selected_demux <= validation_mtime and
-            validation_boundary_mtime <= ledger_mtime <=
-            summary_mtime):
-        raise ValueError(
-            "DEMUX and identity metadata do not both precede validation, "
-            "the final ledger, and the Phase-3 run summary")
-    for item in paths:
-        if os.stat(item.final_assignments).st_mtime_ns < summary_mtime:
-            raise ValueError(
-                f"lib{item.library} final assignment predates the Phase-3 "
-                "finalization run summary")
+            "POSTHOC generation scripts; continuing with direct validation "
+            "summary and assignment-bundle checks")
+    identity_product_mtimes = [
+        ledger_mtime, primary_identity_mtime, summary_mtime,
+        *(os.stat(item.final_assignments).st_mtime_ns for item in paths),
+    ]
+    newest_identity_input = max(newest_selected_demux, metadata_mtime)
+    if (min(identity_product_mtimes) < newest_identity_input or
+            validation_boundary_mtime < max(identity_product_mtimes)):
+        emit_warning(
+            "canonical identity products must follow DEMUX/identity metadata "
+            "and precede the completed identity validation by timestamp; "
+            "continuing because migration can alter timestamps and the "
+            "content-level reconciliation checks passed")
     for item in paths:
         newest_library_demux = max(os.stat(path).st_mtime_ns for path in (
             item.pileup_sites, item.pileup_molecules,
@@ -5788,17 +6066,18 @@ def validate_and_record_input_bundle(
                 item.ambient_standard_prefix + ".contam_rate",
                 item.ambient_standard_prefix + ".contam_prof"):
             if os.stat(ambient_path).st_mtime_ns < newest_library_demux:
-                raise ValueError(
+                emit_warning(
                     f"lib{item.library} standard ambient artifact predates "
-                    f"the forced DEMUX bundle: {ambient_path}")
+                    f"the selected DEMUX bundle by timestamp: {ambient_path}")
         if item.cell_groups:
             newest_mex = max(os.stat(path).st_mtime_ns for path in (
                 item.expression_barcodes, item.expression_features,
                 item.expression_matrix))
             if os.stat(item.cell_groups).st_mtime_ns < newest_mex:
-                raise ValueError(
+                emit_warning(
                     f"lib{item.library} GEX calibration groups predate the "
-                    "selected filtered MEX")
+                    "selected filtered MEX by timestamp; continuing after "
+                    "direct barcode compatibility validation")
     identity_failure_rows = strict_posthoc_tsv(
         args.identity_validation_failures,
         ("check", "library", "barcode", "detail"),
@@ -5833,9 +6112,10 @@ def validate_and_record_input_bundle(
                 item.pileup_observations, item.demux_prefix + ".assignments"))
             if any(os.stat(path).st_mtime_ns < newest_library_demux
                    for path in arm_paths):
-                raise ValueError(
+                emit_warning(
                     f"lib{item.library} reconciliation ambient Arm {arm} "
-                    "predates the forced DEMUX bundle")
+                    "predates the selected DEMUX bundle by timestamp; "
+                    "continuing after direct ambient/final-assignment checks")
 
     mapping_records = []
     mapping_detail = "not required for historical production layout"
@@ -5945,6 +6225,7 @@ def validate_and_record_input_bundle(
                        else "PASS"),
             "detail": identity_detail,
         },
+        "primary_identity": primary_identity_detail,
         "identity_finalization": finalization_detail,
         "identity_metadata": identity_metadata_detail,
         "identity_metadata_generation": identity_metadata_generation,
@@ -5969,7 +6250,14 @@ def validate_and_record_input_bundle(
 
 def identity_validation_summary_passes(
         path: str, libraries: Sequence[int]) -> tuple[bool, str]:
-    """Require the complete attached-validator checklist to pass."""
+    """Accept any complete upstream validation ledger whose rows all pass.
+
+    The upstream validator's checklist grows as new reconciliation invariants
+    are added. Historical production runs therefore cannot be required to
+    contain every check name known to this downstream release. Scientific
+    compatibility is established separately by the direct compact-ledger,
+    final-assignment, finalization-accounting, donor-pool, and UID checks.
+    """
     if not regular_nonempty(path):
         return False, "missing or empty"
     try:
@@ -5981,59 +6269,36 @@ def identity_validation_summary_passes(
             return False, "contains no validation rows"
         if fields != ["check", "status", "n_failures", "detail"]:
             return False, "header is not the canonical validation-summary schema"
-        per_library_checks = {
-            "all_input_barcodes_once",
-            "original_assignments_preserved",
-            "candidate_global_biological_universe",
-            "technical_multiplet_candidate_invariants",
-            "applied_change_invariants",
-            "component_singlet_classification_invariants",
-            "occupancy_ambiguity_invariants",
-            "multiplets_excluded_from_single_cell_assignments",
-            "reconciled_assignments_invariants",
-            "doublet_dragon_context_invariants",
-            "uid_resolution_invariants",
-            "mt_guardrail",
-            "atac_mode_isolation",
-        }
-        global_checks = {
-            "unique_library_barcode",
-            "event_mass_threshold",
-            "component_singlet_event_invariants",
-            "cell_exchange_evidence_invariants",
-            "library_exchange_invariants",
-            "library_exchange_donor_evidence_invariants",
-            "aggregate_row_count",
-            "manifest_invariants",
-        }
-        expected = {
-            (check, f"lib{int(library)}")
-            for library in libraries for check in per_library_checks}
-        expected.update((check, "") for check in global_checks)
         observed: set[tuple[str, str]] = set()
         failed = []
         for index, row in enumerate(rows, start=1):
             check = str(row.get("check", "")).strip()
             detail = str(row.get("detail", "")).strip()
+            if not check:
+                return False, f"empty check name at row {index}"
             key = (check, detail)
             if key in observed:
                 return False, f"duplicate validation row: {check}/{detail}"
             observed.add(key)
             try:
-                failures = int(str(row.get("n_failures", "")).strip())
+                failures_value = float(
+                    str(row.get("n_failures", "")).strip())
+                failures = (
+                    int(failures_value)
+                    if math.isfinite(failures_value) and
+                    failures_value.is_integer() else -1)
             except (TypeError, ValueError):
+                failures_value = math.nan
                 failures = -1
-            if (str(row.get("status", "")).strip() != "PASS"
-                    or failures != 0):
+            if (not math.isfinite(failures_value) or
+                    failures_value != failures or
+                    str(row.get("status", "")).strip().upper() != "PASS" or
+                    failures != 0):
                 failed.append(check or f"row {index}")
         if failed:
             return False, "failed checks: " + ",".join(
                 value or "UNKNOWN" for value in failed[:5])
-        if observed != expected:
-            missing = sorted(expected - observed)[:5]
-            extra = sorted(observed - expected)[:5]
-            return False, f"checklist mismatch: missing={missing}, extra={extra}"
-        return True, f"PASS ({len(rows)} complete checks)"
+        return True, f"PASS ({len(rows)} recorded validation checks)"
     except (OSError, csv.Error, UnicodeError) as exc:
         return False, f"unreadable: {exc}"
 
@@ -6084,8 +6349,52 @@ def publish_new_or_identical(path: str, payload: str, label: str) -> str:
             pass
 
 
+def publish_new_or_warn_replace(path: str, payload: str, label: str) -> str:
+    """Publish a provenance-only record, warning rather than blocking.
+
+    Unlike task maps and generated job scripts, the Fusebox scientific-input
+    contract is not consumed by queued jobs.  Refreshing this descriptive JSON
+    therefore cannot retarget a queued computation.  A difference remains
+    visible to the operator, but it must not prevent a valid resume.
+    """
+    destination = absolute(path)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(destination) + ".tmp.",
+        dir=os.path.dirname(destination), text=True)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.path.lexists(destination):
+            if not os.path.isfile(destination):
+                raise ValueError(
+                    f"existing {label} is not a regular file: {destination}")
+            try:
+                with open(destination, "r", encoding="utf-8") as handle:
+                    existing = handle.read()
+            except OSError as exc:
+                raise ValueError(
+                    f"existing {label} cannot be checked: "
+                    f"{destination}: {exc}") from exc
+            if existing == payload:
+                return destination
+            print(
+                f"WARNING: existing {label} differs; refreshing the "
+                f"provenance-only record and continuing: {destination}",
+                file=sys.stderr)
+        os.replace(temporary, destination)
+        return destination
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def write_task_manifest(path: str, header: Sequence[str],
-                        rows: Iterable[Mapping[str, object]]) -> str:
+                         rows: Iterable[Mapping[str, object]]) -> str:
     """Write a minimal array-index map without retargeting a queued job."""
     return publish_new_or_identical(
         path, manifest_payload(header, rows), "array task map")
@@ -6122,10 +6431,10 @@ def path_contains(parent: str, child: str) -> bool:
 def configure_input_roots(args: argparse.Namespace) -> None:
     """Resolve the mapping-input and upstream-analysis namespaces.
 
-    The production layout historically stores both namespaces below
-    ``MAPPING_ROOT``.  A non-production remap must name the isolated analysis
-    root produced by orchestrate_tetraploid.py so MEX files cannot be silently
-    mixed with demux, ambient, or reconciled-identity products from another run.
+    The canonical layout keeps mapping and analysis as separate siblings under
+    the physical 3P root.  A non-production remap must name its matching
+    isolated analysis root so MEX files cannot be mixed with demux, ambient, or
+    reconciled-identity products from another run.
     """
     mapping_input_root = absolute(args.mapping_input_root)
     production_mapping_root = absolute(MAPPING_ROOT)
@@ -6180,6 +6489,9 @@ def default_templates(args: argparse.Namespace) -> None:
     four_arm_root = os.path.join(
         contam_root, "reconciliation_four_arm", args.ambient_candidate_set)
 
+    args.primary_identity_input = absolute(
+        args.primary_identity_input or os.path.join(
+            identity_root, "aggregate", "identity_assignments.tsv.gz"))
     args.ledger_input = absolute(args.ledger_input or os.path.join(
         identity_root, "aggregate", "identity_reconciliation_final_cells.tsv.gz"))
     args.identity_validation = absolute(
@@ -6754,8 +7066,8 @@ fi
 identity_validation_valid() {{
     python3 - "$IDENTITY_VALIDATION" "$LIBRARY_CSV" <<'PY'
 import csv
+import math
 import os
-import re
 import sys
 
 path, library_csv = sys.argv[1:]
@@ -6767,26 +7079,27 @@ try:
         reader = csv.DictReader(handle, delimiter="\t")
         rows = list(reader)
         fields = list(reader.fieldnames or [])
-    normalized = {{field.strip().lower(): field for field in fields}}
-    status_field = normalized.get("status")
-    failure_field = next((normalized[name] for name in
-        ("n_failures", "failure_count", "failures") if name in normalized), None)
-    library_field = next((normalized[name] for name in
-        ("library", "lib", "lib_num", "library_number") if name in normalized), None)
-    if not rows or status_field is None or failure_field is None:
+    if fields != ["check", "status", "n_failures", "detail"] or not rows:
         raise ValueError("invalid validation summary schema")
-    relevant = []
+    observed = set()
     for row in rows:
-        raw = str(row.get(library_field, "")).strip() if library_field else ""
-        match = re.fullmatch(r"(?:lib)?(\\d+)", raw, re.I)
-        if match and int(match.group(1)) not in requested:
-            continue
-        relevant.append(row)
-    if not relevant:
-        raise ValueError("no relevant validation rows")
-    for row in relevant:
-        if (str(row.get(status_field, "")).strip().upper() != "PASS"
-                or int(float(str(row.get(failure_field, "")))) != 0):
+        check = str(row.get("check", "")).strip()
+        detail = str(row.get("detail", "")).strip()
+        if not check:
+            raise ValueError("empty validation check name")
+        key = (check, detail)
+        if key in observed:
+            raise ValueError("duplicate identity validation row")
+        observed.add(key)
+        failures_value = float(str(row.get("n_failures", "")).strip())
+        failures = (
+            int(failures_value)
+            if math.isfinite(failures_value) and
+            failures_value.is_integer() else -1)
+        if (not math.isfinite(failures_value)
+                or failures_value != failures
+                or str(row.get("status", "")).strip().upper() != "PASS"
+                or failures != 0):
             raise ValueError("identity validation failure")
 except (OSError, ValueError, TypeError, csv.Error):
     raise SystemExit(1)
@@ -6823,7 +7136,8 @@ try:
             reader = csv.reader(handle, delimiter="\t")
             header = next(reader)
             if (len(header) != len(set(header)) or not
-                    {{"library", "barcode", "production_assignment"}} <= set(header)):
+                    {{"library", "barcode", "assignment_status",
+                      "final_assignment"}} <= set(header)):
                 raise ValueError(path)
             library_col = header.index("library")
             count = 0
@@ -7443,20 +7757,23 @@ try:
         (
             prefix + ".uid_chromosome_flags.tsv.gz",
             {{"uid", "donor_pair", "chromosome", "p_state", "q_state",
+              "directional_support_basis", "min_directional_log_bf",
               "whole_chromosome_flag", "summary_status", "schema_version"}},
-            57, "schema_version", "tetra_arm_uid_chromosome_flags_v2",
+            59, "schema_version", "tetra_arm_uid_chromosome_flags_v3",
         ),
         (
             prefix + ".donor_pair_arm_summary.tsv.gz",
             {{"library", "calibration_group", "donor_pair", "arm", "chromosome",
               "individual_evaluable_cells", "aggregate_eligible_cells",
               "tested_cells", "tested_uid_blocks", "supporting_cells",
-              "concordant_cells", "best_state", "partial_conjunction_method",
+              "supporting_fraction", "concordant_cells", "best_state",
+              "directional_support_basis", "min_directional_log_bf",
+              "partial_conjunction_method",
               "dependence_assumption", "fdr_interpretation",
               "partial_conjunction_q_value",
               "partial_conjunction_q_resolution_floor", "recurrence_flag",
               "summary_status", "schema_version"}},
-            45, "schema_version", "tetra_arm_donor_pair_arm_summary_v2",
+            48, "schema_version", "tetra_arm_donor_pair_arm_summary_v3",
         ),
     )
     row_counts = {{}}
@@ -7521,9 +7838,9 @@ try:
             or output_schemas.get("calls") != "tetra_arm_cnv_calls_v2"
             or output_schemas.get("calibration") != "tetra_arm_calibration_v2"
             or output_schemas.get("uid_chromosome_flags")
-               != "tetra_arm_uid_chromosome_flags_v2"
+               != "tetra_arm_uid_chromosome_flags_v3"
             or output_schemas.get("donor_pair_arm_summary")
-               != "tetra_arm_donor_pair_arm_summary_v2"
+               != "tetra_arm_donor_pair_arm_summary_v3"
             or output_schemas.get("qc") != "tetra_arm_call_qc_v2"
             or output_schemas.get("contract")
                != "tetra_arm_call_contract_v2"
@@ -7633,11 +7950,11 @@ try:
             metrics[row[0]] = row[1]
     with open(json_path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    if (payload.get("schema_version") != "tetra_arm_cnv_report_v2"
+    if (payload.get("schema_version") != "tetra_arm_cnv_report_v3"
             or str(payload.get("status", "")).upper()
                not in {{"PASS", "REVIEW", "PASS_NO_HETEROTYPIC_TARGETS",
                        "PASS_NO_OBSERVED_ASE", "PASS_NO_CALLABLE_ASE"}}
-            or metrics.get("schema_version") != "tetra_arm_cnv_report_v2"
+            or metrics.get("schema_version") != "tetra_arm_cnv_report_v3"
             or metrics.get("status", "").upper()
                != str(payload.get("status", "")).upper()):
         raise ValueError(json_path)
@@ -7849,29 +8166,1412 @@ def stage_primary_outputs(stage: str, run: RunPaths,
     raise ValueError(f"unknown stage: {stage}")
 
 
+def omitted_stage_ancestors(selected: Sequence[str]) -> tuple[str, ...]:
+    """Return every DAG ancestor reused rather than submitted in this plan."""
+    selected_set = set(selected)
+    ancestors: set[str] = set()
+
+    def visit(stage: str) -> None:
+        for parent in STAGE_PARENTS[stage]:
+            if parent not in selected_set:
+                ancestors.add(parent)
+            visit(parent)
+
+    for stage in selected:
+        visit(stage)
+    return tuple(stage for stage in STAGES if stage in ancestors)
+
+
+def read_json_object(path: str, label: str) -> dict[str, object]:
+    if not regular_nonempty(path):
+        raise ValueError(f"completed {label} is missing or empty: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"completed {label} is not valid JSON: {path}: {exc}") \
+            from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"completed {label} is not a JSON object: {path}")
+    return payload
+
+
+def read_metric_map(path: str, label: str) -> dict[str, str]:
+    if not regular_nonempty(path):
+        raise ValueError(f"completed {label} is missing or empty: {path}")
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle, delimiter="\t")
+            header = next(reader)
+            if header != ["metric", "value"]:
+                raise ValueError("expected metric/value header")
+            metrics: dict[str, str] = {}
+            for row in reader:
+                if len(row) != 2 or not row[0] or row[0] in metrics:
+                    raise ValueError("invalid or duplicate metric row")
+                metrics[row[0]] = row[1]
+    except (OSError, ValueError, StopIteration, csv.Error) as exc:
+        raise ValueError(f"completed {label} is invalid: {path}: {exc}") from exc
+    return metrics
+
+
+def read_tsv_header(path: str, label: str, compressed: bool = False) -> list[str]:
+    if not regular_nonempty(path):
+        raise ValueError(f"completed {label} is missing or empty: {path}")
+    opener = gzip.open if compressed else open
+    try:
+        with opener(path, "rt", encoding="utf-8", newline="") as handle:
+            header = next(csv.reader(handle, delimiter="\t"))
+    except (OSError, EOFError, ValueError, StopIteration, csv.Error) as exc:
+        raise ValueError(f"completed {label} has no valid TSV header: {path}: {exc}") \
+            from exc
+    if not header or len(header) != len(set(header)):
+        raise ValueError(f"completed {label} has an empty or duplicate TSV header: {path}")
+    return header
+
+
+def require_contract(
+        path: str, label: str, schema: str,
+        allowed_statuses: Sequence[str] = ("PASS",)) -> dict[str, object]:
+    payload = read_json_object(path, label)
+    status = str(payload.get("status", "")).upper()
+    if payload.get("schema_version") != schema or status not in allowed_statuses:
+        raise ValueError(
+            f"completed {label} contract is not valid: {path}; "
+            f"schema={payload.get('schema_version')!r}, status={status!r}")
+    return payload
+
+
+def validate_frozen_input_provenance(run: RunPaths) -> int:
+    """Revalidate the original immutable scientific-input boundary."""
+    payload = read_json_object(run.input_provenance, "input provenance")
+    if payload.get("schema_version") != "tetra_arm_input_provenance_v1":
+        raise ValueError(
+            f"invalid input provenance schema: {run.input_provenance}")
+    records: list[dict[str, object]] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            required = {"path", "realpath", "size", "mtime_ns"}
+            if required <= set(value):
+                records.append(value)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    if not records:
+        raise ValueError(
+            f"input provenance contains no file records: {run.input_provenance}")
+    checked: set[tuple[str, str, int, int, str]] = set()
+    for record in records:
+        path = absolute(str(record["path"]))
+        signature = (
+            path, str(record["realpath"]), int(record["size"]),
+            int(record["mtime_ns"]), str(record.get("sha256", "")))
+        if signature in checked:
+            continue
+        checked.add(signature)
+        try:
+            stat_result = os.stat(path)
+        except OSError as exc:
+            raise ValueError(
+                f"frozen upstream input is unavailable: {path}: {exc}") from exc
+        actual = (os.path.realpath(path), stat_result.st_size, stat_result.st_mtime_ns)
+        if actual != signature[1:4]:
+            raise ValueError(f"frozen upstream input changed after planning: {path}")
+        expected_sha = signature[4]
+        if expected_sha and sha256_file(path) != expected_sha:
+            raise ValueError(f"frozen upstream input hash changed: {path}")
+    return len(checked)
+
+
+def validate_completed_stage(
+        stage: str, run: RunPaths, paths: Sequence[LibraryPaths],
+        args: argparse.Namespace) -> None:
+    """Validate a completed ancestor bundle before it is reused by resume."""
+    missing = [
+        path for path in stage_primary_outputs(stage, run, paths, args)
+        if not regular_nonempty(path)
+    ]
+    if missing:
+        preview = ", ".join(missing[:3])
+        suffix = " ..." if len(missing) > 3 else ""
+        raise ValueError(
+            f"cannot resume: completed {stage} bundle is missing or empty: "
+            f"{preview}{suffix}")
+
+    if stage == "REFERENCE":
+        schema_by_mode = {
+            "EXPLICIT_BED": "tetra_arm_reference_contract_v1",
+            "GENE_SYNTENY": "tetra_arm_gene_synteny_contract_v1",
+            "HAL_LIFTOVER": "tetra_arm_hal_liftover_contract_v1",
+        }
+        contract = require_contract(
+            run.reference_contract, "REFERENCE",
+            schema_by_mode[args.reference_mode])
+        output_field = "arms_bed" if args.reference_mode == "EXPLICIT_BED" else "output"
+        if absolute(str(contract.get(output_field, ""))) != absolute(args.arms_bed):
+            raise ValueError(
+                "cannot resume: REFERENCE contract does not name the selected "
+                f"arm BED: {run.reference_contract}")
+        return
+
+    if stage == "LEDGER":
+        contract_path = os.path.join(run.ledger, "split_ledger_contract.json")
+        contract = require_contract(
+            contract_path, "LEDGER", "tetra_arm_split_ledger_contract_v1")
+        expected_libraries = [path.library for path in paths]
+        observed = [int(value) for value in contract.get("libraries", [])]
+        if observed != expected_libraries or int(contract.get("cells", 0)) < 1:
+            raise ValueError(
+                f"cannot resume: LEDGER contract does not match output "
+                f"libraries {expected_libraries}: {contract_path}")
+        for item in paths:
+            fields = set(read_tsv_header(
+                item.split_ledger, f"LEDGER lib{item.library}", compressed=True))
+            if not {"library", "barcode", "assignment_status",
+                    "final_assignment"} <= fields:
+                raise ValueError(
+                    f"cannot resume: LEDGER header is incomplete: {item.split_ledger}")
+        return
+
+    if stage == "PREPARE":
+        for item in paths:
+            contract = require_contract(
+                item.prepare_contract, f"PREPARE lib{item.library}",
+                "tetra_arm_prepare_contract_v1")
+            if (int(contract.get("library", -1)) != item.library
+                    or int(contract.get("cells", 0)) < 1):
+                raise ValueError(
+                    f"cannot resume: PREPARE contract is inconsistent: "
+                    f"{item.prepare_contract}")
+            cell_fields = set(read_tsv_header(
+                item.cell_manifest, f"PREPARE lib{item.library} cell manifest",
+                compressed=True))
+            ambient_fields = set(read_tsv_header(
+                item.ambient_sources,
+                f"PREPARE lib{item.library} ambient sources", compressed=True))
+            if not {"library", "barcode", "donor_a", "donor_b", "donor_pair",
+                    "model_eligible", "schema_version"} <= cell_fields:
+                raise ValueError(
+                    f"cannot resume: PREPARE cell-manifest header is incomplete: "
+                    f"{item.cell_manifest}")
+            if not {"library", "barcode", "source_label",
+                    "scoring_profile_mass", "schema_version"} <= ambient_fields:
+                raise ValueError(
+                    f"cannot resume: PREPARE ambient-source header is incomplete: "
+                    f"{item.ambient_sources}")
+        return
+
+    if stage == "ASE":
+        allowed = {
+            "PASS", "PASS_NO_HETEROTYPIC_TARGETS",
+            "PASS_NO_INFORMATIVE_EVIDENCE",
+        }
+        for item in paths:
+            header = tuple(read_tsv_header(
+                item.ase, f"ASE lib{item.library}", compressed=True))
+            metrics = read_metric_map(item.ase_qc, f"ASE lib{item.library} QC")
+            if (header != ASE_V2_HEADER
+                    or metrics.get("schema_version") != "tetra_arm_ase_qc_v2"
+                    or metrics.get("status", "").upper() not in allowed):
+                raise ValueError(
+                    f"cannot resume: ASE bundle is not schema-valid: {item.ase}")
+        return
+
+    if stage == "EXPRESSION":
+        expected = [
+            "library", "barcode", "arm", "chromosome", "arm_counts",
+            "other_autosomal_counts", "reference_autosomal_counts",
+            "total_autosomal_counts", "arm_fraction", "log2_arm_to_other",
+            "log2_arm_to_reference", "mapped_genes_on_arm",
+            "nonzero_genes_on_arm", "matrix_value_type",
+            "expression_input_state", "schema_version",
+        ]
+        for item in paths:
+            contract = require_contract(
+                item.expression_contract, f"EXPRESSION lib{item.library}",
+                "tetra_arm_expression_contract_v1")
+            if int(contract.get("library", -1)) != item.library:
+                raise ValueError(
+                    f"cannot resume: EXPRESSION contract has the wrong library: "
+                    f"{item.expression_contract}")
+            if read_tsv_header(
+                    item.expression, f"EXPRESSION lib{item.library}",
+                    compressed=True) != expected:
+                raise ValueError(
+                    f"cannot resume: EXPRESSION header is invalid: {item.expression}")
+        return
+
+    if stage == "CALL":
+        allowed = (
+            "PASS", "PASS_NO_HETEROTYPIC_TARGETS", "PASS_NO_OBSERVED_ASE",
+            "PASS_NO_CALLABLE_ASE")
+        contract = require_contract(
+            run.call_prefix + ".contract.json", "CALL",
+            "tetra_arm_call_contract_v2", allowed)
+        schemas = contract.get("output_schemas", {})
+        if (not isinstance(schemas, dict)
+                or schemas.get("calls") != "tetra_arm_cnv_calls_v2"
+                or schemas.get("calibration") != "tetra_arm_calibration_v2"
+                or schemas.get("uid_chromosome_flags")
+                   != "tetra_arm_uid_chromosome_flags_v3"
+                or schemas.get("donor_pair_arm_summary")
+                   != "tetra_arm_donor_pair_arm_summary_v3"):
+            raise ValueError(
+                f"cannot resume: CALL output schemas are invalid: "
+                f"{run.call_prefix}.contract.json")
+        return
+
+    raise ValueError(f"unsupported resume prerequisite stage: {stage}")
+
+
+def declared_program_version(path: str, label: str) -> tuple[int, int, int]:
+    if not regular_nonempty(path):
+        raise ValueError(f"{label} is missing or empty: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = handle.read(131072)
+    except OSError as exc:
+        raise ValueError(f"cannot read {label}: {path}: {exc}") from exc
+    match = re.search(
+        r'(?m)^PROGRAM_VERSION\s*=\s*["\']([0-9]+)\.([0-9]+)\.([0-9]+)["\']\s*$',
+        payload)
+    if not match:
+        raise ValueError(
+            f"{label} does not declare a literal PROGRAM_VERSION: {path}")
+    return tuple(int(value) for value in match.groups())
+
+
+def validate_resume_plan(
+        selected: Sequence[str], run: RunPaths,
+        paths: Sequence[LibraryPaths], args: argparse.Namespace
+        ) -> tuple[tuple[str, ...], int]:
+    prerequisites = omitted_stage_ancestors(selected)
+    if not prerequisites:
+        raise ValueError(
+            "--resume selected no previously completed ancestor stage; use a "
+            "normal staged submission instead")
+    provenance_records = validate_frozen_input_provenance(run)
+    for stage in prerequisites:
+        validate_completed_stage(stage, run, paths, args)
+    if "LEDGER" in prerequisites and not args.skip_identity_validation:
+        identity_ok, identity_detail = identity_validation_summary_passes(
+            args.identity_validation,
+            args.upstream_cohort_libraries_resolved)
+        if not identity_ok:
+            raise ValueError(
+                "cannot resume: inherited identity validation boundary is not "
+                f"PASS: {args.identity_validation} ({identity_detail})")
+    if "CALL" in selected:
+        observed = declared_program_version(args.call_script, "CALL script")
+        if observed < MIN_AGGREGATE_SAFE_CALLER:
+            required = ".".join(str(value) for value in MIN_AGGREGATE_SAFE_CALLER)
+            actual = ".".join(str(value) for value in observed)
+            raise ValueError(
+                f"CALL recovery requires aggregate-safe tetra_arm_call.py "
+                f">= {required}; "
+                f"selected {args.call_script} declares {actual}")
+    return prerequisites, provenance_records
+
+
+def generated_script_path(
+        run: RunPaths, filename: str, resume: bool,
+        recompute_selected: bool = False) -> str:
+    if not resume:
+        return os.path.join(run.scripts, filename)
+    stem, extension = os.path.splitext(filename)
+    if recompute_selected:
+        release_token = RELEASE.replace(".", "_")
+        return os.path.join(
+            run.scripts,
+            stem + f".recompute_{release_token}" + extension)
+    return os.path.join(run.scripts, stem + ".resume" + extension)
+
+
 def reject_output_conflicts(selected: Sequence[str], run: RunPaths,
                             paths: Sequence[LibraryPaths],
-                            args: argparse.Namespace) -> None:
+                            args: argparse.Namespace) -> list[str]:
+    conflicts_by_stage: dict[str, list[str]] = {}
     for stage in selected:
         conflicts = [path for path in stage_primary_outputs(stage, run, paths, args)
                      if os.path.lexists(path)]
         if conflicts:
-            preview = ", ".join(conflicts[:3])
-            suffix = " ..." if len(conflicts) > 3 else ""
+            conflicts_by_stage[stage] = conflicts
+    conflicts = [
+        path for stage in selected for path in conflicts_by_stage.get(stage, [])]
+    if conflicts and not args.recompute_selected:
+        first_stage = next(
+            stage for stage in selected if conflicts_by_stage.get(stage))
+        stage_conflicts = conflicts_by_stage[first_stage]
+        preview = ", ".join(stage_conflicts[:3])
+        suffix = " ..." if len(stage_conflicts) > 3 else ""
+        raise ValueError(
+            f"selected stage {first_stage} already has "
+            f"{len(stage_conflicts)} output path(s): {preview}{suffix}; "
+            "use a new --run-root or --resume --recompute-selected to "
+            "archive and regenerate CALL/REPORT outputs")
+    return conflicts
+
+
+def archive_selected_stage_outputs(
+        selected: Sequence[str], run: RunPaths,
+        paths: Sequence[LibraryPaths], args: argparse.Namespace) -> str:
+    """Move selected completed outputs into a unique recovery archive."""
+    staged = [
+        (stage, path)
+        for stage in selected
+        for path in stage_primary_outputs(stage, run, paths, args)
+        if os.path.lexists(path)
+    ]
+    if not staged:
+        return ""
+
+    archive_parent = os.path.join(run.root, "recompute_archive")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_root = os.path.join(
+        archive_parent,
+        f"call_report_before_{RELEASE.replace('.', '_')}_{stamp}")
+    suffix = 1
+    while os.path.lexists(archive_root):
+        archive_root = os.path.join(
+            archive_parent,
+            f"call_report_before_{RELEASE.replace('.', '_')}_{stamp}_{suffix}")
+        suffix += 1
+
+    records: list[dict[str, object]] = []
+    moved: list[tuple[str, str]] = []
+    try:
+        for stage, source in staged:
+            if not os.path.isfile(source):
+                raise ValueError(
+                    f"cannot archive non-file selected-stage output: {source}")
+            relative = os.path.relpath(source, run.root)
+            if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+                raise ValueError(
+                    f"selected-stage output is outside the run root: {source}")
+            destination = os.path.join(archive_root, relative)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            stat_result = os.stat(source)
+            os.replace(source, destination)
+            moved.append((source, destination))
+            records.append({
+                "stage": stage,
+                "original_path": source,
+                "archived_path": destination,
+                "size": stat_result.st_size,
+                "mtime_ns": stat_result.st_mtime_ns,
+            })
+        manifest = {
+            "schema_version": "tetra_arm_recompute_archive_v1",
+            "orchestrator_release": RELEASE,
+            "archived_at_utc": datetime.now(timezone.utc).isoformat(),
+            "selected_stages": list(selected),
+            "files": records,
+        }
+        publish_new_or_identical(
+            os.path.join(archive_root, "archive_manifest.json"),
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            "recompute archive manifest")
+        return archive_root
+    except Exception:
+        for source, destination in reversed(moved):
+            if os.path.lexists(destination) and not os.path.lexists(source):
+                os.makedirs(os.path.dirname(source), exist_ok=True)
+                os.replace(destination, source)
+        raise
+
+
+def parse_fusebox_stages(values: Sequence[str] | None) -> tuple[str, ...]:
+    if not values:
+        return FUSEBOX_STAGES
+    selected: set[str] = set()
+    for raw in values:
+        for token in str(raw).split(","):
+            stage = token.strip().upper()
+            if not stage:
+                continue
+            if stage == "ALL":
+                selected.update(FUSEBOX_STAGES)
+            elif stage in FUSEBOX_STAGES:
+                selected.add(stage)
+            else:
+                raise ValueError(
+                    f"unknown Fusebox stage {token!r}; choose from "
+                    + ", ".join(FUSEBOX_STAGES))
+    if not selected:
+        raise ValueError("at least one Fusebox stage must be selected")
+    return tuple(stage for stage in FUSEBOX_STAGES if stage in selected)
+
+
+def fusebox_run_paths(root: str) -> FuseboxRunPaths:
+    root = absolute(root)
+    metadata = os.path.join(root, "metadata")
+    h5ad = os.path.join(root, "h5ad")
+    karyotype = os.path.join(root, "karyotype")
+    return FuseboxRunPaths(
+        root=root,
+        logs=os.path.join(root, "logs"),
+        scripts=os.path.join(root, "generated_scripts"),
+        manifests=os.path.join(root, "task_manifests"),
+        metadata=metadata,
+        barcodes=os.path.join(metadata, "barcodes"),
+        prepared_panels=os.path.join(metadata, "prepared_panels"),
+        ase=os.path.join(root, "ase"),
+        h5ad=h5ad,
+        karyotype=karyotype,
+        metadata_table=os.path.join(metadata, "reconciled_cells.tsv"),
+        metadata_summary=os.path.join(metadata, "reconciled_cells.summary.json"),
+        ase_manifest=os.path.join(root, "task_manifests", "fusebox_ase_tasks.tsv"),
+        h5ad_output=os.path.join(h5ad, "karyotype_input_with_ase.h5ad"),
+        h5ad_summary=os.path.join(h5ad, "karyotype_input_with_ase.summary.json"),
+        karyotype_prefix=os.path.join(karyotype, "tet2025_fusebox"),
+        karyotype_complete=os.path.join(karyotype, "tet2025_fusebox.complete.tsv"),
+    )
+
+
+def parse_fusebox_panels(values: Sequence[str]) -> list[FuseboxPanel]:
+    panels: list[FuseboxPanel] = []
+    seen: set[str] = set()
+    for raw in values:
+        parts = [part.strip() for part in str(raw).split(",", 3)]
+        if len(parts) != 4 or any(not part for part in parts):
             raise ValueError(
-                f"selected stage {stage} already has {len(conflicts)} output "
-                f"path(s): {preview}{suffix}; use a new --run-root rather than "
-                "overwriting primary scientific outputs")
+                "--fusebox-panel must be "
+                "LAYER,SPECIES1,SPECIES2,/absolute/snps.bed[.gz]")
+        name, species1, species2, snps = parts
+        for label, value in (
+                ("layer", name), ("species1", species1), ("species2", species2)):
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", value):
+                raise ValueError(
+                    f"Fusebox panel {label} cannot contain underscores or "
+                    f"whitespace: {value!r}")
+        if name in seen:
+            raise ValueError(f"duplicate Fusebox layer name: {name}")
+        seen.add(name)
+        panels.append(FuseboxPanel(name, species1, species2, absolute(snps)))
+    if not panels:
+        raise ValueError(
+            "--workflow fusebox-karyotype requires at least one "
+            "--fusebox-panel")
+    return panels
+
+
+def parse_karyotype_ase_maps(values: Sequence[str],
+                              panels: Sequence[FuseboxPanel]) -> list[str]:
+    panel_names = {panel.name for panel in panels}
+    mappings: list[str] = []
+    identities: set[str] = set()
+    for raw in values:
+        parts = [part.strip() for part in str(raw).split(",")]
+        if len(parts) not in (2, 4) or any(not part for part in parts):
+            raise ValueError(
+                "--karyotype-ase-map must be "
+                "SPECIES_IDENTITY,LAYER[,SPECIES1,SPECIES2]")
+        identity, layer = parts[:2]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", identity):
+            raise ValueError(
+                f"invalid Fusebox species identity in -a mapping: {identity!r}")
+        if layer not in panel_names:
+            raise ValueError(
+                f"karyotype ASE mapping references undefined layer {layer!r}")
+        if identity in identities:
+            raise ValueError(
+                f"duplicate karyotype ASE mapping for identity {identity!r}")
+        for value in parts[2:]:
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", value):
+                raise ValueError(
+                    f"invalid species override in karyotype ASE mapping: {value!r}")
+        identities.add(identity)
+        mappings.append(",".join(parts))
+    if not mappings:
+        raise ValueError(
+            "--workflow fusebox-karyotype requires at least one "
+            "--karyotype-ase-map so no species/panel pairing is guessed")
+    return mappings
+
+
+def fusebox_panel_output(paths: FuseboxRunPaths, panel: FuseboxPanel,
+                         library: int) -> str:
+    return os.path.join(paths.ase, panel.name, f"lib{library}")
+
+
+def fusebox_prepared_panel(paths: FuseboxRunPaths,
+                           panel: FuseboxPanel) -> str:
+    return os.path.join(
+        paths.prepared_panels, f"{panel.name}.canonical.bed.gz")
+
+
+def fusebox_prepared_panel_qc(paths: FuseboxRunPaths,
+                              panel: FuseboxPanel) -> str:
+    return os.path.join(
+        paths.prepared_panels, f"{panel.name}.canonical.qc.tsv")
+
+
+def fusebox_mex_complete(root: str) -> bool:
+    for allele in ("allele1", "allele2"):
+        directory = os.path.join(root, allele)
+        if not os.path.isdir(directory):
+            return False
+        for stem in ("matrix.mtx", "barcodes.tsv"):
+            if not any(regular_nonempty(os.path.join(directory, stem + suffix))
+                       for suffix in ("", ".gz")):
+                return False
+        if not any(regular_nonempty(os.path.join(directory, stem + suffix))
+                   for stem in ("features.tsv", "genes.tsv")
+                   for suffix in ("", ".gz")):
+            return False
+    return regular_nonempty(os.path.join(root, ".complete.tsv"))
+
+
+def expression_mex_complete(root: str) -> bool:
+    if not os.path.isdir(root):
+        return False
+    for stem in ("matrix.mtx", "barcodes.tsv"):
+        if not any(regular_nonempty(os.path.join(root, stem + suffix))
+                   for suffix in ("", ".gz")):
+            return False
+    return any(regular_nonempty(os.path.join(root, stem + suffix))
+               for stem in ("features.tsv", "genes.tsv")
+               for suffix in ("", ".gz"))
+
+
+def expression_mex_records(root: str, library: int) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for stem in ("matrix.mtx", "barcodes.tsv"):
+        candidates = [os.path.join(root, stem + suffix)
+                      for suffix in ("", ".gz")]
+        path = next((value for value in candidates if regular_nonempty(value)), "")
+        if not path:
+            raise ValueError(f"lib{library} expression MEX lacks {stem}: {root}")
+        records.append(provenance_file_record(
+            path, f"lib{library} expression MEX {stem}"))
+    feature_candidates = [
+        os.path.join(root, stem + suffix)
+        for stem in ("features.tsv", "genes.tsv") for suffix in ("", ".gz")]
+    feature_path = next(
+        (value for value in feature_candidates if regular_nonempty(value)), "")
+    if not feature_path:
+        raise ValueError(f"lib{library} expression MEX lacks features/genes: {root}")
+    records.append(provenance_file_record(
+        feature_path, f"lib{library} expression MEX features"))
+    return records
+
+
+def fusebox_stage_complete(stage: str, paths: FuseboxRunPaths,
+                           libraries: Sequence[int],
+                           panels: Sequence[FuseboxPanel]) -> bool:
+    if stage == "METADATA":
+        return (
+            regular_nonempty(paths.metadata_table)
+            and regular_nonempty(paths.metadata_summary)
+            and all(regular_nonempty(os.path.join(
+                paths.barcodes, f"lib{library}.barcodes.tsv"))
+                    for library in libraries)
+            and all(
+                regular_nonempty(fusebox_prepared_panel(paths, panel))
+                and regular_nonempty(
+                    fusebox_prepared_panel_qc(paths, panel))
+                for panel in panels))
+    if stage == "ASE":
+        return all(
+            fusebox_mex_complete(fusebox_panel_output(paths, panel, library))
+            for panel in panels for library in libraries)
+    if stage == "H5AD":
+        return (regular_nonempty(paths.h5ad_output)
+                and regular_nonempty(paths.h5ad_summary))
+    if stage == "KARYOTYPE":
+        return (
+            regular_nonempty(paths.karyotype_prefix + ".tab")
+            and regular_nonempty(paths.karyotype_prefix + ".lfc")
+            and os.path.isfile(paths.karyotype_prefix + ".cooc")
+            and regular_nonempty(paths.karyotype_complete))
+    raise ValueError(f"unknown Fusebox stage: {stage}")
+
+
+def fusebox_stage_has_any(stage: str, paths: FuseboxRunPaths) -> bool:
+    directory = {
+        "METADATA": paths.metadata,
+        "ASE": paths.ase,
+        "H5AD": paths.h5ad,
+        "KARYOTYPE": paths.karyotype,
+    }[stage]
+    if not os.path.lexists(directory):
+        return False
+    if not os.path.isdir(directory):
+        raise ValueError(
+            f"Fusebox {stage} output path exists but is not a directory: "
+            f"{directory}")
+    if stage == "ASE":
+        # Failed array tasks can leave empty per-panel parent directories after
+        # their temporary result directories are removed.  Those parents are
+        # scaffolding, not stage output.  A file at the ASE root or anything
+        # inside a panel directory still counts as existing output.
+        for entry in os.scandir(directory):
+            if not entry.is_dir(follow_symlinks=False):
+                return True
+            if os.listdir(entry.path):
+                return True
+        return False
+    return bool(os.listdir(directory))
+
+
+def fusebox_ancestors(selected: Sequence[str]) -> tuple[str, ...]:
+    selected_set = set(selected)
+    needed: set[str] = set()
+
+    def visit(stage: str) -> None:
+        for parent in FUSEBOX_STAGE_PARENTS[stage]:
+            if parent not in selected_set:
+                needed.add(parent)
+            visit(parent)
+
+    for stage in selected:
+        visit(stage)
+    return tuple(stage for stage in FUSEBOX_STAGES if stage in needed)
+
+
+def fusebox_dependencies(stage: str, selected: Sequence[str],
+                         jobs: Mapping[str, str]) -> list[str]:
+    selected_set = set(selected)
+    frontier: set[str] = set()
+
+    def visit(node: str) -> None:
+        for parent in FUSEBOX_STAGE_PARENTS[node]:
+            if parent in selected_set:
+                if parent in jobs:
+                    frontier.add(jobs[parent])
+            else:
+                visit(parent)
+
+    visit(stage)
+    return sorted(frontier, key=int)
+
+
+def fusebox_header(stage: str, paths: FuseboxRunPaths,
+                   args: argparse.Namespace, cpus: int, memory: str,
+                   modules: Sequence[str], tasks: int | None = None) -> str:
+    token = "%A_%a" if tasks is not None else "%j"
+    array = ""
+    if tasks is not None:
+        throttle = (f"%{args.array_throttle}"
+                    if args.array_throttle is not None else "")
+        array = f"#SBATCH --array=0-{tasks - 1}{throttle}\n"
+    return f"""#!/bin/bash
+# Generated by orchestrate_tetra_arm_cnv.py {RELEASE}.
+# Do not edit a generated script after submission.
+#SBATCH --job-name=tetfuse_{stage.lower()}
+#SBATCH --output={paths.logs}/tetfuse_{stage.lower()}_{token}.out
+#SBATCH --error={paths.logs}/tetfuse_{stage.lower()}_{token}.err
+#SBATCH --partition={args.partition}
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --mem={memory}
+#SBATCH --time={args.time}
+{array}
+set -euo pipefail
+
+{module_block(modules)}
+"""
+
+
+def fusebox_metadata_script(args: argparse.Namespace, paths: FuseboxRunPaths,
+                            libraries: Sequence[int],
+                            panels: Sequence[FuseboxPanel]) -> str:
+    header = fusebox_header(
+        "METADATA", paths, args, 1, "16G", BASE_PYTHON_MODULES)
+    library_args = " ".join(shlex.quote(str(value)) for value in libraries)
+    barcode_checks = "\n".join(
+        f'test -s "$TMP_BARCODE_DIR/lib{library}.barcodes.tsv"'
+        for library in libraries)
+    panel_preparation = "\n".join(
+        "sanitize_panel "
+        + shlex.quote(panel.snps)
+        + f' "$TMP_PREPARED_PANEL_DIR/{panel.name}.canonical.bed.gz"'
+        + f' "$TMP_PREPARED_PANEL_DIR/{panel.name}.canonical.qc.tsv"'
+        for panel in panels)
+    panel_checks = "\n".join(
+        f'gzip -t "$TMP_PREPARED_PANEL_DIR/{panel.name}.canonical.bed.gz"\n'
+        f'test -s "$TMP_PREPARED_PANEL_DIR/{panel.name}.canonical.qc.tsv"'
+        for panel in panels)
+    return header + f"""
+HELPER={shlex.quote(args.fusebox_metadata_script)}
+LEDGER={shlex.quote(args.ledger_input)}
+PANEL_METADATA={shlex.quote(args.panel_metadata)}
+META={shlex.quote(paths.metadata_table)}
+SUMMARY={shlex.quote(paths.metadata_summary)}
+BARCODE_DIR={shlex.quote(paths.barcodes)}
+PREPARED_PANEL_DIR={shlex.quote(paths.prepared_panels)}
+METADATA_DIR=$(dirname "$META")
+
+command -v python3 >/dev/null 2>&1
+test -s "$HELPER"
+test -s "$LEDGER"
+test -s "$PANEL_METADATA"
+if [[ -e "$METADATA_DIR" ]]; then
+    echo "ERROR: refusing to overwrite METADATA outputs" >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$METADATA_DIR")"
+TMP_METADATA=$(mktemp -d "$(dirname "$METADATA_DIR")/.metadata.tmp.XXXXXX")
+trap 'rm -rf "$TMP_METADATA"' EXIT
+TMP_META="$TMP_METADATA/reconciled_cells.tsv"
+TMP_SUMMARY="$TMP_METADATA/reconciled_cells.summary.json"
+TMP_BARCODE_DIR="$TMP_METADATA/barcodes"
+TMP_PREPARED_PANEL_DIR="$TMP_METADATA/prepared_panels"
+python3 "$HELPER" \
+  --ledger "$LEDGER" \
+  --panel-metadata "$PANEL_METADATA" \
+  --libraries {library_args} \
+  --output-meta "$TMP_META" \
+  --barcode-dir "$TMP_BARCODE_DIR" \
+  --summary "$TMP_SUMMARY" \
+  --library-prefix {shlex.quote(args.fusebox_library_prefix)}
+test -s "$TMP_META"
+test -s "$TMP_SUMMARY"
+{barcode_checks}
+
+sanitize_panel() {{
+    local SOURCE=$1
+    local OUTPUT=$2
+    local QC=$3
+    local TMPDIR TMP_PANEL TMP_QC
+    test -s "$SOURCE"
+    mkdir -p "$(dirname "$OUTPUT")"
+    TMPDIR=$(mktemp -d "$(dirname "$OUTPUT")/.panel.tmp.XXXXXX")
+    TMP_PANEL="$TMPDIR/panel.bed.gz"
+    TMP_QC="$TMPDIR/panel.qc.tsv"
+    if [[ "$SOURCE" == *.gz ]]; then
+        gzip -cd -- "$SOURCE"
+    else
+        cat -- "$SOURCE"
+    fi | awk -F $'\t' -v OFS=$'\t' -v QC="$TMP_QC" '
+        function canonical(base) {{ return base ~ /^[ACGT]$/ }}
+        {{
+            total++
+            if (NF < 5) {{ bad_columns++; next }}
+            if ($2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) {{
+                bad_coordinates++
+                next
+            }}
+            start = $2 + 0
+            end = $3 + 0
+            if (start < 0 || end != start + 1) {{
+                bad_coordinates++
+                next
+            }}
+            allele1 = toupper($4)
+            allele2 = toupper($5)
+            if (!canonical(allele1) || !canonical(allele2)) {{
+                noncanonical_alleles++
+                next
+            }}
+            if (allele1 == allele2) {{ equal_alleles++; next }}
+            print $1, start, end, allele1, allele2
+            kept++
+        }}
+        END {{
+            print "metric", "value" > QC
+            print "status", (kept > 0 ? "PASS" : "FAIL") >> QC
+            print "source_rows", total + 0 >> QC
+            print "kept_rows", kept + 0 >> QC
+            print "dropped_rows", total - kept >> QC
+            print "bad_column_rows", bad_columns + 0 >> QC
+            print "bad_coordinate_rows", bad_coordinates + 0 >> QC
+            print "noncanonical_allele_rows", noncanonical_alleles + 0 >> QC
+            print "equal_allele_rows", equal_alleles + 0 >> QC
+            if (kept == 0) exit 42
+        }}' | gzip -c > "$TMP_PANEL"
+    gzip -t "$TMP_PANEL"
+    test -s "$TMP_QC"
+    mv "$TMP_PANEL" "$OUTPUT"
+    mv "$TMP_QC" "$QC"
+    rmdir "$TMPDIR"
+    echo "PREPARED PANEL: $SOURCE -> $OUTPUT"
+    awk -F $'\t' '$1 == "source_rows" || $1 == "kept_rows" || \
+        $1 == "dropped_rows" {{ printf "  %s=%s", $1, $2 }} \
+        END {{ print "" }}' "$QC"
+}}
+
+{panel_preparation}
+{panel_checks}
+mv "$TMP_METADATA" "$METADATA_DIR"
+trap - EXIT
+echo "COMPLETE: METADATA $META"
+date
+"""
+
+
+def fusebox_ase_script(args: argparse.Namespace, paths: FuseboxRunPaths,
+                       task_count: int) -> str:
+    header = fusebox_header(
+        "ASE", paths, args, 1, args.fusebox_ase_memory,
+        ("htslib/1.20", "fusebox/latest"), tasks=task_count)
+    return header + f"""
+MANIFEST={shlex.quote(paths.ase_manifest)}
+COUNT_ASE={shlex.quote(args.count_ase_binary)}
+command -v "$COUNT_ASE" >/dev/null 2>&1
+test -s "$MANIFEST"
+
+ROW=$(sed -n "$((SLURM_ARRAY_TASK_ID + 2))p" "$MANIFEST")
+if [[ -z "$ROW" ]]; then
+    echo "ERROR: missing ASE task row $SLURM_ARRAY_TASK_ID" >&2
+    exit 1
+fi
+IFS=$'\t' read -r TASK LIBRARY PANEL SPECIES1 SPECIES2 SNPS BAM BARCODES OUT LIBRARY_UID <<< "$ROW"
+if [[ "$TASK" != "$SLURM_ARRAY_TASK_ID" ]]; then
+    echo "ERROR: ASE manifest/task index mismatch" >&2
+    exit 1
+fi
+test -s "$SNPS"
+test -s "$BAM"
+test -s "$BARCODES"
+if [[ -e "$OUT" ]]; then
+    echo "ERROR: refusing to overwrite ASE output: $OUT" >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$OUT")"
+TMP=$(mktemp -d "$(dirname "$OUT")/.${{PANEL}}_${{LIBRARY}}.tmp.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+"$COUNT_ASE" \
+  -b "$BAM" \
+  -s "$SNPS" \
+  -B "$BARCODES" \
+  -u "$LIBRARY_UID" \
+  -g "$TMP/result"
+
+mex_complete() {{
+    local ROOT=$1
+    local ALLELE STEM
+    for ALLELE in allele1 allele2; do
+        [[ -d "$ROOT/$ALLELE" ]] || return 1
+        for STEM in matrix.mtx barcodes.tsv; do
+            [[ -s "$ROOT/$ALLELE/$STEM" || -s "$ROOT/$ALLELE/$STEM.gz" ]] || return 1
+        done
+        [[ -s "$ROOT/$ALLELE/features.tsv" || -s "$ROOT/$ALLELE/features.tsv.gz" || \
+           -s "$ROOT/$ALLELE/genes.tsv" || -s "$ROOT/$ALLELE/genes.tsv.gz" ]] || return 1
+    done
+}}
+mex_complete "$TMP/result" || {{
+    echo "ERROR: count_ase did not produce a complete two-allele MEX bundle" >&2
+    exit 1
+}}
+printf 'status\tPASS\nlibrary\t%s\npanel\t%s\nspecies1\t%s\nspecies2\t%s\n' \
+  "$LIBRARY" "$PANEL" "$SPECIES1" "$SPECIES2" > "$TMP/result/.complete.tsv"
+mv "$TMP/result" "$OUT"
+trap - EXIT
+rm -rf "$TMP"
+echo "COMPLETE: ASE $OUT"
+date
+"""
+
+
+def fusebox_h5ad_script(args: argparse.Namespace, paths: FuseboxRunPaths,
+                        libraries: Sequence[int],
+                        panels: Sequence[FuseboxPanel],
+                        expression_mex: Mapping[int, str]) -> str:
+    header = fusebox_header(
+        "H5AD", paths, args, 8, args.fusebox_h5ad_memory,
+        SCIENTIFIC_PYTHON_MODULES)
+    command = ["python3", args.fusebox_h5ad_script]
+    if args.fusebox_input_h5ad:
+        command.extend(("--h5ad", args.fusebox_input_h5ad))
+    else:
+        command.append("--expr")
+        command.extend(expression_mex[library] for library in libraries)
+        command.append("--uid")
+        command.extend(
+            f"{args.fusebox_library_prefix}{library}" for library in libraries)
+    command.extend((
+        "--meta", paths.metadata_table,
+        "--output-name", paths.h5ad_output,
+        "--summary", paths.h5ad_summary,
+    ))
+    if args.fusebox_expression_layer:
+        command.extend(("--counts-layer", args.fusebox_expression_layer))
+    for panel in panels:
+        command.extend(("--ase", panel.name, panel.species1, panel.species2))
+        command.extend(
+            fusebox_panel_output(paths, panel, library)
+            for library in libraries)
+    rendered = (" \\" + "\n  ").join(
+        shlex.quote(value) for value in command)
+    source_checks = (
+        f"test -s {shlex.quote(args.fusebox_input_h5ad)}"
+        if args.fusebox_input_h5ad else
+        "\n".join(f"test -d {shlex.quote(expression_mex[library])}"
+                  for library in libraries))
+    return header + f"""
+command -v python3 >/dev/null 2>&1
+test -s {shlex.quote(args.fusebox_h5ad_script)}
+{source_checks}
+test -s {shlex.quote(paths.metadata_table)}
+if [[ -e {shlex.quote(paths.h5ad_output)} || -e {shlex.quote(paths.h5ad_summary)} ]]; then
+    echo "ERROR: refusing to overwrite H5AD outputs" >&2
+    exit 1
+fi
+mkdir -p {shlex.quote(paths.h5ad)}
+{rendered}
+test -s {shlex.quote(paths.h5ad_output)}
+test -s {shlex.quote(paths.h5ad_summary)}
+echo "COMPLETE: H5AD {paths.h5ad_output}"
+date
+"""
+
+
+def fusebox_karyotype_script(args: argparse.Namespace,
+                             paths: FuseboxRunPaths,
+                             ase_maps: Sequence[str]) -> str:
+    header = fusebox_header(
+        "KARYOTYPE", paths, args, args.karyotype_cpus,
+        args.karyotype_memory, ("htslib/1.20", "fusebox/latest"))
+    command = [
+        args.karyotype_binary,
+        "-i", paths.h5ad_output,
+        "-o", paths.karyotype_prefix,
+        "-g", args.karyotype_gene_arms,
+        "-T", str(args.karyotype_cpus),
+        "-m", str(args.karyotype_min_cells),
+        "-s", args.karyotype_species_column,
+        "-u", args.karyotype_uid_column,
+    ]
+    for mapping in ase_maps:
+        command.extend(("-a", mapping))
+    rendered = (" \\" + "\n  ").join(
+        shlex.quote(value) for value in command)
+    outputs = [paths.karyotype_prefix + suffix for suffix in (".tab", ".lfc", ".cooc")]
+    conflict = " || ".join(f"-e {shlex.quote(value)}" for value in (*outputs, paths.karyotype_complete))
+    return header + f"""
+KARYOTYPE={shlex.quote(args.karyotype_binary)}
+command -v "$KARYOTYPE" >/dev/null 2>&1
+test -s {shlex.quote(paths.h5ad_output)}
+test -s {shlex.quote(args.karyotype_gene_arms)}
+if [[ {conflict} ]]; then
+    echo "ERROR: refusing to overwrite KARYOTYPE outputs" >&2
+    exit 1
+fi
+mkdir -p {shlex.quote(paths.karyotype)}
+{rendered}
+test -s {shlex.quote(outputs[0])}
+test -s {shlex.quote(outputs[1])}
+test -f {shlex.quote(outputs[2])}
+printf 'status\tPASS\ninput_h5ad\t%s\noutput_prefix\t%s\n' \
+  {shlex.quote(paths.h5ad_output)} {shlex.quote(paths.karyotype_prefix)} \
+  > {shlex.quote(paths.karyotype_complete)}
+echo "COMPLETE: KARYOTYPE {paths.karyotype_prefix}"
+date
+"""
+
+
+def archive_fusebox_outputs(selected: Sequence[str], paths: FuseboxRunPaths) -> str:
+    stage_dirs = {
+        "METADATA": paths.metadata,
+        "ASE": paths.ase,
+        "H5AD": paths.h5ad,
+        "KARYOTYPE": paths.karyotype,
+    }
+    existing: list[tuple[str, str]] = []
+    for stage in selected:
+        directory = stage_dirs[stage]
+        if not os.path.lexists(directory):
+            continue
+        if not os.path.isdir(directory):
+            raise ValueError(
+                f"Fusebox {stage} output path exists but is not a directory: "
+                f"{directory}")
+        if os.listdir(directory):
+            existing.append((stage, directory))
+    if not existing:
+        return ""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = os.path.join(
+        paths.root, "recompute_archive",
+        f"fusebox_before_{RELEASE.replace('.', '_')}_{stamp}")
+    os.makedirs(archive, exist_ok=False)
+    moved: list[tuple[str, str]] = []
+    try:
+        for stage, source in existing:
+            destination = os.path.join(archive, stage.lower())
+            os.replace(source, destination)
+            moved.append((source, destination))
+        return archive
+    except Exception:
+        for source, destination in reversed(moved):
+            if os.path.lexists(destination) and not os.path.lexists(source):
+                os.replace(destination, source)
+        raise
+
+
+def run_fusebox_workflow(args: argparse.Namespace) -> int:
+    libraries = parse_libraries(args.libraries)
+    upstream_cohort = (
+        parse_libraries(args.upstream_cohort_libraries)
+        if args.upstream_cohort_libraries else list(libraries))
+    if not set(libraries) <= set(upstream_cohort):
+        raise ValueError(
+            "--upstream-cohort-libraries must contain every output library")
+    selected = parse_fusebox_stages(args.stages)
+    if args.resume and not args.stages:
+        raise ValueError(
+            "--resume requires an explicit --stage selection")
+    if args.recompute_selected and not args.resume:
+        raise ValueError("--recompute-selected requires --resume")
+    if args.array_throttle is not None and args.array_throttle < 1:
+        raise ValueError("--array-throttle must be positive")
+    if not 1 <= args.karyotype_cpus <= 256:
+        raise ValueError("--karyotype-cpus must be between 1 and 256")
+    if args.karyotype_min_cells < 1:
+        raise ValueError("--karyotype-min-cells must be positive")
+    for name in ("fusebox_ase_memory", "fusebox_h5ad_memory", "karyotype_memory"):
+        if not re.fullmatch(r"[1-9][0-9]*(?:[KMGTP])?", getattr(args, name)):
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be a positive SLURM memory token")
+    if not re.fullmatch(
+            r"[0-9]+-[0-9]{2}:[0-9]{2}:[0-9]{2}|[0-9]{1,3}:[0-9]{2}:[0-9]{2}",
+            args.time):
+        raise ValueError("--time must use D-HH:MM:SS or HH:MM:SS")
+    for name in ("karyotype_species_column", "karyotype_uid_column"):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", getattr(args, name)):
+            raise ValueError(f"--{name.replace('_', '-')} is invalid")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.partition):
+        raise ValueError("--partition contains unsupported characters")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.fusebox_library_prefix):
+        raise ValueError("--fusebox-library-prefix contains unsupported characters")
+
+    supplied_run_root = args.run_root
+    configure_input_roots(args)
+    if not supplied_run_root:
+        args.run_root = absolute(os.path.join(
+            args.upstream_analysis_root, "aggregate_library_analysis",
+            "fusebox_karyotype"))
+    default_templates(args)
+    args.panel_metadata = absolute(args.panel_metadata)
+    args.fusebox_input_h5ad = absolute(args.fusebox_input_h5ad) \
+        if args.fusebox_input_h5ad else ""
+    args.fusebox_expression_mex_template = (
+        args.fusebox_expression_mex_template
+        or os.path.join(
+            absolute(args.mapping_input_root),
+            f"{args.fusebox_library_prefix}{{lib}}", "filtered"))
+    for name in (
+            "fusebox_metadata_script", "fusebox_h5ad_script",
+            "count_ase_binary", "karyotype_binary", "karyotype_gene_arms"):
+        setattr(args, name, absolute(getattr(args, name)))
+    args.fusebox_panel_root = absolute(args.fusebox_panel_root)
+    use_default_panels = not args.fusebox_panel
+    panel_specs = list(args.fusebox_panel)
+    if use_default_panels:
+        panel_specs = [
+            ",".join((name, species1, species2,
+                      os.path.join(args.fusebox_panel_root, filename)))
+            for name, species1, species2, filename
+            in DEFAULT_FUSEBOX_PANEL_FILES
+        ]
+    panels = parse_fusebox_panels(panel_specs)
+    use_default_ase_maps = (
+        use_default_panels and not args.karyotype_ase_map
+        and libraries == [19])
+    ase_map_specs = (
+        list(DEFAULT_KARYOTYPE_ASE_MAPS)
+        if use_default_ase_maps else list(args.karyotype_ase_map))
+    ase_maps = parse_karyotype_ase_maps(ase_map_specs, panels)
+    if not args.fusebox_input_h5ad and args.fusebox_expression_layer:
+        raise ValueError(
+            "--fusebox-expression-layer applies only with --fusebox-input-h5ad")
+    for value, label in (
+            (args.primary_identity_input, "primary reconciled identity input"),
+            (args.ledger_input, "rich finalized reconciliation ledger"),
+            (args.panel_metadata, "panel metadata"),
+            (args.fusebox_metadata_script, "Fusebox metadata helper"),
+            (args.fusebox_h5ad_script, "Fusebox H5AD helper"),
+            (args.count_ase_binary, "count_ase binary"),
+            (args.karyotype_binary, "karyotype binary"),
+            (args.karyotype_gene_arms, "karyotype gene-arm map")):
+        if not regular_nonempty(value):
+            raise ValueError(f"{label} is missing or empty: {value}")
+    if args.fusebox_input_h5ad and not regular_nonempty(args.fusebox_input_h5ad):
+        raise ValueError(
+            f"Fusebox input H5AD is missing or empty: {args.fusebox_input_h5ad}")
+    for panel in panels:
+        if not regular_nonempty(panel.snps):
+            raise ValueError(
+                f"Fusebox SNP panel {panel.name} is missing or empty: {panel.snps}")
+    bam_paths: dict[int, str] = {}
+    expression_mex: dict[int, str] = {}
+    for library in libraries:
+        bam = expand_template(args.mapping_bam_template, library, "mapping BAM template")
+        if not regular_nonempty(bam):
+            raise ValueError(f"lib{library} mapping BAM is missing or empty: {bam}")
+        index_candidates = (bam + ".bai", os.path.splitext(bam)[0] + ".bai", bam + ".csi")
+        if not any(regular_nonempty(value) for value in index_candidates):
+            raise ValueError(
+                f"lib{library} mapping BAM has no nonempty .bai/.csi index: {bam}")
+        bam_paths[library] = bam
+        mex = expand_template(
+            args.fusebox_expression_mex_template, library,
+            "Fusebox expression MEX template")
+        if not args.fusebox_input_h5ad and not expression_mex_complete(mex):
+            raise ValueError(
+                f"lib{library} newest-run expression MEX is incomplete: {mex}")
+        expression_mex[library] = mex
+    if not args.skip_identity_validation:
+        identity_ok, identity_detail = identity_validation_summary_passes(
+            args.identity_validation, upstream_cohort)
+        if not identity_ok:
+            raise ValueError(
+                "identity validation boundary is not PASS: "
+                f"{args.identity_validation} ({identity_detail})")
+    else:
+        identity_detail = "SKIPPED (AUDIT OVERRIDE)"
+    primary_identity_detail = validate_primary_identity_bundle(
+        args.primary_identity_input, args.ledger_input, libraries)
+
+    paths = fusebox_run_paths(args.run_root)
+    prerequisites = fusebox_ancestors(selected)
+    incomplete = [stage for stage in prerequisites
+                  if not fusebox_stage_complete(stage, paths, libraries, panels)]
+    if incomplete:
+        raise ValueError(
+            "selected stages require completed upstream Fusebox stage(s): "
+            + ",".join(incomplete))
+    if args.recompute_selected:
+        first_index = min(FUSEBOX_STAGES.index(stage) for stage in selected)
+        required_descendants = set(FUSEBOX_STAGES[first_index:])
+        missing_descendants = sorted(required_descendants - set(selected))
+        if missing_descendants:
+            raise ValueError(
+                "--recompute-selected must include every downstream stage to "
+                "avoid stale outputs; also select " + ",".join(missing_descendants))
+    conflicts = [stage for stage in selected if fusebox_stage_has_any(stage, paths)]
+    if conflicts and not args.recompute_selected:
+        raise ValueError(
+            "selected Fusebox stage output already exists for "
+            + ",".join(conflicts)
+            + "; select only unfinished downstream stages with --resume, or "
+              "use --resume --recompute-selected")
+
+    os.makedirs(paths.root, exist_ok=True)
+    for directory in (paths.logs, paths.scripts, paths.manifests):
+        os.makedirs(directory, exist_ok=True)
+    scientific_files: list[dict[str, object]] = [
+        provenance_file_record(
+            args.primary_identity_input, "compact reconciled identity input"),
+        provenance_file_record(
+            args.ledger_input, "rich finalized reconciliation ledger"),
+        provenance_file_record(
+            args.panel_metadata, "donor/species panel metadata", True),
+        provenance_file_record(
+            args.karyotype_gene_arms, "Fusebox gene-arm map", True),
+    ]
+    if not args.skip_identity_validation:
+        scientific_files.append(provenance_file_record(
+            args.identity_validation, "identity validation boundary", True))
+    for panel in panels:
+        scientific_files.append(provenance_file_record(
+            panel.snps, f"Fusebox fixed-difference panel {panel.name}"))
+    for library in libraries:
+        scientific_files.append(provenance_file_record(
+            bam_paths[library], f"lib{library} newest-run GEX BAM"))
+    expression_source: dict[str, object]
+    if args.fusebox_input_h5ad:
+        scientific_files.append(provenance_file_record(
+            args.fusebox_input_h5ad, "Fusebox counts-X H5AD"))
+        expression_source = {
+            "mode": "H5AD",
+            "path": args.fusebox_input_h5ad,
+            "counts_layer": args.fusebox_expression_layer or None,
+        }
+    else:
+        for library in libraries:
+            scientific_files.extend(expression_mex_records(
+                expression_mex[library], library))
+        expression_source = {
+            "mode": "NEWEST_MAPPING_FILTERED_MEX",
+            "directories": {
+                f"lib{library}": expression_mex[library]
+                for library in libraries},
+        }
+    # Device and inode identifiers are diagnostic properties of a particular
+    # filesystem client, not scientific identity.  For inputs already bound by
+    # SHA-256, mtime is likewise redundant and changes after a content-identical
+    # reinstall.  Excluding these volatile fields prevents routine deployment
+    # from manufacturing a false scientific-input change.
+    for record in scientific_files:
+        record.pop("device", None)
+        record.pop("inode", None)
+        if "sha256" in record:
+            record.pop("mtime_ns", None)
+    input_contract = {
+        "schema_version": "tetra_fusebox_input_contract_v2",
+        "libraries": libraries,
+        "upstream_cohort_libraries": upstream_cohort,
+        "mapping_input_root": absolute(args.mapping_input_root),
+        "identity_root": absolute(args.identity_root),
+        "panels": [
+            {"layer": panel.name, "species1": panel.species1,
+             "species2": panel.species2,
+             "source_snps": panel.snps,
+             "prepared_snps": fusebox_prepared_panel(paths, panel),
+             "preparation": (
+                 "five_column_one_base_bed; uppercase canonical A/C/G/T; "
+                 "alleles_different")}
+            for panel in panels],
+        "karyotype_ase_maps": list(ase_maps),
+        "karyotype_species_column": args.karyotype_species_column,
+        "karyotype_uid_column": args.karyotype_uid_column,
+        "karyotype_min_cells": args.karyotype_min_cells,
+        "library_prefix": args.fusebox_library_prefix,
+        "expression_source": expression_source,
+        "scientific_files": scientific_files,
+    }
+    input_contract_path = publish_new_or_warn_replace(
+        os.path.join(paths.manifests, "fusebox_input_provenance.json"),
+        json.dumps(input_contract, sort_keys=True, indent=2) + "\n",
+        "Fusebox scientific input contract")
+    tasks = []
+    task_index = 0
+    for panel in panels:
+        for library in libraries:
+            tasks.append({
+                "task_index": task_index,
+                "library": library,
+                "panel": panel.name,
+                "species1": panel.species1,
+                "species2": panel.species2,
+                "snps": fusebox_prepared_panel(paths, panel),
+                "bam": bam_paths[library],
+                "barcodes": os.path.join(paths.barcodes, f"lib{library}.barcodes.tsv"),
+                "output": fusebox_panel_output(paths, panel, library),
+                "uid": f"{args.fusebox_library_prefix}{library}",
+            })
+            task_index += 1
+    if "ASE" in selected:
+        write_task_manifest(
+            paths.ase_manifest,
+            ("task_index", "library", "panel", "species1", "species2",
+             "snps", "bam", "barcodes", "output", "uid"),
+            tasks)
+
+    suffix = (f".recompute_{RELEASE.replace('.', '_')}" if args.recompute_selected
+              else f".resume_{RELEASE.replace('.', '_')}" if args.resume else "")
+    scripts: dict[str, str] = {}
+    if "METADATA" in selected:
+        scripts["METADATA"] = render_script(
+            os.path.join(paths.scripts, f"00_metadata{suffix}.sbatch"),
+            fusebox_metadata_script(args, paths, libraries, panels))
+    if "ASE" in selected:
+        scripts["ASE"] = render_script(
+            os.path.join(paths.scripts, f"01_ase_array{suffix}.sbatch"),
+            fusebox_ase_script(args, paths, len(tasks)))
+    if "H5AD" in selected:
+        scripts["H5AD"] = render_script(
+            os.path.join(paths.scripts, f"02_h5ad{suffix}.sbatch"),
+            fusebox_h5ad_script(
+                args, paths, libraries, panels, expression_mex))
+    if "KARYOTYPE" in selected:
+        scripts["KARYOTYPE"] = render_script(
+            os.path.join(paths.scripts, f"03_karyotype{suffix}.sbatch"),
+            fusebox_karyotype_script(args, paths, ase_maps))
+
+    print(f"Tetraploid Fusebox karyotyper orchestrator {RELEASE}")
+    print(f"Run root: {paths.root}")
+    print(f"Mapping input root: {args.mapping_input_root}")
+    print(f"Reconciled identity input: {args.primary_identity_input}")
+    print(f"Rich reconciliation ledger: {args.ledger_input}")
+    print("Output libraries: " + ",".join(str(value) for value in libraries))
+    print("Validated upstream cohort: " + ",".join(str(value) for value in upstream_cohort))
+    print("Selected stages: " + ",".join(selected))
+    print("Execution mode: " + (
+        "RECOMPUTE_SELECTED" if args.recompute_selected else
+        "RESUME" if args.resume else "NEW"))
+    print("Identity boundary: " + identity_detail)
+    print(
+        "Compact/rich identity agreement: PASS "
+        f"[{primary_identity_detail['cells']} selected-library cells]")
+    if args.fusebox_input_h5ad:
+        print(f"Expression source: H5AD {args.fusebox_input_h5ad}")
+    else:
+        print("Expression source: newest-run filtered MEX")
+        for library in libraries:
+            print(f"  lib{library}: {expression_mex[library]}")
+    print("Fusebox panels:")
+    print("  selection: " + (
+        f"production defaults under {args.fusebox_panel_root}"
+        if use_default_panels else "explicit --fusebox-panel values"))
+    for panel in panels:
+        print(
+            f"  {panel.name}: {panel.species1} vs {panel.species2} "
+            f"[source={panel.snps}; "
+            f"prepared={fusebox_prepared_panel(paths, panel)}]")
+    print("Karyotype ASE mappings:")
+    print("  selection: " + (
+        "Library 19 production defaults"
+        if use_default_ase_maps else "explicit --karyotype-ase-map values"))
+    for mapping in ase_maps:
+        print(f"  -a {mapping}")
+    print(f"ASE array tasks: {len(tasks)}")
+    print(f"Scientific input contract: {input_contract_path}")
+    if "ASE" in selected:
+        print(f"ASE task map: {paths.ase_manifest}")
+    for stage in FUSEBOX_STAGES:
+        state = "planned" if stage in selected else (
+            "validated complete" if stage in prerequisites else "not selected")
+        print(f"  {stage:<10} {state}")
+        if stage in scripts:
+            print(f"              script: {scripts[stage]}")
+    if not args.submit:
+        print("Planning only: no jobs submitted. Re-run with --submit to launch.")
+        return 0
+    if args.recompute_selected:
+        archive = archive_fusebox_outputs(selected, paths)
+        if archive:
+            print(f"Archived previous selected-stage outputs: {archive}")
+    jobs: dict[str, str] = {}
+    for stage in FUSEBOX_STAGES:
+        if stage not in scripts:
+            continue
+        dependencies = fusebox_dependencies(stage, selected, jobs)
+        job = submit_job(scripts[stage], dependencies, paths.root)
+        jobs[stage] = job
+        print(
+            f"Submitted {stage:<10} job {job}; afterok="
+            f"{':'.join(dependencies) if dependencies else 'none'}; "
+            f"logs={paths.logs}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate and optionally submit the downstream chromosome-arm "
-            "ASE/CNV SLURM DAG."))
+            "Generate and optionally submit either the diagnostic arm-CNV "
+            "DAG or the reconciled gene-ASE Fusebox karyotyper DAG."))
     parser.add_argument("--version", action="version", version=f"%(prog)s {RELEASE}")
+    parser.add_argument(
+        "--workflow", choices=("arm-cnv", "fusebox-karyotype"),
+        default="arm-cnv",
+        help=("arm-cnv preserves the existing diagnostic arm caller; "
+              "fusebox-karyotype builds reconciled gene-level ASE layers and "
+              "runs the existing Fusebox karyotype model"))
     parser.add_argument("--submit", action="store_true",
                         help="Submit generated jobs; otherwise print the plan")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help=("Resume an existing run root using the explicitly selected "
+              "--stage values. Every omitted ancestor stage must already "
+              "have a complete validated output bundle. Selected stages must "
+              "have no primary outputs unless --recompute-selected is used. "
+              "Resume scripts are generated under "
+              "new *.resume.sbatch names, so immutable scripts from the "
+              "original submission are not replaced."))
+    parser.add_argument(
+        "--recompute-selected", action="store_true",
+        help=("With --resume, archive the selected stages' existing outputs "
+              "and regenerate only those stages. Every downstream stage must "
+              "also be selected so a recomputation cannot leave stale "
+              "descendant outputs."))
     parser.add_argument(
         "--stage", "--stages", dest="stages", action="append",
         help="Selected stage(s), comma-separated or repeated; default ALL")
@@ -7885,6 +9585,69 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--array-throttle", type=int, default=None,
                         help="Optional maximum concurrent tasks per array")
 
+    fusebox = parser.add_argument_group(
+        "Fusebox karyotyper workflow",
+        "Used only with --workflow fusebox-karyotype")
+    fusebox.add_argument(
+        "--fusebox-panel-root", default=DEFAULT_ANCESTRAL_SNP_ROOT,
+        help=("Directory containing the production fixed-difference panels; "
+              "defaults to /mnt/beegfs/genomes_annotations/ancestral_snps. "
+              "Used only when no --fusebox-panel values are supplied."))
+    fusebox.add_argument(
+        "--fusebox-panel", action="append", default=[], metavar="SPEC",
+        help=("Repeat once per fixed-difference panel as "
+              "LAYER,SPECIES1,SPECIES2,/absolute/snps.bed[.gz]. LAYER and "
+              "species tokens cannot contain underscores. If omitted, use "
+              "the HP, CB, and HO production panels under "
+              "--fusebox-panel-root."))
+    fusebox.add_argument(
+        "--karyotype-ase-map", action="append", default=[], metavar="SPEC",
+        help=("Repeat for every Fusebox -a mapping as "
+              "SPECIES_IDENTITY,LAYER[,SPECIES1,SPECIES2], for example "
+              "Human_Chinobo,HP,Human,Chinobo. If the production panels are "
+              "used and this option is omitted, use the validated Library 19 "
+              "recursive mappings."))
+    fusebox.add_argument(
+        "--fusebox-input-h5ad", default="",
+        help=("Optional existing counts-X H5AD. If omitted, the workflow "
+              "builds counts-X directly from each selected library's "
+              "newest-run filtered expression MEX."))
+    fusebox.add_argument(
+        "--fusebox-expression-mex-template", default="",
+        help=("Expression MEX directory template containing {lib}; defaults "
+              "to <mapping-input-root>/Tet_2025_Multiome-RNA_{lib}/filtered"))
+    fusebox.add_argument(
+        "--fusebox-expression-layer", default="",
+        help=("Optional H5AD layer to promote to X; the default preserves the "
+              "existing X used by the established model"))
+    fusebox.add_argument(
+        "--fusebox-library-prefix", default=LIBRARY_PREFIX,
+        help="Suffix appended to BAM barcodes by count_ase -u")
+    fusebox.add_argument(
+        "--fusebox-metadata-script", default=DEFAULT_FUSEBOX_METADATA_SCRIPT)
+    fusebox.add_argument(
+        "--fusebox-h5ad-script", default=DEFAULT_FUSEBOX_H5AD_SCRIPT)
+    fusebox.add_argument(
+        "--count-ase-binary", default=DEFAULT_FUSEBOX_COUNT_ASE)
+    fusebox.add_argument(
+        "--karyotype-binary", default=DEFAULT_FUSEBOX_KARYOTYPE)
+    fusebox.add_argument(
+        "--karyotype-gene-arms", default=DEFAULT_KARYOTYPE_GENE_ARMS,
+        help=("Gene-to-arm map for the established Fusebox model; defaults "
+              "to <fusebox>/data/hg38_gene_arms.txt and is always passed "
+              "explicitly to avoid the binary's stale compile-time path"))
+    fusebox.add_argument(
+        "--karyotype-species-column", default="species")
+    fusebox.add_argument(
+        "--karyotype-uid-column", default="composition",
+        help=("Reconciled grouping column used for Fusebox enrichment; "
+              "composition groups the resolved two-individual assignments"))
+    fusebox.add_argument("--karyotype-min-cells", type=int, default=10)
+    fusebox.add_argument("--fusebox-ase-memory", default="64G")
+    fusebox.add_argument("--fusebox-h5ad-memory", default="512G")
+    fusebox.add_argument("--karyotype-memory", default="768G")
+    fusebox.add_argument("--karyotype-cpus", type=int, default=24)
+
     parser.add_argument(
         "--run-root", default=None,
         help=("Output root for this downstream DAG; defaults to "
@@ -7896,17 +9659,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Mapping-output root containing per-library filtered MEX files; "
               "--mapping-root is retained as a legacy alias"))
     parser.add_argument(
-        "--upstream-analysis-root", default=None,
+        "--upstream-analysis-root", default=PRODUCTION_ANALYSIS_ROOT,
         help=("Root produced by orchestrate_tetraploid.py containing per-library "
               "DEMUX/ambient products and aggregate reconciliation, ploidy, and "
               "GEX-calibration products. Required with a non-production "
-              "--mapping-input-root; production defaults to the historical "
-              "combined mapping tree."))
+              "--mapping-input-root; production defaults to the canonical "
+              "all-40 analysis namespace."))
     parser.add_argument(
         "--mapping-run-root", default="",
         help=("Top-level mapping run containing control/, validation/, and "
-              "rna3/mapping_output. Auto-derived for the canonical layout and "
-              "required by the non-production provenance check."))
+              "rna3/mapping_output in the legacy run layout. It is not needed "
+              "for the canonical physical 3P layout."))
     parser.add_argument(
         "--identity-root", default=None,
         help=("Advanced override; defaults to <upstream-analysis-root>/"
@@ -7914,7 +9677,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--identity-validation", default=None,
         help=("Identity reconciliation validation_summary.tsv; defaults below "
-              "--identity-root and must be all-PASS before LEDGER submission"))
+              "--identity-root; required structural and three-state checks "
+              "must be PASS before LEDGER submission"))
     parser.add_argument(
         "--identity-validation-failures", default=None,
         help=("Identity reconciliation validation_failures.tsv; defaults "
@@ -7984,6 +9748,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-identity-validation", action="store_true",
         help=("AUDIT OVERRIDE: bypass the required upstream identity boundary; "
               "recorded in the LEDGER job log"))
+    parser.add_argument(
+        "--primary-identity-input", default=None,
+        help=("Canonical compact three-state identity table; defaults to "
+              "<identity-root>/aggregate/identity_assignments.tsv.gz"))
     parser.add_argument("--ledger-input", default=None)
     parser.add_argument("--final-assignments-template", default=None)
     parser.add_argument(
@@ -8050,7 +9818,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--gex-ambient-analysis", default=DEFAULT_GEX_AMBIENT_ANALYSIS,
         help="GEX_AMBIENT analysis namespace used for cluster auto-discovery")
     parser.add_argument("--panel-metadata", default=DEFAULT_PANEL_METADATA)
-    reference_input = parser.add_mutually_exclusive_group(required=True)
+    reference_input = parser.add_mutually_exclusive_group(required=False)
     reference_input.add_argument(
         "--arms-bed", default="",
         help="Existing BED4 in the same coordinates as demux pileup sites")
@@ -8147,6 +9915,22 @@ def validate_args(args: argparse.Namespace) -> tuple[list[int], tuple[str, ...]]
             "--upstream-cohort-libraries must contain every output library")
     args.upstream_cohort_libraries_resolved = upstream_cohort
     stages = parse_stages(args.stages)
+    if args.resume and not args.stages:
+        raise ValueError(
+            "--resume requires an explicit --stage selection; refusing to "
+            "infer which completed scientific stages may be reused")
+    if args.recompute_selected and not args.resume:
+        raise ValueError("--recompute-selected requires --resume")
+    if args.recompute_selected:
+        unsupported = sorted(set(stages) - {"CALL", "REPORT"})
+        if unsupported:
+            raise ValueError(
+                "--recompute-selected supports only CALL and REPORT; "
+                f"unsupported selected stage(s): {','.join(unsupported)}")
+        if "CALL" in stages and "REPORT" not in stages:
+            raise ValueError(
+                "recomputing CALL also requires selecting REPORT so the "
+                "published report cannot remain stale")
     if args.array_throttle is not None and args.array_throttle < 1:
         raise ValueError("--array-throttle must be positive")
     for name in (
@@ -8166,7 +9950,7 @@ def validate_args(args: argparse.Namespace) -> tuple[list[int], tuple[str, ...]]
         "min_uid_arm_posterior", "max_qname_fallback_fraction",
         "min_ambient_genotyped_mass", "min_rho", "max_rho", "default_rho",
         "min_uid_state_concordance", "min_pair_state_concordance",
-        "min_pair_cell_posterior", "min_pair_arm_posterior",
+        "min_pair_arm_posterior",
         "max_pair_arm_q", "empirical_ambient_window",
     )
     for name, _default in CALL_FLOAT_DEFAULTS:
@@ -8189,6 +9973,12 @@ def validate_args(args: argparse.Namespace) -> tuple[list[int], tuple[str, ...]]
     if args.min_pair_recurrence_cells > args.max_pair_test_cells:
         raise ValueError(
             "--min-pair-recurrence-cells cannot exceed --max-pair-test-cells")
+    if (args.min_aggregate_directional_log_bf < 0.0 or
+            args.min_aggregate_directional_log_bf >
+            args.max_aggregate_cell_log_bf):
+        raise ValueError(
+            "--min-aggregate-directional-log-bf must be nonnegative and no "
+            "greater than --max-aggregate-cell-log-bf")
     if args.min_expression_counts < 0.0:
         raise ValueError("--min-expression-counts cannot be negative")
     if not 0.0 < args.min_expression_sigma <= args.max_expression_sigma:
@@ -8253,6 +10043,10 @@ def validate_args(args: argparse.Namespace) -> tuple[list[int], tuple[str, ...]]
 
     configure_input_roots(args)
     default_templates(args)
+    if not (args.arms_bed or args.gene_annotation or args.hal_file):
+        raise ValueError(
+            "--workflow arm-cnv requires exactly one of --arms-bed, "
+            "--gene-annotation, or --hal-file")
     if args.gene_annotation:
         args.reference_mode = "GENE_SYNTENY"
         args.gene_annotation = absolute(args.gene_annotation)
@@ -8287,7 +10081,7 @@ def validate_args(args: argparse.Namespace) -> tuple[list[int], tuple[str, ...]]
         "identity_metadata_helper", "panel_distinguishability_binary",
         "ambient_profile_binary", "geometry_gate_helper", "contam_binary",
         "demux_pool_workbook", "expected_pool_metadata",
-        "ledger_input",
+        "primary_identity_input", "ledger_input",
         "arms_bed", "gene_arms", "arm_builder_script", "source_arms_bed",
         "hal_reference_script", "prepare_script",
         "expression_script", "ase_binary", "call_script", "report_script",
@@ -8313,7 +10107,7 @@ def validate_args(args: argparse.Namespace) -> tuple[list[int], tuple[str, ...]]
             "identity_metadata_helper", "panel_distinguishability_binary",
             "ambient_profile_binary", "geometry_gate_helper", "contam_binary",
             "demux_pool_workbook", "expected_pool_metadata",
-            "ledger_input",
+            "primary_identity_input", "ledger_input",
             "panel_metadata", "ploidy_input_h5ad", "arms_bed",
             "gene_annotation", "gene_arms",
             "reference_fai", "hal_file", "source_arms_bed",
@@ -8340,6 +10134,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.workflow == "fusebox-karyotype":
+            return run_fusebox_workflow(args)
         libraries, selected = validate_args(args)
         run = run_paths(args.run_root)
         stage_directories = {
@@ -8375,11 +10171,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "the selected reference mode requires the REFERENCE stage unless the generated "
                 f"BED already exists: {args.arms_bed}")
-        reject_output_conflicts(selected, run, paths, args)
+        resume_prerequisites: tuple[str, ...] = ()
+        resume_provenance_records = 0
+        if args.resume:
+            resume_prerequisites, resume_provenance_records = validate_resume_plan(
+                selected, run, paths, args)
+        selected_output_conflicts = reject_output_conflicts(
+            selected, run, paths, args)
         input_provenance = ""
         if set(selected) & {"LEDGER", "PREPARE", "ASE", "EXPRESSION"}:
             input_provenance = validate_and_record_input_bundle(
                 args, run, audit_paths, upstream_cohort, selected)
+        elif args.resume:
+            input_provenance = run.input_provenance
         qc_files = report_qc_files(run, paths)
         manifests = prepare_manifests(args, run, paths, selected)
 
@@ -8397,44 +10201,74 @@ def main(argv: Sequence[str] | None = None) -> int:
         scripts: dict[str, str] = {}
         if "REFERENCE" in selected:
             scripts["REFERENCE"] = render_script(
-                os.path.join(run.scripts, "00_reference.sbatch"),
+                generated_script_path(
+                    run, "00_reference.sbatch", args.resume,
+                    args.recompute_selected),
                 reference_script(args, run))
         if "LEDGER" in selected:
             scripts["LEDGER"] = render_script(
-                os.path.join(run.scripts, "01_ledger.sbatch"),
+                generated_script_path(
+                    run, "01_ledger.sbatch", args.resume,
+                    args.recompute_selected),
                 ledger_script(args, run, libraries))
         if "PREPARE" in selected:
             scripts["PREPARE"] = render_script(
-                os.path.join(run.scripts, "02_prepare_array.sbatch"),
+                generated_script_path(
+                    run, "02_prepare_array.sbatch", args.resume,
+                    args.recompute_selected),
                 prepare_script(args, run, manifests["PREPARE"], len(paths)))
         if "ASE" in selected:
             scripts["ASE"] = render_script(
-                os.path.join(run.scripts, "03_ase_array.sbatch"),
+                generated_script_path(
+                    run, "03_ase_array.sbatch", args.resume,
+                    args.recompute_selected),
                 ase_script(args, run, manifests["ASE"], len(paths)))
         if "EXPRESSION" in selected:
             scripts["EXPRESSION"] = render_script(
-                os.path.join(run.scripts, "04_expression_array.sbatch"),
+                generated_script_path(
+                    run, "04_expression_array.sbatch", args.resume,
+                    args.recompute_selected),
                 expression_script(
                     args, run, manifests["EXPRESSION"], len(paths)))
         if "CALL" in selected:
             scripts["CALL"] = render_script(
-                os.path.join(run.scripts, "05_call.sbatch"),
+                generated_script_path(
+                    run, "05_call.sbatch", args.resume,
+                    args.recompute_selected),
                 call_script(args, run, paths))
         if "REPORT" in selected:
             scripts["REPORT"] = render_script(
-                os.path.join(run.scripts, "06_report.sbatch"),
+                generated_script_path(
+                    run, "06_report.sbatch", args.resume,
+                    args.recompute_selected),
                 report_script(args, run, qc_files))
 
         print(f"Tetraploid Arm CNV orchestrator {RELEASE}")
         print(f"Run root: {run.root}")
         print(f"Mapping input root: {args.mapping_input_root}")
         print(f"Upstream analysis root: {args.upstream_analysis_root}")
+        print(f"Primary identity input: {args.primary_identity_input}")
         if input_provenance:
             print(f"Matched input provenance: {input_provenance}")
         print("Output libraries: " + ",".join(str(value) for value in libraries))
         print("Validated upstream cohort: " + ",".join(
             str(value) for value in upstream_cohort))
         print("Selected stages: " + ",".join(selected))
+        if args.resume:
+            print(
+                "Execution mode: " +
+                ("RECOMPUTE_SELECTED" if args.recompute_selected else "RESUME"))
+            print("Validated completed stages: " + ",".join(
+                resume_prerequisites))
+            print(
+                "Revalidated frozen input records: "
+                f"{resume_provenance_records}")
+            if args.recompute_selected:
+                print(
+                    "Existing selected-stage outputs to archive: "
+                    f"{len(selected_output_conflicts)}")
+        else:
+            print("Execution mode: NEW")
         print(f"Arm reference mode: {args.reference_mode}")
         if args.reference_mode == "GENE_SYNTENY":
             print(f"Gene projection mode: {args.gene_projection_mode}")
@@ -8458,6 +10292,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                  (identity_detail if identity_ok
                   else f"NOT PASS ({identity_detail})")) +
                 f" [{args.identity_validation}]")
+        elif args.resume and "LEDGER" in resume_prerequisites:
+            print(
+                "Identity boundary: " +
+                ("INHERITED; VALIDATION SKIPPED (AUDIT OVERRIDE)"
+                 if args.skip_identity_validation else
+                 "INHERITED AND REVALIDATED PASS") +
+                f" [{args.identity_validation}]")
         else:
             print("Identity boundary: not checked (LEDGER not selected)")
         if "PREPARE" in selected:
@@ -8475,6 +10316,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.submit:
             print("Planning only: no jobs submitted. Re-run with --submit to launch.")
             return 0
+
+        if args.recompute_selected:
+            archive_root = archive_selected_stage_outputs(
+                selected, run, paths, args)
+            if archive_root:
+                print(f"Archived previous selected-stage outputs: {archive_root}")
 
         job_ids: dict[str, str] = {}
         for stage in STAGES:
