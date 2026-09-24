@@ -149,7 +149,7 @@ bool llr_table::del(int n_keep){
         for (vector<pair<short, short> >::iterator x = it->second.begin();
             x != it->second.end();){
             if (!included[x->first] || !included[x->second]){
-                it->second.erase(x);
+                x = it->second.erase(x);
             }
             else if (del_all){
                 if (included[x->first]){
@@ -158,7 +158,7 @@ bool llr_table::del(int n_keep){
                     minllr[x->first] = 0.0;
                     maxllr[x->first] = 0.0;
                 }
-                it->second.erase(x);
+                x = it->second.erase(x);
             }
             else{
                 double mllr = maxllr[x->first];
@@ -196,7 +196,7 @@ bool llr_table::del(int n_keep){
                         minllr[x->first] = 0.0;
                         n_indvs--;
                     }
-                    it->second.erase(x);
+                    x = it->second.erase(x);
                 }
                 else{
                     ++x;
@@ -212,7 +212,7 @@ bool llr_table::del(int n_keep){
                     maxllr[x->first] = 0.0;
                     minllr[x->first] = 0.0;
                 }
-                it->second.erase(x);
+                x = it->second.erase(x);
             }
             lookup_llr.erase(it++);
         }
@@ -245,7 +245,7 @@ void llr_table::get_max(int& best_idx, double& best_llr){
                     best_llr = -it->first;
                     break;
                 }
-                it->second.erase(x);
+                x = it->second.erase(x);
             } 
             if (best_idx == -1){
                 ++it;
