@@ -135,6 +135,46 @@ void llr_table::disallow(short i){
     }
 }
 
+void llr_table::recalculate_minmax(){
+    double inf = numeric_limits<double>::infinity();
+    for (int i = 0; i < included.size(); ++i){
+        if (included[i]){
+            minllr[i] = inf;
+            maxllr[i] = -inf;
+        }
+    }
+    for (map<double, vector<pair<short, short> > >::iterator l = lookup_llr.begin();
+        l != lookup_llr.end(); ++l){
+        for (vector<pair<short, short> >::iterator p = l->second.begin();
+            p != l->second.end(); ++p){
+            int low = p->first;
+            int high = p->second;
+            if (low >= included.size() || high >= included.size() ||
+                !included[low] || !included[high]){
+                continue;
+            }
+            if (l->first < minllr[low]){
+                minllr[low] = l->first;
+            }
+            if (l->first > maxllr[low]){
+                maxllr[low] = l->first;
+            }
+            if (-l->first < minllr[high]){
+                minllr[high] = -l->first;
+            }
+            if (-l->first > maxllr[high]){
+                maxllr[high] = -l->first;
+            }
+        }
+    }
+    for (int i = 0; i < included.size(); ++i){
+        if (included[i] && minllr[i] == inf){
+            minllr[i] = -inf;
+            maxllr[i] = -inf;
+        }
+    }
+}
+
 bool llr_table::del(int n_keep){
 
     if (n_indvs < n_keep){
@@ -972,6 +1012,7 @@ bool populate_llr_table(map<pair<int, int>,
         }
     }
 
+    tab.recalculate_minmax();
     return true;
 }
 
