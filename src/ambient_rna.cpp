@@ -68,6 +68,25 @@ double binom_0 = 1e-6;
 
 // ===== Utility functions ===== 
 
+bool expfracs_complete(const map<pair<int, int>, map<int, float> >& expfracs,
+    const vector<int>& idx2samp){
+    for (vector<int>::const_iterator i = idx2samp.begin(); i != idx2samp.end(); ++i){
+        for (int nalt = 0; nalt <= 2; ++nalt){
+            pair<int, int> key = make_pair(*i, nalt);
+            map<pair<int, int>, map<int, float> >::const_iterator ef = expfracs.find(key);
+            if (ef == expfracs.end()){
+                return false;
+            }
+            for (vector<int>::const_iterator j = idx2samp.begin(); j != idx2samp.end(); ++j){
+                if (ef->second.find(*j) == ef->second.end()){
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 /**
  * Integrate binomial log likelihood wrt p_c (expected alt allele match rate from contamination)
  * 
@@ -281,11 +300,14 @@ double ll_amb_prof_mixture(const vector<double>& params,
     double k = data_d.at("k");
     double p_e = data_d.at("p_e");
     double binom_p = (1.0 - c) * p_e + c * p_c;
-    
-    if (isnan(logbinom(n,k,binom_p)) || isinf(logbinom(n,k,binom_p))){
-       fprintf(stderr, "oops\n");
-       exit(1);
-
+    if (!isfinite(binom_p)){
+        return -INFINITY;
+    }
+    if (binom_p < DBL_MIN*1e6){
+        binom_p = DBL_MIN*1e6;
+    }
+    else if (binom_p > 1.0-DBL_MIN*1e6){
+        binom_p = 1.0-DBL_MIN*1e6;
     }
     return logbinom(n, k, binom_p);
 }
@@ -315,6 +337,15 @@ void dll_amb_prof_mixture(const vector<double>& params,
     double p_e = data_d.at("p_e");
     
     double binom_p = (1.0 - c) * p_e + c * p_c;
+    if (!isfinite(binom_p)){
+        return;
+    }
+    if (binom_p < DBL_MIN*1e6){
+        binom_p = DBL_MIN*1e6;
+    }
+    else if (binom_p > 1.0-DBL_MIN*1e6){
+        binom_p = 1.0-DBL_MIN*1e6;
+    }
     double dy_dp = (k-n*binom_p)/(binom_p - binom_p*binom_p);
     
     results[results.size()-1] += dy_dp * c;
@@ -867,8 +898,10 @@ double contamFinder::est_min_c(){
         contam_prof.insert(make_pair(-1, 1.0/((double)minc_by_id.size() + 1.0)));
         denom += contam_prof[-1];
     }
-    for (map<int, double>::iterator cp = contam_prof.begin(); cp != contam_prof.end(); ++cp){
-        cp->second /= denom;
+    if (denom > 0){
+        for (map<int, double>::iterator cp = contam_prof.begin(); cp != contam_prof.end(); ++cp){
+            cp->second /= denom;
+        }
     }
     
     return c_est;
@@ -1387,6 +1420,10 @@ void contamFinder::compile_amb_prof_dat(bool solve_for_c,
  * Edits init_c to updated value (if solve_for_c == true)
  */
 double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, bool use_global_c){
+    if (!expfracs_complete(expfracs, idx2samp)){
+        fprintf(stderr, "ERROR: incomplete conditional matching probabilities\n");
+        return -DBL_MAX;
+    }
     
     vector<double> params;
     if (solve_for_c){
@@ -1421,10 +1458,25 @@ double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, b
     if (contam_prof.count(-1) > 0){
         startprops.push_back(contam_prof[-1]);
     }
+
+    bool valid_data = mixfracs.size() > 0 && startprops.size() > 0 &&
+        weights.size() == mixfracs.size() && n.size() == mixfracs.size() &&
+        k.size() == mixfracs.size() && p_e.size() == mixfracs.size() &&
+        (solve_for_c || c.size() == mixfracs.size());
+    for (int i = 0; valid_data && i < mixfracs.size(); ++i){
+        if (mixfracs[i].size() != startprops.size()){
+            valid_data = false;
+        }
+    }
+    if (!valid_data){
+        fprintf(stderr, "ERROR: invalid ambient profile data\n");
+        return -DBL_MAX;
+    }
     
     // Set up ML solver 
-    solver.add_mixcomp(mixfracs);
-    solver.add_mixcomp_fracs(startprops);
+    if (!solver.add_mixcomp(mixfracs) || !solver.add_mixcomp_fracs(startprops)){
+        return -DBL_MAX;
+    }
     solver.add_data("n", n);
     solver.add_data("k", k);
     solver.add_data("p_e", p_e);
@@ -1439,43 +1491,55 @@ double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, b
 
     if (solve_for_c){
         // First time. Try a few starting conditions and get the maximum LL.
-        solver.solve();
-        
         vector<double> lls;
         vector<vector<double> > mcs;
         vector<double> cs;
-        int maxidx = 0;
-        double maxll = solver.log_likelihood;
-        lls.push_back(solver.log_likelihood);
-        mcs.push_back(solver.results_mixcomp);
-        cs.push_back(solver.results[0]);
+        int maxidx = -1;
+        double maxll = -DBL_MAX;
+        if (solver.solve() && solver.results.size() > 0 &&
+            solver.results_mixcomp.size() == startprops.size() &&
+            isfinite(solver.log_likelihood) && isfinite(solver.results[0])){
+            maxidx = 0;
+            maxll = solver.log_likelihood;
+            lls.push_back(solver.log_likelihood);
+            mcs.push_back(solver.results_mixcomp);
+            cs.push_back(solver.results[0]);
+        }
         
         vector<double> mptest;
         for (int i = 0; i < startprops.size(); ++i){
             mptest.push_back(1.0/startprops.size());
         }
-        solver.add_mixcomp_fracs(mptest);
-        solver.solve();
-        if (solver.log_likelihood > maxll){
-            maxll = solver.log_likelihood;
+        if (solver.add_mixcomp_fracs(mptest) && solver.solve() &&
+            solver.results.size() > 0 && solver.results_mixcomp.size() == startprops.size() &&
+            isfinite(solver.log_likelihood) && isfinite(solver.results[0])){
+            if (maxidx == -1 || solver.log_likelihood > maxll){
+                maxidx = lls.size();
+                maxll = solver.log_likelihood;
+            }
+            lls.push_back(solver.log_likelihood);
+            mcs.push_back(solver.results_mixcomp);
+            cs.push_back(solver.results[0]);
         }
-        lls.push_back(solver.log_likelihood);
-        mcs.push_back(solver.results_mixcomp);
-        cs.push_back(solver.results[0]);
 
         int ntrials = contam_prof.size() * n_mixprop_trials;
         //vector<double> trialprops;
         for (int n = 0; n < ntrials; ++n){
             solver.randomize_mixcomps();
-             
-            solver.solve();
-            if (solver.log_likelihood > maxll){
+            if (solver.solve() && solver.results.size() > 0 &&
+                solver.results_mixcomp.size() == startprops.size() &&
+                isfinite(solver.log_likelihood) && isfinite(solver.results[0]) &&
+                (maxidx == -1 || solver.log_likelihood > maxll)){
                 maxll = solver.log_likelihood;
                 maxidx = lls.size();
                 lls.push_back(solver.log_likelihood);
                 mcs.push_back(solver.results_mixcomp);
                 cs.push_back(solver.results[0]);
             }
+        }
+        if (maxidx == -1){
+            fprintf(stderr, "ERROR: unable to infer ambient RNA profile\n");
+            return -DBL_MAX;
         }
         solver.log_likelihood = maxll;
         solver.results[0] = cs[maxidx];
@@ -1493,7 +1557,11 @@ double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, b
     }
     else{
         vector<double> trialprops;
-        solver.solve();
+        if (!solver.solve() || solver.results_mixcomp.size() != startprops.size() ||
+            !isfinite(solver.log_likelihood)){
+            fprintf(stderr, "ERROR: unable to infer ambient RNA profile\n");
+            return -DBL_MAX;
+        }
         vector<double> maxres = solver.results_mixcomp;
         double maxll = solver.log_likelihood;
         /* 
@@ -1596,6 +1664,12 @@ double contamFinder::update_amb_prof_mixture(bool solve_for_c, double& init_c, b
 void contamFinder::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_params){
     // Assumes we have already solved everything and that this is at the end.
 
+    if (!expfracs_complete(expfracs, idx2samp)){
+        fprintf(stderr, "ERROR: incomplete conditional matching probabilities\n");
+        dirichlet_params.clear();
+        return;
+    }
+
     // Compile everything we need
     vector<vector<double> > mixfracs;
     vector<double> weights;
@@ -1628,6 +1702,19 @@ void contamFinder::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_p
         vector<double> v;
         dirprops.push_back(v);
         mle_fracs.push_back(contam_prof[-1]);
+    }
+
+    bool valid_data = n.size() > 0 && startprops.size() > 0 &&
+        mixfracs.size() == n.size() && weights.size() == n.size() &&
+        k.size() == n.size() && p_e.size() == n.size() && c.size() == n.size();
+    for (int i = 0; valid_data && i < mixfracs.size(); ++i){
+        if (mixfracs[i].size() != startprops.size()){
+            valid_data = false;
+        }
+    }
+    if (!valid_data){
+        dirichlet_params.clear();
+        return;
     }
     
     // Initialize random stuff
@@ -1664,14 +1751,32 @@ void contamFinder::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_p
             //solver.set_threads(num_threads);
             solver.set_bfgs_threads(num_threads);
         }
-        solver.add_mixcomp(mixfracs_boot);
-        solver.add_mixcomp_fracs(startprops);
+        if (!solver.add_mixcomp(mixfracs_boot) ||
+            !solver.add_mixcomp_fracs(startprops)){
+            continue;
+        }
         solver.add_data("n", n_boot);
         solver.add_data("k", k_boot);
         solver.add_data("p_e", p_e_boot);
         solver.add_data("c", c_boot);
         solver.add_weights(weights_boot);
-        solver.solve();
+        if (!solver.solve() || solver.results_mixcomp.size() != startprops.size() ||
+            !isfinite(solver.log_likelihood)){
+            continue;
+        }
+        bool complete = true;
+        double propsum = 0.0;
+        for (int x = 0; x < solver.results_mixcomp.size(); ++x){
+            if (!isfinite(solver.results_mixcomp[x]) || solver.results_mixcomp[x] < 0 ||
+                solver.results_mixcomp[x] > 1){
+                complete = false;
+                break;
+            }
+            propsum += solver.results_mixcomp[x];
+        }
+        if (!complete || fabs(propsum-1.0) > 1e-6){
+            continue;
+        }
         
         for (int x = 0; x < solver.results_mixcomp.size(); ++x){
             dirprops[x].push_back(solver.results_mixcomp[x]);
@@ -1679,10 +1784,19 @@ void contamFinder::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_p
         
     }
     fprintf(stderr, "\n");
+
+    if (dirprops.size() == 0 || dirprops[0].size() == 0){
+        dirichlet_params.clear();
+        return;
+    }
     
     // Now fit Dirichlet MLE
     vector<double> dirichlet_soln;
     fit_dirichlet(mle_fracs, dirprops, dirichlet_soln);
+    if (dirichlet_soln.size() != startprops.size()){
+        dirichlet_params.clear();
+        return;
+    }
     
     dirichlet_params.clear();
     for (int i = 0; i < idx2samp.size(); ++i){
@@ -2231,7 +2345,9 @@ pair<double, double> contamFinder::est_error_rates(bool init){
     double this_e_a = e_a;
 
     try{
-        solver.solve();
+        if (!solver.solve()){
+            throw optimML::OPTIMML_MATH_ERR;
+        }
     
         this_e_r = solver.results[0];
         this_e_a = solver.results[1];
