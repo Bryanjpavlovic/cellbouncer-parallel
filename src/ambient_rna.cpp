@@ -1621,6 +1621,7 @@ void contamFinder::bootstrap_amb_prof(int n_boots, map<int, double>& dirichlet_p
         solver.add_data("k", k_boot);
         solver.add_data("p_e", p_e_boot);
         solver.add_data("c", c_boot);
+        solver.add_weights(weights_boot);
         solver.solve();
         
         for (int x = 0; x < solver.results_mixcomp.size(); ++x){
