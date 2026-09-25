@@ -839,6 +839,13 @@ double contamFinder::est_min_c(){
         denom += frac;
         contam_prof.insert(make_pair(mi->first, frac));
     }
+    for (int i = 0; i < idx2samp.size(); ++i){
+        int samp = idx2samp[i];
+        if (contam_prof.count(samp) == 0){
+            contam_prof.insert(make_pair(samp, minval));
+            denom += minval;
+        }
+    }
     if (inter_species){
         contam_prof.insert(make_pair(-1, 1.0/((double)minc_by_id.size() + 1.0)));
         denom += contam_prof[-1];
@@ -2238,11 +2245,19 @@ double contamFinder::compute_ll(){
  * Return overall log likelihood.
  */
 void contamFinder::fit(){
+    map<int, double> init_prof;
+    if (contam_prof_initialized){
+        init_prof = contam_prof;
+    }
+
     // Begin with minimum estimate of c (global contamination rate)
     // if not provided from a previous run
     if (c_init <= 0){
         // Get (estimated/averaged) min bound on c
         c_init = this->est_min_c();
+    }
+    if (contam_prof_initialized){
+        contam_prof = init_prof;
     }
     double ll_init = init_params(c_init);
     fprintf(stderr, "Initial global contamination rate = %f\n", c_init);

@@ -1059,15 +1059,17 @@ name prefix.\n", output_prefix.c_str());
     if (idfile_given){
         parse_idfile(idfile, samples, allowed_ids, allowed_ids2, true);
         if (allowed_ids.size() == 0){
-            fprintf(stderr, "No valid individual names found in file %s; allowing \
-all possible individuals\n", idfile.c_str());
+            fprintf(stderr, "ERROR: no valid individual names found in file %s\n",
+                idfile.c_str());
+            exit(1);
         }
     }
     if (idfile_doublet_given){
         parse_idfile(idfile_doublet, samples, allowed_ids, allowed_ids2, false);
         if (allowed_ids.size() == 0){
-            fprintf(stderr, "No valid individual names found in file %s; allowing \
-all possible individuals\n", idfile_doublet.c_str());
+            fprintf(stderr, "ERROR: no valid individual names found in file %s\n",
+                idfile_doublet.c_str());
+            exit(1);
         }
     }
     
