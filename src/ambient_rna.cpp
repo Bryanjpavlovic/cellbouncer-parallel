@@ -367,12 +367,12 @@ contamFinder::contamFinder(robin_hood::unordered_map<unsigned long,
 
     for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin(); a != 
         assn.end(); ++a){
-        allowed_ids.insert(a->second);
+        this->allowed_ids.insert(a->second);
         // Make sure we also allow sub-IDs of combinations
         if (a->second >= n_samples){
             pair<int, int> combo = idx_to_hap_comb(a->second, n_samples);
-            allowed_ids.insert(combo.first);
-            allowed_ids.insert(combo.second);
+            this->allowed_ids.insert(combo.first);
+            this->allowed_ids.insert(combo.second);
         }
         if (id_llrsum.count(a->second) == 0){
             id_llrsum.insert(make_pair(a->second, 0.0));
