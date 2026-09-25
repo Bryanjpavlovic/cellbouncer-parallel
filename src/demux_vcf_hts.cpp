@@ -187,6 +187,13 @@ int read_vcf_chrom(string& vcf_file,
                             chrom.c_str(), (long int) bcf_record->pos);
                         exit(1);
                     }
+                    if (num_loaded != num_samples*2){
+                        fprintf(stderr, "WARNING: expected diploid genotypes at %s %ld\n",
+                            chrom.c_str(), (long int) bcf_record->pos);
+                        free(gts);
+                        --nvar;
+                        continue;
+                    }
                     
                     // Assume ploidy = 2
                     int ploidy = 2;
@@ -222,7 +229,11 @@ int read_vcf_chrom(string& vcf_file,
                             }
                         }
                         
-                        if (bcf_gt_is_missing(gtptr[0])){
+                        if (gtptr[0] == bcf_int32_vector_end ||
+                            gtptr[1] == bcf_int32_vector_end ||
+                            bcf_gt_is_missing(gtptr[0]) || bcf_gt_is_missing(gtptr[1]) ||
+                            bcf_gt_allele(gtptr[0]) < 0 || bcf_gt_allele(gtptr[0]) > 1 ||
+                            bcf_gt_allele(gtptr[1]) < 0 || bcf_gt_allele(gtptr[1]) > 1){
                             // Missing genotype.
                             nmiss++;
                         }
@@ -248,6 +259,7 @@ int read_vcf_chrom(string& vcf_file,
                             }
                         }    
                     } 
+                    free(gts);
                     free(gqs);            
                     
                     if (allow_missing || nmiss == 0){
@@ -382,6 +394,13 @@ int read_vcf(string& filename,
                         chrom.c_str(), (long int) bcf_record->pos);
                     exit(1);
                 }
+                if (num_loaded != num_samples*2){
+                    fprintf(stderr, "WARNING: expected diploid genotypes at %s %ld\n",
+                        chrom.c_str(), (long int) bcf_record->pos);
+                    free(gts);
+                    --nvar;
+                    continue;
+                }
                 
                 // Assume ploidy = 2
                 int ploidy = 2;
@@ -417,7 +436,11 @@ int read_vcf(string& filename,
                         }
                     }
                     
-                    if (bcf_gt_is_missing(gtptr[0])){
+                    if (gtptr[0] == bcf_int32_vector_end ||
+                        gtptr[1] == bcf_int32_vector_end ||
+                        bcf_gt_is_missing(gtptr[0]) || bcf_gt_is_missing(gtptr[1]) ||
+                        bcf_gt_allele(gtptr[0]) < 0 || bcf_gt_allele(gtptr[0]) > 1 ||
+                        bcf_gt_allele(gtptr[1]) < 0 || bcf_gt_allele(gtptr[1]) > 1){
                         // Missing genotype.
                         nmiss++;
                     }
@@ -443,6 +466,7 @@ int read_vcf(string& filename,
                         }
                     }    
                 } 
+                free(gts);
                 free(gqs);            
                 
                 if (allow_missing || nmiss == 0){
