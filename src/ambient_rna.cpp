@@ -822,15 +822,32 @@ double contamFinder::est_min_c(){
     double vsum = 0.0;
     double vcount = 0.0;
     for (map<int, double>::iterator mi = minc_by_id.begin(); mi != minc_by_id.end(); ++mi){
-        vsum += mi->second/minc_by_id_count[mi->first];
-        vcount++;
+        if (minc_by_id_count[mi->first] > 0){
+            vsum += mi->second/minc_by_id_count[mi->first];
+            vcount++;
+        }
     }
-    double c_est = vsum/(vcount-1.0);
+    double c_est;
+    if (vcount > 1){
+        c_est = vsum/(vcount-1.0);
+    }
+    else if (vcount > 0){
+        c_est = vsum/vcount;
+    }
+    else{
+        c_est = 0.01;
+    }
+    if (!isfinite(c_est) || c_est <= 0){
+        c_est = 0.01;
+    }
     
     contam_prof.clear();
     double minval = 0.01;
     double denom = 0.0;
     for (map<int, double>::iterator mi = minc_by_id.begin(); mi != minc_by_id.end(); ++mi){
+        if (minc_by_id_count[mi->first] <= 0){
+            continue;
+        }
         double val = mi->second/minc_by_id_count[mi->first];
         double frac = 1.0 - val/c_est;
         if (frac < minval){
@@ -996,7 +1013,10 @@ void contamFinder::est_contam_cells_global(){
  *
  */
 void contamFinder::est_contam_cells(){
-    
+    robin_hood::unordered_map<unsigned long, double> contam_rate_prev = contam_rate;
+    robin_hood::unordered_map<unsigned long, double> contam_rate_se_prev = contam_rate_se;
+    robin_hood::unordered_map<unsigned long, double> contam_rate_ll_prev = contam_rate_ll;
+
     contam_rate.clear();
     contam_rate_se.clear();
     contam_rate_ll.clear();
@@ -1042,21 +1062,36 @@ void contamFinder::est_contam_cells(){
         }
         c_cell.set_maxiter(-1);
         
-        bool root_found = 0.0;
         double se = 0.0;
-        double c_cell_map = 1.0;
+        double c_cell_map = 0.0;
         double ll = 0.0;
+        bool solved = false;
         try{
             c_cell_map = c_cell.solve(0,1);
-            if (c_cell.root_found){
+            if (c_cell.root_found && isfinite(c_cell_map) && c_cell_map >= 0 &&
+                c_cell_map <= 1 && isfinite(c_cell.log_likelihood)){
                 ll = c_cell.log_likelihood;
                 if (c_cell.se_found){
                     se = c_cell.se;
                 }
+                solved = true;
             }
         }
         catch (int exc){
             // pass
+        }
+        if (!solved && contam_rate_prev.count(ci->first) > 0){
+            c_cell_map = contam_rate_prev[ci->first];
+            if (contam_rate_se_prev.count(ci->first) > 0){
+                se = contam_rate_se_prev[ci->first];
+            }
+            if (contam_rate_ll_prev.count(ci->first) > 0){
+                ll = contam_rate_ll_prev[ci->first];
+            }
+            solved = true;
+        }
+        if (!solved){
+            continue;
         }
         // Set SE to 0 if we did not find a maximum-likelihood estimate in the range (0,1) 
         contam_rate.emplace(ci->first, c_cell_map);
@@ -1069,6 +1104,10 @@ void contamFinder::est_contam_cells(){
         contam_rate_ll.emplace(ci->first, ll);
     }
     
+    if (cell_c_maps.size() == 0){
+        return;
+    }
+
     // Re-compute data set-wide distribution
     pair<double, double> mu_var;
     if (weighted){
@@ -1098,6 +1137,9 @@ void contamFinder::est_contam_cells(){
     map<int, double> idccount;
     for (robin_hood::unordered_map<unsigned long, int>::iterator a = assn.begin();
         a != assn.end(); ++a){
+        if (contam_rate.count(a->first) == 0){
+            continue;
+        }
         if (a->second >= n_samples){
             pair<int, int> comb = idx_to_hap_comb(a->second, n_samples);
             if (idcsum.count(comb.first) == 0){
@@ -1818,8 +1860,6 @@ bool contamFinder::reclassify_cells(){
         doub_rate_table = doublet_rate;
     }
 
-    set<unsigned long> cell_rm;
-   
     /*
     vector<pair<double, int> > cpsort;
     for (map<int, double>::iterator cp = contam_prof.begin(); cp != contam_prof.end(); ++cp){
@@ -2080,7 +2120,17 @@ bool contamFinder::reclassify_cells(){
                         c_cell.add_beta_prior(betaparams.first, betaparams.second);
                     }
                     c_cell.set_maxiter(-1);
-                    double c_cell_map = c_cell.solve(0,1);
+                    double c_cell_map = 0.0;
+                    bool c_cell_solved = false;
+                    try{
+                        c_cell_map = c_cell.solve(0,1);
+                        c_cell_solved = c_cell.root_found && isfinite(c_cell_map) &&
+                            c_cell_map >= 0 && c_cell_map <= 1 &&
+                            isfinite(c_cell.log_likelihood);
+                    }
+                    catch (int exc){
+                        // Keep the previous assignment.
+                    }
                     
                     // Only accept the change if the new assignment + contam rate inference has a higher
                     // log likelihood than the older assignment + contam rate inference
@@ -2091,9 +2141,10 @@ bool contamFinder::reclassify_cells(){
                     //if (c_cell.root_found &&
                     //    (contam_rate_ll[a->first] == 0 || c_cell.log_likelihood < contam_rate_ll[a->first])){
   
-                    if (c_cell.root_found &&
+                    if (c_cell_solved &&
 //                        c_cell_map >= contam_rate[a->first] &&  
-                        (contam_rate_ll[a->first] == 0 || c_cell.log_likelihood >= contam_rate_ll[a->first])){
+                        (contam_rate_ll.count(a->first) == 0 || contam_rate_ll[a->first] == 0 ||
+                        c_cell.log_likelihood >= contam_rate_ll[a->first])){
                         n_reassigned++;
                         
                         //fprintf(stdout, "%s\t%f\t%f\t%f\t%f\n", bc2str(a->first).c_str(),
@@ -2105,33 +2156,15 @@ bool contamFinder::reclassify_cells(){
                         a->second = a_new;
                         assn_llr[a->first] = llr_new;
                         contam_rate[a->first] = c_cell_map;
-                        contam_rate_se[a->first] = c_cell.se;
+                        contam_rate_se[a->first] = c_cell.se_found ? c_cell.se : 0.0;
                         contam_rate_ll[a->first] = c_cell.log_likelihood;
                     }
                 }
             }
-            else{
-                cell_rm.insert(a->first);        
-            }
-        }
-        else{
-            // Keep original? Delete original?
-            cell_rm.insert(a->first);
         }
     }
     
     fprintf(stderr, "  %d cells reassigned\n", n_reassigned);
-    fprintf(stderr, "  %ld cells removed\n", cell_rm.size());
-
-    if (cell_rm.size() > 0){
-        changed = true;
-    }
-    for (set<unsigned long>::iterator rm = cell_rm.begin(); rm != cell_rm.end(); ++rm){
-        assn.erase(*rm);
-        assn_llr.erase(*rm);
-        contam_rate.erase(*rm);
-        contam_rate_se.erase(*rm);
-    }
     return changed;
 }
 
