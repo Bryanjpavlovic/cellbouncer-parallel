@@ -200,9 +200,9 @@ int read_vcf_chrom(string& vcf_file,
                     //int ploidy = n_gts / num_samples; 
                     
                     // Load genotype qualities
-                    float* gqs = NULL;
+                    int32_t* gqs = NULL;
                     int n_gqs = 0;
-                    int num_gq_loaded = bcf_get_format_float(bcf_header, bcf_record, "GQ",
+                    int num_gq_loaded = bcf_get_format_int32(bcf_header, bcf_record, "GQ",
                         &gqs, &n_gqs);
                     
                     int nalt_alleles = 0;
@@ -213,14 +213,16 @@ int read_vcf_chrom(string& vcf_file,
                         
                         bool gq_pass = false;
                         
-                        if (num_gq_loaded < num_samples || !isnan(gqs[i]) || 
-                            gqs[i] == bcf_float_missing){
+                        if (num_gq_loaded < num_samples ||
+                            gqs[i] == bcf_int32_missing ||
+                            gqs[i] == bcf_int32_vector_end){
                             // Missing GQ? let it slide
                             gq_pass = true;
                         }
                         else{
                             // valid GQ.
                             if (gqs[i] >= mingq){
+                                gq_pass = true;
                                 v.gqs.push_back(pow(10, -(float)gqs[i] / 10.0));
                             }
                             else{
@@ -407,9 +409,9 @@ int read_vcf(string& filename,
                 //int ploidy = n_gts / num_samples; 
                 
                 // Load genotype qualities
-                float* gqs = NULL;
+                int32_t* gqs = NULL;
                 int n_gqs = 0;
-                int num_gq_loaded = bcf_get_format_float(bcf_header, bcf_record, "GQ",
+                int num_gq_loaded = bcf_get_format_int32(bcf_header, bcf_record, "GQ",
                     &gqs, &n_gqs);
                 
                 int nalt_alleles = 0;
@@ -420,14 +422,16 @@ int read_vcf(string& filename,
                     
                     bool gq_pass = false;
                     
-                    if (num_gq_loaded < num_samples || !isnan(gqs[i]) || 
-                        gqs[i] == bcf_float_missing){
+                    if (num_gq_loaded < num_samples ||
+                        gqs[i] == bcf_int32_missing ||
+                        gqs[i] == bcf_int32_vector_end){
                         // Missing GQ? let it slide
                         gq_pass = true;
                     }
                     else{
                         // valid GQ.
                         if (gqs[i] >= mingq){
+                            gq_pass = true;
                             v.gqs.push_back(pow(10, -(float)gqs[i] / 10.0));
                         }
                         else{
