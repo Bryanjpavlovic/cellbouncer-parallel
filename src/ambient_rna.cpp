@@ -318,7 +318,7 @@ void dll_amb_prof_mixture(const vector<double>& params,
     double dy_dp = (k-n*binom_p)/(binom_p - binom_p*binom_p);
     
     results[results.size()-1] += dy_dp * c;
-    if (c_in_data){
+    if (!c_in_data){
         results[0] += dy_dp * (p_c - p_e);
     }
 }
