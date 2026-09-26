@@ -30,7 +30,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-RELEASE = "2026-09-18-joint-doublet-derivative-validation-v1"
+SCIENTIFIC_METHOD_VERSION = "JOINT_DOUBLET_TARGETED_V4_20260920"
+RELEASE = "2026-09-20-joint-doublet-correctness-efficiency-v4"
+NO_RESCORE_COMPLETION_SCHEMA = "joint_doublet_no_rescore_completion_v4"
 MASTER_SEED = 1729
 BASELINE = {
     "ledger_cells": 327659,
@@ -110,10 +112,52 @@ ANALYSIS_TASKS = (
     "OCCUPANCY_ASSESSMENT", "CONTROL_PARENT_PARTITION",
     "CONTROL_CONSTRUCTION", "CELL_CONDITIONAL_NULL", "STAGE_SUMMARY",
 )
+NO_RESCORE_LIBRARIES = (7, 9, 12, 17, 20, 25, 29)
+NO_RESCORE_PROTECTED_LIBRARIES = (19, 35, 38)
 
 
 def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _validate_scheduler_resources(args):
+    """Single strict boundary for every validation-rendered SBATCH resource."""
+    errors = []
+    for name in ("score_cpus", "worker_cpus", "repair_cpus", "repair_threads",
+                 "gather_cpus", "analysis_cpus"):
+        value = int(getattr(args, name))
+        if value < 1 or value > 256:
+            errors.append(f"--{name.replace('_', '-')} must be in [1,256]")
+    if int(args.repair_threads) > int(args.repair_cpus):
+        errors.append("--repair-threads cannot exceed --repair-cpus")
+    for name in ("score_max_concurrent", "worker_max_concurrent",
+                 "repair_max_concurrent"):
+        if int(getattr(args, name)) < 1:
+            errors.append(f"--{name.replace('_', '-')} must be positive")
+    for name in ("score_memory", "worker_memory", "repair_memory",
+                 "gather_memory", "analysis_memory"):
+        if not re.fullmatch(r"[1-9][0-9]*[KMGTP]", str(
+                getattr(args, name)).upper()):
+            errors.append(
+                f"--{name.replace('_', '-')} must be a Slurm memory token")
+    if not re.fullmatch(
+            r"(?:[0-9]+-)?[0-9]{2}:[0-9]{2}:[0-9]{2}", str(args.time)):
+        errors.append("--time must be a Slurm duration")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(args.partition)):
+        errors.append("--partition contains unsafe characters")
+    if errors:
+        raise RuntimeError("invalid validation resources: " + "; ".join(errors))
+    return {
+        "score_cpus": int(args.score_cpus),
+        "score_memory": str(args.score_memory).upper(),
+        "worker_cpus": int(args.worker_cpus),
+        "worker_memory": str(args.worker_memory).upper(),
+        "gather_cpus": int(args.gather_cpus),
+        "gather_memory": str(args.gather_memory).upper(),
+        "analysis_cpus": int(args.analysis_cpus),
+        "analysis_memory": str(args.analysis_memory).upper(),
+        "time": str(args.time), "partition": str(args.partition),
+    }
 
 
 def sha256(path):
@@ -514,6 +558,11 @@ def _stage_kind(args, libraries):
     selected = set(libraries)
     calibration = int(args.calibration_library)
     if args.workflow_action == "VALIDATE_EXISTING":
+        protected = selected & (heldout | regression | {19, 35, 38})
+        if protected:
+            raise RuntimeError(
+                "development validation cannot include protected libraries: " +
+                ",".join(f"lib{value}" for value in sorted(protected)))
         return "DEVELOPMENT"
     if selected & regression:
         if not (selected - {calibration}) <= regression:
@@ -605,8 +654,10 @@ def _initialize_stage(args, kind, libraries):
         if not heldout_marker.is_file():
             raise RuntimeError("regression stage requires the held-out terminal marker")
         heldout_status = json.loads(heldout_marker.read_text()).get("status")
-        if heldout_status not in {"COMPLETE", "PARTIAL"}:
-            raise RuntimeError("held-out terminal marker is not usable for regression")
+        if heldout_status != "COMPLETE":
+            raise RuntimeError(
+                "regression stage requires a COMPLETE held-out result; "
+                f"observed {heldout_status or 'MISSING'}")
     payload = _stage_plan_payload(args, kind, libraries, score_libraries, root_plan)
     immutable_hash = plan_hash(payload)
     plan_path = resolved_stage / "manifests" / "stage_plan.json"
@@ -1299,10 +1350,13 @@ def _quantile(values, probability):
 
 
 def _molecule_metrics(stage_root, plan):
-    totals = Counter(); changed = Counter()
+    totals = Counter(); changed = Counter(); missing_inputs = []
     for library in plan["score_libraries"]:
         for modality in ("rna", "atac"):
             path = stage_root / f"lib{library}" / f"lib{library}.{modality}_joint_scores.tsv.gz"
+            if not _file_ready(path, True):
+                missing_inputs.append(str(path))
+                continue
             site_top = {}; molecule_top = {}; available = set()
             for row in read_tsv(path):
                 key = row.get("barcode", "")
@@ -1320,7 +1374,16 @@ def _molecule_metrics(stage_root, plan):
             changed[label + "_winner_changed"] = sum(
                 site_top[key][1] != molecule_top[key][1]
                 for key in set(site_top) & set(molecule_top))
+    expected_channels = len(plan["score_libraries"]) * 2
+    available_channels = sum(
+        totals[f"lib{library}_{modality}_molecule_available"] > 0
+        for library in plan["score_libraries"] for modality in ("rna", "atac"))
     return {"counts": dict(totals), "winner_changes": dict(changed),
+            "expected_library_assay_channels": expected_channels,
+            "molecule_evaluable_library_assay_channels": available_channels,
+            "missing_score_inputs": missing_inputs,
+            "complete_site_and_molecule": (
+                not missing_inputs and available_channels == expected_channels),
             "interpretation": "linked-unit sensitivity; not automatically phased-haplotype evidence"}
 
 
@@ -1443,6 +1506,12 @@ def analysis_worker(args):
         status_value = "PARTIAL"; reason = metrics["reason"]
     elif phase == "MOLECULE_SENSITIVITY":
         metrics = _molecule_metrics(stage_root, plan)
+        if plan.get("evidence_mode") == "SITE_AND_MOLECULE" and not \
+                metrics["complete_site_and_molecule"]:
+            status_value = "PARTIAL"
+            reason = (
+                "SITE_AND_MOLECULE was requested but one or more library/assay "
+                "channels lack usable molecule evidence")
     elif phase == "QUANTITY_NORMALIZATION":
         metrics = _normalization_metrics(rows)
     elif phase == "OCCUPANCY_ASSESSMENT":
@@ -1486,18 +1555,25 @@ def finalize_stage(args):
         else:
             missing.append(phase)
     failed = [row["phase"] for row in results if row.get("status") == "FAILED"]
-    partial = [row["phase"] for row in results if row.get("status") == "PARTIAL"]
+    incomplete = [row["phase"] for row in results
+                  if row.get("status") not in {"COMPLETE", "FAILED"}]
     if failed:
         status_value = "FAILED"
-    elif missing or partial:
+    elif missing or incomplete:
         status_value = "PARTIAL"
     else:
         status_value = "COMPLETE"
     frozen_path = stage_root / "frozen_analysis_spec.json"
-    if plan["stage_kind"] == "DEVELOPMENT" and not failed and not missing:
+    if plan["stage_kind"] == "DEVELOPMENT":
+        final_ready = status_value == "COMPLETE"
         frozen = {
             "schema_version": "joint_doublet_frozen_analysis_spec_v2",
-            "state": "final_frozen", "release": RELEASE,
+            "state": (
+                "final_frozen" if final_ready else
+                "development_partial_unfrozen"),
+            "scientific_status": status_value,
+            "protected_stages_unlocked": final_ready,
+            "release": RELEASE,
             "frozen_utc": utc_now(), "master_seed": MASTER_SEED,
             "candidate_policy": "DERIVATIVE_COMPLETE",
             "calibration_library": plan["calibration_library"],
@@ -1507,7 +1583,8 @@ def finalize_stage(args):
             "heldout_values_parsed": False,
             "site_formula_version": "K1_LOCKED_STATE_VS_K2_ADDED_STATE_PLUS_FIXED_AMBIENT_V1",
             "molecule_formula_version": "LINKED_UNIT_EQUAL_WEIGHT_NORMALIZED_SITE_LL_V1",
-            "incomplete_optional_branches": partial,
+            "incomplete_decision_relevant_branches": missing + incomplete,
+            "failed_branches": failed,
             "stage_plan_hash": plan["immutable_hash"],
         }
         frozen["spec_hash"] = plan_hash(frozen)
@@ -1516,13 +1593,16 @@ def finalize_stage(args):
               "status": status_value, "stage_kind": plan["stage_kind"],
               "libraries": plan["libraries"], "score_libraries": plan["score_libraries"],
               "release": RELEASE, "utc": utc_now(), "failed_branches": failed,
-              "incomplete_branches": missing + partial,
+              "incomplete_branches": missing + incomplete,
               "heldout_values_parsed_before_freeze": False,
               "stage_plan_hash": plan["immutable_hash"],
               "frozen_spec": str(frozen_path) if frozen_path.is_file() else plan.get("frozen_spec", "")}
     atomic_json(stage_root / "VALIDATION_ANALYSIS_FINISHED", marker)
+    complete_marker = stage_root / "VALIDATION_ANALYSIS_COMPLETE"
     if status_value == "COMPLETE":
-        atomic_json(stage_root / "VALIDATION_ANALYSIS_COMPLETE", marker)
+        atomic_json(complete_marker, marker)
+    elif complete_marker.is_file():
+        complete_marker.unlink()
     plan["state"] = "RUN_FINISHED"
     plan["terminal_status"] = status_value
     plan["updated_utc"] = utc_now()
@@ -1556,6 +1636,1001 @@ def checkpoint_stage(args):
         atomic_json(stage_root / f"{marker_name}_COMPLETE", payload)
     print(json.dumps(payload, indent=2))
     return 0
+
+
+def _no_rescore_plan(args, libraries, stage_root, targeted_root):
+    if int(args.calibration_library) != 25:
+        raise RuntimeError("this pilot requires calibration Library 25")
+    plan = {
+        "schema_version": "joint_doublet_no_rescore_plan_v4",
+        "scientific_method_version": SCIENTIFIC_METHOD_VERSION,
+        "release": RELEASE,
+        "workflow_action": "NO_RESCORE_REANALYSIS",
+        "stage_kind": "NO_RESCORE_REANALYSIS",
+        "state": "RUN_PLANNED",
+        "libraries": libraries,
+        "primary_development_libraries": [7, 9, 12, 17, 20, 29],
+        "calibration_library": int(args.calibration_library),
+        "forbidden_libraries": list(NO_RESCORE_PROTECTED_LIBRARIES),
+        "existing_stage_root": str(Path(args.source_output_root).resolve()),
+        "historical_gather_root": str(Path(args.partial_output_root).resolve()),
+        "task_search_root": str(Path(args.task_search_root).resolve()),
+        "stage_root": str(stage_root),
+        "targeted_output_root": str(targeted_root),
+        "tool_bin_root": str(Path(args.tool_bin_root).resolve()),
+        "frozen_spec": str(Path(args.frozen_spec).resolve()),
+        "frozen_comparisons": str(Path(args.frozen_comparisons or args.frozen_spec).resolve()),
+        "implementation_version": "targeted_bounded_20260926_v5",
+        "targeted_input_manifest": str(Path(args.targeted_input_manifest).resolve()) if args.targeted_input_manifest else "",
+        "evidence_mode": args.evidence_mode,
+        "permutation_seed": MASTER_SEED,
+        "permutations": 10000,
+        "model_parameters": {
+            "rna_error_ref": float(args.rna_error_ref),
+            "rna_error_alt": float(args.rna_error_alt),
+            "atac_error_ref": float(args.atac_error_ref),
+            "atac_error_alt": float(args.atac_error_alt),
+            "min_evidence": int(args.min_evidence),
+            "max_second_fraction": float(args.max_second_fraction),
+        },
+        "resources": {
+            "cpus": args.analysis_cpus,
+            "memory": args.analysis_memory,
+            "time": args.time,
+            "partition": args.partition,
+            "targeted_extraction_cpus": args.score_cpus,
+            "targeted_extraction_memory": args.score_memory,
+            "targeted_analysis_cpus": args.worker_cpus,
+            "targeted_analysis_memory": args.worker_memory,
+            "targeted_finalizer_cpus": args.gather_cpus,
+            "targeted_finalizer_memory": args.gather_memory,
+            "targeted_gather_cpus": args.gather_cpus,
+            "targeted_gather_memory": args.gather_memory,
+        },
+        "created_utc": utc_now(),
+    }
+    generation_payload = {key: value for key, value in plan.items()
+                          if key not in {"state", "created_utc"}}
+    plan["workload_generation_id"] = "no_rescore_" + hashlib.sha256(
+        json.dumps(generation_payload, sort_keys=True,
+                   separators=(",", ":")).encode()).hexdigest()[:16]
+    return plan
+
+
+def _validate_no_rescore_frozen_manifest(path):
+    from joint_doublet_no_rescore import load_frozen_targets
+    load_frozen_targets(path)
+
+
+def _full_gzip_valid(path, required_fields=()):
+    try:
+        rows = 0
+        header = []
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
+            for line in handle:
+                if rows == 0:
+                    header = line.rstrip("\r\n").split("\t")
+                rows += 1
+        missing = sorted(set(required_fields) - set(header))
+        return not missing and rows > 0, max(0, rows - 1), missing
+    except (OSError, EOFError, gzip.BadGzipFile, UnicodeDecodeError):
+        return False, 0, list(required_fields)
+
+
+def _full_zip_valid(path, required_names=()):
+    try:
+        with zipfile.ZipFile(path) as archive:
+            listed = archive.namelist()
+            names = set(listed)
+            corrupt = archive.testzip()
+            unsafe = [info.filename for info in archive.infolist()
+                      if info.filename.startswith("/") or
+                      ".." in Path(info.filename).parts or
+                      ((info.external_attr >> 16) & 0o170000) == 0o120000]
+        missing = [name for name in required_names if name not in names]
+        if len(listed) != len(names):
+            missing.append("DUPLICATE_ZIP_MEMBER")
+        missing.extend(f"UNSAFE_ZIP_MEMBER:{name}" for name in unsafe)
+        return corrupt is None and not missing, missing
+    except (OSError, zipfile.BadZipFile):
+        return False, list(required_names)
+
+
+def validate_no_rescore_artifacts(stage_root, plan, require_terminal=True,
+                                  marker_override=None):
+    """Shared startup/status/resume/finalizer completion validator."""
+    stage_root = Path(stage_root)
+    problems = []
+    marker_path = stage_root / "NO_RESCORE_REANALYSIS_FINISHED"
+    marker = dict(marker_override or {})
+    if not marker and not marker_path.is_file():
+        problems.append("MISSING_TERMINAL_MARKER")
+    elif not marker:
+        try:
+            marker = json.loads(marker_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            problems.append(f"MALFORMED_TERMINAL_MARKER:{error}")
+    if marker:
+        expected = {
+            "schema_version": NO_RESCORE_COMPLETION_SCHEMA,
+            "scientific_method_version": SCIENTIFIC_METHOD_VERSION,
+            "operational_status": "EXECUTION_COMPLETE",
+            "libraries": list(NO_RESCORE_LIBRARIES),
+            "workload_generation_id": plan.get("workload_generation_id"),
+            "action": "NO_RESCORE_REANALYSIS",
+            "stage_root": str(stage_root.resolve()),
+            "calibration_library": int(plan.get("calibration_library", -1)),
+        }
+        for field, value in expected.items():
+            if marker.get(field) != value:
+                problems.append(
+                    f"TERMINAL_MISMATCH:{field}:{marker.get(field)!r}!={value!r}")
+        accessed = {int(value) for value in marker.get("accessed_libraries", [])}
+        protected = {int(value)
+                     for value in marker.get("protected_libraries_accessed", [])}
+        if protected or accessed & set(NO_RESCORE_PROTECTED_LIBRARIES):
+            problems.append("PROTECTED_LIBRARY_ACCESS_REPORTED")
+        if not accessed or not accessed.issubset(set(NO_RESCORE_LIBRARIES)):
+            problems.append("INVALID_ACCESSED_LIBRARY_AUDIT")
+        plan_path = stage_root / "manifests" / "no_rescore_plan.json"
+        if not plan_path.is_file() or marker.get(
+                "plan_content_sha256") != sha256(plan_path):
+            problems.append("TERMINAL_PLAN_DIGEST_MISMATCH")
+        if not marker.get("timing_finalized"):
+            problems.append("TERMINAL_TIMING_NOT_FINALIZED")
+        planned_job = str(plan.get("job_id", ""))
+        if planned_job and marker.get("job_id") != planned_job:
+            problems.append("TERMINAL_JOB_ID_MISMATCH")
+    required_tables = {
+        "all_cells_reanalysis.tsv.gz": ("library", "barcode"),
+        "focal_cells_site_and_molecule.tsv.gz": ("library", "barcode"),
+        "frozen_59_target_evidence.tsv.gz": ("target_id", "library", "barcode"),
+        "calibration_audit.tsv.gz": ("library", "barcode"),
+        "calibration_reference_roster.tsv.gz": ("library", "barcode"),
+        "changed_cells.tsv.gz": ("library", "barcode"),
+    }
+    table_details = {}
+    for name, fields in required_tables.items():
+        path = stage_root / "analysis" / name
+        valid, rows, missing = _full_gzip_valid(path, fields) \
+            if path.is_file() else (False, 0, list(fields))
+        if not valid:
+            problems.append(f"INVALID_GZIP_TABLE:{name}:{','.join(missing)}")
+        if name == "frozen_59_target_evidence.tsv.gz" and rows != 59:
+            problems.append(f"FROZEN_TARGET_ROW_COUNT:{rows}!=59")
+        table_details[name] = {"valid": valid, "rows": rows,
+                               "missing_fields": missing}
+    for name in (
+            "README_COMPLETION.md", "denominator_and_source_inventory.tsv",
+            "input_open_audit.tsv", "coverage_quintile_edges.tsv",
+            "group_results.tsv", "calibration_reproduction_checks.tsv",
+            "decision_evidence.tsv", "warnings_and_exclusions.tsv",
+            "phase_runtime_accounting.tsv", "process_resource_usage.tsv",
+            "process_time.txt"):
+        path = stage_root / "analysis" / name
+        if not path.is_file() or path.stat().st_size == 0:
+            problems.append(f"MISSING_OR_EMPTY:{path}")
+    # Validate the human/audit tables structurally, including their exact
+    # decision cardinality, rather than treating nonempty files as complete.
+    plain_table_contracts = {
+        "denominator_and_source_inventory.tsv": {
+            "record_type", "library", "input_role", "count"},
+        "input_open_audit.tsv": {
+            "event", "library", "path", "protected_content_opened", "detail"},
+        "group_results.tsv": {"analysis_type", "endpoint", "scope"},
+        "calibration_reproduction_checks.tsv": {
+            "scheme", "evidence_channel", "reproduction_status"},
+        "decision_evidence.tsv": {
+            "question_number", "question", "answer", "estimate",
+            "supporting_table", "interpretation_limit"},
+        "warnings_and_exclusions.tsv": {"library", "warning", "detail"},
+        "phase_runtime_accounting.tsv": {"phase", "wall_seconds"},
+        "process_resource_usage.tsv": {
+            "job_id", "user_cpu_seconds", "system_cpu_seconds",
+            "maximum_resident_set_kb"},
+    }
+    for name, required in plain_table_contracts.items():
+        path = stage_root / "analysis" / name
+        try:
+            rows = list(read_tsv(path))
+            header = set(rows[0]) if rows else set()
+            if not required.issubset(header):
+                problems.append(
+                    f"TABLE_SCHEMA_INVALID:{name}:" +
+                    ",".join(sorted(required - header)))
+            if name == "decision_evidence.tsv":
+                numbers = [row.get("question_number", "") for row in rows]
+                if numbers != [str(value) for value in range(1, 6)] or any(
+                        row.get("answer") not in {
+                            "yes", "no", "unresolved", "descriptive only"}
+                        for row in rows):
+                    problems.append("DECISION_TABLE_KEYS_OR_SEMANTICS_INVALID")
+        except (OSError, csv.Error) as error:
+            problems.append(f"TABLE_CONTENT_INVALID:{name}:{error}")
+    operational_status_path = stage_root / "analysis" / "operational_status.json"
+    try:
+        status = json.loads(operational_status_path.read_text())
+        expected_status = {
+            "schema_version": "joint_doublet_no_rescore_operational_status_v4",
+            "scientific_method_version": SCIENTIFIC_METHOD_VERSION,
+            "calibration_library": 25,
+            "operational_status": "EXECUTION_COMPLETE",
+            "workload_generation_id": plan.get("workload_generation_id"),
+            "action": "NO_RESCORE_REANALYSIS",
+            "stage_root": str(stage_root.resolve()),
+            "timing_finalized": True,
+        }
+        for field, expected_value in expected_status.items():
+            if status.get(field) != expected_value:
+                problems.append(f"OPERATIONAL_STATUS_MISMATCH:{field}")
+    except (OSError, json.JSONDecodeError) as error:
+        problems.append(f"OPERATIONAL_STATUS_INVALID:{error}")
+    # Validate exact frozen identities against the explicitly configured
+    # authoritative ordered manifest, not a row-count surrogate.
+    shipped_frozen = Path(plan.get("frozen_spec", ""))
+    copied_frozen = stage_root / "manifests" / "joint_doublet_frozen_targets_20260920.tsv"
+    try:
+        from joint_doublet_no_rescore import load_frozen_targets, load_frozen_comparisons
+        authoritative = load_frozen_targets(shipped_frozen)[1]
+        copied = load_frozen_targets(copied_frozen)[1]
+        if authoritative != copied:
+            problems.append("FROZEN_TARGET_IDENTITIES_CHANGED")
+        expected_ids = {row["target_id"] for row in authoritative}
+        observed_ids = {row.get("target_id", "") for row in read_tsv(
+            stage_root / "analysis" / "frozen_59_target_evidence.tsv.gz")}
+        if observed_ids != expected_ids:
+            problems.append("FROZEN_TARGET_IDENTITIES_INVALID")
+        keys = {(f"lib{row['library']}", row["barcode"]) for row in authoritative}
+        original = load_frozen_comparisons(plan.get("frozen_comparisons", ""), keys)
+        published = load_frozen_comparisons(Path(plan["targeted_output_root"]) /
+            "target_cells_and_matched_comparisons.tsv", keys)
+        by_id = {row["target_id"]: row for row in published}
+        if any(any(by_id[row["target_id"]].get(k) != v for k,v in row.items()) for row in original):
+            problems.append("FROZEN_COMPARISON_PROVENANCE_CHANGED")
+    except (OSError, ValueError, RuntimeError, csv.Error, gzip.BadGzipFile) as error:
+        problems.append(f"FROZEN_TARGET_VALIDATION_ERROR:{error}")
+    # Reconcile actual content opens against the frozen input manifest.  Pure
+    # directory enumeration remains explicitly separate and is never counted
+    # as content access.
+    audit_path = stage_root / "analysis" / "input_open_audit.tsv"
+    source_manifest_path = stage_root / "manifests" / \
+        "no_rescore_input_manifest.tsv"
+    try:
+        audit_rows = list(read_tsv(audit_path))
+        source_rows = list(read_tsv(source_manifest_path))
+        allowed_paths = {}
+        for row in source_rows:
+            library = str(row.get("library", ""))
+            for role in ("cell_ledger", "rna_manifest", "atac_manifest",
+                         "rna_scores", "atac_scores"):
+                raw = row.get(role, "")
+                if raw:
+                    allowed_paths[(library, role)] = str(Path(raw).resolve())
+        opened = [row for row in audit_rows if row.get("event") == "INPUT_OPEN"]
+        opened_paths = []
+        opened_libraries = set()
+        for row in opened:
+            library = str(row.get("library", ""))
+            role = str(row.get("detail", ""))
+            resolved = str(Path(row.get("path", "")).resolve())
+            opened_paths.append(resolved)
+            if allowed_paths.get((library, role)) != resolved:
+                problems.append(
+                    f"INPUT_OPEN_NOT_IN_ALLOWED_MANIFEST:{library}:{role}")
+            try:
+                number = int(library.removeprefix("lib"))
+                opened_libraries.add(number)
+            except ValueError:
+                problems.append(f"INPUT_OPEN_LIBRARY_INVALID:{library}")
+            if str(row.get("protected_content_opened", "")).lower() in {
+                    "1", "true", "yes"} or any(re.search(
+                    rf"(?<![a-z0-9])lib0*{number}(?![0-9])", resolved.lower())
+                    for number in NO_RESCORE_PROTECTED_LIBRARIES):
+                problems.append("PROTECTED_OR_UNEXPECTED_INPUT_OPEN")
+        if len(opened_paths) != len(set(opened_paths)):
+            problems.append("INPUT_OPEN_PATHS_NOT_DEDUPLICATED")
+        if marker and opened_libraries != set(marker.get(
+                "accessed_libraries", [])):
+            problems.append("INPUT_OPEN_AUDIT_TERMINAL_RECONCILIATION_FAILED")
+        if set(allowed_paths.values()) != set(opened_paths):
+            problems.append("INPUT_OPEN_AUDIT_MANIFEST_RECONCILIATION_FAILED")
+        if marker and marker.get("input_open_audit_content_sha256") != \
+                sha256(audit_path):
+            problems.append("INPUT_OPEN_AUDIT_DIGEST_MISMATCH")
+    except (OSError, ValueError, csv.Error) as error:
+        problems.append(f"INPUT_OPEN_AUDIT_INVALID:{error}")
+    targeted_root = Path(plan.get("targeted_output_root", ""))
+    targeted_marker = targeted_root / "TARGETED_WORKLOAD_RENDERED_UNSUBMITTED"
+    if not targeted_marker.is_file():
+        problems.append("MISSING_TARGETED_RENDER_MARKER")
+    else:
+        try:
+            rendered = json.loads(targeted_marker.read_text())
+            if rendered.get("status") != "RENDERED_UNSUBMITTED":
+                problems.append("TARGETED_WORKLOAD_NOT_UNSUBMITTED")
+            if rendered.get("protected_libraries_accessed"):
+                problems.append("TARGETED_RENDER_REPORTS_PROTECTED_ACCESS")
+        except (OSError, json.JSONDecodeError) as error:
+            problems.append(f"MALFORMED_TARGETED_RENDER_MARKER:{error}")
+    archives = {
+        "result_archive": (
+            "analysis/README_COMPLETION.md",
+            "analysis/denominator_and_source_inventory.tsv",
+            "analysis/input_open_audit.tsv",
+            "analysis/coverage_quintile_edges.tsv",
+            "analysis/all_cells_reanalysis.tsv.gz",
+            "analysis/focal_cells_site_and_molecule.tsv.gz",
+            "analysis/frozen_59_target_evidence.tsv.gz",
+            "analysis/group_results.tsv",
+            "analysis/calibration_audit.tsv.gz",
+            "analysis/calibration_reference_roster.tsv.gz",
+            "analysis/calibration_reproduction_checks.tsv",
+            "analysis/changed_cells.tsv.gz", "analysis/decision_evidence.tsv",
+            "analysis/warnings_and_exclusions.tsv",
+            "analysis/phase_runtime_accounting.tsv",
+            "analysis/process_resource_usage.tsv", "analysis/process_time.txt",
+            "manifests/joint_doublet_frozen_targets_20260920.tsv",
+            "manifests/no_rescore_input_manifest.tsv",
+            "commands_actually_used.sh",
+            "analysis/no_rescore_artifact_manifest.tsv",
+            "analysis/operational_status.json",
+            "proposed_targeted_workload.zip",
+            "proposal/manifests/extraction_tasks.tsv",
+            "proposal/benchmark_unsubmitted/manifests/extraction_tasks.tsv"),
+        "targeted_archive": (
+            "proposal/workload_blueprint.json", "proposal/exact_commands.json",
+            "proposal/workload_accounting.tsv", "proposal/resource_projection.json",
+            "proposal/TARGETED_WORKLOAD_RENDERED_UNSUBMITTED",
+            "proposal/target_cells_and_matched_comparisons.tsv",
+            "proposal/target_comparison_balance.tsv",
+            "proposal/control_capacity_and_reuse.tsv",
+            "proposal/control_parent_eligibility.tsv.gz",
+            "proposal/frozen_targets_20260920.tsv",
+            "proposal/manifests/extraction_tasks.tsv",
+            "proposal/manifests/analysis_tasks.tsv",
+            "proposal/manifests/control_pairs_provisional.tsv",
+            "proposal/manifests/lib12.rna_targeted_manifest.tsv.gz",
+            "proposal/manifests/lib12.atac_targeted_manifest.tsv.gz",
+            "proposal/manifests/lib20.rna_targeted_manifest.tsv.gz",
+            "proposal/manifests/lib20.atac_targeted_manifest.tsv.gz",
+            "proposal/manifests/lib29.rna_targeted_manifest.tsv.gz",
+            "proposal/manifests/lib29.atac_targeted_manifest.tsv.gz",
+            "proposal/benchmark_unsubmitted/manifests/extraction_tasks.tsv",
+            "proposal/benchmark_unsubmitted/manifests/analysis_tasks.tsv"),
+    }
+    archive_details = {}
+    for field, names in archives.items():
+        raw = marker.get(field, "") if marker else ""
+        path = Path(raw) if raw else Path("/__missing__")
+        valid, missing = _full_zip_valid(path, names) \
+            if path.is_file() and path.stat().st_size else (False, list(names))
+        if not valid:
+            problems.append(f"INVALID_ARCHIVE:{field}:{','.join(missing)}")
+        archive_details[field] = {"path": raw, "valid": valid,
+                                  "missing_entries": missing}
+        if valid and marker.get(f"{field}_content_sha256") != sha256(path):
+            problems.append(f"ARCHIVE_DIGEST_MISMATCH:{field}")
+        if valid and field == "targeted_archive":
+            expected_members = set()
+            explicit = [
+                "target_cells_and_matched_comparisons.tsv",
+                "target_comparison_balance.tsv",
+                "frozen_target_comparisons.tsv",
+                "unavailable_cells.tsv",
+                "primary_calibration_audit.tsv.gz",
+                "primary_calibration_reference_roster.tsv.gz",
+                "control_parent_eligibility.tsv.gz",
+                "control_capacity_and_reuse.tsv",
+                "frozen_targets_20260920.tsv", "workload_accounting.tsv",
+                "resource_projection.json", "workload_blueprint.json",
+                "CURRENT_GENERATION.json", "exact_commands.json",
+                "TARGETED_WORKLOAD_RENDERED_UNSUBMITTED",
+                "benchmark_unsubmitted/BENCHMARK_RENDERED_UNSUBMITTED",
+            ]
+            expected_members.update("proposal/" + item for item in explicit)
+            for relative in ("manifests", "slurm_scripts",
+                             "benchmark_unsubmitted/manifests",
+                             "benchmark_unsubmitted/slurm_scripts"):
+                directory = targeted_root / relative
+                if directory.is_dir():
+                    expected_members.update(
+                        "proposal/" + child.relative_to(
+                            targeted_root).as_posix()
+                        for child in directory.rglob("*") if child.is_file())
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    actual_members = archive.namelist()
+                if len(actual_members) != len(set(actual_members)) or \
+                        set(actual_members) != expected_members:
+                    member_mismatch = {
+                        "missing": sorted(expected_members - set(actual_members)),
+                        "unexpected": sorted(set(actual_members) - expected_members),
+                        "duplicates": sorted(name for name, count in
+                                             Counter(actual_members).items()
+                                             if count > 1),
+                    }
+                    problems.append(
+                        "TARGETED_ARCHIVE_EXACT_LOGICAL_MEMBER_SET_INVALID:" +
+                        json.dumps(member_mismatch, sort_keys=True))
+            except (OSError, zipfile.BadZipFile) as error:
+                problems.append(f"TARGETED_ARCHIVE_MEMBER_AUDIT_INVALID:{error}")
+    artifact_manifest = stage_root / "analysis" / \
+        "no_rescore_artifact_manifest.tsv"
+    if artifact_manifest.is_file():
+        try:
+            rows = list(read_tsv(artifact_manifest))
+            keys = [row.get("logical_archive_path", "") for row in rows]
+            if any(not key for key in keys) or len(keys) != len(set(keys)):
+                problems.append("ARTIFACT_MANIFEST_KEYS_INVALID")
+            for row in rows:
+                raw_path = row.get("absolute_path", "")
+                path = Path(raw_path) if raw_path else \
+                    stage_root / row.get("relative_path", "")
+                if not path.is_file() or row.get(
+                        "workload_generation_id") != plan.get(
+                            "workload_generation_id") or row.get(
+                        "content_sha256") != sha256(path):
+                    problems.append(
+                        f"ARTIFACT_MANIFEST_BINDING_INVALID:{row.get('relative_path')}")
+            result_archive_raw = marker.get("result_archive", "") \
+                if marker else ""
+            result_archive = Path(result_archive_raw) \
+                if result_archive_raw else None
+            if result_archive and result_archive.is_file():
+                with zipfile.ZipFile(result_archive) as archive:
+                    archive_names = archive.namelist()
+                expected_names = set(keys) | {
+                    "analysis/no_rescore_artifact_manifest.tsv"}
+                if len(archive_names) != len(set(archive_names)) or \
+                        set(archive_names) != expected_names:
+                    problems.append(
+                        "RESULT_ARCHIVE_EXACT_LOGICAL_MEMBER_SET_INVALID")
+        except (OSError, csv.Error, zipfile.BadZipFile) as error:
+            problems.append(f"ARTIFACT_MANIFEST_INVALID:{error}")
+    else:
+        problems.append("MISSING_ARTIFACT_MANIFEST")
+    if require_terminal and marker_override is not None:
+        problems.append("INTERNAL_VALIDATOR_MISUSE")
+    return not problems, problems, {
+        "terminal": marker, "tables": table_details,
+        "archives": archive_details,
+    }
+
+
+def _atomic_no_rescore_zip(path, member_mappings):
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    destinations = set()
+    try:
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED,
+                             compresslevel=9) as archive:
+            for member, arcname in member_mappings:
+                member = Path(member)
+                destination = Path(arcname)
+                if member.is_symlink() or not member.is_file():
+                    raise RuntimeError(
+                        f"required return artifact missing/unsafe: {member}")
+                if destination.is_absolute() or ".." in destination.parts:
+                    raise RuntimeError(
+                        f"unsafe return archive destination: {arcname}")
+                normalized = destination.as_posix()
+                if normalized in destinations:
+                    raise RuntimeError(
+                        f"duplicate return archive destination: {normalized}")
+                destinations.add(normalized)
+                archive.write(member.resolve(), arcname=normalized)
+        with zipfile.ZipFile(temporary) as archive:
+            names = archive.namelist()
+            corrupt = archive.testzip()
+            if corrupt or len(names) != len(set(names)):
+                raise RuntimeError(
+                    f"return ZIP integrity failure: {corrupt or 'duplicate member'}")
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return path
+
+
+def finalize_no_rescore_completion(args):
+    """Publish COMPLETE only after process timing and shared validation."""
+    stage_root = Path(args.stage_root).resolve()
+    plan_path = stage_root / "manifests" / "no_rescore_plan.json"
+    preliminary_path = stage_root / "NO_RESCORE_ANALYSIS_FINISHED_UNVALIDATED"
+    if not plan_path.is_file():
+        raise RuntimeError("no-rescore finalizer requires its bound plan")
+    plan = json.loads(plan_path.read_text())
+    # Completed publications are immutable.  A redundant finalizer invocation
+    # must not rewrite a validated archive, status, or terminal marker.
+    prior_valid, _prior_problems, prior_details = \
+        validate_no_rescore_artifacts(stage_root, plan)
+    if prior_valid:
+        print(json.dumps({
+            "operational_status": "ALREADY_COMPLETE_VALIDATED",
+            "workload_generation_id": plan.get("workload_generation_id"),
+            "artifact_details": prior_details,
+        }, indent=2))
+        return 0
+    if not preliminary_path.is_file():
+        raise RuntimeError("no-rescore finalizer requires preliminary marker")
+    if plan.get("scientific_method_version") != SCIENTIFIC_METHOD_VERSION or \
+            int(plan.get("calibration_library", -1)) != 25:
+        raise RuntimeError(
+            "no-rescore plan scientific method/calibration binding mismatch")
+    preliminary = json.loads(preliminary_path.read_text())
+    generation = plan.get("workload_generation_id", "")
+    if preliminary.get("workload_generation_id") != generation or \
+            preliminary.get("action") != "NO_RESCORE_REANALYSIS" or \
+            preliminary.get("stage_root") != str(stage_root):
+        raise RuntimeError("preliminary no-rescore generation/action/root mismatch")
+    if preliminary.get("operational_status") != \
+            "ANALYSIS_PROCESS_COMPLETE_AWAITING_ACCOUNTING_VALIDATION":
+        raise RuntimeError("analysis process did not reach the finalizable state")
+    time_path = stage_root / "analysis" / "process_time.txt"
+    if not time_path.is_file() or time_path.stat().st_size == 0:
+        raise RuntimeError("finalized /usr/bin/time accounting is missing")
+    time_text = time_path.read_text(errors="replace")
+    for label in ("Elapsed (wall clock) time", "Maximum resident set size"):
+        if label not in time_text:
+            raise RuntimeError(f"process accounting lacks {label}")
+    targeted_archive = Path(preliminary.get("targeted_archive", ""))
+    if not targeted_archive.is_file():
+        raise RuntimeError("targeted return archive is missing")
+    operational_status = stage_root / "analysis" / "operational_status.json"
+    atomic_json(operational_status, {
+        "schema_version": "joint_doublet_no_rescore_operational_status_v4",
+        "scientific_method_version": SCIENTIFIC_METHOD_VERSION,
+        "calibration_library": 25,
+        "operational_status": "EXECUTION_COMPLETE",
+        "scientific_status": preliminary.get(
+            "scientific_status", "COMPLETE_WITH_SCIENTIFIC_WARNINGS"),
+        "workload_generation_id": generation,
+        "action": "NO_RESCORE_REANALYSIS",
+        "stage_root": str(stage_root),
+        "timing_finalized": True,
+    })
+    members = [
+        stage_root / "analysis" / name for name in (
+            "README_COMPLETION.md", "denominator_and_source_inventory.tsv",
+            "input_open_audit.tsv", "coverage_quintile_edges.tsv",
+            "all_cells_reanalysis.tsv.gz",
+            "focal_cells_site_and_molecule.tsv.gz",
+            "frozen_59_target_evidence.tsv.gz", "group_results.tsv",
+            "calibration_audit.tsv.gz", "calibration_reference_roster.tsv.gz",
+            "calibration_reproduction_checks.tsv", "changed_cells.tsv.gz",
+            "decision_evidence.tsv", "warnings_and_exclusions.tsv",
+            "phase_runtime_accounting.tsv", "process_resource_usage.tsv",
+            "process_time.txt", "operational_status.json")
+    ]
+    members.extend((
+        stage_root / "manifests" / "joint_doublet_frozen_targets_20260920.tsv",
+        stage_root / "manifests" / "no_rescore_input_manifest.tsv",
+        stage_root / "commands_actually_used.sh", targeted_archive,
+    ))
+    targeted_root = Path(plan["targeted_output_root"]).resolve()
+    targeted_members = []
+    for candidate in sorted(targeted_root.rglob("*")):
+        if candidate == stage_root or _is_relative_to(candidate, stage_root):
+            continue
+        if candidate.is_symlink():
+            raise RuntimeError(
+                f"targeted proposal contains a forbidden symlink: {candidate}")
+        if candidate.is_file():
+            targeted_members.append((
+                candidate, Path("proposal") / candidate.relative_to(targeted_root)))
+    artifact_manifest_path = stage_root / "analysis" / \
+        "no_rescore_artifact_manifest.tsv"
+    artifact_rows = []
+    for path in members:
+        artifact_rows.append({
+            "schema_version": "joint_doublet_no_rescore_artifact_manifest_v4",
+            "workload_generation_id": generation,
+            "action": "NO_RESCORE_REANALYSIS",
+            "stage_root": str(stage_root),
+            "relative_path": str(path.relative_to(stage_root)),
+            "logical_archive_path": str(path.relative_to(stage_root)),
+            "absolute_path": str(path.resolve()),
+            "bytes": path.stat().st_size,
+            "content_sha256": sha256(path),
+        })
+    for path, logical in targeted_members:
+        artifact_rows.append({
+            "schema_version": "joint_doublet_no_rescore_artifact_manifest_v4",
+            "scientific_method_version": SCIENTIFIC_METHOD_VERSION,
+            "workload_generation_id": generation,
+            "action": "NO_RESCORE_REANALYSIS",
+            "stage_root": str(stage_root),
+            "relative_path": "",
+            "logical_archive_path": logical.as_posix(),
+            "absolute_path": str(path.resolve()),
+            "bytes": path.stat().st_size,
+            "content_sha256": sha256(path),
+        })
+    write_tsv(artifact_manifest_path, artifact_rows, (
+        "schema_version", "scientific_method_version", "workload_generation_id",
+        "action", "stage_root", "relative_path", "logical_archive_path",
+        "absolute_path", "bytes", "content_sha256",
+    ))
+    members.append(artifact_manifest_path)
+    mappings = [(path, path.relative_to(stage_root)) for path in members]
+    mappings.extend(targeted_members)
+    final_archive = stage_root / "completed_no_rescore_results.zip"
+    candidate_archive = stage_root / \
+        f".completed_no_rescore_results.zip.candidate.{os.getpid()}"
+    result_archive = _atomic_no_rescore_zip(candidate_archive, mappings)
+    marker = dict(preliminary)
+    marker.update({
+        "schema_version": NO_RESCORE_COMPLETION_SCHEMA,
+        "scientific_method_version": SCIENTIFIC_METHOD_VERSION,
+        "operational_status": "EXECUTION_COMPLETE",
+        "calibration_library": int(plan["calibration_library"]),
+        "timing_finalized": True,
+        "plan_content_sha256": sha256(plan_path),
+        "input_open_audit_content_sha256": sha256(
+            stage_root / "analysis" / "input_open_audit.tsv"),
+        "artifact_manifest_content_sha256": sha256(artifact_manifest_path),
+        "result_archive": str(result_archive),
+        "result_archive_content_sha256": sha256(result_archive),
+        "targeted_archive_content_sha256": sha256(targeted_archive),
+        "finalized_utc": utc_now(),
+    })
+    valid, problems, _details = validate_no_rescore_artifacts(
+        stage_root, plan, require_terminal=False, marker_override=marker)
+    if not valid:
+        candidate_archive.unlink(missing_ok=True)
+        raise RuntimeError(
+            "no-rescore completion validation failed: " + ";".join(problems))
+    os.replace(candidate_archive, final_archive)
+    result_archive = final_archive
+    marker["result_archive"] = str(result_archive)
+    marker["result_archive_content_sha256"] = sha256(result_archive)
+    atomic_json(stage_root / "NO_RESCORE_REANALYSIS_FINISHED", marker)
+    valid, problems, details = validate_no_rescore_artifacts(stage_root, plan)
+    if not valid:
+        raise RuntimeError(
+            "published no-rescore terminal marker failed validation: " +
+            ";".join(problems))
+    print(json.dumps({"operational_status": "EXECUTION_COMPLETE",
+                      "workload_generation_id": generation,
+                      "result_archive": str(result_archive),
+                      "artifact_details": details}, indent=2))
+    return 0
+
+
+def _job_state(job_id):
+    if not str(job_id).isdigit():
+        return "", "NONE"
+    # Query the queue before filtering locally: a retired job ID can make
+    # `squeue -j` fail even though the scheduler is healthy. Include every
+    # state so suspended, held, and requeued jobs still prevent resubmission.
+    try:
+        result = subprocess.run(
+            ["squeue", "--all", "--states=all", "-h", "-o", "%i|%T"],
+            capture_output=True, text=True, check=False)
+    except OSError as error:
+        return None, f"SCHEDULER_QUERY_FAILED:{error}"
+    if result.returncode:
+        return None, "SCHEDULER_QUERY_FAILED:" + (
+            result.stderr.strip() or result.stdout.strip() or
+            f"returncode={result.returncode}")
+    terminal_states = {
+        "BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED",
+        "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "REVOKED", "TIMEOUT",
+    }
+    active_states = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) != 2 or not all(fields):
+            return None, "SCHEDULER_QUERY_FAILED:malformed squeue response"
+        queued_id, state = fields
+        parent_id = queued_id.split("_", 1)[0].split("+", 1)[0]
+        if not parent_id.isdigit():
+            return None, "SCHEDULER_QUERY_FAILED:malformed squeue job ID"
+        if parent_id == str(job_id) and state not in terminal_states:
+            active_states.append(state)
+    for state in ("RUNNING", "COMPLETING"):
+        if state in active_states:
+            return state, "OK"
+    return (active_states[0] if active_states else ""), "OK"
+
+
+def no_rescore_reanalysis(args):
+    libraries = parse_libraries(args.libraries)
+    if tuple(libraries) != NO_RESCORE_LIBRARIES:
+        raise RuntimeError(
+            "NO_RESCORE_REANALYSIS requires exactly Libraries " +
+            " ".join(str(value) for value in NO_RESCORE_LIBRARIES))
+    if set(libraries) & set(NO_RESCORE_PROTECTED_LIBRARIES):
+        raise RuntimeError("protected libraries are forbidden in no-rescore analysis")
+    calibration_library = int(args.calibration_library)
+    if calibration_library not in libraries or \
+            calibration_library in NO_RESCORE_PROTECTED_LIBRARIES:
+        raise RuntimeError(
+            "calibration library must be one requested, unprotected library")
+    if int(args.min_evidence) < 0 or not 0 < float(
+            args.max_second_fraction) <= 1:
+        raise RuntimeError("invalid no-rescore targeted model limits")
+    for label, error_ref, error_alt in (
+            ("RNA", args.rna_error_ref, args.rna_error_alt),
+            ("ATAC", args.atac_error_ref, args.atac_error_alt)):
+        if not (0 <= error_ref <= 1 and 0 <= error_alt <= 1 and
+                error_ref + error_alt < 1):
+            raise RuntimeError(
+                f"invalid no-rescore targeted {label} error parameters")
+    _validate_scheduler_resources(args)
+    required = {
+        "existing pilot root": args.source_output_root,
+        "historical gather root": args.partial_output_root,
+        "task-output search root": args.task_search_root,
+        "no-rescore output root": args.stage_root,
+        "targeted proposal root": args.targeted_output_root,
+        "tool root": args.tool_bin_root,
+        "frozen target manifest": args.frozen_spec,
+    }
+    bad = [label for label, value in required.items()
+           if not value or not Path(value).is_absolute()]
+    if bad:
+        raise RuntimeError("absolute paths required for: " + ", ".join(bad))
+    stage_root = Path(args.stage_root).resolve(strict=False)
+    targeted_root = Path(args.targeted_output_root).resolve(strict=False)
+    protected_roots = (
+        Path(args.source_output_root).resolve(strict=False),
+        Path(args.partial_output_root).resolve(strict=False),
+    )
+    for source in protected_roots:
+        if stage_root == source or _is_relative_to(stage_root, source) or \
+                _is_relative_to(source, stage_root):
+            raise RuntimeError(
+                f"no-rescore output must be separate from read-only source {source}")
+        if targeted_root == source or _is_relative_to(targeted_root, source) or \
+                _is_relative_to(source, targeted_root):
+            raise RuntimeError(
+                f"targeted proposal output must be separate from read-only source {source}")
+    if stage_root == targeted_root or _is_relative_to(targeted_root, stage_root):
+        raise RuntimeError("no-rescore and targeted proposal roots must be separate")
+    helper = Path(args.tool_bin_root).resolve() / "joint_doublet_no_rescore.py"
+    identity = Path(args.tool_bin_root).resolve() / "identity_reconciliation.py"
+    frozen_targets = Path(args.frozen_spec).resolve()
+    for path in (helper, identity, frozen_targets):
+        if not path.is_file():
+            raise RuntimeError(f"required coordinated runtime file is missing: {path}")
+    _validate_no_rescore_frozen_manifest(frozen_targets)
+    from joint_doublet_no_rescore import load_frozen_targets, load_frozen_comparisons
+    frozen_rows = load_frozen_targets(frozen_targets)[1]
+    load_frozen_comparisons(args.frozen_comparisons or args.frozen_spec,
+        {(f"lib{row['library']}", row["barcode"]) for row in frozen_rows})
+    stage_root.mkdir(parents=True, exist_ok=True)
+    for name in ("manifests", "slurm_scripts", "logs", "aggregate", "analysis",
+                 "task_scratch", "scores", "cache", "markers"):
+        (stage_root / name).mkdir(parents=True, exist_ok=True)
+    plan_path = stage_root / "manifests" / "no_rescore_plan.json"
+    requested = _no_rescore_plan(args, libraries, stage_root, targeted_root)
+    if plan_path.is_file():
+        existing = json.loads(plan_path.read_text())
+        comparable = {
+            key: value for key, value in existing.items()
+            if key not in {"state", "created_utc", "updated_utc", "job_id",
+                           "submission_history"}
+        }
+        wanted = {
+            key: value for key, value in requested.items()
+            if key not in {"state", "created_utc", "updated_utc", "job_id"}
+        }
+        if comparable != wanted:
+            raise RuntimeError("existing no-rescore plan does not match this command")
+        plan = existing
+    else:
+        plan = requested
+        atomic_json(plan_path, plan)
+    script = stage_root / "slurm_scripts" / "no_rescore_reanalysis.sbatch"
+    body = f'''#!/bin/bash
+#SBATCH --job-name=joint_doublet_no_rescore
+#SBATCH --output={stage_root}/logs/no_rescore_%j.out
+#SBATCH --error={stage_root}/logs/no_rescore_%j.err
+#SBATCH --time={args.time}
+#SBATCH --cpus-per-task={args.analysis_cpus}
+#SBATCH --mem={args.analysis_memory}
+#SBATCH --partition={args.partition}
+#SBATCH --nodes=1
+
+set -uo pipefail
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+module purge
+module load miniforge/3 genomics-base/latest htslib/1.20 || exit $?
+/usr/bin/time -v -o {shlex.quote(str(stage_root / 'analysis' / 'process_time.txt'))} \
+python3 -B {shlex.quote(str(helper))} run \
+  --stage-root {shlex.quote(str(stage_root))} \
+  --existing-stage-root {shlex.quote(str(Path(args.source_output_root).resolve()))} \
+  --historical-gather-root {shlex.quote(str(Path(args.partial_output_root).resolve()))} \
+  --task-search-root {shlex.quote(str(Path(args.task_search_root).resolve()))} \
+  --targeted-output-root {shlex.quote(str(targeted_root))} \
+  --identity-tool {shlex.quote(str(identity))} \
+  --tool-bin-root {shlex.quote(str(Path(args.tool_bin_root).resolve()))} \
+  --targeted-input-manifest {shlex.quote(args.targeted_input_manifest)} \
+  --frozen-comparisons {shlex.quote(str(Path(args.frozen_comparisons or args.frozen_spec).resolve()))} \
+  --frozen-targets {shlex.quote(str(frozen_targets))} \
+  --generation {shlex.quote(plan['workload_generation_id'])} \
+  --libraries {' '.join(str(value) for value in libraries)} \
+  --calibration-library {calibration_library} --seed {MASTER_SEED} --permutations 10000 \
+  --targeted-extraction-cpus {args.score_cpus} \
+  --targeted-extraction-memory {shlex.quote(args.score_memory)} \
+  --targeted-analysis-cpus {args.worker_cpus} \
+  --targeted-analysis-memory {shlex.quote(args.worker_memory)} \
+  --targeted-finalizer-cpus {args.gather_cpus} \
+  --targeted-finalizer-memory {shlex.quote(args.gather_memory)} \
+  --targeted-gather-cpus {args.gather_cpus} \
+  --targeted-gather-memory {shlex.quote(args.gather_memory)} \
+  --targeted-time {shlex.quote(args.time)} \
+  --targeted-partition {shlex.quote(args.partition)} \
+  --rna-error-ref {args.rna_error_ref:.17g} \
+  --rna-error-alt {args.rna_error_alt:.17g} \
+  --atac-error-ref {args.atac_error_ref:.17g} \
+  --atac-error-alt {args.atac_error_alt:.17g} \
+  --min-evidence {args.min_evidence} \
+  --max-second-fraction {args.max_second_fraction:.17g}
+status=$?
+if [[ $status -eq 0 ]]; then
+  python3 -B {shlex.quote(str(Path(__file__).resolve()))} no-rescore-finalize \
+    --stage-root {shlex.quote(str(stage_root))}
+  status=$?
+fi
+if [[ $status -ne 0 ]]; then
+  echo "NO_RESCORE_REANALYSIS failed with status $status" >&2
+fi
+exit $status
+'''
+    _write_script(script, body)
+    prior_execution_evidence = any(path.exists() for path in (
+        stage_root / "NO_RESCORE_REANALYSIS_FINISHED",
+        stage_root / "analysis" / "no_rescore_artifact_manifest.tsv",
+        stage_root / "analysis" / "process_time.txt",
+        stage_root / "completed_no_rescore_results.zip",
+    ))
+    if prior_execution_evidence:
+        artifacts_valid, artifact_problems, artifact_details = \
+            validate_no_rescore_artifacts(stage_root, plan)
+    else:
+        artifacts_valid = False
+        artifact_problems = ["NOT_RUN"]
+        artifact_details = {"state": "NOT_RUN"}
+    active_state, scheduler_query = _job_state(plan.get("job_id", ""))
+    payload = {
+        "action": "NO_RESCORE_REANALYSIS",
+        "stage_root": str(stage_root),
+        "targeted_output_root": str(targeted_root),
+        "libraries": libraries,
+        "graph_nodes": ["NO_RESCORE_ANALYSIS"],
+        "forbidden_nodes_absent": [
+            "PREPARE", "RNA_SCORE", "ATAC_SCORE", "PILEUP",
+            "SYNTHETIC_CONTROL_EXECUTION", "CELL_CONDITIONAL_NULL_EXECUTION"],
+        "script": str(script),
+        "artifacts_valid": artifacts_valid,
+        "artifact_problems": artifact_problems,
+        "active_scheduler_state": active_state,
+        "scheduler_query": scheduler_query,
+        "submit": bool(args.submit),
+    }
+    print(json.dumps(payload, indent=2))
+    if not args.submit or artifacts_valid:
+        return 0
+    if active_state is None:
+        raise RuntimeError(
+            "scheduler query failed; resubmission is prohibited until a "
+            "successful scheduler check")
+    if active_state:
+        raise RuntimeError(
+            f"no-rescore job {plan.get('job_id')} is already active ({active_state})")
+    job_id = _submit_sbatch(script, stage_root)
+    history = list(plan.get("submission_history", []))
+    history.append({"job_id": job_id, "utc": utc_now(),
+                    "artifact_problems_before_submit": artifact_problems})
+    plan.update({"state": "RUN_SUBMITTED", "job_id": job_id,
+                 "submission_history": history, "updated_utc": utc_now()})
+    atomic_json(plan_path, plan)
+    print(json.dumps({"submitted_jobs": {"no_rescore_analysis": job_id}}, indent=2))
+    return 0
+
+
+def no_rescore_status(args):
+    if int(args.calibration_library) != 25:
+        raise RuntimeError("no-rescore status requires calibration Library 25")
+    stage_root = Path(args.stage_root)
+    plan_path = stage_root / "manifests" / "no_rescore_plan.json"
+    if not plan_path.is_file():
+        print(json.dumps({"operational_status": "FOREIGN_OR_UNINITIALIZED",
+                          "scientific_status": "UNASSESSED",
+                          "stage_root": str(stage_root)}, indent=2))
+        return 2
+    plan = json.loads(plan_path.read_text())
+    valid, problems, details = validate_no_rescore_artifacts(stage_root, plan)
+    job_id = str(plan.get("job_id", ""))
+    active_state, scheduler_query = _job_state(job_id)
+    if active_state is None:
+        operational = "TECHNICAL_UNRESOLVED_SCHEDULER_QUERY"
+    elif valid:
+        operational = "EXECUTION_COMPLETE"
+    elif active_state in {"RUNNING", "COMPLETING"}:
+        operational = "RUNNING"
+    elif active_state:
+        operational = "QUEUED"
+    elif plan.get("submission_history") or job_id:
+        operational = "TECHNICAL_FAILURE"
+    else:
+        operational = "RENDERED_UNSUBMITTED"
+    terminal = details.get("terminal", {})
+    payload = {
+        "operational_status": operational,
+        "scientific_status": terminal.get("scientific_status", "UNASSESSED"),
+        "scientific_summary": terminal.get(
+            "scientific_summary", "analysis artifacts are not yet validated"),
+        "stage_root": str(stage_root), "job_id": job_id,
+        "active_scheduler_state": active_state,
+        "scheduler_query": scheduler_query,
+        "artifact_valid": valid, "artifact_problems": problems,
+        "artifact_details": details,
+    }
+    if job_id.isdigit():
+        try:
+            result = subprocess.run([
+                "sacct", "-P", "-n", "-j", job_id,
+                "--format=JobID,JobName,State,ExitCode,Elapsed,TotalCPU,AllocCPUS,MaxRSS,ReqMem,NodeList"],
+                capture_output=True, text=True, check=False)
+            payload["sacct_snapshot"] = result.stdout.strip() \
+                if result.returncode == 0 else result.stderr.strip()
+        except OSError as error:
+            payload["sacct_snapshot"] = f"UNAVAILABLE:{error}"
+    print(json.dumps(payload, indent=2))
+    return 0 if valid else 2
+
+
+def targeted_validation_control(args, scope, operation):
+    if int(args.calibration_library) != 25:
+        raise RuntimeError("targeted validation requires calibration Library 25")
+    if not args.targeted_output_root or \
+            not Path(args.targeted_output_root).is_absolute():
+        raise RuntimeError("targeted control requires an absolute targeted output root")
+    if not args.tool_bin_root or not Path(args.tool_bin_root).is_absolute():
+        raise RuntimeError("targeted control requires an absolute tool-bin root")
+    helper = Path(args.tool_bin_root).resolve() / "joint_doublet_no_rescore.py"
+    if not helper.is_file():
+        raise RuntimeError(f"targeted control helper is missing: {helper}")
+    if operation in {"launch", "resume"} and not args.submit:
+        raise RuntimeError(f"targeted {operation} requires explicit --submit")
+    command = [
+        sys.executable, "-B", str(helper), "targeted-control",
+        "--targeted-root", str(Path(args.targeted_output_root).resolve()),
+        "--tool-bin-root", str(Path(args.tool_bin_root).resolve()),
+        "--calibration-library", "25",
+        "--scope", scope, "--operation", operation,
+    ]
+    if args.submit:
+        command.append("--submit")
+    return subprocess.run(command, check=False).returncode
+
+
+def targeted_reproject(args):
+    if int(args.calibration_library) != 25:
+        raise RuntimeError("targeted reprojection requires calibration Library 25")
+    if args.submit:
+        raise RuntimeError("targeted reprojection is non-submitting; omit --submit")
+    if not args.targeted_output_root or \
+            not Path(args.targeted_output_root).is_absolute():
+        raise RuntimeError("targeted reprojection requires an absolute targeted output root")
+    if not args.tool_bin_root or not Path(args.tool_bin_root).is_absolute():
+        raise RuntimeError("targeted reprojection requires an absolute tool-bin root")
+    helper = Path(args.tool_bin_root).resolve() / "joint_doublet_no_rescore.py"
+    command = [
+        sys.executable, "-B", str(helper), "targeted-reproject",
+        "--targeted-root", str(Path(args.targeted_output_root).resolve()),
+        "--tool-bin-root", str(Path(args.tool_bin_root).resolve()),
+        "--calibration-library", "25",
+    ]
+    return subprocess.run(command, check=False).returncode
 
 
 def stage_status_payload(stage_root):
@@ -1888,7 +2963,11 @@ def build_parser():
     parser.add_argument("action", choices=(
         "preflight", "run-stage", "run-repair", "resume", "status",
         "analysis-worker", "stage-checkpoint", "finalize-stage", "finalize-repair",
-        "finalize-checkpoint"))
+        "finalize-checkpoint", "no-rescore-reanalysis", "no-rescore-finalize",
+        "no-rescore-status",
+        "targeted-benchmark-launch", "targeted-benchmark-status",
+        "targeted-benchmark-resume", "targeted-launch", "targeted-status",
+        "targeted-resume", "targeted-reproject"))
     parser.add_argument("--libraries", nargs="*", default=[])
     parser.add_argument("--source-output-root", default="")
     parser.add_argument("--partial-output-root", default="")
@@ -1901,8 +2980,12 @@ def build_parser():
     parser.add_argument("--regression-libraries", nargs="*", default=[])
     parser.add_argument("--evidence-mode", default="SITE_AND_MOLECULE")
     parser.add_argument("--frozen-spec", default="")
+    parser.add_argument("--frozen-comparisons", default="")
+    parser.add_argument("--targeted-input-manifest", default="")
     parser.add_argument("--repair-plan", default="")
     parser.add_argument("--temp-root", default="")
+    parser.add_argument("--task-search-root", default="")
+    parser.add_argument("--targeted-output-root", default="")
     parser.add_argument("--score-cpus", type=int, default=16)
     parser.add_argument("--score-memory", default="96G")
     parser.add_argument("--score-max-concurrent", type=int, default=4)
@@ -1917,6 +3000,12 @@ def build_parser():
     parser.add_argument("--gather-memory", default="256G")
     parser.add_argument("--analysis-cpus", type=int, default=1)
     parser.add_argument("--analysis-memory", default="64G")
+    parser.add_argument("--rna-error-ref", type=float, default=0.001)
+    parser.add_argument("--rna-error-alt", type=float, default=0.001)
+    parser.add_argument("--atac-error-ref", type=float, default=0.005)
+    parser.add_argument("--atac-error-alt", type=float, default=0.005)
+    parser.add_argument("--min-evidence", type=int, default=10)
+    parser.add_argument("--max-second-fraction", type=float, default=0.95)
     parser.add_argument("--time", default="7-00:00:00")
     parser.add_argument("--partition", default="compute")
     parser.add_argument("--analysis-task-manifest", default="")
@@ -1932,6 +3021,9 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     try:
+        if args.action in {"preflight", "run-stage", "run-repair",
+                           "no-rescore-reanalysis"}:
+            _validate_scheduler_resources(args)
         if args.action == "preflight":
             return preflight(args)
         if args.action == "run-stage":
@@ -1952,6 +3044,26 @@ def main():
             return finalize_repair(args)
         if args.action == "finalize-checkpoint":
             return finalize_checkpoint(args)
+        if args.action == "no-rescore-reanalysis":
+            return no_rescore_reanalysis(args)
+        if args.action == "no-rescore-finalize":
+            return finalize_no_rescore_completion(args)
+        if args.action == "no-rescore-status":
+            return no_rescore_status(args)
+        if args.action == "targeted-benchmark-launch":
+            return targeted_validation_control(args, "benchmark", "launch")
+        if args.action == "targeted-benchmark-status":
+            return targeted_validation_control(args, "benchmark", "status")
+        if args.action == "targeted-benchmark-resume":
+            return targeted_validation_control(args, "benchmark", "resume")
+        if args.action == "targeted-launch":
+            return targeted_validation_control(args, "production", "launch")
+        if args.action == "targeted-status":
+            return targeted_validation_control(args, "production", "status")
+        if args.action == "targeted-resume":
+            return targeted_validation_control(args, "production", "resume")
+        if args.action == "targeted-reproject":
+            return targeted_reproject(args)
         raise RuntimeError(f"unsupported action: {args.action}")
     except (OSError, ValueError, RuntimeError, AssertionError) as error:
         print(f"ERROR: {error}", file=sys.stderr)

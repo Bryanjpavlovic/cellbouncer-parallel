@@ -106,7 +106,7 @@ from pathlib import Path
 # AMBIENT_PLOTS uses only standard-library imports during orchestration.  The
 # numerical plotting stack is loaded inside its compute-node worker.
 AMBIENT_PLOT_DEFAULT_CONDITION = "IND_CK_RF_SX0_GATED_RFREE_PFIT"
-ORCHESTRATOR_RELEASE = "2026-09-18-joint-doublet-derivative-validation-v1"
+ORCHESTRATOR_RELEASE = "2026-09-20-joint-doublet-correctness-efficiency-v4"
 CANDIDATE_AXIS_STAGE = "IDENTITY_CANDIDATE_AXIS"
 JOINT_DOUBLET_STAGE = "JOINT_DOUBLET"
 JOINT_DOUBLET_ACTIONS = (
@@ -114,7 +114,10 @@ JOINT_DOUBLET_ACTIONS = (
     "PARTIAL_GATHER_WORKER", "ANALYZE", "ANALYZE_WORKER",
     "VALIDATION_PREFLIGHT", "VALIDATE_EXISTING", "DERIVATIVE_RESCORE",
     "REPAIR_MOLECULE_SIDECARS", "DERIVATIVE_STATUS", "DERIVATIVE_RESUME",
-    "VALIDATION_FINALIZE")
+    "VALIDATION_FINALIZE", "NO_RESCORE_REANALYSIS", "NO_RESCORE_STATUS",
+    "TARGETED_BENCHMARK_LAUNCH", "TARGETED_BENCHMARK_STATUS",
+    "TARGETED_BENCHMARK_RESUME", "TARGETED_REPROJECT",
+    "TARGETED_LAUNCH", "TARGETED_STATUS", "TARGETED_RESUME")
 IDENTITY_READINESS_STAGE = "IDENTITY_RECONCILIATION_READINESS"
 IDENTITY_FILL_MISSING_STAGE = "IDENTITY_RECONCILIATION_FILL_MISSING"
 CANDIDATE_AXIS_MIN_EVIDENCE = 10
@@ -4937,11 +4940,12 @@ mkdir -p {shlex.quote(aggregate_root)}
 python3 {shlex.quote(helper)} joint-aggregate \\
     --input-root {shlex.quote(output_root)} \\
     --output-root {shlex.quote(aggregate_root)} \\
-    --libraries {library_args}
+    --libraries {library_args} \\
+    --calibration-library lib{args.joint_doublet_calibration_library}
 test -s {shlex.quote(os.path.join(aggregate_root, 'joint_doublet_cell_ledger.tsv.gz'))}
 test -s {shlex.quote(os.path.join(aggregate_root, 'joint_doublet_candidate_scores.tsv.gz'))}
 test -s {shlex.quote(os.path.join(aggregate_root, 'joint_doublet_library_summary.tsv'))}
-test -s {shlex.quote(os.path.join(aggregate_root, 'library25_calibration.tsv'))}
+test -s {shlex.quote(os.path.join(aggregate_root, f'library{args.joint_doublet_calibration_library}_calibration.tsv'))}
 '''
 
     paths = {
@@ -5179,8 +5183,9 @@ def _joint_doublet_status(args, records, output_root, jobs):
     print("RNA_COMPLETE=" + ",".join(rna_complete))
     print("ATAC_COMPLETE=" + ",".join(atac_complete))
     print("PAIRED_COMPLETE=" + ",".join(paired_complete))
-    print("LIB25_RNA_READY=" + str("lib25" in rna_complete))
-    print("LIB25_ATAC_READY=" + str("lib25" in atac_complete))
+    calibration_name = f"lib{args.joint_doublet_calibration_library}"
+    print("CALIBRATION_RNA_READY=" + str(calibration_name in rna_complete))
+    print("CALIBRATION_ATAC_READY=" + str(calibration_name in atac_complete))
     _joint_doublet_write_job_record(output_root, jobs, "STATUS")
     return 0
 
@@ -5296,9 +5301,11 @@ def _joint_doublet_partial_worker(args, records, output_root, jobs):
     _write_if_changed(
         os.path.join(partial_root, "partial_gather_selection.tsv"),
         "\n".join(status_lines) + "\n")
-    if "lib25" not in selected:
+    calibration_name = f"lib{args.joint_doublet_calibration_library}"
+    if calibration_name not in selected:
         raise ValueError(
-            "Library 25 lacks completed RNA+ATAC scores; paired calibrated "
+            f"Library {args.joint_doublet_calibration_library} lacks completed "
+            "RNA+ATAC scores; paired calibrated "
             "partial gather cannot run")
     if not selected:
         raise ValueError("no paired-complete JOINT_DOUBLET libraries found")
@@ -5307,7 +5314,8 @@ def _joint_doublet_partial_worker(args, records, output_root, jobs):
         sys.executable, helper, "joint-aggregate",
         "--input-root", output_root,
         "--output-root", partial_root,
-        "--libraries"] + selected
+        "--libraries"] + selected + [
+            "--calibration-library", calibration_name]
     print("PARTIAL_GATHER_LIBRARIES=" + ",".join(selected))
     print("PARTIAL_GATHER_OUTPUT_ROOT=" + partial_root)
     result = subprocess.run(command, check=False)
@@ -5318,7 +5326,7 @@ def _joint_doublet_partial_worker(args, records, output_root, jobs):
         "joint_doublet_cell_ledger.tsv.gz",
         "joint_doublet_candidate_scores.tsv.gz",
         "joint_doublet_library_summary.tsv",
-        "library25_calibration.tsv")
+        f"library{args.joint_doublet_calibration_library}_calibration.tsv")
     missing = [name for name in required
                if not os.path.isfile(os.path.join(partial_root, name)) or
                os.path.getsize(os.path.join(partial_root, name)) == 0]
@@ -5334,10 +5342,14 @@ def _joint_doublet_partial_submit(args, records, output_root, jobs, lib_nums):
         raise ValueError(
             "PARTIAL_GATHER requires --joint-doublet-rna-score-job-id and "
             "--joint-doublet-atac-score-job-id, or a saved active-job record")
+    calibration_name = f"lib{args.joint_doublet_calibration_library}"
     calibration_record = next(
-        (record for record in records if record["library"] == "lib25"), None)
+        (record for record in records if record["library"] == calibration_name),
+        None)
     if calibration_record is None:
-        raise ValueError("PARTIAL_GATHER requires Library 25 in --libraries")
+        raise ValueError(
+            "PARTIAL_GATHER requires the selected calibration library in "
+            "--libraries")
     calibration_index = calibration_record["_task_index"]
     calibration_states = _joint_doublet_sacct_states([jobs["atac_score"]])
     calibration_state = calibration_states.get(
@@ -5350,7 +5362,7 @@ def _joint_doublet_partial_submit(args, records, output_root, jobs, lib_nums):
     if calibration_state == "COMPLETED":
         if not calibration_file_ready:
             raise ValueError(
-                f"Library 25 ATAC task {calibration_task} completed but its "
+                f"Calibration-library ATAC task {calibration_task} completed but its "
                 f"score file is missing or empty: {calibration_file}")
         dependency = ""
         calibration_note = (
@@ -5367,7 +5379,7 @@ def _joint_doublet_partial_submit(args, records, output_root, jobs, lib_nums):
             f"{calibration_task}; submitting immediately")
     else:
         raise ValueError(
-            f"Library 25 ATAC calibration is not usable: task "
+            f"Calibration-library ATAC calibration is not usable: task "
             f"{calibration_task} state={calibration_state}, "
             f"score_file_ready={int(calibration_file_ready)}, "
             f"score_file={calibration_file}")
@@ -5440,12 +5452,12 @@ def _joint_doublet_analysis_paths(args):
     return gather_root, analysis_root
 
 
-def _joint_doublet_analysis_validate_inputs(gather_root):
+def _joint_doublet_analysis_validate_inputs(gather_root, calibration_library):
     required = (
         "joint_doublet_cell_ledger.tsv.gz",
         "joint_doublet_candidate_scores.tsv.gz",
         "joint_doublet_library_summary.tsv",
-        "library25_calibration.tsv")
+        f"library{calibration_library}_calibration.tsv")
     missing = [
         os.path.join(gather_root, name) for name in required
         if not os.path.isfile(os.path.join(gather_root, name)) or
@@ -5458,7 +5470,8 @@ def _joint_doublet_analysis_validate_inputs(gather_root):
 
 def _joint_doublet_analysis_worker(args):
     gather_root, analysis_root = _joint_doublet_analysis_paths(args)
-    _joint_doublet_analysis_validate_inputs(gather_root)
+    _joint_doublet_analysis_validate_inputs(
+        gather_root, args.joint_doublet_calibration_library)
     os.makedirs(analysis_root, exist_ok=True)
     helper = os.path.join(SOFTWARE_BIN, "identity_reconciliation.py")
     command = [
@@ -5492,7 +5505,8 @@ def _joint_doublet_analysis_worker(args):
 
 def _joint_doublet_analysis_submit(args, output_root, lib_nums):
     gather_root, analysis_root = _joint_doublet_analysis_paths(args)
-    _joint_doublet_analysis_validate_inputs(gather_root)
+    _joint_doublet_analysis_validate_inputs(
+        gather_root, args.joint_doublet_calibration_library)
     script_dir = os.path.join(output_root, "slurm_scripts")
     log_dir = os.path.join(output_root, "logs")
     os.makedirs(script_dir, exist_ok=True)
@@ -5540,8 +5554,62 @@ set -euo pipefail
     return 0
 
 
-def _joint_doublet_option_errors(args):
+def _joint_doublet_scheduler_resource_errors(args):
     errors = []
+    for option in (
+            "joint_doublet_prepare_cpus", "joint_doublet_atac_cpus",
+            "joint_doublet_score_cpus", "joint_doublet_gather_cpus",
+            "joint_doublet_analysis_cpus",
+            "joint_doublet_validation_worker_cpus",
+            "joint_doublet_repair_cpus", "joint_doublet_repair_threads"):
+        if getattr(args, option) < 1 or getattr(args, option) > 256:
+            errors.append("--" + option.replace("_", "-") +
+                          " must be in [1,256]")
+    if args.joint_doublet_repair_threads > args.joint_doublet_repair_cpus:
+        errors.append(
+            "--joint-doublet-repair-threads cannot exceed repair CPUs")
+    for option in (
+            "joint_doublet_prepare_memory", "joint_doublet_atac_memory",
+            "joint_doublet_score_memory", "joint_doublet_gather_memory",
+            "joint_doublet_analysis_memory",
+            "joint_doublet_validation_worker_memory",
+            "joint_doublet_repair_memory"):
+        if not re.fullmatch(r"[1-9][0-9]*[KMGTP]", str(
+                getattr(args, option)).upper()):
+            errors.append("--" + option.replace("_", "-") +
+                          " must be a Slurm memory token such as 128G")
+    if not re.fullmatch(
+            r"(?:[0-9]+-)?[0-9]{2}:[0-9]{2}:[0-9]{2}",
+            args.joint_doublet_time):
+        errors.append(
+            "--joint-doublet-time must be a Slurm duration such as 7-00:00:00")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+",
+                        args.joint_doublet_partition):
+        errors.append("--joint-doublet-partition contains unsafe characters")
+    return errors
+
+
+def _joint_doublet_model_parameter_errors(args):
+    errors = []
+    if not 0 < args.joint_doublet_max_second_fraction <= 1:
+        errors.append("--joint-doublet-max-second-fraction must be in (0,1]")
+    if args.joint_doublet_min_evidence < 0:
+        errors.append("--joint-doublet-min-evidence must be nonnegative")
+    for label, ref_error, alt_error in (
+            ("RNA", args.joint_doublet_rna_error_ref,
+             args.joint_doublet_rna_error_alt),
+            ("ATAC", args.joint_doublet_atac_error_ref,
+             args.joint_doublet_atac_error_alt)):
+        if (not 0 <= ref_error <= 1 or not 0 <= alt_error <= 1 or
+                ref_error + alt_error >= 1):
+            errors.append(
+                f"JOINT_DOUBLET {label} errors must be in [0,1] and sum below 1")
+    return errors
+
+
+def _joint_doublet_option_errors(args):
+    errors = (_joint_doublet_scheduler_resource_errors(args) +
+              _joint_doublet_model_parameter_errors(args))
     for option, value in (
             ("--joint-doublet-output-root", args.joint_doublet_output_root),
             ("--joint-doublet-atac-vcf", args.joint_doublet_atac_vcf)):
@@ -5552,43 +5620,10 @@ def _joint_doublet_option_errors(args):
     if args.joint_doublet_atac_cpus < args.joint_doublet_atac_threads:
         errors.append(
             "--joint-doublet-atac-cpus must be at least --joint-doublet-atac-threads")
-    for option in (
-            "joint_doublet_prepare_cpus", "joint_doublet_score_cpus",
-            "joint_doublet_gather_cpus", "joint_doublet_analysis_cpus"):
-        if getattr(args, option) < 1:
-            errors.append("--" + option.replace("_", "-") + " must be positive")
-    for option in (
-            "joint_doublet_prepare_memory", "joint_doublet_atac_memory",
-            "joint_doublet_score_memory", "joint_doublet_gather_memory",
-            "joint_doublet_analysis_memory"):
-        if not re.fullmatch(r"[0-9]+[KMGTP]", getattr(args, option)):
-            errors.append("--" + option.replace("_", "-") +
-                          " must be a SLURM memory token such as 128G")
-    if not 0 < args.joint_doublet_max_second_fraction <= 1:
-        errors.append("--joint-doublet-max-second-fraction must be in (0,1]")
     if args.joint_doublet_folds < 2:
         errors.append("--joint-doublet-folds must be at least 2")
-    if args.joint_doublet_min_evidence < 0:
-        errors.append("--joint-doublet-min-evidence must be nonnegative")
     if args.joint_doublet_max_runner_ups < 1:
         errors.append("--joint-doublet-max-runner-ups must be positive")
-    if not re.fullmatch(
-            r"(?:[0-9]+-[0-9]{2}:[0-9]{2}:[0-9]{2}|"
-            r"[0-9]+:[0-9]{2}:[0-9]{2})",
-            args.joint_doublet_time):
-        errors.append(
-            "--joint-doublet-time must be a SLURM duration such as 7-00:00:00")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.joint_doublet_partition):
-        errors.append("--joint-doublet-partition contains unsafe characters")
-    for label, ref_error, alt_error in (
-            ("RNA", args.joint_doublet_rna_error_ref,
-             args.joint_doublet_rna_error_alt),
-            ("ATAC", args.joint_doublet_atac_error_ref,
-             args.joint_doublet_atac_error_alt)):
-        if (not 0 <= ref_error <= 1 or not 0 <= alt_error <= 1 or
-                ref_error + alt_error >= 1):
-            errors.append(
-                f"JOINT_DOUBLET {label} errors must be in [0,1] and sum below 1")
     return errors
 
 
@@ -5609,10 +5644,27 @@ def _joint_doublet_validation_action(args, lib_nums):
         "DERIVATIVE_STATUS": "status",
         "DERIVATIVE_RESUME": "resume",
         "VALIDATION_FINALIZE": "finalize-checkpoint",
+        "NO_RESCORE_REANALYSIS": "no-rescore-reanalysis",
+        "NO_RESCORE_STATUS": "no-rescore-status",
+        "TARGETED_BENCHMARK_LAUNCH": "targeted-benchmark-launch",
+        "TARGETED_BENCHMARK_STATUS": "targeted-benchmark-status",
+        "TARGETED_BENCHMARK_RESUME": "targeted-benchmark-resume",
+        "TARGETED_REPROJECT": "targeted-reproject",
+        "TARGETED_LAUNCH": "targeted-launch",
+        "TARGETED_STATUS": "targeted-status",
+        "TARGETED_RESUME": "targeted-resume",
     }[action]
-    command = [sys.executable, helper, mapped,
-               "--validation-root", os.path.abspath(
-                   args.joint_doublet_validation_root or "")]
+    command = [sys.executable, helper, mapped]
+    targeted_mapped = {
+        "targeted-benchmark-launch", "targeted-benchmark-status",
+        "targeted-benchmark-resume", "targeted-reproject",
+        "targeted-launch", "targeted-status", "targeted-resume",
+    }
+    if mapped not in {"no-rescore-reanalysis", "no-rescore-status"} | \
+            targeted_mapped:
+        command.extend([
+            "--validation-root", os.path.abspath(
+                args.joint_doublet_validation_root or "")])
     if mapped == "preflight":
         required = {
             "--joint-doublet-source-output-root":
@@ -5719,6 +5771,90 @@ def _joint_doublet_validation_action(args, lib_nums):
             command.extend(["--temp-root", args.joint_doublet_temp_root])
         if args.submit:
             command.append("--submit")
+    elif mapped == "no-rescore-reanalysis":
+        required = {
+            "--joint-doublet-source-output-root":
+                args.joint_doublet_source_output_root,
+            "--joint-doublet-partial-output-root":
+                args.joint_doublet_partial_output_root,
+            "--joint-doublet-task-search-root":
+                args.joint_doublet_task_search_root,
+            "--joint-doublet-output-root": args.joint_doublet_output_root,
+            "--joint-doublet-targeted-output-root":
+                args.joint_doublet_targeted_output_root,
+            "--joint-doublet-tool-bin-root": args.joint_doublet_tool_bin_root,
+            "--joint-doublet-frozen-spec": args.joint_doublet_frozen_spec,
+        }
+        missing = [name for name, value in required.items()
+                   if not value or not os.path.isabs(value)]
+        if missing:
+            raise ValueError("absolute paths required: " + ", ".join(missing))
+        command.extend([
+            "--workflow-action", action,
+            "--libraries", *[str(value) for value in lib_nums],
+            "--source-output-root", args.joint_doublet_source_output_root,
+            "--partial-output-root", args.joint_doublet_partial_output_root,
+            "--task-search-root", args.joint_doublet_task_search_root,
+            "--stage-root", args.joint_doublet_output_root,
+            "--targeted-output-root", args.joint_doublet_targeted_output_root,
+            "--tool-bin-root", args.joint_doublet_tool_bin_root,
+            "--frozen-spec", args.joint_doublet_frozen_spec,
+            "--frozen-comparisons", args.joint_doublet_frozen_comparisons or args.joint_doublet_frozen_spec,
+            "--targeted-input-manifest", args.joint_doublet_targeted_input_manifest or "",
+            "--calibration-library", str(args.joint_doublet_calibration_library),
+            "--evidence-mode", args.joint_doublet_evidence_mode,
+            "--analysis-cpus", str(args.joint_doublet_analysis_cpus),
+            "--analysis-memory", args.joint_doublet_analysis_memory,
+            "--score-cpus", str(args.joint_doublet_score_cpus),
+            "--score-memory", args.joint_doublet_score_memory,
+            "--worker-cpus", str(args.joint_doublet_validation_worker_cpus),
+            "--worker-memory", args.joint_doublet_validation_worker_memory,
+            "--gather-cpus", str(args.joint_doublet_gather_cpus),
+            "--gather-memory", args.joint_doublet_gather_memory,
+            "--rna-error-ref", str(args.joint_doublet_rna_error_ref),
+            "--rna-error-alt", str(args.joint_doublet_rna_error_alt),
+            "--atac-error-ref", str(args.joint_doublet_atac_error_ref),
+            "--atac-error-alt", str(args.joint_doublet_atac_error_alt),
+            "--min-evidence", str(args.joint_doublet_min_evidence),
+            "--max-second-fraction",
+                str(args.joint_doublet_max_second_fraction),
+            "--time", args.joint_doublet_time,
+            "--partition", args.joint_doublet_partition,
+        ])
+        if args.submit:
+            command.append("--submit")
+    elif mapped == "no-rescore-status":
+        if not args.joint_doublet_output_root or not os.path.isabs(
+                args.joint_doublet_output_root):
+            raise ValueError(
+                "NO_RESCORE_STATUS requires absolute --joint-doublet-output-root")
+        command.extend([
+            "--stage-root", args.joint_doublet_output_root,
+            "--calibration-library", "25",
+        ])
+    elif mapped in targeted_mapped:
+        required = {
+            "--joint-doublet-targeted-output-root":
+                args.joint_doublet_targeted_output_root,
+            "--joint-doublet-tool-bin-root": args.joint_doublet_tool_bin_root,
+        }
+        missing = [name for name, value in required.items()
+                   if not value or not os.path.isabs(value)]
+        if missing:
+            raise ValueError("absolute paths required: " + ", ".join(missing))
+        command.extend([
+            "--targeted-output-root", args.joint_doublet_targeted_output_root,
+            "--tool-bin-root", args.joint_doublet_tool_bin_root,
+            "--calibration-library", "25",
+        ])
+        if mapped in {
+                "targeted-benchmark-launch", "targeted-benchmark-resume",
+                "targeted-launch", "targeted-resume"}:
+            if not args.submit:
+                raise ValueError(f"{action} requires explicit --submit")
+            command.append("--submit")
+        elif mapped == "targeted-reproject" and args.submit:
+            raise ValueError("TARGETED_REPROJECT never accepts --submit")
     elif mapped in {"status", "resume"}:
         if not args.joint_doublet_validation_root or not os.path.isabs(
                 args.joint_doublet_validation_root):
@@ -5744,13 +5880,31 @@ def _joint_doublet_validation_action(args, lib_nums):
 
 def run_joint_doublet(args, lib_nums):
     """Run or manage the all-library joint-doublet workflow."""
+    # The pilot calibration design is frozen to Library 25.  Keep this check
+    # before any action can resolve, stat, or open a project data path.
+    if args.joint_doublet_calibration_library != 25:
+        print("  ERROR: this joint-doublet pilot requires calibration Library 25")
+        return 1
     action = args.joint_doublet_action
     validation_actions = {
         "VALIDATION_PREFLIGHT", "VALIDATE_EXISTING", "DERIVATIVE_RESCORE",
         "REPAIR_MOLECULE_SIDECARS", "DERIVATIVE_STATUS", "DERIVATIVE_RESUME",
-        "VALIDATION_FINALIZE",
+        "VALIDATION_FINALIZE", "NO_RESCORE_REANALYSIS", "NO_RESCORE_STATUS",
+        "TARGETED_BENCHMARK_LAUNCH", "TARGETED_BENCHMARK_STATUS",
+        "TARGETED_BENCHMARK_RESUME", "TARGETED_REPROJECT",
+        "TARGETED_LAUNCH", "TARGETED_STATUS", "TARGETED_RESUME",
     }
     if action in validation_actions:
+        resource_errors = (_joint_doublet_scheduler_resource_errors(args) +
+                           _joint_doublet_model_parameter_errors(args))
+        if resource_errors:
+            for error in resource_errors:
+                print(f"  ERROR: {error}")
+            return 1
+        if args.joint_doublet_calibration_library not in lib_nums or \
+                args.joint_doublet_calibration_library in {19, 35, 38}:
+            print("  ERROR: calibration library must be requested and unprotected")
+            return 1
         try:
             return _joint_doublet_validation_action(args, lib_nums)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -5781,9 +5935,10 @@ def run_joint_doublet(args, lib_nums):
                 return _joint_doublet_trim(
                     args, records, output_root, jobs)
             if action == "PARTIAL_GATHER":
-                if 25 not in lib_nums:
+                if args.joint_doublet_calibration_library not in lib_nums:
                     raise ValueError(
-                        "PARTIAL_GATHER requires Library 25 in --libraries")
+                        "PARTIAL_GATHER requires the selected calibration "
+                        "library in --libraries")
                 return _joint_doublet_partial_submit(
                     args, records, output_root, jobs, lib_nums)
             if action == "PARTIAL_GATHER_WORKER":
@@ -5797,8 +5952,8 @@ def run_joint_doublet(args, lib_nums):
             print(f"  ERROR: JOINT_DOUBLET {action} failed: {exc}")
             return 1
 
-    if 25 not in lib_nums:
-        print("ERROR: JOINT_DOUBLET requires Library 25 for calibration")
+    if args.joint_doublet_calibration_library not in lib_nums:
+        print("ERROR: JOINT_DOUBLET requires the selected calibration library")
         return 1
     errors = _joint_doublet_option_errors(args)
     if errors:
@@ -5817,7 +5972,7 @@ def run_joint_doublet(args, lib_nums):
     print("=" * 72)
     print("JOINT_DOUBLET")
     print(f"  Libraries: {' '.join(record['library'] for record in records)}")
-    print("  Calibration: lib25 only")
+    print(f"  Calibration: lib{args.joint_doublet_calibration_library} only")
     print("  Frozen evaluation: lib35 lib38")
     print("  Pathological holdout interpreted last: lib19")
     print(f"  Output root: {output_root}")
@@ -21618,6 +21773,19 @@ Named condition sets:
     joint_group.add_argument("--joint-doublet-source-output-root", default=None)
     joint_group.add_argument("--joint-doublet-validation-root", default=None)
     joint_group.add_argument(
+        "--joint-doublet-task-search-root",
+        default="/mnt/beegfs/home/b/Doublet_ATAC_RNA/task_scratch",
+        help=("BeeGFS search root used only to recover already-completed "
+              "per-library no-rescore inputs omitted from compact returns."))
+    joint_group.add_argument(
+        "--joint-doublet-targeted-output-root",
+        default=("/mnt/beegfs/tetraploid_multiome_cis_trans/3P/analysis/"
+                 "aggregate_library_analysis/"
+                 "joint_doublet_validation_20260920_v4/"
+                 "proposed_targeted_validation_optimized_unsubmitted_v3"),
+        help=("Absolute destination for the rendered, unsubmitted targeted "
+              "validation workload."))
+    joint_group.add_argument(
         "--joint-doublet-tool-bin-root", default=SOFTWARE_BIN,
         help="One directory containing the matched orchestrator, helper, and scorer")
     joint_group.add_argument("--joint-doublet-calibration-library", type=int, default=25)
@@ -21627,6 +21795,9 @@ Named condition sets:
         "--joint-doublet-evidence-mode", choices=["SITE_AND_MOLECULE"],
         default="SITE_AND_MOLECULE")
     joint_group.add_argument("--joint-doublet-frozen-spec", default=None)
+    joint_group.add_argument("--joint-doublet-targeted-input-manifest", default=None)
+    joint_group.add_argument("--joint-doublet-frozen-comparisons", default=None,
+        help="Original target_cells_and_matched_comparisons.tsv; preserve the exact mappings")
     joint_group.add_argument("--joint-doublet-repair-plan", default=None)
     joint_group.add_argument("--joint-doublet-repair-cpus", type=int, default=40)
     joint_group.add_argument("--joint-doublet-repair-threads", type=int, default=32)
@@ -22126,6 +22297,18 @@ Named condition sets:
 
 def main():
     args = parse_args()
+    # This is a scientific-control-plane invariant, not a data-dependent
+    # validation.  Reject it before the generic workflow validates or probes
+    # any configured project root (O06).
+    requested_stages = {
+        item.strip().upper()
+        for item in str(args.stage or "").split(",") if item.strip()
+    }
+    if "JOINT_DOUBLET" in requested_stages and \
+            args.joint_doublet_calibration_library != 25:
+        print("ERROR: this joint-doublet pilot requires calibration library 25",
+              file=sys.stderr)
+        return 1
     if gex_maybe_run_internal_worker(args):
         return
     if ambient_maybe_run_internal_worker(args):

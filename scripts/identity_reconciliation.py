@@ -7801,7 +7801,7 @@ def finalize_main():
 
 JOINT_LEDGER_SCHEMA = "joint_doublet_canonical_cell_ledger_v2"
 JOINT_MANIFEST_SCHEMA = "joint_doublet_candidate_manifest_v2"
-JOINT_AGGREGATE_SCHEMA = "joint_doublet_ranked_cell_ledger_v2"
+JOINT_AGGREGATE_SCHEMA = "joint_doublet_ranked_cell_ledger_v3"
 JOINT_ANALYSIS_SCHEMA = "joint_doublet_post_gather_analysis_v1"
 
 
@@ -8613,8 +8613,7 @@ def _joint_percentile(value, reference):
 
 def _joint_score_rows(path, modality):
     if not path.is_file() or path.stat().st_size == 0:
-        return []
-    rows = []
+        return
     for row in read_tsv(str(path)):
         base = {
             key: row.get(key, "")
@@ -8622,28 +8621,79 @@ def _joint_score_rows(path, modality):
                 "schema_version", "library", "barcode", "candidate_id",
                 "locked_state", "locked_copy_vector", "second_state",
                 "second_copy_vector", "candidate_origin", "exhaustive_fallback",
-                "nomination_modalities")
+                "nomination_modalities", "candidate_policy",
+                "physical_pool_state", "component_only_state",
+                "structural_added_state_relationship")
         }
         for key, value in row.items():
             if key not in base and key not in {"library", "barcode", "candidate_id"}:
                 base[f"{modality}_{key}"] = value
-        rows.append(base)
-    return rows
+        yield base
 
 
 def joint_aggregate_parse_args():
     parser = argparse.ArgumentParser(
         description="Calibrate on Library 25 and build the frozen all-library ranked joint-doublet ledger.")
-    parser.add_argument("--input-root", required=True)
+    parser.add_argument("--input-root", default="")
+    parser.add_argument(
+        "--input-manifest", default="",
+        help=("Optional explicit per-library source roster with cell_ledger, "
+              "RNA/ATAC manifest, and RNA/ATAC score paths."))
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--libraries", nargs="+", required=True)
     parser.add_argument("--calibration-library", default="25")
+    parser.add_argument(
+        "--allow-missing", action="store_true",
+        help=("Warn and preserve incomplete scientific status when an expected "
+              "input is absent instead of aborting the remaining aggregation."))
     return parser.parse_args()
+
+
+JOINT_AGGREGATE_SOURCE_FIELDS = (
+    "library", "cell_ledger", "rna_manifest", "atac_manifest",
+    "rna_scores", "atac_scores",
+)
+
+
+def _joint_aggregate_sources(args, libraries):
+    """Resolve explicit inputs without assuming they share one stage root."""
+    if args.input_manifest:
+        manifest_path = Path(args.input_manifest)
+        if not manifest_path.is_file():
+            raise SystemExit(f"missing joint-aggregate input manifest: {manifest_path}")
+        sources = {}
+        for row in read_tsv(str(manifest_path)):
+            library = _joint_library(row.get("library", ""))
+            if library in sources:
+                raise SystemExit(
+                    f"{manifest_path}: duplicate source row for {library}")
+            sources[library] = {
+                field: Path(row.get(field, "")) if row.get(field, "") else None
+                for field in JOINT_AGGREGATE_SOURCE_FIELDS[1:]
+            }
+        return sources
+    if not args.input_root:
+        raise SystemExit("joint-aggregate requires --input-root or --input-manifest")
+    input_root = Path(args.input_root)
+    return {
+        library: {
+            "cell_ledger": input_root / library /
+                f"{library}.cell_ledger.tsv.gz",
+            "rna_manifest": input_root / library /
+                f"{library}.rna_joint_manifest.tsv.gz",
+            "atac_manifest": input_root / library /
+                f"{library}.atac_joint_manifest.tsv.gz",
+            "rna_scores": input_root / library /
+                f"{library}.rna_joint_scores.tsv.gz",
+            "atac_scores": input_root / library /
+                f"{library}.atac_joint_scores.tsv.gz",
+        }
+        for library in libraries
+    }
 
 
 def joint_aggregate_main():
     args = joint_aggregate_parse_args()
-    input_root = Path(args.input_root)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     libraries = [_joint_library(value) for value in args.libraries]
@@ -8652,33 +8702,87 @@ def joint_aggregate_main():
         raise SystemExit(
             "joint-aggregate requires the selected calibration library in --libraries")
 
+    sources = _joint_aggregate_sources(args, libraries)
+    warnings = []
+
+    def expected_path(library, field):
+        path = sources.get(library, {}).get(field)
+        if path is not None and path.is_file() and path.stat().st_size > 0:
+            return path
+        message = {
+            "library": library, "input_role": field,
+            "path": str(path) if path is not None else "UNRESOLVED",
+            "warning": "MISSING_OR_EMPTY_EXPECTED_INPUT",
+        }
+        warnings.append(message)
+        if not args.allow_missing:
+            raise SystemExit(
+                f"missing or empty {field} for {library}: {message['path']}")
+        return None
+
     ledgers = []
     ledger_by_key = {}
     candidate_by_key = {}
     for library in libraries:
-        ledger_path = input_root / library / f"{library}.cell_ledger.tsv.gz"
-        if not ledger_path.is_file():
-            raise SystemExit(f"missing canonical ledger: {ledger_path}")
-        for row in read_tsv(str(ledger_path)):
-            row = dict(row)
-            ledgers.append(row)
-            ledger_by_key[(library, row["barcode"])] = row
+        ledger_path = expected_path(library, "cell_ledger")
+        if ledger_path is not None:
+            for row in read_tsv(str(ledger_path)):
+                row = dict(row)
+                key = (library, row.get("barcode", ""))
+                if key in ledger_by_key:
+                    raise SystemExit(
+                        f"{ledger_path}: duplicate canonical cell {library}:{key[1]}")
+                ledgers.append(row)
+                ledger_by_key[key] = row
         for modality in ("rna", "atac"):
-            score_path = input_root / library / f"{library}.{modality}_joint_scores.tsv.gz"
-            for row in _joint_score_rows(score_path, modality):
-                key = (library, row["barcode"], row["candidate_id"])
-                candidate_by_key.setdefault(key, {}).update(row)
-        manifest_path = input_root / library / f"{library}.rna_joint_manifest.tsv.gz"
-        if manifest_path.is_file():
+            score_path = expected_path(library, f"{modality}_scores")
+            if score_path is not None:
+                seen_score_keys = set()
+                for row in _joint_score_rows(score_path, modality):
+                    key = (library, row["barcode"], row["candidate_id"])
+                    if key in seen_score_keys:
+                        raise SystemExit(
+                            f"{score_path}: duplicate candidate key "
+                            f"{library}:{row['barcode']}:{row['candidate_id']}")
+                    seen_score_keys.add(key)
+                    candidate_by_key.setdefault(key, {}).update(row)
+            manifest_path = expected_path(library, f"{modality}_manifest")
+            if manifest_path is None:
+                continue
+            seen_manifest_keys = set()
             for row in read_tsv(str(manifest_path)):
                 key = (library, row["barcode"], row["candidate_id"])
-                candidate_by_key.setdefault(key, {}).update({
-                    field: row.get(field, "") for field in (
+                if key in seen_manifest_keys:
+                    raise SystemExit(
+                        f"{manifest_path}: duplicate candidate key "
+                        f"{library}:{row['barcode']}:{row['candidate_id']}")
+                seen_manifest_keys.add(key)
+                target = candidate_by_key.setdefault(key, {})
+                for field in (
                         "library", "barcode", "candidate_id", "locked_state",
                         "locked_copy_vector", "second_state", "second_copy_vector",
                         "candidate_origin", "exhaustive_fallback",
-                        "nomination_modalities")
-                })
+                        "nomination_modalities", "candidate_policy",
+                        "physical_pool_state", "component_only_state",
+                        "structural_added_state_relationship"):
+                    value = row.get(field, "")
+                    prior = target.get(field, "")
+                    if prior and value and prior != value:
+                        warnings.append({
+                            "library": library,
+                            "input_role": f"{modality}_manifest",
+                            "path": str(manifest_path),
+                            "warning": (
+                                "RNA_ATAC_OR_SCORE_MANIFEST_FIELD_MISMATCH:"
+                                f"{field}:{row['barcode']}:{row['candidate_id']}"),
+                        })
+                    if value or not prior:
+                        target[field] = value
+
+    warning_fields = ("library", "input_role", "path", "warning")
+    write_tsv(
+        str(output_root / "joint_doublet_aggregate_warnings.tsv"),
+        warnings, warning_fields)
 
     calibration_cells = [
         row for row in ledgers
@@ -8686,8 +8790,17 @@ def joint_aggregate_main():
         donor_components(canonical_genotype(
             row.get("reconciled_identity_locked", "")))]
     if not calibration_cells:
-        raise SystemExit(
-            f"{calibration_library} has no canonical cells with a frozen identity")
+        message = {
+            "library": calibration_library,
+            "input_role": "cell_ledger",
+            "path": str(sources.get(calibration_library, {}).get(
+                "cell_ledger") or "UNRESOLVED"),
+            "warning": "NO_CALIBRATION_CELLS_WITH_FROZEN_IDENTITY",
+        }
+        warnings.append(message)
+        if not args.allow_missing:
+            raise SystemExit(
+                f"{calibration_library} has no canonical cells with a frozen identity")
     feature_names = (
         "rna_total_counts", "rna_detected_features",
         "atac_fragments", "atac_fragment_records")
@@ -8733,28 +8846,64 @@ def joint_aggregate_main():
     # The calibration distribution is one best nested-model improvement per
     # Library-25 cell and assay. Candidate multiplicity therefore cannot make
     # the reference distribution artificially more extreme.
-    best_calibration_delta = {"rna": defaultdict(lambda: -math.inf),
-                              "atac": defaultdict(lambda: -math.inf)}
+    calibration_channels = {
+        "site": {
+            "status_suffix": "score_status",
+            "delta_suffix": "delta_site_balanced_log_likelihood_k2_minus_k1",
+        },
+        "molecule": {
+            "status_suffix": "molecule_score_status",
+            "delta_suffix": "molecule_balanced_delta_log_likelihood_k2_minus_k1",
+        },
+    }
+    best_calibration_delta = {
+        evidence: {
+            modality: defaultdict(lambda: -math.inf)
+            for modality in ("rna", "atac")
+        }
+        for evidence in calibration_channels
+    }
     for row in candidate_by_key.values():
         if row.get("library") != calibration_library:
             continue
-        for modality in ("rna", "atac"):
-            status = clean(row.get(f"{modality}_score_status", "")).upper()
-            delta = _joint_finite(row.get(
-                f"{modality}_delta_site_balanced_log_likelihood_k2_minus_k1", ""))
-            if status == "AVAILABLE" and math.isfinite(delta):
-                barcode = row["barcode"]
-                best_calibration_delta[modality][barcode] = max(
-                    best_calibration_delta[modality][barcode], delta)
+        for evidence, channel in calibration_channels.items():
+            for modality in ("rna", "atac"):
+                status = clean(row.get(
+                    f"{modality}_{channel['status_suffix']}", "")).upper()
+                delta = _joint_finite(row.get(
+                    f"{modality}_{channel['delta_suffix']}", ""))
+                if status == "AVAILABLE" and math.isfinite(delta):
+                    barcode = row["barcode"]
+                    best_calibration_delta[evidence][modality][barcode] = max(
+                        best_calibration_delta[evidence][modality][barcode], delta)
     delta_reference = {
-        modality: sorted(
-            value for value in best_calibration_delta[modality].values()
-            if math.isfinite(value))
-        for modality in ("rna", "atac")
+        evidence: {
+            modality: sorted(
+                value for value in
+                best_calibration_delta[evidence][modality].values()
+                if math.isfinite(value))
+            for modality in ("rna", "atac")
+        }
+        for evidence in calibration_channels
     }
-    if not delta_reference["rna"] and not delta_reference["atac"]:
-        raise SystemExit(
-            f"{calibration_library} has no available RNA or ATAC joint-doublet scores")
+    if not delta_reference["site"]["rna"] and not delta_reference["site"]["atac"]:
+        warnings.append({
+            "library": calibration_library,
+            "input_role": "rna_scores,atac_scores",
+            "path": "SEE_EXPLICIT_SOURCE_ROSTER",
+            "warning": "NO_AVAILABLE_SITE_CALIBRATION_SCORES",
+        })
+        if not args.allow_missing:
+            raise SystemExit(
+                f"{calibration_library} has no available RNA or ATAC joint-doublet scores")
+    if not delta_reference["molecule"]["rna"] or \
+            not delta_reference["molecule"]["atac"]:
+        warnings.append({
+            "library": calibration_library,
+            "input_role": "rna_scores,atac_scores",
+            "path": "SEE_EXPLICIT_SOURCE_ROSTER",
+            "warning": "MOLECULE_CALIBRATION_REFERENCE_INCOMPLETE",
+        })
 
     candidate_rows = []
     candidates_by_cell = defaultdict(list)
@@ -8762,18 +8911,35 @@ def joint_aggregate_main():
             natural_key(item[0]), natural_key(item[1]), natural_key(item[2]))):
         row = dict(candidate_by_key[key])
         library, barcode, _ = key
-        percentiles = {}
+        percentiles = {"site": {}, "molecule": {}}
         for modality in ("rna", "atac"):
-            status = clean(row.get(f"{modality}_score_status", "")).upper()
-            delta = _joint_finite(row.get(
+            site_status = clean(
+                row.get(f"{modality}_score_status", "")).upper()
+            site_delta = _joint_finite(row.get(
                 f"{modality}_delta_site_balanced_log_likelihood_k2_minus_k1", ""))
-            percentiles[modality] = _joint_percentile(
-                delta, delta_reference[modality]) \
-                if status == "AVAILABLE" else math.nan
-            row[f"{modality}_library25_empirical_percentile"] = percentiles[modality]
+            molecule_status = clean(
+                row.get(f"{modality}_molecule_score_status", "")).upper()
+            molecule_delta = _joint_finite(row.get(
+                f"{modality}_molecule_balanced_delta_log_likelihood_k2_minus_k1", ""))
+            percentiles["site"][modality] = _joint_percentile(
+                site_delta, delta_reference["site"][modality]) \
+                if site_status == "AVAILABLE" else math.nan
+            percentiles["molecule"][modality] = _joint_percentile(
+                molecule_delta, delta_reference["molecule"][modality]) \
+                if molecule_status == "AVAILABLE" else math.nan
+            row[f"{modality}_library25_empirical_percentile"] = \
+                percentiles["site"][modality]
+            row[f"{modality}_molecule_library25_empirical_percentile"] = \
+                percentiles["molecule"][modality]
         available_snp = [
-            value for value in percentiles.values() if math.isfinite(value)]
+            value for value in percentiles["site"].values()
+            if math.isfinite(value)]
         snp_score = statistics.mean(available_snp) if available_snp else math.nan
+        available_molecule = [
+            value for value in percentiles["molecule"].values()
+            if math.isfinite(value)]
+        molecule_score = statistics.mean(available_molecule) \
+            if available_molecule else math.nan
         rna_z, atac_z, occupancy = occupancy_by_cell.get(
             (library, barcode), (math.nan, math.nan, math.nan))
         occupancy_percentile = _joint_percentile(
@@ -8791,7 +8957,7 @@ def joint_aggregate_main():
             (not available_snp and genotype_equivalent_evidence))
         rank_score = occupancy_percentile if genotype_equivalent else snp_score
         row.update({
-            "schema_version": "joint_doublet_candidate_aggregate_v1",
+            "schema_version": "joint_doublet_candidate_aggregate_v2",
             "calibration_library": calibration_library,
             "rna_expression_occupancy_z": rna_z,
             "atac_chromatin_occupancy_z": atac_z,
@@ -8799,12 +8965,15 @@ def joint_aggregate_main():
             "technical_occupancy_library25_empirical_percentile": occupancy_percentile,
             "genotype_equivalent_candidate": genotype_equivalent,
             "combined_snp_library25_empirical_percentile": snp_score,
+            "combined_molecule_library25_empirical_percentile": molecule_score,
             "candidate_rank_score": rank_score,
             "ranking_evidence_basis": (
                 "OCCUPANCY_GENOTYPE_EQUIVALENT" if genotype_equivalent else
                 "RNA_ATAC_SNP_ASSAY_CALIBRATED" if len(available_snp) == 2 else
-                "RNA_SNP_ASSAY_CALIBRATED" if math.isfinite(percentiles["rna"]) else
-                "ATAC_SNP_ASSAY_CALIBRATED" if math.isfinite(percentiles["atac"]) else
+                "RNA_SNP_ASSAY_CALIBRATED" if math.isfinite(
+                    percentiles["site"]["rna"]) else
+                "ATAC_SNP_ASSAY_CALIBRATED" if math.isfinite(
+                    percentiles["site"]["atac"]) else
                 "UNAVAILABLE"),
             "discovery_priority_tier": (
                 "PRIORITY_P99" if math.isfinite(rank_score) and rank_score >= 0.99 else
@@ -8816,16 +8985,24 @@ def joint_aggregate_main():
 
     rna_top = {}
     atac_top = {}
+    rna_molecule_top = {}
+    atac_molecule_top = {}
     for cell_key, rows in candidates_by_cell.items():
-        for modality, target in (("rna", rna_top), ("atac", atac_top)):
+        for modality, target, percentile_field in (
+                ("rna", rna_top, "rna_library25_empirical_percentile"),
+                ("atac", atac_top, "atac_library25_empirical_percentile"),
+                ("rna", rna_molecule_top,
+                 "rna_molecule_library25_empirical_percentile"),
+                ("atac", atac_molecule_top,
+                 "atac_molecule_library25_empirical_percentile")):
             scored = [
                 row for row in rows
                 if math.isfinite(_joint_finite(
-                    row.get(f"{modality}_library25_empirical_percentile", "")))]
+                    row.get(percentile_field, "")))]
             if scored:
                 target[cell_key] = max(
                     scored, key=lambda row: (
-                        _joint_finite(row[f"{modality}_library25_empirical_percentile"]),
+                        _joint_finite(row[percentile_field]),
                         natural_key(row["candidate_id"])))
 
     cell_rows = []
@@ -8837,6 +9014,8 @@ def joint_aggregate_main():
             natural_key(row.get("candidate_id", "")))) if rows else None
         rna_best = rna_top.get((library, barcode))
         atac_best = atac_top.get((library, barcode))
+        rna_molecule_best = rna_molecule_top.get((library, barcode))
+        atac_molecule_best = atac_molecule_top.get((library, barcode))
         if rna_best and atac_best:
             modality_conflict = (
                 "AGREE_TOP_SECOND_CONTRIBUTOR"
@@ -8870,15 +9049,38 @@ def joint_aggregate_main():
             "best_second_state": best.get("second_state", "") if best else "",
             "best_second_copy_vector": best.get("second_copy_vector", "") if best else "",
             "best_candidate_origin": best.get("candidate_origin", "") if best else "",
+            "best_candidate_policy": best.get("candidate_policy", "") if best else "",
+            "best_physical_pool_state": best.get(
+                "physical_pool_state", "") if best else "",
+            "best_component_only_state": best.get(
+                "component_only_state", "") if best else "",
+            "best_structural_added_state_relationship": best.get(
+                "structural_added_state_relationship", "") if best else "",
             "candidate_rank_score": best.get("candidate_rank_score", math.nan) if best else math.nan,
             "ranking_evidence_basis": best.get("ranking_evidence_basis", "UNAVAILABLE") if best else "UNAVAILABLE",
             "discovery_priority_tier": best.get("discovery_priority_tier", "UNRANKED") if best else "UNRANKED",
             "rna_top_second_state": rna_best.get("second_state", "") if rna_best else "",
+            "rna_top_candidate_id": rna_best.get("candidate_id", "") if rna_best else "",
             "rna_top_empirical_percentile": rna_best.get(
                 "rna_library25_empirical_percentile", math.nan) if rna_best else math.nan,
             "atac_top_second_state": atac_best.get("second_state", "") if atac_best else "",
+            "atac_top_candidate_id": atac_best.get("candidate_id", "") if atac_best else "",
             "atac_top_empirical_percentile": atac_best.get(
                 "atac_library25_empirical_percentile", math.nan) if atac_best else math.nan,
+            "rna_molecule_top_second_state": rna_molecule_best.get(
+                "second_state", "") if rna_molecule_best else "",
+            "rna_molecule_top_candidate_id": rna_molecule_best.get(
+                "candidate_id", "") if rna_molecule_best else "",
+            "rna_molecule_top_empirical_percentile": rna_molecule_best.get(
+                "rna_molecule_library25_empirical_percentile", math.nan)
+                if rna_molecule_best else math.nan,
+            "atac_molecule_top_second_state": atac_molecule_best.get(
+                "second_state", "") if atac_molecule_best else "",
+            "atac_molecule_top_candidate_id": atac_molecule_best.get(
+                "candidate_id", "") if atac_molecule_best else "",
+            "atac_molecule_top_empirical_percentile": atac_molecule_best.get(
+                "atac_molecule_library25_empirical_percentile", math.nan)
+                if atac_molecule_best else math.nan,
             "modality_conflict": modality_conflict,
             "rna_expression_occupancy_z": rna_z,
             "atac_chromatin_occupancy_z": atac_z,
@@ -8943,7 +9145,7 @@ def joint_aggregate_main():
     calibration_rows = []
     for feature, (median, scale) in feature_parameters.items():
         calibration_rows.append({
-            "schema_version": "joint_doublet_calibration_v2",
+            "schema_version": "joint_doublet_calibration_v3",
             "calibration_library": calibration_library,
             "channel": feature,
             "reference_count": len(feature_values[feature]),
@@ -8954,22 +9156,27 @@ def joint_aggregate_main():
             "calibration_interpretation":
                 "LIB25_FROZEN_ROBUST_NORMALIZATION;EMPIRICAL_DISCOVERY_REFERENCE_NOT_TRUTH_LABELS_OR_FDR",
         })
-    for modality in ("rna", "atac"):
-        reference = delta_reference[modality]
-        calibration_rows.append({
-            "schema_version": "joint_doublet_calibration_v2",
-            "calibration_library": calibration_library,
-            "channel": f"{modality}_best_cell_site_balanced_delta",
-            "reference_count": len(reference),
-            "median": _joint_quantile(reference, 0.5),
-            "robust_scale": "",
-            "p95": _joint_quantile(reference, 0.95),
-            "p99": _joint_quantile(reference, 0.99),
-            "calibration_interpretation":
-                "EMPIRICAL_DISCOVERY_REFERENCE_NOT_TRUTH_LABELS_OR_FDR",
-        })
+    for evidence in ("site", "molecule"):
+        for modality in ("rna", "atac"):
+            reference = delta_reference[evidence][modality]
+            calibration_rows.append({
+                "schema_version": "joint_doublet_calibration_v3",
+                "calibration_library": calibration_library,
+                "channel": (
+                    f"{modality}_best_cell_site_balanced_delta"
+                    if evidence == "site" else
+                    f"{modality}_best_cell_molecule_balanced_delta"),
+                "reference_count": len(reference),
+                "median": _joint_quantile(reference, 0.5),
+                "robust_scale": "",
+                "p95": _joint_quantile(reference, 0.95),
+                "p99": _joint_quantile(reference, 0.99),
+                "calibration_interpretation":
+                    "EMPIRICAL_DISCOVERY_REFERENCE_NOT_TRUTH_LABELS_OR_FDR;"
+                    "SITE_AND_MOLECULE_REFERENCES_NEVER_INTERCHANGED",
+            })
     calibration_rows.append({
-        "schema_version": "joint_doublet_calibration_v2",
+        "schema_version": "joint_doublet_calibration_v3",
         "calibration_library": calibration_library,
         "channel": "technical_occupancy_combined_z",
         "reference_count": len(occupancy_reference),
@@ -8980,9 +9187,8 @@ def joint_aggregate_main():
         "calibration_interpretation":
             "EMPIRICAL_DISCOVERY_REFERENCE_NOT_TRUTH_LABELS_OR_FDR",
     })
-    calibration_library_number = calibration_library.removeprefix("lib")
     write_tsv(
-        str(output_root / f"library{calibration_library_number}_calibration.tsv"),
+        str(output_root / f"library{calibration_library.removeprefix('lib')}_calibration.tsv"),
         calibration_rows, list(calibration_rows[0]))
 
     summary_rows = []
@@ -9005,10 +9211,21 @@ def joint_aggregate_main():
             "rna_atac_top_conflicts": conflicts["CONFLICT_TOP_SECOND_CONTRIBUTOR"],
             "atac_evidence_missing": conflicts["ATAC_EVIDENCE_MISSING"],
             "rna_evidence_missing": conflicts["RNA_EVIDENCE_MISSING"],
+            "rna_molecule_evaluable_cells": sum(
+                math.isfinite(_joint_finite(
+                    row.get("rna_molecule_top_empirical_percentile", "")))
+                for row in rows),
+            "atac_molecule_evaluable_cells": sum(
+                math.isfinite(_joint_finite(
+                    row.get("atac_molecule_top_empirical_percentile", "")))
+                for row in rows),
         })
     write_tsv(
         str(output_root / "joint_doublet_library_summary.tsv"),
         summary_rows, list(summary_rows[0]))
+    write_tsv(
+        str(output_root / "joint_doublet_aggregate_warnings.tsv"),
+        warnings, warning_fields)
     print(
         f"Aggregated {len(cell_rows)} cells and {len(candidate_rows)} candidates; "
         f"{calibration_library} alone supplied calibration references")
@@ -9033,39 +9250,73 @@ def _joint_analysis_candidate_value(row, modality, suffix, default=math.nan):
     return _joint_finite(row.get(f"{modality}_{suffix}", ""), default)
 
 
-def _joint_analysis_candidate_record(row, modality):
-    percentile = _joint_finite(
-        row.get(f"{modality}_library25_empirical_percentile", ""))
-    status = clean(row.get(f"{modality}_score_status", "")).upper()
+def _joint_analysis_candidate_record(row, modality, evidence="site"):
+    if evidence not in {"site", "molecule"}:
+        raise ValueError(f"unsupported joint evidence basis: {evidence}")
+    percentile_field = (
+        f"{modality}_library25_empirical_percentile"
+        if evidence == "site" else
+        f"{modality}_molecule_library25_empirical_percentile")
+    status_field = (
+        f"{modality}_score_status" if evidence == "site" else
+        f"{modality}_molecule_score_status")
+    percentile = _joint_finite(row.get(percentile_field, ""))
+    status = clean(row.get(status_field, "")).upper()
     if status != "AVAILABLE" or not math.isfinite(percentile):
         return None
+    prefix = "" if evidence == "site" else "molecule_balanced_"
     return {
         "candidate_id": clean(row.get("candidate_id", "")),
         "second_state": clean(row.get("second_state", "")),
+        "second_copy_vector": clean(row.get("second_copy_vector", "")),
         "percentile": percentile,
         "delta": _joint_analysis_candidate_value(
             row, modality,
-            "delta_site_balanced_log_likelihood_k2_minus_k1"),
+            ("delta_site_balanced_log_likelihood_k2_minus_k1"
+             if evidence == "site" else
+             "molecule_balanced_delta_log_likelihood_k2_minus_k1")),
         "fitted_second_fraction": _joint_analysis_candidate_value(
-            row, modality, "fitted_second_fraction"),
+            row, modality, prefix + "fitted_second_fraction"),
         "fitted_second_fraction_profile_low": _joint_analysis_candidate_value(
-            row, modality, "fitted_second_fraction_profile_low"),
+            row, modality, prefix + "fitted_second_fraction_profile_low"),
         "fitted_second_fraction_profile_high": _joint_analysis_candidate_value(
-            row, modality, "fitted_second_fraction_profile_high"),
+            row, modality, prefix + "fitted_second_fraction_profile_high"),
         "n_discriminating_sites": _joint_analysis_candidate_value(
-            row, modality, "n_discriminating_sites"),
+            row, modality, (
+                "n_discriminating_sites" if evidence == "site" else
+                "n_discriminating_linked_units")),
         "discriminating_depth": _joint_analysis_candidate_value(
             row, modality, "discriminating_depth"),
         "fold_support_fraction": _joint_analysis_candidate_value(
-            row, modality, "leave_one_fold_out_support_fraction"),
+            row, modality, (
+                "leave_one_fold_out_support_fraction" if evidence == "site" else
+                "molecule_heldout_fold_support_fraction")),
         "minimum_fold_delta": _joint_analysis_candidate_value(
-            row, modality, "minimum_leave_one_fold_out_balanced_delta"),
+            row, modality, (
+                "minimum_leave_one_fold_out_balanced_delta" if evidence == "site" else
+                "molecule_heldout_minimum_fold_mean_delta")),
         "top_site_fraction": _joint_analysis_candidate_value(
             row, modality,
-            "maximum_single_site_absolute_balanced_delta_fraction"),
-        "warnings": clean(row.get(f"{modality}_warnings", "")),
+            ("maximum_single_site_absolute_balanced_delta_fraction"
+             if evidence == "site" else
+             "maximum_single_linked_unit_absolute_contribution_fraction")),
+        "effective_linked_unit_count": _joint_analysis_candidate_value(
+            row, modality, "effective_linked_unit_count"),
+        "umi_gene_basis_fraction": _joint_analysis_candidate_value(
+            row, modality, "rna_umi_gene_basis_fraction"),
+        "query_name_fallback_basis_fraction": _joint_analysis_candidate_value(
+            row, modality, "query_name_fallback_basis_fraction"),
+        "warnings": clean(row.get(
+            f"{modality}_{'warnings' if evidence == 'site' else 'molecule_warnings'}",
+            "")),
         "candidate_origin": clean(row.get("candidate_origin", "")),
         "exhaustive_fallback": clean(row.get("exhaustive_fallback", "")),
+        "candidate_policy": clean(row.get("candidate_policy", "")),
+        "physical_pool_state": clean(row.get("physical_pool_state", "")),
+        "component_only_state": clean(row.get("component_only_state", "")),
+        "structural_added_state_relationship": clean(
+            row.get("structural_added_state_relationship", "")),
+        "evidence_basis": evidence.upper(),
     }
 
 
