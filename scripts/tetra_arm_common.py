@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import io
 import json
 import math
 import os
@@ -15,12 +16,27 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 
-RELEASE = "2.5.0"
+RELEASE = "2.5.1"
 CELL_MANIFEST_SCHEMA = "tetra_arm_cell_manifest_v1"
 AMBIENT_SCHEMA = "tetra_arm_ambient_sources_v1"
 ASE_SCHEMA = "tetra_arm_ase_evidence_v2"
 EXPRESSION_SCHEMA = "tetra_arm_expression_evidence_v1"
 CALL_SCHEMA = "tetra_arm_cnv_calls_v2"
+
+# Hybrid v1 adds a parallel set of contracts.  The legacy constants above are
+# intentionally unchanged because ``arm-cnv`` remains the frozen comparator.
+HYBRID_CELL_MANIFEST_SCHEMA = "tetra_arm_hybrid_cell_manifest_v1"
+EXPRESSION_MODEL_SCHEMA = "tetra_arm_expression_model_evidence_v1"
+HYBRID_SHARD_SCHEMA = "tetra_arm_hybrid_shard_v1"
+HYBRID_SCORE_SCHEMA = "tetra_arm_hybrid_scores_v1"
+HYBRID_COMPONENT_SCHEMA = "tetra_arm_expression_components_v1"
+HYBRID_CALIBRATION_SCHEMA = "tetra_arm_hybrid_calibration_v1"
+HYBRID_CALL_SCHEMA = "tetra_arm_cnv_calls_v3"
+HYBRID_UID_SCHEMA = "tetra_arm_uid_chromosome_flags_v4"
+HYBRID_PAIR_SCHEMA = "tetra_arm_donor_pair_arm_summary_v4"
+HYBRID_QC_SCHEMA = "tetra_arm_call_qc_v3"
+HYBRID_CONTRACT_SCHEMA = "tetra_arm_call_contract_v3"
+HYBRID_REPORT_SCHEMA = "tetra_arm_cnv_report_v4"
 
 
 def clean(value) -> str:
@@ -122,8 +138,49 @@ def read_tsv(path: str) -> Iterator[Dict[str, str]]:
             yield {str(k): str(v) for k, v in row.items()}
 
 
+def validate_tsv_schema(
+        path: str, schema: str, required_fields: Iterable[str],
+        schema_field: str = "schema_version",
+        allow_header_only: bool = True) -> Tuple[List[str], int]:
+    """Validate a versioned TSV using a required-column subset contract.
+
+    Hybrid tables are deliberately extensible.  Their validators therefore
+    reject missing or duplicate columns, malformed rows, and mixed schemas,
+    but they do not require an exact column count.  A complete header-only
+    table is a valid scientific terminal state when ``allow_header_only`` is
+    true.
+    """
+    target = require_file(path)
+    required = set(required_fields)
+    required.add(schema_field)
+    with open_text(target) as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        header = list(reader.fieldnames or [])
+        if not header:
+            raise ValueError(f"empty or headerless TSV: {target}")
+        if len(header) != len(set(header)):
+            raise ValueError(f"duplicate columns in TSV header: {target}")
+        missing = sorted(required - set(header))
+        if missing:
+            raise ValueError(
+                f"{target} lacks required columns for {schema}: {missing}")
+        count = 0
+        for line_number, row in enumerate(reader, start=2):
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"malformed TSV row {target}:{line_number}")
+            if clean(row.get(schema_field)) != schema:
+                raise ValueError(
+                    f"incompatible schema at {target}:{line_number}; "
+                    f"expected {schema}")
+            count += 1
+    if not allow_header_only and count == 0:
+        raise ValueError(f"header-only table is not allowed: {target}")
+    return header, count
+
+
 @contextmanager
-def atomic_text(path: str, gzip_output: bool | None = None):
+def atomic_text(path: str, gzip_output: bool | None = None,
+                deterministic_gzip: bool = False):
     destination = Path(path)
     if os.path.lexists(destination):
         raise FileExistsError(
@@ -136,13 +193,22 @@ def atomic_text(path: str, gzip_output: bool | None = None):
         dir=str(destination.parent))
     os.close(fd)
     try:
-        if suffix:
+        raw_handle = None
+        if suffix and deterministic_gzip:
+            raw_handle = open(temporary, "wb")
+            compressed = gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw_handle, mtime=0)
+            handle = io.TextIOWrapper(
+                compressed, encoding="utf-8", newline="")
+        elif suffix:
             handle = gzip.open(temporary, "wt", encoding="utf-8", newline="")
         else:
             handle = open(temporary, "w", encoding="utf-8", newline="")
         with handle:
             yield handle
             handle.flush()
+        if raw_handle is not None:
+            raw_handle.close()
         if os.path.getsize(temporary) == 0:
             raise ValueError(f"refusing to publish empty output: {path}")
         # The temporary file lives beside its destination, so a hard link is
@@ -150,6 +216,8 @@ def atomic_text(path: str, gzip_output: bool | None = None):
         # the race between the initial existence check and publication.
         os.link(temporary, destination)
     finally:
+        if "raw_handle" in locals() and raw_handle is not None:
+            raw_handle.close()
         try:
             os.unlink(temporary)
         except FileNotFoundError:
@@ -168,9 +236,10 @@ def require_outputs_absent(paths: Iterable[os.PathLike | str]) -> None:
 
 
 def write_tsv_atomic(path: str, rows: Iterable[Mapping[str, object]],
-                     fields: Sequence[str]) -> int:
+                     fields: Sequence[str],
+                     deterministic_gzip: bool = False) -> int:
     count = 0
-    with atomic_text(path) as handle:
+    with atomic_text(path, deterministic_gzip=deterministic_gzip) as handle:
         writer = csv.DictWriter(
             handle, fieldnames=list(fields), delimiter="\t",
             lineterminator="\n", extrasaction="raise")

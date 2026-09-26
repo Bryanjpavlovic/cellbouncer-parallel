@@ -15,6 +15,7 @@ from pathlib import Path
 from tetra_arm_common import (
     AMBIENT_SCHEMA,
     CELL_MANIFEST_SCHEMA,
+    HYBRID_CELL_MANIFEST_SCHEMA,
     RELEASE,
     canonical_barcode,
     canonical_pair,
@@ -56,6 +57,13 @@ CELL_FIELDS = [
     "ambient_exact_donor_burden_fields", "ambient_background_shift_fields",
     "model_eligible", "calibration_eligible",
     "eligibility_reasons", "schema_version",
+]
+
+HYBRID_CELL_FIELDS = CELL_FIELDS[:-1] + [
+    "hybrid_target_eligible", "hybrid_target_reasons",
+    "expression_reference_eligible", "expression_reference_reasons",
+    "cell_group_source", "cell_group_target_chromosome_excluded",
+    "schema_version",
 ]
 
 AMBIENT_FIELDS = [
@@ -156,6 +164,75 @@ def load_groups(path: str, library: int) -> dict[str, str]:
         if barcode in result and result[barcode] != group:
             raise ValueError(f"duplicate/conflicting group for {barcode}")
         result[barcode] = group
+    return result
+
+
+def load_group_provenance(path: str, library: int) -> dict[str, dict[str, object]]:
+    """Load optional group provenance used only by the hybrid model.
+
+    A group remains useful for reporting when its construction did not exclude
+    the target chromosome.  It is marked inferentially valid only when the
+    input explicitly says so; absence of that optional annotation is never a
+    structural failure.
+    """
+    if not path:
+        return {}
+    group_path = require_file(path, "cell groups")
+    with open_text(group_path) as handle:
+        first_line = handle.readline().rstrip("\r\n")
+    if not first_line:
+        raise ValueError(f"empty cell-group file: {group_path}")
+    first_fields = first_line.split("\t")
+    normalized_header = {clean(field).lower() for field in first_fields}
+    has_header = (
+        "barcode" in normalized_header
+        and bool({"group", "cluster", "cell_type"} & normalized_header)
+    )
+
+    if has_header:
+        rows = read_tsv(group_path)
+    else:
+        def headerless_rows():
+            with open_text(group_path) as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    fields = line.rstrip("\r\n").split("\t")
+                    if len(fields) != 2 or not all(clean(value) for value in fields):
+                        raise ValueError(
+                            f"headerless cell-group row must have two nonempty "
+                            f"columns: {group_path}:{line_number}")
+                    yield {"barcode": fields[0], "group": fields[1]}
+        rows = headerless_rows()
+
+    result: dict[str, dict[str, object]] = {}
+    for row in rows:
+        raw_library = clean(row.get("library"))
+        if raw_library:
+            raw_library = raw_library.lower().removeprefix("lib")
+            try:
+                if int(raw_library) != library:
+                    continue
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid library in cell-group file: {raw_library}") from exc
+        barcode = canonical_barcode(row.get("barcode", ""))
+        group = clean(row.get("group") or row.get("cluster") or row.get("cell_type"))
+        if not barcode or not group:
+            continue
+        source = clean(
+            row.get("cell_group_source") or row.get("group_source")
+            or row.get("source")) or os.path.abspath(group_path)
+        excluded = truthy(
+            row.get("cell_group_target_chromosome_excluded")
+            or row.get("target_chromosome_excluded")
+            or row.get("chromosome_excluded"))
+        value = {
+            "group": group,
+            "source": source,
+            "target_chromosome_excluded": excluded,
+        }
+        if barcode in result and result[barcode] != value:
+            raise ValueError(f"duplicate/conflicting group provenance for {barcode}")
+        result[barcode] = value
     return result
 
 
@@ -402,11 +479,18 @@ def prepare_library(args) -> int:
     ambient_path = output_dir / f"lib{library}.ambient_sources.tsv.gz"
     qc_path = output_dir / f"lib{library}.prepare_qc.tsv"
     contract_path = output_dir / f"lib{library}.prepare_contract.json"
-    require_outputs_absent((manifest_path, ambient_path, qc_path, contract_path))
+    hybrid_manifest_path = output_dir / f"lib{library}.hybrid_cell_manifest.tsv.gz"
+    output_paths = [manifest_path, ambient_path, qc_path, contract_path]
+    if args.emit_hybrid_manifest:
+        output_paths.append(hybrid_manifest_path)
+    require_outputs_absent(output_paths)
     ledger_path = require_file(args.ledger, "split final ledger")
     assignments_path = require_file(args.final_assignments, "final assignments")
     assignments = parse_headerless_assignments(assignments_path)
     groups = load_groups(args.cell_groups, library)
+    group_provenance = (
+        load_group_provenance(args.cell_groups, library)
+        if args.emit_hybrid_manifest else {})
     ploidy_nn = load_ploidy_nn(args.ploidy_nn, library)
     species = load_species_map(args.panel_metadata)
 
@@ -442,6 +526,7 @@ def prepare_library(args) -> int:
             f"missing={missing[:5]} extra={extra[:5]}")
 
     cells = []
+    hybrid_cells = []
     reason_counts = Counter()
     profile_counts = Counter()
     profile_objects = {}
@@ -500,8 +585,8 @@ def prepare_library(args) -> int:
             raise ValueError(
                 f"ambient-rate mismatch for lib{library}/{barcode}: "
                 f"ledger={ledger_c} prefix={ambient_c}")
-        if not 0 <= ambient_c < 1:
-            raise ValueError(f"ambient rate outside [0,1) for lib{library}/{barcode}")
+        if not 0 <= ambient_c <= 1:
+            raise ValueError(f"ambient rate outside [0,1] for lib{library}/{barcode}")
         if math.isfinite(ambient_se) and ambient_se < 0:
             raise ValueError(
                 f"ambient rate standard error is negative for lib{library}/{barcode}")
@@ -512,6 +597,8 @@ def prepare_library(args) -> int:
         selected_arms[barcode] = arm
 
         model_reasons = []
+        if ambient_c >= 1.0:
+            model_reasons.append("AMBIENT_C_AT_UPPER_BOUNDARY")
         if not donor_a or not donor_b:
             model_reasons.append("NOT_HETEROTYPIC_TWO_DONOR")
         if assignment_status == "REVIEW_NEEDED":
@@ -531,11 +618,17 @@ def prepare_library(args) -> int:
         model_eligible = not model_reasons
 
         calibration_reasons = list(model_reasons)
+        expression_reference_reasons = [
+            reason for reason in model_reasons
+            if reason != "NOT_HETEROTYPIC_TWO_DONOR"
+        ]
         ploidy_state = clean(row.get("current_ploidy_state"))
         if ploidy_state and "TETRA" not in ploidy_state.upper():
             calibration_reasons.append("NON_TETRAPLOID_STATE")
+            expression_reference_reasons.append("NON_TETRAPLOID_STATE")
         if row_bad_status(row.get("ploidy_evidence_status")):
             calibration_reasons.append("PLOIDY_EVIDENCE_UNRESOLVED")
+            expression_reference_reasons.append("PLOIDY_EVIDENCE_UNRESOLVED")
         if row_bad_status(row.get("nuclear_reconciliation_status")):
             calibration_reasons.append("NUCLEAR_IDENTITY_UNRESOLVED")
         if args.ploidy_nn and barcode not in ploidy_nn:
@@ -558,18 +651,24 @@ def prepare_library(args) -> int:
             nn_qc = clean(row.get("nn_qc_pass"))
         if math.isfinite(p_tet) and p_tet < args.min_calibration_tet_probability:
             calibration_reasons.append("LOW_TETRAPLOID_PROBABILITY")
+            expression_reference_reasons.append("LOW_TETRAPLOID_PROBABILITY")
         if nn_qc and not truthy(nn_qc):
             calibration_reasons.append("PLOIDY_NN_QC_FAIL")
+            expression_reference_reasons.append("PLOIDY_NN_QC_FAIL")
         if has_event_id(row.get("event_id")):
             calibration_reasons.append("IDENTITY_EVENT_CELL")
+            expression_reference_reasons.append("IDENTITY_EVENT_CELL")
         calibration_eligible = model_eligible and not calibration_reasons
+        expression_reference_reasons = sorted(
+            set(expression_reference_reasons), key=natural_key)
+        expression_reference_eligible = not expression_reference_reasons
         reasons = sorted(set(model_reasons + calibration_reasons), key=natural_key)
         if not reasons:
             reasons = ["PASS"]
         reason_counts.update(reasons)
         group = groups.get(barcode, f"lib{library}")
         uid = clean(row.get("uid_or_uid_set") or row.get("reconciled_uid") or row.get("uid"))
-        cells.append({
+        cell = {
             "library": library,
             "barcode": barcode,
             "production_assignment": assignment,
@@ -633,12 +732,45 @@ def prepare_library(args) -> int:
             "calibration_eligible": int(calibration_eligible),
             "eligibility_reasons": ";".join(reasons),
             "schema_version": CELL_MANIFEST_SCHEMA,
-        })
+        }
+        cells.append(cell)
+        if args.emit_hybrid_manifest:
+            provenance = group_provenance.get(barcode, {})
+            target_reasons = sorted(set(model_reasons), key=natural_key)
+            hybrid = dict(cell)
+            hybrid.update({
+                "hybrid_target_eligible": int(model_eligible),
+                "hybrid_target_reasons": (
+                    ";".join(target_reasons) if target_reasons else "PASS"),
+                "expression_reference_eligible": int(
+                    expression_reference_eligible),
+                "expression_reference_reasons": (
+                    ";".join(expression_reference_reasons)
+                    if expression_reference_reasons else "PASS"),
+                "cell_group_source": clean(provenance.get("source")) or
+                    "LIBRARY_FALLBACK",
+                "cell_group_target_chromosome_excluded": int(bool(
+                    provenance.get("target_chromosome_excluded", False))),
+                "schema_version": HYBRID_CELL_MANIFEST_SCHEMA,
+            })
+            hybrid_cells.append(hybrid)
+
+    upper_boundary_cells = reason_counts.get(
+        "AMBIENT_C_AT_UPPER_BOUNDARY", 0)
+    if upper_boundary_cells:
+        print(
+            f"WARNING: lib{library} has {upper_boundary_cells} cell(s) with "
+            "ambient_c=1; retaining them for provenance and excluding them "
+            "from target and calibration inference",
+            file=sys.stderr)
 
     profile_statuses = {
         prefix: scan_cell_source_metadata(profile_objects[prefix], set(barcodes))
         for prefix, barcodes in profile_cells.items()
     }
+    hybrid_by_barcode = {
+        row["barcode"]: row for row in hybrid_cells
+    } if args.emit_hybrid_manifest else {}
     for cell in cells:
         barcode = cell["barcode"]
         prefix = selected_profiles[barcode]
@@ -649,10 +781,19 @@ def prepare_library(args) -> int:
         else:
             cell["ambient_profile_mode"] = "CELL_SPECIFIC"
             cell["ambient_profile_status"] = status
+        if args.emit_hybrid_manifest:
+            hybrid_by_barcode[barcode]["ambient_profile_mode"] = cell[
+                "ambient_profile_mode"]
+            hybrid_by_barcode[barcode]["ambient_profile_status"] = cell[
+                "ambient_profile_status"]
         profile_counts[cell["ambient_profile_mode"]] += 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_tsv_atomic(str(manifest_path), cells, CELL_FIELDS)
+    if args.emit_hybrid_manifest:
+        write_tsv_atomic(
+            str(hybrid_manifest_path), hybrid_cells, HYBRID_CELL_FIELDS,
+            deterministic_gzip=True)
     ambient_rows = write_tsv_atomic(
         str(ambient_path),
         iter_ambient_rows(
@@ -674,7 +815,7 @@ def prepare_library(args) -> int:
         ["library", "cells", "model_eligible", "calibration_eligible",
          "ambient_rows", "profile_modes", "eligibility_reasons", "status",
          "schema_version"])
-    write_json_atomic(str(contract_path), {
+    contract = {
         "schema_version": "tetra_arm_prepare_contract_v1",
         "release": RELEASE,
         "library": library,
@@ -696,8 +837,23 @@ def prepare_library(args) -> int:
             "ambient_sources": str(ambient_path),
         },
         "cells": len(cells),
+        "ambient_c_upper_boundary_cells": upper_boundary_cells,
         "status": "PASS",
-    })
+    }
+    if args.emit_hybrid_manifest:
+        contract["hybrid"] = {
+            "schema_version": HYBRID_CELL_MANIFEST_SCHEMA,
+            "hybrid_cell_manifest": str(hybrid_manifest_path),
+            "hybrid_target_eligible": sum(
+                int(row["hybrid_target_eligible"]) for row in hybrid_cells),
+            "expression_reference_eligible": sum(
+                int(row["expression_reference_eligible"])
+                for row in hybrid_cells),
+            "cell_group_provenance_policy": (
+                "INFERENTIAL_ONLY_WHEN_TARGET_CHROMOSOME_EXCLUDED"),
+        }
+        contract["outputs"]["hybrid_cell_manifest"] = str(hybrid_manifest_path)
+    write_json_atomic(str(contract_path), contract)
     return 0
 
 
@@ -724,6 +880,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--cell-groups", default="")
     prepare.add_argument("--ploidy-nn", default="")
     prepare.add_argument("--min-calibration-tet-probability", type=float, default=0.90)
+    prepare.add_argument(
+        "--emit-hybrid-manifest", action="store_true",
+        help=("also emit the independently eligible hybrid target/reference "
+              "manifest without changing the legacy manifest"))
     prepare.add_argument("--output-dir", required=True)
     prepare.set_defaults(func=prepare_library)
     return parser

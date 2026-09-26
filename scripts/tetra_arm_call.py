@@ -50,7 +50,7 @@ from tetra_arm_common import (
 )
 
 
-PROGRAM_VERSION = "2.6.0"
+PROGRAM_VERSION = "2.6.1"
 ASE_INPUT_SCHEMA = "tetra_arm_ase_evidence_v2"
 CALL_OUTPUT_SCHEMA = "tetra_arm_cnv_calls_v2"
 CALIBRATION_OUTPUT_SCHEMA = "tetra_arm_calibration_v2"
@@ -2226,7 +2226,7 @@ def load_ase(paths: Sequence[str], manifests: Mapping[Tuple[str, str], Mapping[s
                 raise ValueError(f"donor-pair label mismatch for lib{library}/{barcode}")
             ambient_c_value = finite_float(row.get("ambient_c"))
             if (not math.isfinite(ambient_c_value) or
-                    not 0.0 <= ambient_c_value < 1.0):
+                    not 0.0 <= ambient_c_value <= 1.0):
                 raise ValueError(
                     f"invalid ambient_c for lib{library}/{barcode}: "
                     f"{row.get('ambient_c')!r}")

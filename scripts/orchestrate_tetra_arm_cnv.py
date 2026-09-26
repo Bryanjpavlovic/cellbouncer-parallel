@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 
-RELEASE = "3.0.10"
+RELEASE = "3.0.13"
 MIN_AGGREGATE_SAFE_CALLER = (2, 6, 0)
 FINAL_IDENTITY_SCHEMA = "identity_reconciliation_final_v8_production_evidence_split"
 FINAL_ASSIGNMENT_STATUSES = {

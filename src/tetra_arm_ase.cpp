@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* PROGRAM = "tetra_arm_ase";
-constexpr const char* VERSION = "2.4.0";
+constexpr const char* VERSION = "2.4.1";
 constexpr const char* SCHEMA = "tetra_arm_ase_evidence_v2";
 constexpr const char* QC_SCHEMA = "tetra_arm_ase_qc_v2";
 constexpr const char* CELL_MANIFEST_SCHEMA = "tetra_arm_cell_manifest_v1";
@@ -209,6 +209,10 @@ bool parse_double(const std::string& text, double& value) {
     value = std::strtod(text.c_str(), &end);
     return errno == 0 && end != text.c_str() && *end == '\0' &&
            std::isfinite(value);
+}
+
+bool valid_ambient_c(double value) {
+    return std::isfinite(value) && value >= 0.0 && value <= 1.0;
 }
 
 bool missing_value(const std::string& value) {
@@ -678,10 +682,14 @@ void load_cells(const Options& options, const std::vector<std::string>& samples,
         // targets. A header-only target set is a valid terminal state, but it
         // must not turn malformed upstream data into a successful run.
         if (!parse_double(fields[c_col], cell.ambient_c) ||
-                cell.ambient_c < 0.0 || cell.ambient_c >= 1.0) {
+                !valid_ambient_c(cell.ambient_c)) {
             gzclose(input);
             throw UserError("invalid ambient_c for " + cell.barcode);
         }
+        // c=1 is a valid upstream boundary estimate, but it contains no
+        // identifiable endogenous signal and must never be scored or used for
+        // calibration. Preserve the observed value while forcing exclusion.
+        if (cell.ambient_c == 1.0) cell.model_eligible = false;
         if (missing_value(fields[cse_col])) {
             cell.ambient_c_se = std::numeric_limits<double>::quiet_NaN();
         } else if (!parse_double(fields[cse_col], cell.ambient_c_se) ||
@@ -1644,6 +1652,12 @@ void internal_self_test() {
     }
     if (!rejected_negative) {
         throw UserError("self-test failed: negative unsigned integer accepted");
+    }
+
+    if (!valid_ambient_c(0.0) || !valid_ambient_c(1.0) ||
+            valid_ambient_c(std::nextafter(0.0, -1.0)) ||
+            valid_ambient_c(std::nextafter(1.0, 2.0))) {
+        throw UserError("self-test failed: ambient-c inclusive-boundary policy");
     }
 
     std::string barcode_a = "AAAAAAAAAAAAAAAA";
