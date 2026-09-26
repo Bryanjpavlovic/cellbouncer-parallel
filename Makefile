@@ -79,8 +79,7 @@ AUX_ROOT_BINS = demux_mt demux_species demux_tags doublet_dragon bulkprops \
 DEPRECATED_BINS = demux_vcf quant_contam quant3_contam quant3_contam_ap \
                   quant3_contam_empty_drops downsample_vcf
 UTIL_BINS = utils/refine_vcf utils/bam_indiv_rg utils/bam_split_bcs \
-            utils/bam_cb_cache_extract utils/split_read_files \
-            utils/atac_fq_preprocess utils/combine_species_counts \
+            utils/bam_cb_cache_extract utils/combine_species_counts \
             utils/composite_bam2counts \
             utils/nuclear_panel_distinguishability
 
@@ -302,16 +301,6 @@ utils/bam_cb_cache_extract: src/bam_cb_cache_extract.cpp
 	$(COMP) $(CXXIFLAGS) $(CXXFLAGS_CACHE) src/bam_cb_cache_extract.cpp \
 	    -o $@ $(LFLAGS) $(DEPS_CACHE)
 
-utils/atac_fq_preprocess: src/atac_fq_preprocess.cpp build/common.o $(DEPS)
-	mkdir -p utils
-	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o \
-	    src/atac_fq_preprocess.cpp $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
-
-utils/split_read_files: src/split_read_files.cpp build/common.o $(DEPS)
-	mkdir -p utils
-	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o \
-	    src/split_read_files.cpp $(LFLAGS) $(DEPS) -o $@ $(DEPS2)
-
 utils/combine_species_counts: src/combine_species_counts.cpp build/common.o $(DEPS)
 	mkdir -p utils
 	$(COMP) $(CXXFLAGS_STD) $(CXXIFLAGS) build/common.o \
@@ -470,6 +459,8 @@ clean_build:
 clean_binaries:
 	rm -f $(ORCHESTRATOR_BINS) $(AUX_ROOT_BINS) $(DEPRECATED_BINS) test_ambient_math
 	rm -f $(UTIL_BINS) utils/get_unique_kmers
+	# Remove old FASTQ utilities now built and installed by align_pipelines.
+	rm -f utils/atac_fq_preprocess utils/split_read_files bin/atac_fq_preprocess bin/split_read_files
 
 clean_deps:
 	cd dependencies/htswrapper && $(MAKE) clean || true
